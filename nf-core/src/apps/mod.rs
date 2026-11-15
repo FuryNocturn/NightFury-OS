@@ -85,25 +85,3 @@ pub fn create(kind: AppKind) -> Box<dyn App> {
         AppKind::Terminal => terminal::new(),
     }
 }
-
-/// App provisional mientras se escriben las de verdad.
-pub(crate) struct Placeholder(pub(crate) AppKind);
-
-impl App for Placeholder {
-    fn kind(&self) -> AppKind {
-        self.0
-    }
-    fn title(&self) -> String {
-        String::from(APPS.iter().find(|a| a.0 == self.0).map(|a| a.1).unwrap_or(""))
-    }
-    fn min_size(&self) -> (i32, i32) {
-        (200, 120)
-    }
-    fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {
-        let b = s.bounds();
-        s.fill_rect(b, 0xFFFFFF);
-    }
-    fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
-    fn mouse(&mut self, _ev: MouseEv, _cx: &mut Ctx) {}
-    fn tick(&mut self, _cx: &mut Ctx) {}
-}
