@@ -68,6 +68,7 @@ pub struct Keyboard {
     alt: bool,
     altgr: bool,
     caps: bool,
+    caps_held: bool,
     /// Tecla muerta pendiente (` ´ ¨ ^).
     dead: Option<char>,
 }
@@ -140,6 +141,7 @@ impl Keyboard {
             alt: false,
             altgr: false,
             caps: false,
+            caps_held: false,
             dead: None,
         }
     }
@@ -196,9 +198,11 @@ impl Keyboard {
                 Key::Other
             }
             (false, 0x3A) => {
-                if down {
+                // Solo al pulsar, no con la repetición automática de la tecla mantenida.
+                if down && !self.caps_held {
                     self.caps = !self.caps;
                 }
+                self.caps_held = down;
                 Key::Other
             }
             (false, 0x01) => Key::Escape,
