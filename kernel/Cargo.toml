@@ -1,0 +1,14 @@
+[package]
+name = "kernel"
+version.workspace = true
+edition.workspace = true
+description = "NightFury: núcleo y arranque UEFI (sin dependencias externas)"
+
+[[bin]]
+name = "nightfury"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+nf-core = { path = "../nf-core" }
