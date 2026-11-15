@@ -8,6 +8,11 @@ use crate::theme::Theme;
 use alloc::boxed::Box;
 use alloc::string::String;
 
+mod calc;
+mod notepad;
+mod settings;
+mod terminal;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AppKind {
     Notepad,
@@ -74,15 +79,15 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
 
 pub fn create(kind: AppKind) -> Box<dyn App> {
     match kind {
-        AppKind::Notepad => Box::new(Placeholder(kind)),
-        AppKind::Calc => Box::new(Placeholder(kind)),
-        AppKind::Settings => Box::new(Placeholder(kind)),
-        AppKind::Terminal => Box::new(Placeholder(kind)),
+        AppKind::Notepad => notepad::new(),
+        AppKind::Calc => calc::new(),
+        AppKind::Settings => settings::new(),
+        AppKind::Terminal => terminal::new(),
     }
 }
 
 /// App provisional mientras se escriben las de verdad.
-struct Placeholder(AppKind);
+pub(crate) struct Placeholder(pub(crate) AppKind);
 
 impl App for Placeholder {
     fn kind(&self) -> AppKind {
