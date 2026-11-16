@@ -5,14 +5,17 @@
 
 extern crate alloc;
 
+mod ahci;
 mod arch;
 mod boot;
 mod fb;
+mod pci;
 mod ps2;
 mod rtc;
 mod serial;
 mod uefi;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -20,7 +23,9 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering::*};
 use fb::Fb;
 use nf_core::desktop::Desktop;
+use nf_core::block::{BlockDev, BLOCK};
 use nf_core::files::Files;
+use nf_core::fs::Nffs;
 use nf_core::geom::Rect;
 use nf_core::heap::Heap;
 use nf_core::icons::{self, Icon};
@@ -131,6 +136,52 @@ impl Platform for Plat {
     }
 }
 
+// ---------- Disco de datos ----------
+
+/// ¿Los primeros 256 bloques (o todo el disco, si es menor) son ceros?
+fn en_blanco(d: &mut dyn BlockDev) -> bool {
+    let mut b = [0u8; BLOCK];
+    (0..d.blocks().min(256)).all(|n| d.read(n, &mut b).is_ok() && b.iter().all(|&x| x == 0))
+}
+
+/// Sondea PCI/AHCI y ofrece el primer disco SATA que sea de NightFury o esté en blanco.
+/// Cualquier otro disco se salta sin escribir nada en él.
+fn elegir_disco() -> Option<Box<dyn BlockDev>> {
+    let Some(abar) = pci::buscar_ahci() else {
+        if TRAZA {
+            traza!("NF disco: sin controlador AHCI");
+        }
+        return None;
+    };
+    let mut elegido: Option<Box<dyn BlockDev>> = None;
+    for mut d in ahci::sondear(abar) {
+        let mib = d.blocks() * BLOCK as u64 >> 20;
+        let motivo = if Nffs::is_formatted(&mut *d) {
+            "NightFury"
+        } else if Nffs::is_blank(&mut *d) || en_blanco(&mut *d) {
+            "en blanco"
+        } else {
+            ""
+        };
+        let ofrecer = !motivo.is_empty() && elegido.is_none();
+        if TRAZA {
+            let r = match (motivo, ofrecer) {
+                (_, true) => "se ofrece",
+                ("", _) => "se salta: contenido ajeno",
+                _ => "se salta: ya hay otro disco ofrecido",
+            };
+            traza!("NF disco: puerto {} {} MiB {} bloques ({}) {}", d.puerto(), mib, d.blocks(), motivo, r);
+        }
+        if ofrecer {
+            elegido = Some(d);
+        }
+    }
+    if elegido.is_none() && TRAZA {
+        traza!("NF disco: ninguno ofrecido");
+    }
+    elegido
+}
+
 // ---------- Núcleo ----------
 
 #[no_mangle]
@@ -150,7 +201,12 @@ extern "C" fn kmain() -> ! {
     pantalla_de_arranque(&fb);
     ps2::init();
 
-    let mut plat = Plat { info, files: Files::default() };
+    let disco = elegir_disco();
+    let files = Files::probe(disco, rtc::now());
+    if TRAZA {
+        traza!("NF archivos: persistente={} formato_pendiente={}", files.persistent(), files.pending_format());
+    }
+    let mut plat = Plat { info, files };
     let (w, h) = (info.width as i32, info.height as i32);
     let mut desk = Desktop::new(w, h, &mut plat);
 

@@ -1,12 +1,14 @@
 # Arranca NightFury en QEMU sin ventana, manda órdenes de monitor y guarda una captura PNG.
-# Uso: tools\shot.ps1 -Out shots\a.png [-Seconds 8] [-Commands 'mouse_move 40 30','sendkey a'] [-Serial shots\a.log] [-NoBuild]
+# Uso: tools\shot.ps1 -Out shots\a.png [-Seconds 8] [-Commands 'mouse_move 40 30','sendkey a'] [-Serial shots\a.log] [-NoBuild] [-Disk disco.img] [-NoDisk]
 param(
     [string]$Out = 'shots\shot.png',
     [int]$Seconds = 8,
     [string[]]$Commands = @(),
     [string]$Serial = '',
     [int]$Port = 4455,
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [string]$Disk = 'disco.img',
+    [switch]$NoDisk
 )
 $ErrorActionPreference = 'Stop'
 $Commands = @($Commands | ForEach-Object { $_ -split "," })  # con -File, una lista llega como una sola cadena con comas
@@ -30,6 +32,11 @@ $q = @(
     '-display', 'none',
     '-monitor', "tcp:127.0.0.1:$Port,server,nowait"
 )
+if (-not $NoDisk) {
+    $img = if ([System.IO.Path]::IsPathRooted($Disk)) { $Disk } else { [System.IO.Path]::GetFullPath((Join-Path $root $Disk)) }
+    if (-not (Test-Path $img)) { fsutil file createnew $img 268435456 | Out-Null }
+    $q += @('-drive', "id=datos,if=none,format=raw,file=$img", '-device', 'ide-hd,drive=datos,bus=ide.1')
+}
 if ($Serial) {
     $s = [System.IO.Path]::GetFullPath((Join-Path $root $Serial))
     $q += @('-serial', "file:$s")
