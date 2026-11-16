@@ -24,3 +24,27 @@ No toca los discos del PC: todo vive en memoria.
   solo funciona si la placa emula PS/2 para USB. Si no, el escritorio se ve pero no responde.
 - Para apagar si no responde: mantener pulsado el botón de encendido.
 - No probado todavía en hardware real.
+
+## Intercambiar archivos con el disco virtual (nfdisk)
+`nfdisk` es una herramienta de consola para Windows que lee y escribe la imagen NFFS (`disco.img`)
+sin arrancar NightFury. **Úsala con QEMU cerrado**: si QEMU tiene la imagen abierta, ambos podrían
+escribir a la vez y dañarla.
+
+Compilar: `cargo build -p nfdisk --release` → `target\release\nfdisk.exe`.
+
+```powershell
+nfdisk crear disco.img 64                       # imagen nueva de 64 MiB, formateada y con sus carpetas
+nfdisk info disco.img                           # tamaño, libre y usado
+nfdisk meter disco.img foto.bmp C:\Imágenes\foto.bmp
+nfdisk carpeta disco.img C:\Documentos\Trabajo
+nfdisk listar disco.img C:\Documentos -r
+nfdisk ver disco.img C:\Documentos\nota.txt
+nfdisk sacar disco.img C:\Documentos\nota.txt nota.txt
+nfdisk borrar disco.img C:\Documentos\nota.txt
+nfdisk comprobar disco.img                      # revisa la coherencia del volumen
+```
+- Las rutas de la imagen se aceptan como `C:\Documentos\a.txt`, `\Documentos\a.txt` o `Documentos/a.txt`.
+- `meter` y `sacar` no sustituyen un archivo existente salvo con `--reemplazar`.
+- `formatear disco.img` solo funciona con una imagen en blanco; con datos exige `--forzar` (borra todo).
+- Solo trabaja con archivos normales: rechaza `\.\PhysicalDrive0`, `\?\...`, `D:\` y similares.
+- Una imagen creada con `nfdisk crear` arranca en NightFury sin preguntar por formato.

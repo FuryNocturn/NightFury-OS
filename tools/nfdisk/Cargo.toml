@@ -1,0 +1,8 @@
+[package]
+name = "nfdisk"
+version.workspace = true
+edition.workspace = true
+description = "NightFury: herramienta de consola para leer y escribir imágenes de disco NFFS"
+
+[dependencies]
+nf-core = { path = "../../nf-core" }
