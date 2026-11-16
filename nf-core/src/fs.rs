@@ -61,6 +61,8 @@ pub enum FsError {
     Corrupt,
     /// Operación no permitida (p. ej. mover una carpeta dentro de sí misma).
     Invalid,
+    /// La sesión abierta no tiene permiso (carpeta de otro usuario, o del sistema sin ser administrador).
+    Denied,
 }
 
 impl FsError {
@@ -78,6 +80,7 @@ impl FsError {
             FsError::Disk => "Error de disco.",
             FsError::Corrupt => "El disco está dañado o no tiene formato.",
             FsError::Invalid => "La operación no se puede hacer.",
+            FsError::Denied => "No tienes permiso para hacer eso.",
         }
     }
 }

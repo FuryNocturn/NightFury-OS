@@ -1029,6 +1029,11 @@ impl Files {
             return Err(AccountError::Exists);
         }
         let first = list.is_empty();
+        // Una carpeta conservada de una cuenta eliminada no se hereda: la cuenta nueva vería sus
+        // archivos. (La primera cuenta sí puede coincidir con la carpeta de la unidad en memoria.)
+        if !first && self.fs.stat(rel(&join(USERS_DIR, name))).is_ok() {
+            return Err(AccountError::Exists);
+        }
         let mut a = Account::new(name, admin || first);
         a.set_password(password, salt)?;
         // Primero la carpeta: un corte deja una carpeta sin cuenta, que es inofensiva.
@@ -1150,7 +1155,7 @@ impl Files {
 
 // ---- Permisos, registro, arranque y migración (internos salvo `log`) ----
 impl Files {
-    /// Permisos de la sesión sobre una ruta relativa canónica (ver la cabecera). `Invalid` si no.
+    /// Permisos de la sesión sobre una ruta relativa canónica (ver la cabecera). `Denied` si no.
     fn guard(&self, r: &str, write: bool) -> Result<(), FsError> {
         let c = comps(r);
         let Some(&top) = c.first() else { return Ok(()) };
@@ -1166,7 +1171,7 @@ impl Files {
             write && self.user.is_none()
         };
         if denied {
-            Err(FsError::Invalid)
+            Err(FsError::Denied)
         } else {
             Ok(())
         }
@@ -1386,6 +1391,22 @@ mod tests {
     use crate::block::{DiskError, BLOCK};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn cuenta_nueva_no_hereda_carpeta_conservada() {
+        let n = DateTime::default();
+        let disk = Disk::new(2048);
+        drop(Nffs::format(Box::new(disk.clone()), n).unwrap());
+        let mut f = Files::probe(Some(Box::new(disk)), n);
+        f.create_account("Ana", None, true, [1; 16], n).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], n).unwrap();
+        f.write("C:\\Usuarios\\Luis\\Documentos\\privado.txt", b"x", n).unwrap();
+        f.delete_account("Luis", true, n).unwrap();
+        assert!(f.exists("C:\\Usuarios\\Luis\\Documentos\\privado.txt"), "la carpeta se conserva");
+        assert_eq!(f.create_account("luis", None, false, [3; 16], n), Err(AccountError::Exists));
+        assert_eq!(f.accounts().len(), 1);
+    }
 
     #[test]
     fn cuentas_y_sesion() {
@@ -2054,7 +2075,7 @@ mod tests {
         assert!(f.persistent() && !f.pending_format() && f.notice().is_none());
         // Sin sesión: asistente pendiente y nada de lo de la memoria al alcance.
         assert!(f.user().is_none() && f.needs_setup());
-        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt"), Err(FsError::Invalid));
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt"), Err(FsError::Denied));
         // La primera cuenta (con otro nombre) adopta la carpeta de la memoria.
         f.create_account("Ana", None, false, [1; 16], d(10)).unwrap();
         assert!(!f.exists_raw("Usuarios\\Usuario"), "la carpeta de la memoria ya no está");
@@ -2200,9 +2221,9 @@ mod tests {
         assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
         assert_eq!(f.home(), "C:\\Usuarios");
         assert!(f.user().is_none() && f.needs_setup());
-        assert_eq!(f.write("C:\\x.txt", b"1", d(2)), Err(FsError::Invalid), "sin sesión no se escribe");
-        assert_eq!(f.write("C:\\Usuarios\\x.txt", b"1", d(2)), Err(FsError::Invalid));
-        assert_eq!(f.read("C:\\Sistema\\config\\cuentas"), Err(FsError::Invalid));
+        assert_eq!(f.write("C:\\x.txt", b"1", d(2)), Err(FsError::Denied), "sin sesión no se escribe");
+        assert_eq!(f.write("C:\\Usuarios\\x.txt", b"1", d(2)), Err(FsError::Denied));
+        assert_eq!(f.read("C:\\Sistema\\config\\cuentas"), Err(FsError::Denied));
         // Cada cuenta crea su carpeta completa; la sesión da las rutas.
         f.create_account("Ana", None, true, [1; 16], d(3)).unwrap();
         f.create_account("Ana", None, true, [1; 16], d(3)).unwrap_err();
@@ -2247,7 +2268,7 @@ mod tests {
         assert_eq!(f.trash(&format!("C:\\Usuarios\\Luis\\.papelera\\{id}"), d(4)), Err(FsError::Invalid));
         // Un índice manipulado no saca nada a la carpeta de otro.
         f.fs.write("Usuarios\\Luis\\.papelera\\indice", format!("{id}|2026-11-3-1-2-3|{ANA}\\Documentos\\mala.txt\n").as_bytes(), d(5)).unwrap();
-        assert_eq!(f.restore(&id), Err(FsError::Invalid));
+        assert_eq!(f.restore(&id), Err(FsError::Denied));
         f.empty_trash().unwrap();
         assert!(f.trash_list().unwrap().is_empty());
         f.login("Ana", "").unwrap();
@@ -2275,16 +2296,16 @@ mod tests {
         assert!(!f.is_admin());
         assert_eq!(names(&mut f, "C:\\Usuarios"), ["Luis"]);
         let a = format!("{ANA}\\Documentos\\a.txt");
-        assert_eq!(f.read(&a), Err(FsError::Invalid));
-        assert_eq!(f.stat(ANA), Err(FsError::Invalid));
-        assert_eq!(f.list(ANA).err(), Some(FsError::Invalid));
-        assert_eq!(f.write(&a, b"x", d(3)), Err(FsError::Invalid));
-        assert_eq!(f.mkdir(&format!("{ANA}\\Documentos\\n"), d(3)), Err(FsError::Invalid));
-        assert_eq!(f.delete(&a), Err(FsError::Invalid));
-        assert_eq!(f.trash(&a, d(3)), Err(FsError::Invalid));
-        assert_eq!(f.rename(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt"), Err(FsError::Invalid));
-        assert_eq!(f.copy(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt", d(3)), Err(FsError::Invalid));
-        assert_eq!(f.copy("C:\\Usuarios\\Luis\\Documentos\\l.txt", &format!("{ANA}\\Documentos\\l.txt"), d(3)), Err(FsError::Invalid));
+        assert_eq!(f.read(&a), Err(FsError::Denied));
+        assert_eq!(f.stat(ANA), Err(FsError::Denied));
+        assert_eq!(f.list(ANA).err(), Some(FsError::Denied));
+        assert_eq!(f.write(&a, b"x", d(3)), Err(FsError::Denied));
+        assert_eq!(f.mkdir(&format!("{ANA}\\Documentos\\n"), d(3)), Err(FsError::Denied));
+        assert_eq!(f.delete(&a), Err(FsError::Denied));
+        assert_eq!(f.trash(&a, d(3)), Err(FsError::Denied));
+        assert_eq!(f.rename(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt"), Err(FsError::Denied));
+        assert_eq!(f.copy(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt", d(3)), Err(FsError::Denied));
+        assert_eq!(f.copy("C:\\Usuarios\\Luis\\Documentos\\l.txt", &format!("{ANA}\\Documentos\\l.txt"), d(3)), Err(FsError::Denied));
         assert!(f.transfer(&[String::from("C:\\Usuarios\\Luis\\Documentos\\l.txt")], &format!("{ANA}\\Escritorio"), true, d(3)).is_err());
         assert_eq!(f.read("C:\\Usuarios\\Luis\\Documentos\\l.txt").unwrap(), b"L");
         assert!(f.user_rename(&a, &format!("{ANA}\\Documentos\\b.txt")).is_err());
@@ -2293,14 +2314,14 @@ mod tests {
         f.write("C:\\Usuarios\\Luis\\Documentos\\m.txt", b"M", d(3)).unwrap();
         f.trash("C:\\Usuarios\\Luis\\Documentos\\m.txt", d(3)).unwrap();
         assert!(f.read("C:\\Sistema\\temp\\t.txt").is_ok());
-        assert_eq!(f.write("C:\\Sistema\\temp\\u.txt", b"u", d(3)), Err(FsError::Invalid));
-        assert_eq!(f.delete("C:\\Sistema\\temp\\t.txt"), Err(FsError::Invalid));
-        assert_eq!(f.mkdir("C:\\Sistema\\nueva", d(3)), Err(FsError::Invalid));
-        assert_eq!(f.rename("C:\\Sistema\\temp\\t.txt", "C:\\Usuarios\\Luis\\t.txt"), Err(FsError::Invalid));
-        assert_eq!(f.read(ACCOUNTS_FILE), Err(FsError::Invalid));
+        assert_eq!(f.write("C:\\Sistema\\temp\\u.txt", b"u", d(3)), Err(FsError::Denied));
+        assert_eq!(f.delete("C:\\Sistema\\temp\\t.txt"), Err(FsError::Denied));
+        assert_eq!(f.mkdir("C:\\Sistema\\nueva", d(3)), Err(FsError::Denied));
+        assert_eq!(f.rename("C:\\Sistema\\temp\\t.txt", "C:\\Usuarios\\Luis\\t.txt"), Err(FsError::Denied));
+        assert_eq!(f.read(ACCOUNTS_FILE), Err(FsError::Denied));
         // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
         f.login("Ana", "").unwrap();
-        assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Invalid));
+        assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Denied));
         assert!(f.read(ACCOUNTS_FILE).is_ok());
     }
 
