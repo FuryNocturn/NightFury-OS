@@ -5,12 +5,13 @@
 //! a `damage`; `render` redibuja lo sucio, normaliza las zonas y recompone solo dentro de cada una.
 use crate::apps::{self, App, AppKind, Ctx, MouseEv, APPS};
 use crate::dialogs::{self, Answer, Buttons, Dialog, DialogRequest, DialogResult};
-use crate::files;
+use crate::files::{self, Std};
 use crate::fs::FsError;
 use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
+use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::platform::{DateTime, Platform};
 use crate::surface::{blend, lighten, Surface};
@@ -308,6 +309,14 @@ pub struct Desktop {
     order: Order,
     /// Ruta afectada por el diálogo del sistema que está abierto (cambiar nombre).
     pending: Option<String>,
+    /// Pantallas de cuentas (asistente, inicio de sesión, bloqueo) y el fondo oscurecido que llevan.
+    login: Login,
+    dim: Surface,
+    /// Hay disco con cuentas: el menú de apagado ofrece Bloquear y Cerrar sesión.
+    can_session: bool,
+    /// Cerrando sesión: se pide cerrar cada ventana, una a una; espera la respuesta de esta.
+    logging_out: bool,
+    logout_wait: Option<u32>,
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -360,7 +369,8 @@ fn normalize(list: Vec<Rect>, screen: Rect) -> Vec<Rect> {
 
 /// Aplica `fondo=`, `enfasis=`, `iconos=` y `orden=` de `C:\Sistema\config.txt` si son válidos.
 fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, order: &mut Order) {
-    let Ok(bytes) = sys.files().read(files::CONFIG_FILE) else { return };
+    let cfg = sys.files().config_file();
+    let Ok(bytes) = sys.files().read(&cfg) else { return };
     let Ok(text) = core::str::from_utf8(&bytes) else { return };
     for line in text.lines() {
         match line.trim().split_once('=') {
@@ -399,8 +409,11 @@ fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, o
 fn save_config(sys: &mut dyn Platform, theme: &Theme, size: IconSize, order: Order) {
     let now = sys.now();
     let f = sys.files();
-    let _ = f.mkdir("C:\\Sistema", now);
-    let old = f.read(files::CONFIG_FILE).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let cfg = f.config_file();
+    if let Some(dir) = files::parent(&cfg) {
+        let _ = f.mkdir(&dir, now);
+    }
+    let old = f.read(&cfg).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
     let mut text = format!(
         "fondo={}\nenfasis={:06X}\niconos={}\norden={}\n",
         theme.wallpaper,
@@ -415,7 +428,7 @@ fn save_config(sys: &mut dyn Platform, theme: &Theme, size: IconSize, order: Ord
             text.push('\n');
         }
     }
-    let _ = f.write(files::CONFIG_FILE, text.as_bytes(), now);
+    let _ = f.write(&cfg, text.as_bytes(), now);
 }
 
 /// (título, texto) del cuadro "Propiedades de <nombre>".
@@ -473,7 +486,8 @@ fn ext(name: &str) -> String {
 fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIcon> {
     let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), label: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
     v.push(DIcon { name: String::from("Papelera"), label: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
-    let mut list = sys.files().list(files::DESKTOP_DIR).unwrap_or_default();
+    let dir = sys.files().std_dir(Std::Desktop);
+    let mut list = sys.files().list(&dir).unwrap_or_default();
     list.sort_by(|a, b| {
         let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
         b.dir.cmp(&a.dir).then_with(|| match order {
@@ -493,18 +507,15 @@ fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIco
             Icon::FileBlank
         };
         let label = String::from(files::display_name(&e.name, e.dir, show_ext));
-        v.push(DIcon { act: Act::Path(files::join(files::DESKTOP_DIR, &e.name)), label, name: e.name, icon });
+        v.push(DIcon { act: Act::Path(files::join(&dir, &e.name)), label, name: e.name, icon });
     }
     v
 }
 
 impl Desktop {
     pub fn new(w: i32, h: i32, sys: &mut dyn Platform) -> Self {
-        let mut theme = Theme::default();
-        let (mut size, mut order) = (IconSize::Mid, Order::Name);
-        load_config(sys, &mut theme, &mut size, &mut order);
-        let show_ext = sys.files().show_ext();
-        Desktop {
+        let theme = Theme::default();
+        let mut d = Desktop {
             w,
             h,
             back: Surface::new(w, h, 0),
@@ -528,18 +539,174 @@ impl Desktop {
             clock: sys.now(),
             last_active: None,
             cur: 0,
-            icons: build_icons(sys, order, show_ext),
-            size,
-            order,
+            icons: Vec::new(),
+            size: IconSize::Mid,
+            order: Order::Name,
             pending: None,
             files_gen: sys.files().generation(),
-            show_ext,
+            show_ext: true,
             mods_sent: (false, false),
             mods_to: None,
             mods: (false, false),
             booted: false,
             menu: None,
             rbtn: false,
+            login: Login::new(w, h),
+            dim: Surface::empty(),
+            can_session: sys.files().persistent(),
+            logging_out: false,
+            logout_wait: None,
+        };
+        d.login.set_clock(d.clock);
+        if sys.files().user().is_some() {
+            d.load_session(sys);
+        } else {
+            // Disco con cuentas: hasta el primer tick (`boot_flow`) solo se ve el fondo oscuro.
+            d.login.start_boot();
+            d.screen_on();
+        }
+        d
+    }
+
+    /// Lee todo lo de la sesión que acaba de empezar: configuración, extensiones e iconos.
+    fn load_session(&mut self, sys: &mut dyn Platform) {
+        self.theme = Theme::default();
+        self.size = IconSize::Mid;
+        self.order = Order::Name;
+        load_config(sys, &mut self.theme, &mut self.size, &mut self.order);
+        self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
+        self.show_ext = sys.files().show_ext();
+        self.icons = build_icons(sys, self.order, self.show_ext);
+        self.files_gen = sys.files().generation();
+        self.can_session = sys.files().persistent();
+        self.sel = None;
+        self.dmg_all();
+    }
+
+    /// Prepara una pantalla de cuentas: nada del escritorio queda activo y el fondo se oscurece.
+    fn screen_on(&mut self) {
+        self.set_start(false);
+        self.set_shut(false);
+        self.close_menu();
+        self.drag = Drag::None;
+        self.chover = None;
+        self.sel = None;
+        let mut dim = Surface::new(self.w, self.h, 0);
+        dim.blit(&self.wall, 0, 0);
+        dim.blend_rect(Rect::new(0, 0, self.w, self.h), 0x000000, 150);
+        self.dim = dim;
+        self.dmg_all();
+    }
+
+    fn flush_login(&mut self) {
+        for r in self.login.take_damage() {
+            self.dmg(r);
+        }
+    }
+
+    /// Pantalla actual de cuentas (para pruebas y capturas).
+    pub fn login_mode(&self) -> Mode {
+        self.login.mode
+    }
+
+    fn open_session(&mut self, sys: &mut dyn Platform) {
+        self.login.off();
+        self.load_session(sys);
+        self.flush_login();
+    }
+
+    /// Orden del arranque: aviso/diálogo de disco, asistente si hace falta, inicio de sesión, escritorio.
+    fn enter_flow(&mut self, sys: &mut dyn Platform) {
+        if sys.files().user().is_some() {
+            if self.login.mode != Mode::Off {
+                self.open_session(sys);
+            }
+            return;
+        }
+        if sys.files().needs_setup() {
+            self.login.start_setup();
+            self.screen_on();
+            return;
+        }
+        let list = sys.files().accounts();
+        if let [a] = list.as_slice() {
+            if !a.has_password() && sys.files().login(&a.name, "").is_ok() {
+                self.open_session(sys);
+                return;
+            }
+        }
+        self.show_pick(sys);
+    }
+
+    fn show_pick(&mut self, sys: &mut dyn Platform) {
+        let users = sys.files().accounts().iter().map(|a| (a.name.clone(), a.has_password())).collect();
+        self.login.start_pick(users);
+        self.screen_on();
+    }
+
+    fn login_out(&mut self, out: Out, sys: &mut dyn Platform) {
+        match out {
+            Out::None => {}
+            Out::Entered => self.open_session(sys),
+            Out::Unlocked => {
+                self.login.off();
+                for w in self.wins.iter_mut() {
+                    w.dirty = true;
+                }
+                self.files_gen = 0;
+                self.dmg_all();
+            }
+            Out::SetupDone => self.enter_flow(sys),
+            Out::Shutdown => sys.shutdown(),
+            Out::Reboot => sys.reboot(),
+        }
+        self.flush_login();
+    }
+
+    /// Bloquea: las ventanas siguen abiertas pero no se ven ni reciben nada.
+    fn lock(&mut self, sys: &mut dyn Platform) {
+        let Some(name) = sys.files().user().map(String::from) else { return };
+        let has = sys.files().has_password();
+        self.login.start_lock(&name, has);
+        self.screen_on();
+        self.flush_login();
+        self.sync_mods(sys);
+    }
+
+    /// Cierra la sesión: pide cerrar cada ventana (una a una; si alguna se niega, se cancela).
+    fn begin_logout(&mut self, sys: &mut dyn Platform) {
+        self.set_start(false);
+        self.set_shut(false);
+        self.logging_out = true;
+        self.logout_step(sys);
+    }
+
+    fn logout_step(&mut self, sys: &mut dyn Platform) {
+        loop {
+            if !self.logging_out || self.wins.iter().any(|w| w.dlg.is_some()) {
+                return;
+            }
+            let Some(id) = self.wins.iter().rev().find(|w| w.dlg.is_none()).map(|w| w.id) else {
+                self.logging_out = false;
+                self.logout_wait = None;
+                sys.files().logout();
+                self.theme = Theme::default();
+                self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
+                self.icons.clear();
+                self.show_pick(sys);
+                self.flush_login();
+                return;
+            };
+            self.raise(id);
+            self.request_close(id, sys);
+            if self.pos(id).is_some() {
+                if self.modal_of(id).is_some() {
+                    self.logout_wait = Some(id);
+                } else {
+                    self.logging_out = false;
+                }
+                return;
+            }
         }
     }
 
@@ -600,6 +767,11 @@ impl Desktop {
         self.mx = x;
         self.my = y;
         self.dmg(cursor_rect(x, y));
+        if self.login.covers() {
+            self.login.hover(x, y);
+            self.flush_login();
+            return;
+        }
         if self.menu.is_some() {
             self.menu_edit(|m| m.hover(x, y));
             return;
@@ -640,6 +812,14 @@ impl Desktop {
             return;
         }
         self.btn = down;
+        if self.login.covers() {
+            if down {
+                let out = self.login.click(self.mx, self.my, sys);
+                self.login_out(out, sys);
+            }
+            self.flush_login();
+            return;
+        }
         if self.menu.is_some() {
             if down {
                 self.menu_click(sys);
@@ -661,7 +841,7 @@ impl Desktop {
             return;
         }
         self.rbtn = down;
-        if !down {
+        if !down || self.login.covers() {
             return;
         }
         if self.menu.is_some() {
@@ -669,6 +849,7 @@ impl Desktop {
             return;
         }
         match self.hit(self.mx, self.my) {
+            Hit::None | Hit::Icon(_) if self.login.mode == Mode::Boot => {}
             Hit::Content(id) if self.modal_of(id).is_none() => {
                 self.set_start(false);
                 self.raise(id);
@@ -683,7 +864,7 @@ impl Desktop {
     /// Gira la rueda `dz` muescas (positivo = hacia abajo) sobre la ventana que está bajo el puntero,
     /// tenga o no el foco. Con un menú abierto se ignora.
     pub fn wheel(&mut self, dz: i32, sys: &mut dyn Platform) {
-        if self.menu.is_some() || dz == 0 || self.drag != Drag::None {
+        if self.menu.is_some() || dz == 0 || self.drag != Drag::None || self.login.covers() {
             return;
         }
         if let Hit::Content(id) = self.hit(self.mx, self.my) {
@@ -851,7 +1032,10 @@ impl Desktop {
                 self.dmg_all();
             }
             M_PASTE => {
-                if let Err(e) = sys.files().paste(files::DESKTOP_DIR, now) {
+                if let Err(e) = {
+                let dir = sys.files().std_dir(Std::Desktop);
+                sys.files().paste(&dir, now)
+            } {
                     self.info("No se puede pegar", e.message(), sys);
                 }
             }
@@ -859,7 +1043,10 @@ impl Desktop {
             M_NEWDIR | M_NEWDOC => {
                 let (tag, title, name) =
                     if id == M_NEWDIR { (TAG_NEWDIR, "Nueva carpeta", "Nueva carpeta") } else { (TAG_NEWDOC, "Nuevo documento de texto", "Nuevo documento de texto.txt") };
-                let value = sys.files().free_name(files::DESKTOP_DIR, name);
+                let value = {
+                let dir = sys.files().std_dir(Std::Desktop);
+                sys.files().free_name(&dir, name)
+            };
                 let req = DialogRequest::Input { tag, title: String::from(title), label: String::from("Nombre:"), value };
                 self.open_dialog(None, req, sys);
             }
@@ -1057,6 +1244,7 @@ impl Desktop {
     /// (ya recortadas a la pantalla) para que el núcleo las copie al monitor.
     pub fn render(&mut self, sys: &mut dyn Platform) -> Vec<Rect> {
         let act = self.active_id();
+        let hidden = self.login.covers();
         if act != self.last_active {
             for w in self.wins.iter_mut() {
                 if Some(w.id) == act || Some(w.id) == self.last_active {
@@ -1067,7 +1255,7 @@ impl Desktop {
             self.dmg_all();
         }
         for w in self.wins.iter_mut() {
-            if w.dirty && !w.min {
+            if w.dirty && !w.min && !hidden {
                 match w.dlg.as_mut() {
                     Some(d) => d.draw(&mut w.content, &self.theme),
                     None => w.app.draw(&mut w.content, &self.theme, sys, Some(w.id) == act),
@@ -1240,7 +1428,19 @@ impl Desktop {
         let owner = self.pos(id).and_then(|i| self.wins[i].owner);
         self.close(id);
         match owner {
-            Some(o) => self.with_app(o, sys, |a, cx| a.dialog_result(res, cx)),
+            Some(o) => {
+                self.with_app(o, sys, |a, cx| a.dialog_result(res, cx));
+                if self.logging_out && self.logout_wait == Some(o) {
+                    // La ventana sigue y no hay otro diálogo suyo: el usuario canceló.
+                    if self.pos(o).is_none() {
+                        self.logout_wait = None;
+                        self.logout_step(sys);
+                    } else if self.modal_of(o).is_none() {
+                        self.logging_out = false;
+                        self.logout_wait = None;
+                    }
+                }
+            }
             None => self.system_result(res, sys),
         }
     }
@@ -1252,7 +1452,17 @@ impl Desktop {
                 if answer == Answer::Yes {
                     let now = sys.now();
                     match sys.files().format_pending(now) {
-                        Ok(()) => save_config(sys, &self.theme, self.size, self.order),
+                        Ok(()) => {
+                            // El disco nuevo no tiene cuentas: se descarta la sesión de la unidad en
+                            // memoria y se pasa al asistente (tras los avisos).
+                            let ids: Vec<u32> = self.wins.iter().map(|w| w.id).collect();
+                            for id in ids {
+                                self.close(id);
+                            }
+                            sys.files().logout();
+                            self.login.start_boot();
+                            self.screen_on();
+                        }
                         Err(e) => {
                             let text = format!("No se ha podido preparar el disco: {}", e.message());
                             let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Disco nuevo"), text, buttons: Buttons::Ok };
@@ -1267,6 +1477,7 @@ impl Desktop {
                 self.show_notice(sys);
             }
             DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            DialogResult::Answer { tag: u32::MAX, .. } => self.enter_flow(sys),
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
                 if let Err(e) = sys.files().empty_trash() {
                     self.info("No se puede vaciar la Papelera", e.message(), sys);
@@ -1304,7 +1515,10 @@ impl Desktop {
                 }
                 let now = sys.now();
                 let res = if files::valid_name(&name) {
-                    sys.files().user_create(&files::join(files::DESKTOP_DIR, &name), tag == TAG_NEWDIR, now)
+                    {
+                    let p = files::join(&sys.files().std_dir(Std::Desktop), &name);
+                    sys.files().user_create(&p, tag == TAG_NEWDIR, now)
+                }
                 } else {
                     Err(FsError::BadName)
                 };
@@ -1321,6 +1535,8 @@ impl Desktop {
         if let Some(text) = sys.files().notice() {
             let req = DialogRequest::Message { tag: u32::MAX, title: String::from("Almacenamiento"), text: String::from(text), buttons: Buttons::Ok };
             self.open_dialog(None, req, sys);
+        } else {
+            self.enter_flow(sys);
         }
     }
 
@@ -1508,7 +1724,16 @@ impl Desktop {
     }
     fn shut_rect(&self) -> Rect {
         let p = self.mpower_rect();
-        Rect::new(p.x, p.y - 80, 180, 80)
+        let n = self.shut_count() as i32;
+        Rect::new(p.x, p.y - 40 * n, 180, 40 * n)
+    }
+    /// Filas del menú de apagado: Apagar, Reiniciar y, con disco con cuentas, Bloquear y Cerrar sesión.
+    fn shut_count(&self) -> usize {
+        if self.can_session {
+            4
+        } else {
+            2
+        }
     }
     fn shut_row(&self, i: usize) -> Rect {
         let s = self.shut_rect();
@@ -1524,7 +1749,7 @@ impl Desktop {
     /// Refresca los iconos del escritorio si ha cambiado algo en los archivos.
     fn refresh_icons(&mut self, sys: &mut dyn Platform) {
         let g = sys.files().generation();
-        if g == self.files_gen {
+        if g == self.files_gen || sys.files().user().is_none() {
             return;
         }
         self.files_gen = g;
@@ -1567,8 +1792,13 @@ impl Desktop {
     // ---------------------------------------------------------------- puntero y entrada
 
     fn hit(&self, x: i32, y: i32) -> Hit {
+        // Con una pantalla de cuentas no hay nada alcanzable; en el arranque solo los diálogos.
+        let boot = self.login.mode == Mode::Boot;
+        if self.login.covers() {
+            return Hit::None;
+        }
         if self.shut_open && self.shut_rect().contains(x, y) {
-            return Hit::Shut(((y - self.shut_rect().y) / 40).clamp(0, 1) as usize);
+            return Hit::Shut(((y - self.shut_rect().y) / 40).clamp(0, self.shut_count() as i32 - 1) as usize);
         }
         if self.start_open && self.menu_rect().contains(x, y) {
             if self.msettings_rect().contains(x, y) {
@@ -1587,7 +1817,7 @@ impl Desktop {
             }
             return Hit::MenuBg;
         }
-        if y >= self.bar_y() {
+        if y >= self.bar_y() && !boot {
             if self.start_rect().contains(x, y) {
                 return Hit::Start;
             }
@@ -1605,6 +1835,9 @@ impl Desktop {
             if w.rect.contains(x, y) {
                 return Self::hit_win(w, x, y);
             }
+        }
+        if boot {
+            return Hit::None;
         }
         (0..self.icons.len()).find(|&i| self.icon_cell(i).contains(x, y)).map_or(Hit::None, Hit::Icon)
     }
@@ -1701,12 +1934,13 @@ impl Desktop {
         }
         match hit {
             Hit::Shut(i) => {
-                if i == 0 {
-                    sys.shutdown();
-                } else {
-                    sys.reboot();
-                }
                 self.set_shut(false);
+                match i {
+                    0 => sys.shutdown(),
+                    1 => sys.reboot(),
+                    2 => self.lock(sys),
+                    _ => self.begin_logout(sys),
+                }
             }
             Hit::MPower => self.set_shut(!shut_was),
             Hit::MSettings => self.launch(AppKind::Settings, sys),
@@ -1811,7 +2045,7 @@ impl Desktop {
     /// al día (`down` = alguna de las dos pulsada). Si el foco pasa a otra ventana, o se abre un
     /// menú, diálogo o el menú Inicio, la app anterior recibe el estado neutro (todo en `false`).
     fn sync_mods(&mut self, sys: &mut dyn Platform) {
-        let target = if self.menu.is_some() || self.start_open || self.shut_open {
+        let target = if self.menu.is_some() || self.start_open || self.shut_open || self.login.covers() {
             None
         } else {
             self.active_id().filter(|&id| self.pos(id).is_some_and(|i| self.wins[i].dlg.is_none()))
@@ -1850,9 +2084,18 @@ impl Desktop {
         if !k.down {
             return;
         }
+        if self.login.covers() {
+            let out = self.login.key(&k, sys);
+            self.login_out(out, sys);
+            self.flush_login();
+            return;
+        }
         if self.menu.is_some() {
             let act = self.menu_edit(|m| m.key(k.key));
             self.menu_act(act, sys);
+            return;
+        }
+        if self.login.mode == Mode::Boot && (k.key == Key::Super || self.active_id().is_none()) {
             return;
         }
         if k.key == Key::Super {
@@ -1883,6 +2126,8 @@ impl Desktop {
 
     fn tick(&mut self, ms: u64, sys: &mut dyn Platform) {
         self.now_ms = ms;
+        self.login.tick(ms);
+        self.flush_login();
         if !self.booted {
             self.booted = true;
             self.boot_flow(sys);
@@ -1909,6 +2154,8 @@ impl Desktop {
                 self.clock = t;
                 self.dmg(self.clock_rect());
             }
+            self.login.set_clock(t);
+            self.flush_login();
         }
         self.after(sys);
     }
@@ -1916,20 +2163,30 @@ impl Desktop {
     // ---------------------------------------------------------------- composición
 
     fn paint(&self, s: &mut Surface, active: Option<u32>) {
-        s.blit(&self.wall, 0, 0);
-        self.paint_icons(s);
-        for w in self.wins.iter().filter(|w| !w.min) {
-            self.paint_window(s, w, Some(w.id) == active);
+        if self.login.mode == Mode::Off {
+            s.blit(&self.wall, 0, 0);
+            self.paint_icons(s);
+        } else {
+            s.blit(&self.dim, 0, 0);
         }
-        self.paint_bar(s, active);
-        if self.start_open {
-            self.paint_menu(s);
-        }
-        if self.shut_open {
-            self.paint_shut(s);
-        }
-        if let Some(m) = &self.menu {
-            m.menu.draw(s);
+        if self.login.covers() {
+            self.login.paint(s, self.theme.accent);
+        } else {
+            for w in self.wins.iter().filter(|w| !w.min) {
+                self.paint_window(s, w, Some(w.id) == active);
+            }
+            if self.login.mode == Mode::Off {
+                self.paint_bar(s, active);
+                if self.start_open {
+                    self.paint_menu(s);
+                }
+                if self.shut_open {
+                    self.paint_shut(s);
+                }
+                if let Some(m) = &self.menu {
+                    m.menu.draw(s);
+                }
+            }
         }
         if !cursor_rect(self.mx, self.my).intersects(s.clip()) {
             return;
@@ -2126,7 +2383,7 @@ impl Desktop {
             return;
         }
         s.fill_rect(r, 0x2B2B2B);
-        for (i, name) in ["Apagar", "Reiniciar"].iter().enumerate() {
+        for (i, name) in ["Apagar", "Reiniciar", "Bloquear", "Cerrar sesión"].iter().take(self.shut_count()).enumerate() {
             let row = self.shut_row(i);
             if self.hot == Hit::Shut(i) {
                 s.fill_rect(row, 0x4A4A4A);
