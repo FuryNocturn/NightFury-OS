@@ -148,6 +148,8 @@ enum Act {
 
 struct DIcon {
     name: String,
+    /// Lo que se escribe bajo el icono (sin extensión si el usuario la oculta).
+    label: String,
     icon: Icon,
     act: Act,
 }
@@ -289,6 +291,13 @@ pub struct Desktop {
     /// Iconos del escritorio: apps, Papelera y lo que haya en `C:\Escritorio`.
     icons: Vec<DIcon>,
     files_gen: u64,
+    /// ¿Se muestran las extensiones? Se lee al reconstruir los iconos, no al dibujar.
+    show_ext: bool,
+    /// Última combinación (ctrl, mayús) entregada a una app, y a qué ventana.
+    mods_sent: (bool, bool),
+    mods_to: Option<u32>,
+    /// Estado actual (ctrl, mayús) del teclado.
+    mods: (bool, bool),
     /// ¿Ya se hizo el flujo de arranque del disco (primer tick)?
     booted: bool,
     /// Menú contextual abierto: recibe todo el teclado y el ratón.
@@ -461,9 +470,9 @@ fn ext(name: &str) -> String {
 }
 
 /// Apps, Papelera y el contenido de `C:\Escritorio` (carpetas antes que archivos, según `order`).
-fn build_icons(sys: &mut dyn Platform, order: Order) -> Vec<DIcon> {
-    let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
-    v.push(DIcon { name: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
+fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIcon> {
+    let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), label: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
+    v.push(DIcon { name: String::from("Papelera"), label: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
     let mut list = sys.files().list(files::DESKTOP_DIR).unwrap_or_default();
     list.sort_by(|a, b| {
         let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
@@ -483,7 +492,8 @@ fn build_icons(sys: &mut dyn Platform, order: Order) -> Vec<DIcon> {
         } else {
             Icon::FileBlank
         };
-        v.push(DIcon { act: Act::Path(files::join(files::DESKTOP_DIR, &e.name)), name: e.name, icon });
+        let label = String::from(files::display_name(&e.name, e.dir, show_ext));
+        v.push(DIcon { act: Act::Path(files::join(files::DESKTOP_DIR, &e.name)), label, name: e.name, icon });
     }
     v
 }
@@ -493,6 +503,7 @@ impl Desktop {
         let mut theme = Theme::default();
         let (mut size, mut order) = (IconSize::Mid, Order::Name);
         load_config(sys, &mut theme, &mut size, &mut order);
+        let show_ext = sys.files().show_ext();
         Desktop {
             w,
             h,
@@ -517,11 +528,15 @@ impl Desktop {
             clock: sys.now(),
             last_active: None,
             cur: 0,
-            icons: build_icons(sys, order),
+            icons: build_icons(sys, order, show_ext),
             size,
             order,
             pending: None,
             files_gen: sys.files().generation(),
+            show_ext,
+            mods_sent: (false, false),
+            mods_to: None,
+            mods: (false, false),
             booted: false,
             menu: None,
             rbtn: false,
@@ -876,7 +891,8 @@ impl Desktop {
 
     fn start_rename(&mut self, path: &str, sys: &mut dyn Platform) {
         self.pending = Some(String::from(path));
-        let value = String::from(files::file_name(path));
+        let is_dir = sys.files().stat(path).is_ok_and(|e| e.dir);
+        let value = String::from(files::display_name(files::file_name(path), is_dir, self.show_ext));
         let req = DialogRequest::Input { tag: TAG_RENAME, title: String::from("Cambiar nombre"), label: String::from("Nuevo nombre:"), value };
         self.open_dialog(None, req, sys);
     }
@@ -1128,6 +1144,7 @@ impl Desktop {
         let (redraw, close, themed) = (cx.redraw, cx.close, cx.theme_changed);
         let (dialog, open) = (cx.dialog.take(), cx.open.take());
         let (open_new, menu) = (cx.open_new.take(), cx.menu.take());
+        let open_term = cx.open_terminal.take();
         if themed {
             self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
             for w in self.wins.iter_mut() {
@@ -1155,12 +1172,21 @@ impl Desktop {
         if let Some(p) = open_new {
             self.open_new_explorer(&p, sys);
         }
+        if let Some(p) = open_term {
+            self.open_terminal_at(&p, sys);
+        }
         if let Some(req) = menu {
             // De coordenadas del contenido de la ventana a las de pantalla.
             if let Some(c) = self.pos(id).filter(|&i| !self.wins[i].min).map(|i| self.wins[i].content_rect()) {
                 self.open_menu(Some(id), req.tag, c.x + req.x, c.y + req.y, req.items);
             }
         }
+    }
+
+    /// Abre un Terminal NUEVO situado en la carpeta `path`.
+    fn open_terminal_at(&mut self, path: &str, sys: &mut dyn Platform) {
+        let id = self.launch_id(AppKind::Terminal, sys);
+        self.with_app(id, sys, |a, cx| a.open_path(path, cx));
     }
 
     /// Abre `path` en una ventana NUEVA del Explorador.
@@ -1250,8 +1276,13 @@ impl Desktop {
             DialogResult::Text { tag: TAG_RENAME, value } => {
                 let from = self.pending.take();
                 if let (Some(from), Some(v)) = (from, value) {
-                    let name = v.trim();
-                    if name == files::file_name(&from) {
+                    // Con las extensiones ocultas el diálogo no la mostró: se conserva la original.
+                    let old = files::file_name(&from);
+                    let is_dir = sys.files().stat(&from).is_ok_and(|e| e.dir);
+                    let tail = &old[files::display_name(old, is_dir, self.show_ext).len()..];
+                    let full = if v.trim().is_empty() { String::new() } else { format!("{}{tail}", v.trim()) };
+                    let name = full.as_str();
+                    if name == old {
                         return;
                     }
                     let res = if files::valid_name(name) {
@@ -1502,9 +1533,10 @@ impl Desktop {
 
     /// Reconstruye los iconos; si cambian, repinta y conserva la selección por nombre.
     fn reload_icons(&mut self, sys: &mut dyn Platform) {
-        let new = build_icons(sys, self.order);
+        self.show_ext = sys.files().show_ext();
+        let new = build_icons(sys, self.order, self.show_ext);
         let same = new.len() == self.icons.len()
-            && new.iter().zip(&self.icons).all(|(a, b)| a.name == b.name && a.icon == b.icon);
+            && new.iter().zip(&self.icons).all(|(a, b)| a.name == b.name && a.label == b.label && a.icon == b.icon);
         if same {
             return;
         }
@@ -1774,7 +1806,47 @@ impl Desktop {
         dbl
     }
 
+    /// Entrega a la app con el foco el estado de Ctrl y Mayús cada vez que cambia: un
+    /// `KeyEvent` con `key: Key::Other`, `ch: None`, `alt: false` y las banderas `ctrl`/`shift`
+    /// al día (`down` = alguna de las dos pulsada). Si el foco pasa a otra ventana, o se abre un
+    /// menú, diálogo o el menú Inicio, la app anterior recibe el estado neutro (todo en `false`).
+    fn sync_mods(&mut self, sys: &mut dyn Platform) {
+        let target = if self.menu.is_some() || self.start_open || self.shut_open {
+            None
+        } else {
+            self.active_id().filter(|&id| self.pos(id).is_some_and(|i| self.wins[i].dlg.is_none()))
+        };
+        let want = if target.is_some() { self.mods } else { (false, false) };
+        if self.mods_to != target {
+            if let Some(old) = self.mods_to.take() {
+                if self.mods_sent != (false, false) {
+                    self.send_mods(old, (false, false), sys);
+                }
+            }
+            self.mods_sent = (false, false);
+            self.mods_to = target;
+        }
+        if let Some(id) = target {
+            if want != self.mods_sent {
+                self.mods_sent = want;
+                self.send_mods(id, want, sys);
+            }
+        }
+    }
+
+    fn send_mods(&mut self, id: u32, (ctrl, shift): (bool, bool), sys: &mut dyn Platform) {
+        let ev = KeyEvent { key: Key::Other, ch: None, down: ctrl || shift, shift, ctrl, alt: false };
+        self.with_app(id, sys, |a, cx| a.key(&ev, cx));
+    }
+
     fn key(&mut self, k: KeyEvent, sys: &mut dyn Platform) {
+        // Ctrl y Mayús llegan como `Key::Other`; se reparten aparte (ver `sync_mods`).
+        if k.key == Key::Other {
+            self.mods = (k.ctrl, k.shift);
+            self.sync_mods(sys);
+            self.after(sys);
+            return;
+        }
         if !k.down {
             return;
         }
@@ -1816,6 +1888,7 @@ impl Desktop {
             self.boot_flow(sys);
         }
         self.refresh_icons(sys);
+        self.sync_mods(sys);
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
         for id in ids {
             self.with_app(id, sys, |a, cx| a.tick(cx));
@@ -1888,7 +1961,7 @@ impl Desktop {
     }
 
     fn paint_icons(&self, s: &mut Surface) {
-        for (i, DIcon { name, icon, .. }) in self.icons.iter().enumerate() {
+        for (i, DIcon { label: name, icon, .. }) in self.icons.iter().enumerate() {
             let c = self.icon_cell(i);
             if !c.intersects(s.clip()) {
                 continue;
@@ -3539,5 +3612,126 @@ mod menu_tests {
         check(&mut d, &mut sys, "supr");
         key(&mut d, &mut sys, Key::Char('z'), None, true);
         check(&mut d, &mut sys, "deshacer");
+    }
+}
+
+#[cfg(test)]
+mod cinta_tests {
+    use super::*;
+    use crate::platform::TestPlatform;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    fn setup() -> (Desktop, TestPlatform) {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.booted = true;
+        (d, sys)
+    }
+
+    fn labels(d: &Desktop) -> Vec<String> {
+        d.icons.iter().skip(6).map(|i| i.label.clone()).collect()
+    }
+
+    #[test]
+    fn extensions_hidden_on_icons_and_kept_on_rename() {
+        let (mut d, mut sys) = setup();
+        assert_eq!(labels(&d), ["nota.txt"]);
+        // Ocultar extensiones: el archivo de preferencias cambia y "Actualizar" lo recoge.
+        let now = sys.now();
+        sys.files.write(files::EXPLORER_PREFS, b"extensiones=no\n", now).unwrap();
+        d.bg_action(M_REFRESH, &mut sys);
+        assert_eq!(labels(&d), ["nota"]);
+        assert_eq!(d.icons[6].name, "nota.txt");
+        // El diálogo propone el nombre sin extensión y la extensión original se conserva.
+        d.start_rename("C:\\Escritorio\\nota.txt", &mut sys);
+        d.system_result(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("otra")) }, &mut sys);
+        assert!(sys.files.exists("C:\\Escritorio\\otra.txt") && !sys.files.exists("C:\\Escritorio\\nota.txt"));
+        // Un nombre vacío sigue siendo inválido (no queda ".txt").
+        let n = d.dialog_count();
+        d.start_rename("C:\\Escritorio\\otra.txt", &mut sys);
+        d.system_result(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("  ")) }, &mut sys);
+        assert!(sys.files.exists("C:\\Escritorio\\otra.txt"));
+        assert!(d.dialog_count() > n);
+    }
+
+    /// App de pruebas que anota los `KeyEvent` que recibe.
+    struct Rec(Rc<RefCell<Vec<(Key, bool, bool, bool)>>>);
+    impl App for Rec {
+        fn kind(&self) -> AppKind {
+            AppKind::Calc
+        }
+        fn title(&self) -> String {
+            String::from("Rec")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, _s: &mut Surface, _t: &Theme, _p: &mut dyn Platform, _f: bool) {}
+        fn key(&mut self, ev: &KeyEvent, _cx: &mut Ctx) {
+            self.0.borrow_mut().push((ev.key, ev.down, ev.ctrl, ev.shift));
+        }
+        fn mouse(&mut self, _ev: MouseEv, _cx: &mut Ctx) {}
+        fn tick(&mut self, _cx: &mut Ctx) {}
+    }
+
+    fn other(down: bool, ctrl: bool, shift: bool) -> Event {
+        Event::Key(KeyEvent { key: Key::Other, ch: None, down, shift, ctrl, alt: false })
+    }
+
+    #[test]
+    fn app_receives_ctrl_and_shift_changes_and_neutral_on_focus_loss() {
+        let (mut d, mut sys) = setup();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        d.launch_app(Box::new(Rec(log.clone())), &mut sys);
+        d.event(other(true, true, false), &mut sys);
+        d.event(other(true, true, true), &mut sys);
+        d.event(other(false, false, true), &mut sys);
+        d.event(other(false, false, false), &mut sys);
+        assert_eq!(
+            *log.borrow(),
+            [(Key::Other, true, true, false), (Key::Other, true, true, true), (Key::Other, true, false, true), (Key::Other, false, false, false)]
+        );
+        // Una repetición sin cambios no se reenvía.
+        log.borrow_mut().clear();
+        d.event(other(true, true, false), &mut sys);
+        d.event(other(true, true, false), &mut sys);
+        assert_eq!(log.borrow().len(), 1);
+        // Otra ventana toma el foco con Ctrl pulsado: la anterior recibe el estado neutro.
+        d.launch(AppKind::Notepad, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        assert_eq!(log.borrow().last(), Some(&(Key::Other, false, false, false)));
+        // Soltar mientras el foco está en otra ventana no llega a la primera.
+        let n = log.borrow().len();
+        d.event(other(false, false, false), &mut sys);
+        assert_eq!(log.borrow().len(), n);
+    }
+
+    #[test]
+    fn modifier_events_do_not_disturb_other_apps() {
+        let (mut d, mut sys) = setup();
+        d.launch(AppKind::Notepad, &mut sys);
+        d.launch(AppKind::Terminal, &mut sys);
+        d.launch(AppKind::Calc, &mut sys);
+        let n = d.window_count();
+        for ev in [other(true, true, false), other(true, true, true), other(false, false, true), other(false, false, false)] {
+            d.event(ev, &mut sys);
+        }
+        assert_eq!(d.window_count(), n);
+    }
+
+    #[test]
+    fn open_terminal_opens_a_new_terminal_in_that_folder() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.mkdir("C:\\Escritorio\\Sub", now).unwrap();
+        d.launch(AppKind::Calc, &mut sys);
+        let id = d.active_id().unwrap();
+        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(String::from("C:\\Escritorio\\Sub")));
+        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(String::from("C:\\Escritorio\\Sub")));
+        let terms = d.wins.iter().filter(|w| w.kind == AppKind::Terminal).count();
+        assert_eq!(terms, 2);
     }
 }

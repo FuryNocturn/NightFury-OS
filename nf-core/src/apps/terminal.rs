@@ -430,6 +430,14 @@ impl App for Terminal {
         (320, 160)
     }
 
+    /// "Abrir Terminal aquí": si la ruta es una carpeta existente pasa a ser la actual.
+    fn open_path(&mut self, path: &str, cx: &mut Ctx) {
+        if cx.sys.files().stat(path).is_ok_and(|e| e.dir) {
+            self.cwd = String::from(path);
+            cx.redraw = true;
+        }
+    }
+
     fn draw(&mut self, s: &mut Surface, theme: &Theme, _sys: &mut dyn Platform, focused: bool) {
         self.focused = focused;
         s.fill_rect(s.bounds(), BG);
@@ -628,6 +636,34 @@ mod tests {
             assert_eq!(t.cwd, "C:\\Documentos");
             escribe(&mut t, "eco x", cx);
             assert_eq!(t.out[t.out.len() - 2], "C:\\Documentos> eco x");
+        });
+    }
+
+    #[test]
+    fn open_path_cambia_la_carpeta_solo_si_existe() {
+        let mut sys = TestPlatform::default();
+        let now = sys.now();
+        sys.files().write("C:\\a.txt", b"x", now).unwrap();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut t = Terminal::new();
+        t.open_path("C:\\Documentos", &mut cx);
+        assert_eq!(t.cwd, "C:\\Documentos");
+        assert_eq!(prompt(&t.cwd), "C:\\Documentos> ");
+        t.open_path("C:\\nada", &mut cx);
+        t.open_path("C:\\a.txt", &mut cx);
+        assert_eq!(t.cwd, "C:\\Documentos");
+    }
+
+    #[test]
+    fn ctrl_y_mayus_sueltos_no_escriben() {
+        con_cx(|cx| {
+            let mut t = Terminal::new();
+            let n = t.out.len();
+            let m = KeyEvent { key: Key::Other, ch: None, down: true, shift: false, ctrl: true, alt: false };
+            t.key(&m, cx);
+            t.key(&KeyEvent { down: false, ctrl: false, ..m }, cx);
+            assert!(t.input.is_empty() && t.out.len() == n);
         });
     }
 
