@@ -32,6 +32,9 @@ pub trait Platform {
     fn shutdown(&mut self);
     /// Archivos del sistema (unidad C:).
     fn files(&mut self) -> &mut Files;
+    /// 64 bits impredecibles (generador del procesador si existe, mezclado con el reloj fino).
+    /// Para sales; las llaves de cifrado mezclan muchas lecturas con otras fuentes.
+    fn entropy(&mut self) -> u64;
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
@@ -43,6 +46,8 @@ pub struct TestPlatform {
     pub size: (u32, u32),
     /// Unidad C: en memoria.
     pub files: Files,
+    /// Contador para `entropy` (determinista en las pruebas).
+    pub seed: u64,
 }
 
 impl Platform for TestPlatform {
@@ -69,5 +74,9 @@ impl Platform for TestPlatform {
     }
     fn files(&mut self) -> &mut Files {
         &mut self.files
+    }
+    fn entropy(&mut self) -> u64 {
+        self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.seed
     }
 }

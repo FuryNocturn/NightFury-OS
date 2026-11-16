@@ -134,6 +134,24 @@ impl Platform for Plat {
     fn files(&mut self) -> &mut Files {
         &mut self.files
     }
+    fn entropy(&mut self) -> u64 {
+        use core::arch::x86_64::{__cpuid, _rdtsc};
+        // Contador de ciclos del procesador y reloj del sistema: siempre disponibles.
+        #[allow(unused_unsafe)]
+        let mut v = unsafe { _rdtsc() } ^ arch::TICKS.load(Relaxed).rotate_left(40);
+        // RDRAND (Intel SDM vol. 2, CPUID.01H:ECX bit 30) si el procesador lo tiene.
+        #[allow(unused_unsafe)]
+        let has = unsafe { __cpuid(1) }.ecx & (1 << 30) != 0;
+        if has {
+            let r: u64;
+            let ok: u8;
+            unsafe { core::arch::asm!("rdrand {r}", "setc {ok}", r = out(reg) r, ok = out(reg_byte) ok, options(nomem, nostack)) };
+            if ok != 0 {
+                v ^= r;
+            }
+        }
+        v
+    }
 }
 
 // ---------- Disco de datos ----------

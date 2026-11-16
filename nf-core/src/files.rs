@@ -8,6 +8,7 @@
 //! un número como nombre y un índice de texto (`indice`) guarda su ruta original y su fecha.
 //! Al enviar se escribe primero el índice y luego se mueve el elemento; al restaurar o vaciar,
 //! al revés: un corte solo puede dejar líneas de índice sin elemento, que se ignoran.
+use crate::accounts::{self, Account, AccountError};
 use crate::block::{BlockDev, RamDisk};
 use crate::fs::{same, Entry, FsError, Nffs};
 use crate::platform::DateTime;
@@ -26,6 +27,47 @@ pub const PICTURES_DIR: &str = "C:\\Imágenes";
 pub const CONFIG_FILE: &str = "C:\\Sistema\\config.txt";
 /// Preferencias del Explorador: `vista=`, `orden=`, `desc=`, `extensiones=`.
 pub const EXPLORER_PREFS: &str = "C:\\Sistema\\explorador.txt";
+
+// ---- Estructura del disco (v0.5.0). Ningún otro módulo escribe estas rutas a mano. ----
+pub const USERS_DIR: &str = "C:\\Usuarios";
+pub const SYSTEM_DIR: &str = "C:\\Sistema";
+pub const SYS_CONFIG_DIR: &str = "C:\\Sistema\\config";
+pub const SYS_TEMP_DIR: &str = "C:\\Sistema\\temp";
+pub const SYS_LIB_DIR: &str = "C:\\Sistema\\lib";
+pub const SYS_DRIVERS_DIR: &str = "C:\\Sistema\\drivers";
+pub const SYS_LOGS_DIR: &str = "C:\\Sistema\\logs";
+/// Cuentas de usuario (formato en `accounts.rs`).
+pub const ACCOUNTS_FILE: &str = "C:\\Sistema\\config\\cuentas";
+pub const LOG_FILE: &str = "C:\\Sistema\\logs\\sistema.log";
+/// Cuenta de la unidad en memoria (sin disco no hay cuentas que guardar).
+pub const DEFAULT_USER: &str = "Usuario";
+
+/// Carpetas estándar de cada usuario.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Std {
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
+}
+
+impl Std {
+    pub const ALL: [Std; 6] = [Std::Desktop, Std::Documents, Std::Downloads, Std::Pictures, Std::Music, Std::Videos];
+
+    /// Nombre de la carpeta (y el que se muestra).
+    pub fn name(self) -> &'static str {
+        match self {
+            Std::Desktop => "Escritorio",
+            Std::Documents => "Documentos",
+            Std::Downloads => "Descargas",
+            Std::Pictures => "Imágenes",
+            Std::Music => "Música",
+            Std::Videos => "Vídeos",
+        }
+    }
+}
 
 /// Almacén interno de la Papelera (relativo a la raíz) y su índice.
 const STORE: &str = "$Papelera";
@@ -216,6 +258,8 @@ pub struct Files {
     generation: u64,
     clip: Option<(Vec<String>, bool)>,
     undo: Option<(Vec<Undo>, &'static str)>,
+    /// Sesión abierta: (nombre de la cuenta, es administrador).
+    user: Option<(String, bool)>,
 }
 
 impl Default for Files {
@@ -227,7 +271,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)) }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -246,7 +290,7 @@ impl Files {
             return match Nffs::mount(dev) {
                 Ok(mut fs) => {
                     init_folders(&mut fs, now);
-                    Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None }
+                    Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None }
                 }
                 Err(_) => Files::memory(NOTICE_DAMAGED, None, now),
             };
@@ -742,6 +786,174 @@ enum Undo {
     Trashed(String),
 }
 
+// ---- Cuentas, sesión y rutas del usuario (v0.5.0) ----
+//
+// CONTRATO. Semántica final (la estructura del disco la completa `files.rs`):
+// - Unidad en memoria (sin disco): hay una sesión abierta de `DEFAULT_USER`, administrador, y
+//   no hay archivo de cuentas. `needs_setup()` es `false`.
+// - Disco montado: sin sesión hasta `login`. Si no hay ninguna cuenta, `needs_setup()` es `true`
+//   y `create_account` crea la primera, que siempre es administradora.
+// - Las rutas del usuario salen SIEMPRE de `home`, `std_dir`, `config_file` y `explorer_prefs`.
+impl Files {
+    /// Cuentas guardadas (vacío si no hay archivo).
+    pub fn accounts(&mut self) -> Vec<Account> {
+        match self.read(ACCOUNTS_FILE) {
+            Ok(d) => accounts::parse(&String::from_utf8_lossy(&d)),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn save_accounts(&mut self, list: &[Account], now: DateTime) -> Result<(), AccountError> {
+        if !self.exists(SYS_CONFIG_DIR) {
+            self.mkdir(SYS_CONFIG_DIR, now)?;
+        }
+        Ok(self.write(ACCOUNTS_FILE, accounts::serialize(list).as_bytes(), now)?)
+    }
+
+    /// Hay disco pero ninguna cuenta: toca el asistente inicial.
+    pub fn needs_setup(&mut self) -> bool {
+        self.persistent && self.accounts().is_empty()
+    }
+
+    /// Nombre de la cuenta con la sesión abierta.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_ref().map(|u| u.0.as_str())
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.user.as_ref().is_some_and(|u| u.1)
+    }
+
+    /// Abre la sesión de `name` si la clave es correcta (vacía para una cuenta sin clave).
+    pub fn login(&mut self, name: &str, password: &str) -> Result<(), AccountError> {
+        let a = self.accounts().into_iter().find(|a| same(&a.name, name)).ok_or(AccountError::NotFound)?;
+        if !a.verify(password) {
+            return Err(AccountError::WrongPassword);
+        }
+        self.user = Some((a.name, a.admin));
+        self.clip = None;
+        self.undo = None;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Cierra la sesión (en la unidad en memoria no hace nada: no hay a qué volver).
+    pub fn logout(&mut self) {
+        if self.persistent {
+            self.user = None;
+            self.clip = None;
+            self.undo = None;
+            self.generation += 1;
+        }
+    }
+
+    /// Comprueba la clave de la sesión abierta (para desbloquear).
+    pub fn verify_password(&mut self, password: &str) -> bool {
+        let Some(name) = self.user().map(String::from) else { return false };
+        if !self.persistent {
+            return password.is_empty();
+        }
+        self.accounts().iter().find(|a| same(&a.name, &name)).is_some_and(|a| a.verify(password))
+    }
+
+    /// ¿Tiene clave la cuenta de la sesión abierta?
+    pub fn has_password(&mut self) -> bool {
+        let Some(name) = self.user().map(String::from) else { return false };
+        self.accounts().iter().find(|a| same(&a.name, &name)).is_some_and(|a| a.has_password())
+    }
+
+    /// Crea una cuenta. La primera es siempre administradora y no exige sesión; después solo
+    /// puede crear cuentas un administrador. `salt`: `accounts::salt_from` con `Platform::entropy`.
+    pub fn create_account(&mut self, name: &str, password: Option<&str>, admin: bool, salt: [u8; 16], now: DateTime) -> Result<(), AccountError> {
+        let mut list = self.accounts();
+        if !list.is_empty() && !self.is_admin() {
+            return Err(AccountError::NotAdmin);
+        }
+        if !accounts::valid_user_name(name) {
+            return Err(AccountError::BadName);
+        }
+        if list.iter().any(|a| same(&a.name, name)) {
+            return Err(AccountError::Exists);
+        }
+        let mut a = Account::new(name, admin || list.is_empty());
+        a.set_password(password, salt)?;
+        list.push(a);
+        self.save_accounts(&list, now)
+    }
+
+    /// Elimina una cuenta (solo un administrador; no la de la sesión abierta ni la última
+    /// administradora). `keep_files == false` borra su carpeta para siempre.
+    pub fn delete_account(&mut self, name: &str, keep_files: bool, now: DateTime) -> Result<(), AccountError> {
+        let _ = keep_files; // la carpeta del usuario llega con la estructura nueva del disco
+        if !self.is_admin() {
+            return Err(AccountError::NotAdmin);
+        }
+        if self.user().is_some_and(|u| same(u, name)) {
+            return Err(AccountError::InUse);
+        }
+        let mut list = self.accounts();
+        let i = list.iter().position(|a| same(&a.name, name)).ok_or(AccountError::NotFound)?;
+        if list[i].admin && list.iter().filter(|a| a.admin).count() == 1 {
+            return Err(AccountError::LastAdmin);
+        }
+        list.remove(i);
+        self.save_accounts(&list, now)
+    }
+
+    /// Hace administradora o normal a una cuenta (solo un administrador; debe quedar uno).
+    pub fn set_admin(&mut self, name: &str, admin: bool, now: DateTime) -> Result<(), AccountError> {
+        if !self.is_admin() {
+            return Err(AccountError::NotAdmin);
+        }
+        let mut list = self.accounts();
+        let i = list.iter().position(|a| same(&a.name, name)).ok_or(AccountError::NotFound)?;
+        if list[i].admin && !admin && list.iter().filter(|a| a.admin).count() == 1 {
+            return Err(AccountError::LastAdmin);
+        }
+        list[i].admin = admin;
+        if let Some(u) = self.user.as_mut().filter(|u| same(&u.0, name)) {
+            u.1 = admin;
+        }
+        self.save_accounts(&list, now)
+    }
+
+    /// Cambia, pone (`new = Some`) o quita (`new = None`) la clave de la sesión abierta.
+    /// `old` es la clave actual (vacía si no tenía).
+    pub fn set_password(&mut self, old: &str, new: Option<&str>, salt: [u8; 16], now: DateTime) -> Result<(), AccountError> {
+        let name = self.user().map(String::from).ok_or(AccountError::NotFound)?;
+        let mut list = self.accounts();
+        let a = list.iter_mut().find(|a| same(&a.name, &name)).ok_or(AccountError::NotFound)?;
+        if !a.verify(old) {
+            return Err(AccountError::WrongPassword);
+        }
+        a.set_password(new, salt)?;
+        self.save_accounts(&list, now)
+    }
+
+    /// Carpeta del usuario de la sesión abierta: `C:\Usuarios\<nombre>`.
+    /// shortcut: hasta que llegue la estructura nueva devuelve la raíz (estructura antigua).
+    pub fn home(&self) -> String {
+        String::from("C:\\")
+    }
+
+    /// Carpeta estándar del usuario: `C:\Usuarios\<nombre>\Documentos`, etc.
+    pub fn std_dir(&self, d: Std) -> String {
+        join(&self.home(), d.name())
+    }
+
+    /// Configuración del usuario (`fondo=`, `enfasis=`, `iconos=`, `orden=`).
+    /// shortcut: ruta antigua hasta que llegue la estructura nueva (`<home>\.config\config.txt`).
+    pub fn config_file(&self) -> String {
+        String::from(CONFIG_FILE)
+    }
+
+    /// Preferencias del Explorador del usuario (`<home>\.config\explorador.txt`).
+    pub fn explorer_prefs(&self) -> String {
+        String::from(EXPLORER_PREFS)
+    }
+}
+
+
 fn lower(s: &str) -> String {
     s.chars().flat_map(char::to_lowercase).collect()
 }
@@ -752,6 +964,59 @@ mod tests {
     use crate::block::{DiskError, BLOCK};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn cuentas_y_sesion() {
+        let n = DateTime::default();
+        // En memoria: sesión de la cuenta por defecto, sin asistente.
+        let mut m = Files::default();
+        assert_eq!(m.user(), Some(DEFAULT_USER));
+        assert!(m.is_admin() && !m.needs_setup() && m.verify_password(""));
+        m.logout();
+        assert_eq!(m.user(), Some(DEFAULT_USER));
+        // Con disco: sin sesión y con asistente hasta crear la primera cuenta.
+        let disk = Disk::new(2048);
+        let fs = Nffs::format(Box::new(disk.clone()), n).unwrap();
+        drop(fs);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), n);
+        assert!(f.persistent() && f.user().is_none() && f.needs_setup());
+        assert_eq!(f.create_account("a|b", None, false, [1; 16], n), Err(AccountError::BadName));
+        f.create_account("Ana", Some("secreta1"), false, [1; 16], n).unwrap();
+        assert!(!f.needs_setup() && f.accounts()[0].admin, "la primera cuenta es administradora");
+        // Sin sesión de administrador no se crean más.
+        assert_eq!(f.create_account("Luis", None, false, [2; 16], n), Err(AccountError::NotAdmin));
+        assert_eq!(f.login("Ana", "mala"), Err(AccountError::WrongPassword));
+        assert_eq!(f.login("Nadie", ""), Err(AccountError::NotFound));
+        f.login("ana", "secreta1").unwrap();
+        assert_eq!(f.user(), Some("Ana"));
+        assert!(f.is_admin() && f.has_password() && f.verify_password("secreta1") && !f.verify_password(""));
+        f.create_account("Luis", None, false, [2; 16], n).unwrap();
+        assert_eq!(f.create_account("LUIS", None, false, [2; 16], n), Err(AccountError::Exists));
+        // Administradores: debe quedar uno; no se elimina la sesión abierta.
+        assert_eq!(f.set_admin("Ana", false, n), Err(AccountError::LastAdmin));
+        assert_eq!(f.delete_account("Ana", true, n), Err(AccountError::InUse));
+        f.set_admin("Luis", true, n).unwrap();
+        f.set_admin("Ana", false, n).unwrap();
+        assert!(!f.is_admin());
+        assert_eq!(f.delete_account("Luis", true, n), Err(AccountError::NotAdmin));
+        // Cambio de clave propio.
+        assert_eq!(f.set_password("mala", Some("otraclave"), [3; 16], n), Err(AccountError::WrongPassword));
+        assert_eq!(f.set_password("secreta1", Some("abc"), [3; 16], n), Err(AccountError::WeakPassword));
+        f.set_password("secreta1", Some("otraclave"), [3; 16], n).unwrap();
+        f.logout();
+        assert!(f.user().is_none());
+        assert_eq!(f.login("Ana", "secreta1"), Err(AccountError::WrongPassword));
+        // Las cuentas sobreviven a un reinicio; Luis entra sin clave y puede eliminar a Ana.
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), n);
+        assert_eq!(f.accounts().len(), 2);
+        f.login("Luis", "").unwrap();
+        f.delete_account("Ana", true, n).unwrap();
+        assert_eq!(f.delete_account("Luis", true, n), Err(AccountError::InUse));
+        assert_eq!(f.accounts().len(), 1);
+        let raw = disk.0.borrow();
+        assert!(!raw.windows(8).any(|w| w == b"secreta1") && !raw.windows(9).any(|w| w == b"otraclave"), "la clave no se guarda");
+    }
 
     #[test]
     fn lotes_y_extensiones() {

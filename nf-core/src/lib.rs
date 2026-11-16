@@ -2,8 +2,10 @@
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
+pub mod accounts;
 pub mod apps;
 pub mod block;
+pub mod crypto;
 pub mod bmp;
 pub mod dialogs;
 pub mod files;
