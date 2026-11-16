@@ -138,12 +138,6 @@ impl Platform for Plat {
 
 // ---------- Disco de datos ----------
 
-/// ¿Los primeros 256 bloques (o todo el disco, si es menor) son ceros?
-fn en_blanco(d: &mut dyn BlockDev) -> bool {
-    let mut b = [0u8; BLOCK];
-    (0..d.blocks().min(256)).all(|n| d.read(n, &mut b).is_ok() && b.iter().all(|&x| x == 0))
-}
-
 /// Sondea PCI/AHCI y ofrece el primer disco SATA que sea de NightFury o esté en blanco.
 /// Cualquier otro disco se salta sin escribir nada en él.
 fn elegir_disco() -> Option<Box<dyn BlockDev>> {
@@ -158,7 +152,7 @@ fn elegir_disco() -> Option<Box<dyn BlockDev>> {
         let mib = d.blocks() * BLOCK as u64 >> 20;
         let motivo = if Nffs::is_formatted(&mut *d) {
             "NightFury"
-        } else if Nffs::is_blank(&mut *d) || en_blanco(&mut *d) {
+        } else if Nffs::is_blank(&mut *d) {
             "en blanco"
         } else {
             ""
