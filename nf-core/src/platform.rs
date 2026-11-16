@@ -1,6 +1,7 @@
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;
+use crate::keys::Pool;
 use alloc::string::String;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -35,6 +36,9 @@ pub trait Platform {
     /// 64 bits impredecibles (generador del procesador si existe, mezclado con el reloj fino).
     /// Para sales; las llaves de cifrado mezclan muchas lecturas con otras fuentes.
     fn entropy(&mut self) -> u64;
+    /// Acumulador de aleatoriedad del sistema. El escritorio le echa cada movimiento del ratón
+    /// y cada tecla; de él salen las llaves de cifrado.
+    fn pool(&mut self) -> &mut Pool;
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
@@ -48,6 +52,7 @@ pub struct TestPlatform {
     pub files: Files,
     /// Contador para `entropy` (determinista en las pruebas).
     pub seed: u64,
+    pub pool: Pool,
 }
 
 impl Platform for TestPlatform {
@@ -78,5 +83,8 @@ impl Platform for TestPlatform {
     fn entropy(&mut self) -> u64 {
         self.seed = self.seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         self.seed
+    }
+    fn pool(&mut self) -> &mut Pool {
+        &mut self.pool
     }
 }

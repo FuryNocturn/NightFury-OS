@@ -6,6 +6,7 @@ pub mod accounts;
 pub mod apps;
 pub mod block;
 pub mod cipher;
+pub mod cryptdev;
 pub mod crypto;
 pub mod bmp;
 pub mod dialogs;

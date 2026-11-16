@@ -67,6 +67,7 @@ static ASIGNADOR: Asignador = Asignador;
 struct Plat {
     info: boot::BootInfo,
     files: Files,
+    pool: nf_core::keys::Pool,
 }
 
 fn cpu_name() -> String {
@@ -133,6 +134,9 @@ impl Platform for Plat {
     }
     fn files(&mut self) -> &mut Files {
         &mut self.files
+    }
+    fn pool(&mut self) -> &mut nf_core::keys::Pool {
+        &mut self.pool
     }
     fn entropy(&mut self) -> u64 {
         use core::arch::x86_64::{__cpuid, _rdtsc};
@@ -218,7 +222,7 @@ extern "C" fn kmain() -> ! {
     if TRAZA {
         traza!("NF archivos: persistente={} formato_pendiente={}", files.persistent(), files.pending_format());
     }
-    let mut plat = Plat { info, files };
+    let mut plat = Plat { info, files, pool: nf_core::keys::Pool::new() };
     let (w, h) = (info.width as i32, info.height as i32);
     let mut desk = Desktop::new(w, h, &mut plat);
 
