@@ -908,9 +908,10 @@ impl Files {
 
     // ---- Extensiones de nombre de archivo (Explorador y escritorio) ----
 
-    /// `false` si el usuario ocultó las extensiones (`extensiones=no` en `EXPLORER_PREFS`).
+    /// `false` si el usuario ocultó las extensiones (`extensiones=no` en `explorer_prefs()`).
     pub fn show_ext(&mut self) -> bool {
-        match self.read(EXPLORER_PREFS) {
+        let prefs = self.explorer_prefs();
+        match self.read(&prefs) {
             Ok(d) => !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"),
             Err(_) => true,
         }
@@ -1500,7 +1501,8 @@ mod tests {
         assert!(f.clip().is_none());
         // Extensiones.
         assert!(f.show_ext());
-        f.write(EXPLORER_PREFS, b"vista=lista\nextensiones=no\n", n).unwrap();
+        let prefs = f.explorer_prefs();
+        f.write(&prefs, b"vista=lista\nextensiones=no\n", n).unwrap();
         assert!(!f.show_ext());
         assert_eq!(display_name("nota.txt", false, false), "nota");
         assert_eq!(display_name("nota.txt", false, true), "nota.txt");
