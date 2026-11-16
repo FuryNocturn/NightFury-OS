@@ -108,7 +108,7 @@ impl ScrollBar {
     }
 
     /// Tirador relativo al inicio de la barra: (inicio, largo).
-    fn thumb(&self, m: &Metrics) -> (i32, i32) {
+    pub fn thumb(&self, m: &Metrics) -> (i32, i32) {
         let (ts, tl) = self.track(m);
         let total = m.total.max(1) as i64;
         let len = ((tl as i64 * m.page.max(0) as i64 / total) as i32).max(MIN_THUMB).min(tl);
