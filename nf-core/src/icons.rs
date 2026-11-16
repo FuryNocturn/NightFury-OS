@@ -47,6 +47,13 @@ pub enum Icon {
     Ordenar,
     VentanaNueva,
     Cerrar,
+    /// Carpetas estándar del usuario.
+    Escritorio,
+    Documentos,
+    Descargas,
+    Imagenes,
+    Musica,
+    Videos,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -333,6 +340,71 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             cell(s, o, k, (2.0, 3.0, 14.0, 5.0), AZUL);
             insignia(s, p(11.5, 11.0), k, VERDE);
         }
+        Icon::Escritorio => {
+            // Monitor con el fondo azul y una barra de tareas.
+            cell(s, o, k, (1.0, 2.0, 15.0, 11.0), OSCURO);
+            cell(s, o, k, (2.0, 3.0, 14.0, 10.0), AZUL);
+            cell(s, o, k, (2.0, 8.5, 14.0, 10.0), CLARO);
+            cell(s, o, k, (3.5, 4.5, 6.0, 7.0), 0xFFFFFF);
+            cell(s, o, k, (7.0, 11.0, 9.0, 13.0), OSCURO);
+            cell(s, o, k, (4.5, 13.0, 11.5, 14.5), OSCURO);
+        }
+        Icon::Documentos => {
+            // Hoja con cabecera azul, texto y un doblez; otra hoja asoma detrás.
+            sheet(s, o, k, (2.0, 2.5, 11.0, 15.0), GRIS, 0xFFFFFF);
+            sheet(s, o, k, (5.0, 1.0, 14.0, 13.5), AZUL, 0xFFFFFF);
+            cell(s, o, k, (6.0, 2.0, 13.0, 4.5), AZUL);
+            for (i, yy) in [6.0f32, 8.0, 10.0].iter().enumerate() {
+                let x1 = if i == 2 { 10.0 } else { 12.0 };
+                cell(s, o, k, (7.0, *yy, x1, yy + 1.0), CLARO);
+            }
+        }
+        Icon::Descargas => {
+            // Disco verde con una flecha blanca hacia abajo sobre una bandeja.
+            let (cx, cy) = p(8.0, 8.0);
+            s.fill_circle(cx, cy, 7.2 * k, VERDE, 255);
+            let t = tw(1.8);
+            s.stroke(&[p(8.0, 3.8), p(8.0, 9.6)], t, 0xFFFFFF);
+            s.stroke(&[p(5.0, 7.0), p(8.0, 10.0), p(11.0, 7.0)], t, 0xFFFFFF);
+            cell(s, o, k, (4.5, 11.3, 11.5, 12.6), 0xFFFFFF);
+        }
+        Icon::Imagenes => {
+            // Marco con cielo, sol y montañas.
+            cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
+            cell(s, o, k, (2.0, 3.0, 14.0, 13.0), CLARO);
+            let (sx, sy) = p(11.3, 5.7);
+            s.fill_circle(sx, sy, (1.4 * k).max(1.2), rgb(0xF6, 0xC8, 0x4C), 255);
+            cell(s, o, k, (2.0, 11.0, 14.0, 13.0), VERDE);
+            s.stroke(&[p(2.5, 11.0), p(6.0, 7.0), p(9.5, 11.0)], tw(2.6), rgb(0x2E, 0x8B, 0x57));
+            s.stroke(&[p(8.0, 11.0), p(11.0, 8.6), p(13.8, 11.0)], tw(2.2), rgb(0x3C, 0x9F, 0x66));
+            cell(s, o, k, (2.0, 11.0, 14.0, 13.0), VERDE);
+        }
+        Icon::Musica => {
+            // Corchea doble: dos cabezas, dos plicas y la barra.
+            let col = rgb(0x8E, 0x4B, 0xC8);
+            let (ax, ay) = p(4.8, 12.2);
+            let (bx, by) = p(11.4, 10.8);
+            s.fill_circle(ax, ay, (2.0 * k).max(1.7), col, 255);
+            s.fill_circle(bx, by, (2.0 * k).max(1.7), col, 255);
+            let t = tw(1.3);
+            s.stroke(&[p(6.5, 11.8), p(6.5, 2.8)], t, col);
+            s.stroke(&[p(13.1, 10.4), p(13.1, 1.8)], t, col);
+            s.stroke(&[p(6.5, 2.6), p(13.1, 1.6)], tw(2.0), col);
+        }
+        Icon::Videos => {
+            // Fotograma oscuro con perforaciones y un triángulo de reproducir.
+            cell(s, o, k, (1.0, 3.0, 15.0, 13.0), OSCURO);
+            for i in 0..4 {
+                let y0 = 4.0 + i as f32 * 2.4;
+                cell(s, o, k, (1.8, y0, 2.9, y0 + 1.2), 0xFFFFFF);
+                cell(s, o, k, (13.1, y0, 14.2, y0 + 1.2), 0xFFFFFF);
+            }
+            for i in 0..5 {
+                let x0 = 5.4 + i as f32 * 1.0;
+                let h = 3.2 - i as f32 * 0.64;
+                cell(s, o, k, (x0, 8.0 - h, x0 + 1.0, 8.0 + h), rgb(0xF2, 0x8B, 0x30));
+            }
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -349,7 +421,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 35] = [
+    const ALL: [Icon; 41] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -385,6 +457,12 @@ mod tests {
         Icon::Ordenar,
         Icon::VentanaNueva,
         Icon::Cerrar,
+        Icon::Escritorio,
+        Icon::Documentos,
+        Icon::Descargas,
+        Icon::Imagenes,
+        Icon::Musica,
+        Icon::Videos,
     ];
     const SENT: u32 = 0x123456;
 

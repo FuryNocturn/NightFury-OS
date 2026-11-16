@@ -3,7 +3,7 @@
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::dialogs::{self, Answer, Buttons, DialogRequest, DialogResult};
-use crate::files::{self, file_name, join, parent, valid_name, Files};
+use crate::files::{self, file_name, join, parent, valid_name, Files, Std};
 use crate::font::{self, Align};
 use crate::fs::FsError;
 use crate::geom::Rect;
@@ -39,15 +39,61 @@ const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
 const DISABLED: u32 = 0xA6A6A6;
 const LINE: u32 = 0xDADADA;
-const PLACES: [(&str, &str, Icon); 5] = [
-    ("Escritorio", files::DESKTOP_DIR, Icon::Folder),
-    ("Documentos", files::DOCUMENTS_DIR, Icon::Folder),
-    ("Imágenes", files::PICTURES_DIR, Icon::Folder),
-    ("Disco local (C:)", "C:\\", Icon::Drive),
-    ("Papelera", files::TRASH, Icon::Trash),
+/// Alto de cada entrada del panel izquierdo.
+const PLACE_H: i32 = 26;
+/// Entradas del panel izquierdo, en orden.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Std(Std),
+    Disk,
+    Trash,
+}
+const PLACES: [Place; 8] = [
+    Place::Std(Std::Desktop),
+    Place::Std(Std::Documents),
+    Place::Std(Std::Downloads),
+    Place::Std(Std::Pictures),
+    Place::Std(Std::Music),
+    Place::Std(Std::Videos),
+    Place::Disk,
+    Place::Trash,
 ];
-//// Dónde se recuerdan la vista, el orden y las extensiones.
-const PREFS: &str = files::EXPLORER_PREFS;
+
+impl Place {
+    fn name(self) -> &'static str {
+        match self {
+            Place::Std(d) => d.name(),
+            Place::Disk => "Disco local (C:)",
+            Place::Trash => "Papelera",
+        }
+    }
+    fn icon(self) -> Icon {
+        match self {
+            Place::Std(d) => std_icon(d),
+            Place::Disk => Icon::Drive,
+            Place::Trash => Icon::Trash,
+        }
+    }
+    /// Carpeta de la sesión actual (o `TRASH` / `C:\`).
+    fn path(self, f: &Files) -> String {
+        match self {
+            Place::Std(d) => f.std_dir(d),
+            Place::Disk => String::from("C:\\"),
+            Place::Trash => String::from(files::TRASH),
+        }
+    }
+}
+
+fn std_icon(d: Std) -> Icon {
+    match d {
+        Std::Desktop => Icon::Escritorio,
+        Std::Documents => Icon::Documentos,
+        Std::Downloads => Icon::Descargas,
+        Std::Pictures => Icon::Imagenes,
+        Std::Music => Icon::Musica,
+        Std::Videos => Icon::Videos,
+    }
+}
 const TAG_NEW: u32 = 1;
 const TAG_RENAME: u32 = 2;
 const TAG_EMPTY: u32 = 3;
@@ -56,6 +102,7 @@ const TAG_PROPS: u32 = 5;
 const TAG_NEWDOC: u32 = 6;
 const TAG_MOVETO: u32 = 7;
 const TAG_COPYTO: u32 = 8;
+const TAG_SYS: u32 = 9;
 /// Menús: sobre un elemento / sobre la zona vacía / de la cinta (Archivo y Ordenar por).
 const TAG_MENU_ITEM: u32 = 1;
 const TAG_MENU_BG: u32 = 2;
@@ -192,6 +239,16 @@ enum Hit {
     Head(Sort),
 }
 
+/// Operación que modifica archivos; si toca `C:\Sistema` espera a que el usuario confirme.
+#[derive(Clone, Debug)]
+enum Act {
+    Trash(Vec<String>),
+    Rename { from: String, to: String },
+    Create { path: String, dir: bool },
+    Paste(String),
+    Transfer { paths: Vec<String>, dir: String, mv: bool },
+}
+
 struct Row {
     name: String,
     dir: bool,
@@ -221,6 +278,8 @@ struct Explorer {
     h: i32,
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
+    /// Carpeta de cada entrada del panel (según la sesión; se pone al día al dibujar).
+    places: Vec<String>,
     last_click: Option<(usize, u64)>,
     sb_v: ScrollBar,
     sb_h: ScrollBar,
@@ -238,7 +297,12 @@ struct Explorer {
     sort: Sort,
     desc: bool,
     show_ext: bool,
-    prefs_loaded: bool,
+    /// Archivo de preferencias ya leído (cambia con la cuenta de la sesión).
+    prefs_for: String,
+    /// Se puede crear y pegar en la carpeta actual (permisos de la sesión).
+    can_create: bool,
+    /// Operación en espera del Sí del aviso de `C:\Sistema`.
+    pending_sys: Option<Act>,
     /// Hay algo en el portapapeles (se actualiza al dibujar y al ejecutar órdenes).
     has_clip: bool,
     /// Estado de Ctrl y Mayús para el ratón (`MouseEv` no lleva modificadores): el escritorio lo
@@ -301,7 +365,8 @@ fn build_ribbon(trash: bool) -> Ribbon {
 
 fn make() -> Explorer {
     Explorer {
-        cwd: String::from(files::DOCUMENTS_DIR),
+        // Vacío hasta el primer `reload`: Documentos depende de la sesión.
+        cwd: String::new(),
         back: Vec::new(),
         rows: Vec::new(),
         sel: None,
@@ -313,6 +378,7 @@ fn make() -> Explorer {
         h: 520,
         hits: Vec::new(),
         hover: None,
+        places: Vec::new(),
         last_click: None,
         sb_v: ScrollBar::new(false),
         sb_h: ScrollBar::new(true),
@@ -326,7 +392,9 @@ fn make() -> Explorer {
         sort: Sort::Name,
         desc: false,
         show_ext: true,
-        prefs_loaded: false,
+        prefs_for: String::new(),
+        can_create: true,
+        pending_sys: None,
         has_clip: false,
         ctrl: false,
         shift: false,
@@ -400,6 +468,18 @@ fn clipped(s: &mut Surface, r: Rect, text: &str, color: u32, align: Align) {
     s.set_clip(old.intersect(r));
     font::draw_in(s, r, text, 9, false, color, align);
     s.set_clip(old);
+}
+
+/// ¿Deja la sesión crear o pegar algo directamente en `dir`? (No en `C:\Usuarios` ni en la
+/// carpeta de una cuenta, ni en `C:\Sistema` sin ser administrador.)
+fn can_create_in(f: &Files, dir: &str) -> bool {
+    let c = dir.get(3..).unwrap_or("");
+    let mut parts = c.split('\\').filter(|p| !p.is_empty());
+    let users = parts.next().is_some_and(|p| same(p, "Usuarios"));
+    if users && parts.count() <= 1 {
+        return false;
+    }
+    !files::in_system(dir) || f.is_admin()
 }
 
 fn chevron(s: &mut Surface, x: f32, y: f32, dir: f32, c: u32) {
@@ -484,8 +564,11 @@ impl Explorer {
     // ---- recordar vista, orden y extensiones ----
 
     fn load_prefs(&mut self, f: &mut Files) {
-        self.prefs_loaded = true;
-        let Ok(bytes) = f.read(PREFS) else { return };
+        let path = f.explorer_prefs();
+        self.prefs_for = path.clone();
+        // Cada cuenta tiene las suyas: se parte de los valores por defecto.
+        (self.view, self.sort, self.desc) = (View::Details, Sort::Name, false);
+        let Ok(bytes) = f.read(&path) else { return };
         let text = String::from_utf8_lossy(&bytes);
         for l in text.lines() {
             match l.split_once('=') {
@@ -507,7 +590,8 @@ impl Explorer {
 
     /// Escribe esas claves y conserva las demás líneas del archivo.
     fn write_prefs(sys: &mut dyn Platform, new: &[(&str, String)]) {
-        let old = sys.files().read(PREFS).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let path = sys.files().explorer_prefs();
+        let old = sys.files().read(&path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
         let mut out = String::new();
         for (k, v) in new {
             out += &format!("{k}={v}\n");
@@ -520,7 +604,7 @@ impl Explorer {
             }
         }
         let now = sys.now();
-        let _ = sys.files().write(PREFS, out.as_bytes(), now);
+        let _ = sys.files().write(&path, out.as_bytes(), now);
     }
 
     fn save_prefs(&self, sys: &mut dyn Platform) {
@@ -689,7 +773,10 @@ impl Explorer {
     // ---- carga y operaciones ----
 
     fn reload(&mut self, sys: &mut dyn Platform) {
-        if !self.prefs_loaded {
+        if self.cwd.is_empty() {
+            self.cwd = sys.files().std_dir(Std::Documents);
+        }
+        if self.prefs_for != sys.files().explorer_prefs() {
             self.load_prefs(sys.files());
         }
         let (keep, cur) = if self.want.is_empty() {
@@ -732,6 +819,7 @@ impl Explorer {
                 }
             }
         }
+        self.can_create = !self.trash() && can_create_in(f, &self.cwd);
         self.sort_rows();
         self.marked = (0..self.rows.len()).filter(|&i| keep.contains(&self.rows[i].name)).collect();
         self.sel = cur.and_then(|c| self.marked.iter().copied().find(|&i| self.rows[i].name == c)).or(self.marked.last().copied());
@@ -801,15 +889,22 @@ impl Explorer {
         }
     }
 
+    /// ¿La selección incluye una carpeta protegida? Solo puede haberla si la carpeta actual lo es.
+    fn sel_protected(&self) -> bool {
+        !self.trash() && files::is_protected(&self.cwd) && self.paths().iter().any(|p| files::is_protected(p))
+    }
+
     fn enabled(&self, c: Cmd) -> bool {
         let n = self.marked.len();
         let trash = self.trash();
         match c {
-            Cmd::NewFolder | Cmd::NewDoc => !trash,
-            Cmd::Rename | Cmd::Open => n == 1 && !trash,
-            Cmd::Copy | Cmd::Cut | Cmd::Delete | Cmd::MoveTo | Cmd::CopyTo => n >= 1 && !trash,
+            Cmd::NewFolder | Cmd::NewDoc => self.can_create,
+            Cmd::Open => n == 1 && !trash,
+            Cmd::Rename => n == 1 && !trash && !self.sel_protected(),
+            Cmd::Copy | Cmd::CopyTo => n >= 1 && !trash,
+            Cmd::Cut | Cmd::Delete | Cmd::MoveTo => n >= 1 && !trash && !self.sel_protected(),
             Cmd::Restore => n >= 1 && trash,
-            Cmd::Paste => self.has_clip && !trash,
+            Cmd::Paste => self.has_clip && self.can_create,
             Cmd::EmptyTrash => trash && !self.rows.is_empty(),
             Cmd::Props => true,
             Cmd::SelAll | Cmd::Invert => !self.rows.is_empty(),
@@ -822,7 +917,6 @@ impl Explorer {
         if !self.enabled(c) {
             return;
         }
-        let now = cx.sys.now();
         let paths = self.paths();
         match c {
             Cmd::NewFolder => {
@@ -856,10 +950,7 @@ impl Explorer {
                 let dir = self.cwd.clone();
                 self.paste_into(&dir, cx);
             }
-            Cmd::Delete => {
-                let r = cx.sys.files().user_trash_many(&paths, now);
-                self.done(r, cx);
-            }
+            Cmd::Delete => self.act(Act::Trash(paths), cx),
             Cmd::MoveTo | Cmd::CopyTo => {
                 let mv = c == Cmd::MoveTo;
                 self.pending = paths;
@@ -898,12 +989,64 @@ impl Explorer {
     }
 
     fn paste_into(&mut self, dir: &str, cx: &mut Ctx) {
-        let now = cx.sys.now();
-        let r = cx.sys.files().paste_all(dir, now);
-        if let (Ok(v), true) = (&r, same(dir, &self.cwd)) {
-            self.want = v.iter().map(|p| String::from(file_name(p))).collect();
+        self.act(Act::Paste(String::from(dir)), cx);
+    }
+
+    /// Hace la operación; si toca `C:\Sistema`, antes pregunta (Sí/No) y la deja en espera.
+    fn act(&mut self, a: Act, cx: &mut Ctx) {
+        let touches = |p: &String| files::in_system(p);
+        let sys = match &a {
+            Act::Trash(v) => v.iter().any(touches),
+            Act::Rename { from, to } => touches(from) || touches(to),
+            Act::Create { path, .. } => touches(path),
+            Act::Paste(dir) => {
+                let (src, cut) = cx.sys.files().clip_paths();
+                touches(dir) || (cut && src.iter().any(touches))
+            }
+            Act::Transfer { paths, dir, mv } => touches(dir) || (*mv && paths.iter().any(touches)),
+        };
+        if sys {
+            self.pending_sys = Some(a);
+            cx.dialog = Some(DialogRequest::Message {
+                tag: TAG_SYS,
+                title: String::from("Carpeta del sistema"),
+                text: String::from(
+                    "Vas a modificar una carpeta del sistema. Si cambias o borras algo aquí, NightFury puede dejar de funcionar. ¿Continuar?",
+                ),
+                buttons: Buttons::YesNo,
+            });
+            cx.redraw = true;
+        } else {
+            self.apply(a, cx);
         }
-        self.done(r.map(|_| ()), cx);
+    }
+
+    fn apply(&mut self, a: Act, cx: &mut Ctx) {
+        let now = cx.sys.now();
+        let r = match a {
+            Act::Trash(paths) => cx.sys.files().user_trash_many(&paths, now),
+            Act::Rename { from, to } => {
+                self.want = vec![String::from(file_name(&to))];
+                cx.sys.files().user_rename(&from, &to)
+            }
+            Act::Create { path, dir } => {
+                self.want = vec![String::from(file_name(&path))];
+                cx.sys.files().user_create(&path, dir, now)
+            }
+            Act::Paste(dir) => {
+                let r = cx.sys.files().paste_all(&dir, now);
+                if let (Ok(v), true) = (&r, same(&dir, &self.cwd)) {
+                    self.want = v.iter().map(|p| String::from(file_name(p))).collect();
+                }
+                r.map(|_| ())
+            }
+            Act::Transfer { paths, dir, mv } => cx.sys.files().transfer(&paths, &dir, mv, now).map(|v| {
+                if same(&dir, &self.cwd) {
+                    self.want = v.iter().map(|p| String::from(file_name(p))).collect();
+                }
+            }),
+        };
+        self.done(r, cx);
     }
 
     fn undo(&mut self, cx: &mut Ctx) {
@@ -916,7 +1059,7 @@ impl Explorer {
     }
 
     fn new_doc(&mut self, cx: &mut Ctx) {
-        if self.trash() {
+        if !self.can_create {
             return;
         }
         let name = cx.sys.files().free_name(&self.cwd, "Nuevo documento de texto.txt");
@@ -1053,7 +1196,8 @@ impl Explorer {
         MenuItem::submenu("Ordenar por", self.sort_items())
     }
 
-    fn item_menu(&self, dir: bool, has_clip: bool, multi: bool) -> Vec<MenuItem> {
+    /// `paste_ok`: se puede pegar dentro de la carpeta clicada.
+    fn item_menu(&self, dir: bool, has_clip: bool, multi: bool, paste_ok: bool) -> Vec<MenuItem> {
         let n = MenuItem::new;
         if self.trash() {
             return vec![n(M_RESTORE, "Restaurar"), MenuItem::sep(), n(M_PROPS, "Propiedades")];
@@ -1065,15 +1209,16 @@ impl Explorer {
             v.push(MenuItem::submenu("Abrir con", vec![n(M_NOTEPAD, "Bloc de notas")]).disabled(multi));
         }
         v.push(MenuItem::sep());
-        v.push(n(M_CUT, "Cortar"));
+        let prot = self.sel_protected();
+        v.push(n(M_CUT, "Cortar").disabled(prot));
         v.push(n(M_COPY, "Copiar"));
         if dir {
-            v.push(n(M_PASTE, "Pegar").disabled(!has_clip));
+            v.push(n(M_PASTE, "Pegar").disabled(!has_clip || !paste_ok));
         }
         v.extend([
             MenuItem::sep(),
-            n(M_DELETE, "Eliminar"),
-            n(M_RENAME, "Cambiar nombre").disabled(multi),
+            n(M_DELETE, "Eliminar").disabled(prot),
+            n(M_RENAME, "Cambiar nombre").disabled(multi || prot),
             MenuItem::sep(),
             n(M_PROPS, "Propiedades"),
         ]);
@@ -1108,10 +1253,10 @@ impl Explorer {
             self.sort_menu(),
             n(M_REFRESH, "Actualizar"),
             MenuItem::sep(),
-            n(M_PASTE, "Pegar").disabled(!has_clip),
+            n(M_PASTE, "Pegar").disabled(!has_clip || !self.can_create),
             undo.shortcut("Ctrl+Z"),
             MenuItem::sep(),
-            MenuItem::submenu("Nuevo", vec![n(M_NEW_FOLDER, "Carpeta"), n(M_NEW_DOC, "Documento de texto")]),
+            MenuItem::submenu("Nuevo", vec![n(M_NEW_FOLDER, "Carpeta"), n(M_NEW_DOC, "Documento de texto")]).disabled(!self.can_create),
             MenuItem::sep(),
             n(M_PROPS, "Propiedades"),
         ]
@@ -1261,16 +1406,16 @@ impl Explorer {
         let y0 = self.body_y();
         s.fill_rect(Rect::new(0, y0, PANEL_W, self.h - y0 - STATUS_H), 0xF7F7F7);
         s.fill_rect(Rect::new(PANEL_W - 1, y0, 1, self.h - y0 - STATUS_H), LINE);
-        for (i, (name, path, icon)) in PLACES.iter().enumerate() {
-            let r = Rect::new(0, y0 + 8 + i as i32 * 28, PANEL_W - 1, 28);
-            if same(&self.cwd, path) {
+        for (i, place) in PLACES.iter().enumerate() {
+            let r = Rect::new(0, y0 + 8 + i as i32 * PLACE_H, PANEL_W - 1, PLACE_H);
+            if same(&self.cwd, &self.places[i]) {
                 s.fill_rect(r, blend(0xF7F7F7, theme.accent, 55));
                 s.fill_rect(Rect::new(0, r.y + 5, 3, r.h - 10), theme.accent);
             } else if self.hover == Some(Hit::Place(i)) {
                 s.fill_rect(r, 0xE9E9E9);
             }
-            icons::draw(s, *icon, 14, r.y + 6, 16, 0x444444);
-            clipped(s, Rect::new(38, r.y, PANEL_W - 42, r.h), name, TEXT, Align::Left);
+            icons::draw(s, place.icon(), 14, r.y + (PLACE_H - 16) / 2, 16, 0x444444);
+            clipped(s, Rect::new(38, r.y, PANEL_W - 42, r.h), place.name(), TEXT, Align::Left);
             self.hits.push((r, Hit::Place(i)));
         }
     }
@@ -1321,13 +1466,18 @@ impl Explorer {
             self.heads(s, a.right());
         }
         let cx = self.col_x();
+        let in_home = !trash && parent(&self.cwd).is_some_and(|p| same(&p, files::USERS_DIR));
         let (pl, page, _) = self.dims();
         let old = s.clip();
         s.set_clip(old.intersect(a));
         for (n, row) in self.rows.iter().enumerate().skip(self.top * pl).take(page * pl) {
             let r = self.item_rect(n);
             let icon = if row.dir {
-                Icon::Folder
+                // Dentro de la carpeta de una cuenta, las seis estándar llevan su icono.
+                match Std::ALL.iter().find(|d| in_home && same(d.name(), &row.name)) {
+                    Some(&d) => std_icon(d),
+                    None => Icon::Folder,
+                }
             } else if is_txt(&row.name) {
                 Icon::FileText
             } else {
@@ -1417,6 +1567,7 @@ impl App for Explorer {
             String::from("Papelera")
         } else {
             match file_name(&self.cwd) {
+                "" if self.cwd.is_empty() => String::from(Std::Documents.name()),
                 "" => String::from("Disco local (C:)"),
                 n => String::from(n),
             }
@@ -1433,6 +1584,7 @@ impl App for Explorer {
             self.reload(sys);
         }
         self.has_clip = sys.files().clip().is_some();
+        self.places = PLACES.iter().map(|p| p.path(sys.files())).collect();
         self.top = self.top.min(self.max_top());
         self.hits.clear();
         self.sync_ribbon();
@@ -1535,7 +1687,9 @@ impl App for Explorer {
                     }
                     self.last_click = None;
                     let multi = self.marked.len() > 1;
-                    (TAG_MENU_ITEM, self.item_menu(self.rows[i].dir && !multi, has_clip, multi))
+                    let dir = self.rows[i].dir && !multi;
+                    let paste_ok = !dir || can_create_in(cx.sys.files(), &join(&self.cwd, &self.rows[i].name));
+                    (TAG_MENU_ITEM, self.item_menu(dir, has_clip, multi, paste_ok))
                 } else if self.area().contains(x, y) {
                     self.clear_sel();
                     (TAG_MENU_BG, self.bg_menu(has_clip, cx.sys.files().undo_label()))
@@ -1575,7 +1729,10 @@ impl App for Explorer {
                         Hit::Back => self.go_back(cx),
                         Hit::Up => self.up(cx),
                         Hit::Crumb(p) => self.go(&p, true, cx),
-                        Hit::Place(i) => self.go(PLACES[i].1, true, cx),
+                        Hit::Place(i) => {
+                            let p = PLACES[i].path(cx.sys.files());
+                            self.go(&p, true, cx);
+                        }
                         Hit::Head(so) => {
                             if self.sort == so {
                                 self.desc = !self.desc;
@@ -1629,28 +1786,23 @@ impl App for Explorer {
     }
 
     fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
-        let now = cx.sys.now();
         match result {
             DialogResult::Text { tag: TAG_NEW, value: Some(v) } => {
-                let r = if valid_name(&v) {
-                    self.want = vec![v.clone()];
-                    cx.sys.files().user_create(&join(&self.cwd, &v), true, now)
+                if valid_name(&v) {
+                    self.act(Act::Create { path: join(&self.cwd, &v), dir: true }, cx);
                 } else {
-                    Err(FsError::BadName)
-                };
-                self.done(r, cx);
+                    self.done(Err(FsError::BadName), cx);
+                }
             }
             DialogResult::Text { tag: TAG_NEWDOC, value: Some(mut v) } => {
                 if !v.rsplit_once('.').is_some_and(|(a, b)| !a.is_empty() && !b.is_empty()) {
                     v.push_str(".txt");
                 }
-                let r = if valid_name(&v) {
-                    self.want = vec![v.clone()];
-                    cx.sys.files().user_create(&join(&self.cwd, &v), false, now)
+                if valid_name(&v) {
+                    self.act(Act::Create { path: join(&self.cwd, &v), dir: false }, cx);
                 } else {
-                    Err(FsError::BadName)
-                };
-                self.done(r, cx);
+                    self.done(Err(FsError::BadName), cx);
+                }
             }
             DialogResult::Text { tag: TAG_RENAME, value: Some(v) } => {
                 let from = core::mem::take(&mut self.rename_from);
@@ -1658,29 +1810,27 @@ impl App for Explorer {
                 let empty = v.trim().is_empty();
                 // Con las extensiones ocultas se escribe solo el nombre; la extensión se conserva.
                 let v = v + &ext;
-                let r = if !empty && file_name(&from) == v {
-                    Ok(())
+                if !empty && file_name(&from) == v {
+                    self.done(Ok(()), cx);
                 } else if empty || !valid_name(&v) {
-                    Err(FsError::BadName)
+                    self.done(Err(FsError::BadName), cx);
                 } else {
                     let to = join(&parent(&from).unwrap_or_default(), &v);
-                    self.want = vec![v];
-                    cx.sys.files().user_rename(&from, &to)
-                };
-                self.done(r, cx);
+                    self.act(Act::Rename { from, to }, cx);
+                }
             }
             DialogResult::Path { tag, path: Some(dir) } if tag == TAG_MOVETO || tag == TAG_COPYTO => {
                 let paths = core::mem::take(&mut self.pending);
                 let mv = tag == TAG_MOVETO;
-                let r = cx.sys.files().transfer(&paths, &dir, mv, now);
-                let r = r.map(|v| {
-                    if same(&dir, &self.cwd) {
-                        self.want = v.iter().map(|p| String::from(file_name(p))).collect();
-                    }
-                });
-                self.done(r, cx);
+                self.act(Act::Transfer { paths, dir, mv }, cx);
             }
             DialogResult::Path { path: None, .. } => self.pending.clear(),
+            DialogResult::Answer { tag: TAG_SYS, answer } => {
+                if let (Answer::Yes, Some(a)) = (answer, self.pending_sys.take()) {
+                    self.apply(a, cx);
+                }
+                self.pending_sys = None;
+            }
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
                 let r = cx.sys.files().empty_trash();
                 self.done(r, cx);
@@ -1702,7 +1852,7 @@ impl App for Explorer {
             M_PASTE => {
                 self.has_clip = cx.sys.files().clip().is_some();
                 match path {
-                    Some(p) if item && dir && self.has_clip => self.paste_into(&p, cx),
+                    Some(p) if item && dir && self.has_clip && can_create_in(cx.sys.files(), &p) => self.paste_into(&p, cx),
                     _ if self.enabled(Cmd::Paste) => {
                         let dir = self.cwd.clone();
                         self.paste_into(&dir, cx);
@@ -1718,7 +1868,7 @@ impl App for Explorer {
             M_REFRESH => self.reload(cx.sys),
             M_UNDO => self.undo(cx),
             M_NEW_FOLDER => self.run(Cmd::NewFolder, cx),
-            M_NEW_DOC => self.new_doc(cx),
+            M_NEW_DOC if self.can_create => self.new_doc(cx),
             M_FILE_NEWWIN => cx.open_new = Some(self.cwd.clone()),
             M_FILE_TERM if !self.trash() => cx.open_terminal = Some(self.cwd.clone()),
             M_FILE_CLOSE => cx.close = true,
