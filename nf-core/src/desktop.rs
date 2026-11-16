@@ -10,6 +10,7 @@ use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
+use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::platform::{DateTime, Platform};
 use crate::surface::{blend, lighten, Surface};
 use crate::theme::{self, Theme, WALLPAPERS};
@@ -185,6 +186,13 @@ impl Window {
     }
 }
 
+/// Menú contextual abierto: lo pide una ventana (`owner = Some(id)`) o el propio escritorio (`None`).
+struct OpenMenu {
+    menu: Menu,
+    owner: Option<u32>,
+    tag: u32,
+}
+
 pub struct Desktop {
     w: i32,
     h: i32,
@@ -216,6 +224,10 @@ pub struct Desktop {
     files_gen: u64,
     /// ¿Ya se hizo el flujo de arranque del disco (primer tick)?
     booted: bool,
+    /// Menú contextual abierto: recibe todo el teclado y el ratón.
+    menu: Option<OpenMenu>,
+    /// Estado del botón derecho.
+    rbtn: bool,
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -349,6 +361,8 @@ impl Desktop {
             icons: build_icons(sys),
             files_gen: sys.files().generation(),
             booted: false,
+            menu: None,
+            rbtn: false,
         }
     }
 
@@ -386,6 +400,13 @@ impl Desktop {
                 if down != self.btn {
                     self.left_button(down, sys);
                 }
+                let right = p.buttons & 2 != 0;
+                if right != self.rbtn {
+                    self.right_button(right, sys);
+                }
+                if p.dz != 0 {
+                    self.wheel(p.dz, sys);
+                }
             }
             Event::Key(k) => self.key(k, sys),
             Event::Tick(ms) => self.tick(ms, sys),
@@ -402,6 +423,10 @@ impl Desktop {
         self.mx = x;
         self.my = y;
         self.dmg(cursor_rect(x, y));
+        if self.menu.is_some() {
+            self.menu_edit(|m| m.hover(x, y));
+            return;
+        }
         match self.drag {
             Drag::Move { id, ox, oy } => {
                 if let Some(i) = self.pos(id) {
@@ -438,12 +463,122 @@ impl Desktop {
             return;
         }
         self.btn = down;
+        if self.menu.is_some() {
+            if down {
+                self.menu_click(sys);
+            }
+            return;
+        }
         if down {
             self.press(sys);
         } else {
             self.release(sys);
         }
         self.after(sys);
+    }
+
+    /// Pulsa o suelta el botón derecho en la posición actual. Pulsado sobre el contenido de una
+    /// ventana (no bloqueada por un diálogo) la enfoca y avisa a su app con `RightDown`.
+    pub fn right_button(&mut self, down: bool, sys: &mut dyn Platform) {
+        if down == self.rbtn {
+            return;
+        }
+        self.rbtn = down;
+        if !down {
+            return;
+        }
+        if self.menu.is_some() {
+            self.menu_click(sys);
+            return;
+        }
+        match self.hit(self.mx, self.my) {
+            Hit::Content(id) if self.modal_of(id).is_none() => {
+                self.set_start(false);
+                self.raise(id);
+                self.send(id, sys, |x, y| MouseEv::RightDown { x, y });
+            }
+            Hit::None | Hit::Icon(_) => self.desktop_menu(self.mx, self.my, sys),
+            _ => {}
+        }
+        self.after(sys);
+    }
+
+    /// Gira la rueda `dz` muescas (positivo = hacia abajo) sobre la ventana que está bajo el puntero,
+    /// tenga o no el foco. Con un menú abierto se ignora.
+    pub fn wheel(&mut self, dz: i32, sys: &mut dyn Platform) {
+        if self.menu.is_some() || dz == 0 || self.drag != Drag::None {
+            return;
+        }
+        if let Hit::Content(id) = self.hit(self.mx, self.my) {
+            if self.modal_of(id).is_none() {
+                self.send(id, sys, |x, y| MouseEv::Wheel { x, y, dz });
+            }
+        }
+        self.after(sys);
+    }
+
+    /// Hay un menú contextual abierto (y el menú mismo, para pruebas y capturas).
+    pub fn menu(&self) -> Option<&Menu> {
+        self.menu.as_ref().map(|m| &m.menu)
+    }
+
+    /// Punto de enganche del menú del fondo y de los iconos del escritorio (otra tanda):
+    /// debe llamar a `open_menu(None, tag, x, y, items)`.
+    fn desktop_menu(&mut self, _x: i32, _y: i32, _sys: &mut dyn Platform) {}
+
+    /// Elección en un menú del escritorio (`owner == None`). Otra tanda.
+    fn desktop_menu_result(&mut self, _tag: u32, _id: u32, _sys: &mut dyn Platform) {}
+
+    /// Abre un menú en coordenadas de pantalla; sustituye al que hubiera.
+    fn open_menu(&mut self, owner: Option<u32>, tag: u32, x: i32, y: i32, items: Vec<MenuItem>) {
+        self.close_menu();
+        let screen = Rect::new(0, 0, self.w, self.bar_y());
+        let menu = Menu::new(items, x, y, screen);
+        self.dmg(menu.bounds());
+        self.menu = Some(OpenMenu { menu, owner, tag });
+    }
+
+    fn close_menu(&mut self) {
+        if let Some(m) = self.menu.take() {
+            self.dmg(m.menu.bounds());
+        }
+    }
+
+    /// Cambia el menú abierto y marca como sucio lo que ocupaba y lo que ocupa ahora.
+    fn menu_edit<R>(&mut self, f: impl FnOnce(&mut Menu) -> R) -> Option<R> {
+        let m = self.menu.as_mut()?;
+        let old = m.menu.bounds();
+        let r = f(&mut m.menu);
+        let new = m.menu.bounds();
+        self.dmg(old);
+        self.dmg(new);
+        Some(r)
+    }
+
+    /// Clic (izquierdo o derecho) con un menú abierto: elige, o cierra si es fuera. No llega a nada más.
+    fn menu_click(&mut self, sys: &mut dyn Platform) {
+        let (x, y) = (self.mx, self.my);
+        let act = self.menu_edit(|m| m.click(x, y));
+        self.menu_act(act, sys);
+    }
+
+    fn menu_act(&mut self, act: Option<MenuAct>, sys: &mut dyn Platform) {
+        match act {
+            Some(MenuAct::Pick(id)) => {
+                let Some(m) = self.menu.take() else { return };
+                self.dmg(m.menu.bounds());
+                match m.owner {
+                    Some(w) => self.with_app(w, sys, |a, cx| a.menu_result(m.tag, id, cx)),
+                    None => self.desktop_menu_result(m.tag, id, sys),
+                }
+                self.after(sys);
+            }
+            Some(MenuAct::Close) => {
+                self.close_menu();
+                self.after(sys);
+            }
+            _ => {}
+        }
     }
 
     /// Abre una app (o trae al frente Configuración si ya está abierta).
@@ -619,6 +754,7 @@ impl Desktop {
         f(&mut *self.wins[i].app, &mut cx);
         let (redraw, close, themed) = (cx.redraw, cx.close, cx.theme_changed);
         let (dialog, open) = (cx.dialog.take(), cx.open.take());
+        let (open_new, menu) = (cx.open_new.take(), cx.menu.take());
         if themed {
             self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
             for w in self.wins.iter_mut() {
@@ -643,6 +779,21 @@ impl Desktop {
         if let Some(p) = open {
             self.open_path(&p, sys);
         }
+        if let Some(p) = open_new {
+            self.open_new_explorer(&p, sys);
+        }
+        if let Some(req) = menu {
+            // De coordenadas del contenido de la ventana a las de pantalla.
+            if let Some(c) = self.pos(id).filter(|&i| !self.wins[i].min).map(|i| self.wins[i].content_rect()) {
+                self.open_menu(Some(id), req.tag, c.x + req.x, c.y + req.y, req.items);
+            }
+        }
+    }
+
+    /// Abre `path` en una ventana NUEVA del Explorador.
+    fn open_new_explorer(&mut self, path: &str, sys: &mut dyn Platform) {
+        let id = self.launch_id(AppKind::Files, sys);
+        self.with_app(id, sys, |a, cx| a.open_path(path, cx));
     }
 
     /// Abre una ruta: carpeta (o Papelera) en el Explorador, archivo en un Bloc de notas nuevo.
@@ -661,7 +812,7 @@ impl Desktop {
     }
 
     /// Envía un evento de ratón con coordenadas relativas al contenido de la ventana.
-    fn send(&mut self, id: u32, sys: &mut dyn Platform, f: fn(i32, i32) -> MouseEv) {
+    fn send(&mut self, id: u32, sys: &mut dyn Platform, f: impl Fn(i32, i32) -> MouseEv) {
         let Some(i) = self.pos(id) else { return };
         let c = self.wins[i].content_rect();
         let ev = f(self.mx - c.x, self.my - c.y);
@@ -792,6 +943,9 @@ impl Desktop {
 
     /// Olvida referencias a una ventana que se ha ido (cierre o minimizado).
     fn forget(&mut self, id: u32) {
+        if self.menu.as_ref().is_some_and(|m| m.owner == Some(id)) {
+            self.close_menu();
+        }
         if self.chover == Some(id) {
             self.chover = None;
         }
@@ -1201,6 +1355,11 @@ impl Desktop {
         if !k.down {
             return;
         }
+        if self.menu.is_some() {
+            let act = self.menu_edit(|m| m.key(k.key));
+            self.menu_act(act, sys);
+            return;
+        }
         if k.key == Key::Super {
             self.set_start(!self.start_open);
         } else if k.key == Key::Escape && (self.start_open || self.shut_open) {
@@ -1262,6 +1421,9 @@ impl Desktop {
         }
         if self.shut_open {
             self.paint_shut(s);
+        }
+        if let Some(m) = &self.menu {
+            m.menu.draw(s);
         }
         if !cursor_rect(self.mx, self.my).intersects(s.clip()) {
             return;
