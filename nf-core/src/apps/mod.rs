@@ -112,7 +112,7 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
         AppKind::Notepad => (640, 420),
         AppKind::Calc => (320, 470),
         AppKind::Settings => (780, 520),
-        AppKind::Files => (1000, 520),
+        AppKind::Files => (1040, 540),
         AppKind::Terminal => (680, 400),
     }
 }

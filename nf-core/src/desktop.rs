@@ -3734,4 +3734,27 @@ mod cinta_tests {
         let terms = d.wins.iter().filter(|w| w.kind == AppKind::Terminal).count();
         assert_eq!(terms, 2);
     }
+
+    #[test]
+    fn cinta_copiar_tras_seleccionar_todo() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.write("C:\\Documentos\\a.txt", b"hola", now).unwrap();
+        sys.files.write("C:\\Documentos\\b.txt", b"hola", now).unwrap();
+        d.launch(AppKind::Files, &mut sys);
+        d.render(&mut sys);
+        let c = d.wins[0].content_rect();
+        for (x, y) in [(922, 38), (32, 54)] {
+            d.mouse_to(c.x + x, c.y + y, &mut sys);
+            sys.ms += 700; d.tick(sys.ms, &mut sys);
+            d.render(&mut sys);
+            d.left_button(true, &mut sys);
+            sys.ms += 700; d.tick(sys.ms, &mut sys);
+            d.render(&mut sys);
+            d.left_button(false, &mut sys);
+            sys.ms += 700; d.tick(sys.ms, &mut sys);
+            d.render(&mut sys);
+        }
+        assert_eq!(sys.files.clip_paths().0.len(), 2);
+    }
 }

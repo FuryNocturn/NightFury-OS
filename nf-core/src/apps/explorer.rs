@@ -848,7 +848,10 @@ impl Explorer {
                     value,
                 });
             }
-            Cmd::Copy | Cmd::Cut => cx.sys.files().set_clip_many(&paths, c == Cmd::Cut),
+            Cmd::Copy | Cmd::Cut => {
+                cx.sys.files().set_clip_many(&paths, c == Cmd::Cut);
+                cx.redraw = true; // Pegar pasa a estar disponible en la cinta
+            }
             Cmd::Paste => {
                 let dir = self.cwd.clone();
                 self.paste_into(&dir, cx);
@@ -1494,7 +1497,10 @@ impl App for Explorer {
             match self.rib.mouse(ev, self.w) {
                 RibbonAct::None => {}
                 RibbonAct::Redraw => cx.redraw = true,
-                RibbonAct::Pick(id) => self.rib_pick(id, cx),
+                RibbonAct::Pick(id) => {
+                    cx.redraw = true; // el botón deja de estar pulsado
+                    self.rib_pick(id, cx);
+                }
                 RibbonAct::File => {
                     self.file_menu(cx);
                     cx.redraw = true;
