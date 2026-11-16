@@ -339,7 +339,8 @@ impl Desktop {
         let ch = dh.min(self.h - BAR_H - TITLE_H - 2).max(1);
         let (ow, oh) = (cw + 2, ch + TITLE_H + 2);
         let n = (self.launched % 8) as i32;
-        let x = (40 + 30 * n).min(self.w - ow).max(0);
+        // Empieza a la derecha de la columna de iconos del escritorio.
+        let x = (110 + 30 * n).min(self.w - ow).max(0);
         let y = (30 + 30 * n).min(self.h - BAR_H - oh).max(0);
         let app = apps::create(kind);
         let rect = Rect::new(x, y, ow, oh);
