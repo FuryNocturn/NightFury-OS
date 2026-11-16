@@ -2440,4 +2440,238 @@ mod modal_tests {
         check(&mut d, &mut sys, "cerrado");
         assert_eq!(d.dialog_count(), 0);
     }
+
+    /// App de pruebas del menú: clic derecho pide un menú, 'n' pide abrir una carpeta en ventana nueva.
+    struct MenuProbe {
+        log: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl App for MenuProbe {
+        fn kind(&self) -> AppKind {
+            AppKind::Notepad
+        }
+        fn title(&self) -> String {
+            String::from("MenuProbe")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {
+            let b = s.bounds();
+            s.fill_rect(b, 0xEEEEEE);
+        }
+        fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
+            if ev.key == Key::Char('n') {
+                cx.open_new = Some(String::from("C:\\Documentos"));
+            }
+        }
+        fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+            match ev {
+                MouseEv::Down { .. } => self.log.borrow_mut().push(String::from("down")),
+                MouseEv::Wheel { dz, .. } => self.log.borrow_mut().push(format!("rueda {dz}")),
+                MouseEv::RightDown { x, y } => {
+                    self.log.borrow_mut().push(format!("derecho {x},{y}"));
+                    let sub = vec![MenuItem::new(20, "Uno").checked(true), MenuItem::new(21, "Dos")];
+                    cx.menu = Some(crate::menu::MenuRequest {
+                        tag: 7,
+                        x,
+                        y,
+                        items: vec![MenuItem::submenu("Ver", sub), MenuItem::new(1, "Actualizar"), MenuItem::sep(), MenuItem::new(2, "Pegar").disabled(true)],
+                    });
+                }
+                _ => {}
+            }
+        }
+        fn tick(&mut self, _cx: &mut Ctx) {}
+        fn menu_result(&mut self, tag: u32, id: u32, _cx: &mut Ctx) {
+            self.log.borrow_mut().push(format!("menu {tag} {id}"));
+        }
+    }
+
+    fn menu_app(d: &mut Desktop, sys: &mut TestPlatform) -> Rc<RefCell<Vec<String>>> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        d.launch_app(Box::new(MenuProbe { log: log.clone() }), sys);
+        log
+    }
+
+    fn right_click(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+        d.right_button(true, sys);
+        d.right_button(false, sys);
+    }
+
+    #[test]
+    fn context_menu_opens_picks_and_closes() {
+        let (mut d, mut sys) = setup();
+        let log = menu_app(&mut d, &mut sys);
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        assert_eq!(log.borrow()[0], "derecho 40,50");
+        let m = d.menu().expect("menú abierto");
+        assert_eq!((m.rect().x, m.rect().y), (c.x + 40, c.y + 50));
+        // Elegir: la app recibe tag e id y el menú se cierra.
+        let r = m.item_rect(1);
+        click_at(&mut d, &mut sys, center(r));
+        assert!(d.menu().is_none());
+        assert_eq!(log.borrow()[1], "menu 7 1");
+        // Esc cierra sin elegir; con flechas y Enter se elige en el submenú.
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        assert!(d.menu().is_none());
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        key(&mut d, &mut sys, Key::Down, None, false);
+        key(&mut d, &mut sys, Key::Right, None, false);
+        key(&mut d, &mut sys, Key::Down, None, false);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert!(d.menu().is_none());
+        assert_eq!(log.borrow().last().unwrap(), "menu 7 21");
+        // Con el menú abierto el teclado no llega a la app.
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        key(&mut d, &mut sys, Key::Char('n'), Some('n'), false);
+        assert_eq!(d.window_count(), 1);
+    }
+
+    #[test]
+    fn context_menu_outside_click_only_closes() {
+        let (mut d, mut sys) = setup();
+        let log = menu_app(&mut d, &mut sys);
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        let n = log.borrow().len();
+        // Clic fuera, aunque sea sobre la propia ventana: no llega a la app.
+        click_at(&mut d, &mut sys, (c.x + 300, c.y + 200));
+        assert!(d.menu().is_none());
+        assert_eq!(log.borrow().len(), n);
+        // Clic sobre un desactivado no lo cierra ni elige.
+        right_click(&mut d, &mut sys, (c.x + 40, c.y + 50));
+        let r = d.menu().unwrap().item_rect(3);
+        click_at(&mut d, &mut sys, center(r));
+        assert!(d.menu().is_some());
+        assert_eq!(log.borrow().len(), n + 1);
+        // Botón derecho fuera: cierra y no abre otro.
+        right_click(&mut d, &mut sys, (c.x + 300, c.y + 200));
+        assert!(d.menu().is_none());
+        assert_eq!(log.borrow().len(), n + 1);
+    }
+
+    #[test]
+    fn context_menu_fits_screen_and_follows_owner() {
+        let (mut d, mut sys) = setup();
+        menu_app(&mut d, &mut sys);
+        d.set_rect(0, Rect::new(1000, 560, 270, 190));
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 200, c.bottom() - 20));
+        let m = d.menu().unwrap();
+        assert!(m.rect().right() <= 1280 && m.rect().bottom() <= 800 - BAR_H);
+        // Si la ventana dueña se cierra, el menú también.
+        let id = d.wins[0].id;
+        d.close(id);
+        assert!(d.menu().is_none());
+        // Y si se minimiza.
+        menu_app(&mut d, &mut sys);
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 20, c.y + 20));
+        assert!(d.menu().is_some());
+        let id = d.wins[0].id;
+        d.minimize(id);
+        assert!(d.menu().is_none());
+    }
+
+    #[test]
+    fn right_click_only_on_content_and_wheel_goes_under_pointer() {
+        let (mut d, mut sys) = setup();
+        let log1 = menu_app(&mut d, &mut sys);
+        let log2 = menu_app(&mut d, &mut sys);
+        d.set_rect(0, Rect::new(20, 20, 400, 300));
+        d.set_rect(1, Rect::new(600, 100, 400, 300));
+        let (c0, c1) = (d.wins[0].content_rect(), d.wins[1].content_rect());
+        // Título, barra de tareas y fondo: nada.
+        let t = d.wins[1].title_rect();
+        right_click(&mut d, &mut sys, (t.x + 50, t.y + 5));
+        right_click(&mut d, &mut sys, (600, 790));
+        right_click(&mut d, &mut sys, (500, 500));
+        assert!(d.menu().is_none() && log2.borrow().is_empty());
+        // Rueda sobre la ventana de atrás (sin foco) y sobre la activa.
+        d.mouse_to(c0.x + 10, c0.y + 10, &mut sys);
+        d.event(Event::Mouse(crate::input::MousePacket { dx: 0, dy: 0, buttons: 0, dz: -2 }), &mut sys);
+        assert_eq!(log1.borrow().as_slice(), ["rueda -2"]);
+        d.mouse_to(c1.x + 10, c1.y + 10, &mut sys);
+        d.wheel(3, &mut sys);
+        assert_eq!(log2.borrow().as_slice(), ["rueda 3"]);
+        // Botón derecho por evento de ratón: enfoca la de atrás y le llega.
+        d.mouse_to(c0.x + 10, c0.y + 10, &mut sys);
+        d.event(Event::Mouse(crate::input::MousePacket { dx: 0, dy: 0, buttons: 2, dz: 0 }), &mut sys);
+        assert_eq!(log1.borrow()[1], "derecho 10,10");
+        assert_eq!(d.active_id(), Some(d.wins[1].id));
+        assert!(d.menu().is_some());
+        // La rueda no llega a nadie con el menú abierto.
+        d.wheel(1, &mut sys);
+        assert_eq!(log1.borrow().len(), 2);
+    }
+
+    #[test]
+    fn right_click_ignored_on_blocked_window() {
+        let (mut d, mut sys) = setup();
+        let (p, _) = probe(Some(msg(4, Buttons::Ok)), false);
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 5, c.y + 5));
+        assert!(d.menu().is_none());
+    }
+
+    #[test]
+    fn open_new_always_opens_a_new_explorer() {
+        let (mut d, mut sys) = setup();
+        menu_app(&mut d, &mut sys);
+        d.launch(AppKind::Files, &mut sys);
+        let explorers = |d: &Desktop| d.wins.iter().filter(|w| w.kind == AppKind::Files).count();
+        assert_eq!(explorers(&d), 1);
+        let id = d.wins[0].id;
+        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(String::from("C:\\Documentos")));
+        assert_eq!(explorers(&d), 2);
+        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(String::from("C:\\Documentos")));
+        assert_eq!(explorers(&d), 3);
+    }
+
+    #[test]
+    fn incremental_equals_full_with_context_menu() {
+        let (mut d, mut sys) = setup();
+        menu_app(&mut d, &mut sys);
+        d.render(&mut sys);
+        let check = |d: &mut Desktop, sys: &mut TestPlatform, what: &str| {
+            d.render(sys);
+            let inc = d.back().px.clone();
+            d.invalidate();
+            d.render(sys);
+            assert!(inc == d.back().px, "incremental distinto del completo: {what}");
+        };
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 60, c.y + 60));
+        check(&mut d, &mut sys, "abrir");
+        let r = d.menu().unwrap().item_rect(1);
+        d.mouse_to(r.x + 10, r.y + 5, &mut sys);
+        check(&mut d, &mut sys, "resaltar");
+        let r = d.menu().unwrap().item_rect(0);
+        d.mouse_to(r.x + 10, r.y + 5, &mut sys);
+        assert!(d.menu().unwrap().sub_rect().is_some());
+        check(&mut d, &mut sys, "abrir submenú");
+        let s = d.menu().unwrap().sub_item_rect(1).unwrap();
+        d.mouse_to(s.x + 10, s.y + 5, &mut sys);
+        check(&mut d, &mut sys, "resaltar en submenú");
+        key(&mut d, &mut sys, Key::Left, None, false);
+        key(&mut d, &mut sys, Key::Down, None, false);
+        check(&mut d, &mut sys, "teclado");
+        key(&mut d, &mut sys, Key::Right, None, false);
+        check(&mut d, &mut sys, "submenú con teclado");
+        key(&mut d, &mut sys, Key::Left, None, false);
+        check(&mut d, &mut sys, "cerrar submenú");
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        check(&mut d, &mut sys, "cerrar");
+        // Cerca del borde: recolocado y con submenú a la izquierda.
+        right_click(&mut d, &mut sys, (1270, 700));
+        key(&mut d, &mut sys, Key::Down, None, false);
+        key(&mut d, &mut sys, Key::Right, None, false);
+        check(&mut d, &mut sys, "borde");
+    }
 }
