@@ -412,6 +412,7 @@ impl App for CalcApp {
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         let (hover, down) = match ev {
+            MouseEv::RightDown { .. } | MouseEv::Wheel { .. } => return,
             MouseEv::Move { x, y } => (self.hit(x, y), self.down),
             MouseEv::Down { x, y } => {
                 let h = self.hit(x, y);

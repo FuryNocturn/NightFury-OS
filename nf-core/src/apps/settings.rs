@@ -188,6 +188,7 @@ impl App for Settings {
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         let at = |s: &Self, x: i32, y: i32| s.hits.iter().find(|(r, _)| r.contains(x, y)).map(|h| h.1);
         match ev {
+            MouseEv::RightDown { .. } | MouseEv::Wheel { .. } => {}
             MouseEv::Move { x, y } => {
                 let h = match at(self, x, y) {
                     Some(Hit::Nav(i)) => Some(i),

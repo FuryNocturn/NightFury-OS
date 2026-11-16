@@ -16,6 +16,7 @@ pub mod heap;
 pub mod icons;
 pub mod input;
 pub mod math;
+pub mod menu;
 pub mod platform;
 pub mod surface;
 pub mod sync;

@@ -689,6 +689,7 @@ impl App for Explorer {
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         match ev {
+            MouseEv::RightDown { .. } | MouseEv::Wheel { .. } => {}
             MouseEv::Leave => {
                 if self.hover.take().is_some() {
                     cx.redraw = true;

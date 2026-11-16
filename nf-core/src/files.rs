@@ -212,6 +212,8 @@ pub struct Files {
     pending: Option<Box<dyn BlockDev>>,
     notice: Option<&'static str>,
     generation: u64,
+    clip: Option<(String, bool)>,
+    undo: Option<(Undo, &'static str)>,
 }
 
 impl Default for Files {
@@ -223,7 +225,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0 }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -242,7 +244,7 @@ impl Files {
             return match Nffs::mount(dev) {
                 Ok(mut fs) => {
                     init_folders(&mut fs, now);
-                    Files { fs, persistent: true, pending: None, notice: None, generation: 0 }
+                    Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None }
                 }
                 Err(_) => Files::memory(NOTICE_DAMAGED, None, now),
             };
@@ -569,6 +571,91 @@ impl Files {
     pub fn space(&mut self) -> (u64, u64) {
         self.fs.space()
     }
+
+    // ---- Portapapeles y deshacer (compartidos por el Explorador y el escritorio) ----
+
+    /// Ruta en el portapapeles de archivos y si es "cortar".
+    pub fn clip(&self) -> Option<(&str, bool)> {
+        self.clip.as_ref().map(|(p, cut)| (p.as_str(), *cut))
+    }
+
+    pub fn set_clip(&mut self, path: &str, cut: bool) {
+        self.clip = Some((String::from(path), cut));
+    }
+
+    /// Pega el portapapeles en `dir` (con otro nombre libre si ya existe). Devuelve la ruta nueva.
+    /// Cortar y pegar en la misma carpeta no hace nada. Tras pegar un "cortar" se vacía.
+    pub fn paste(&mut self, dir: &str, now: DateTime) -> Result<String, FsError> {
+        let (src, cut) = self.clip.clone().ok_or(FsError::NotFound)?;
+        if cut {
+            self.clip = None;
+            if parent(&src).is_some_and(|p| lower(&p) == lower(dir)) {
+                return Ok(src);
+            }
+        }
+        let dest = join(dir, &self.free_name(dir, file_name(&src)));
+        if cut {
+            self.rename(&src, &dest)?;
+            self.undo = Some((Undo::Move { from: src, to: dest.clone() }, "Mover"));
+        } else {
+            self.copy(&src, &dest, now)?;
+            self.undo = Some((Undo::Created(dest.clone()), "Copiar"));
+        }
+        Ok(dest)
+    }
+
+    /// Como `rename`, pero se puede deshacer ("Cambiar nombre").
+    pub fn user_rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
+        self.rename(from, to)?;
+        self.undo = Some((Undo::Move { from: String::from(from), to: String::from(to) }, "Cambiar nombre"));
+        Ok(())
+    }
+
+    /// Como `trash`, pero se puede deshacer ("Eliminar").
+    pub fn user_trash(&mut self, path: &str, now: DateTime) -> Result<(), FsError> {
+        self.trash(path, now)?;
+        self.undo = Some((Undo::Trashed(String::from(path)), "Eliminar"));
+        Ok(())
+    }
+
+    /// Crea una carpeta (`dir == true`) o un archivo vacío; se puede deshacer ("Nuevo").
+    pub fn user_create(&mut self, path: &str, dir: bool, now: DateTime) -> Result<(), FsError> {
+        if dir {
+            self.mkdir(path, now)?;
+        } else if self.exists(path) {
+            return Err(FsError::Exists);
+        } else {
+            self.write(path, &[], now)?;
+        }
+        self.undo = Some((Undo::Created(String::from(path)), "Nuevo"));
+        Ok(())
+    }
+
+    /// Nombre de la última operación que se puede deshacer: "Cambiar nombre", "Mover", "Copiar",
+    /// "Nuevo" o "Eliminar". Para el texto "Deshacer <nombre>".
+    pub fn undo_label(&self) -> Option<&'static str> {
+        self.undo.as_ref().map(|u| u.1)
+    }
+
+    /// Deshace la última operación (un solo nivel). Lo creado o copiado va a la Papelera.
+    pub fn undo(&mut self, now: DateTime) -> Result<(), FsError> {
+        let (u, _) = self.undo.take().ok_or(FsError::NotFound)?;
+        match u {
+            Undo::Move { from, to } => self.rename(&to, &from),
+            Undo::Created(p) => self.trash(&p, now),
+            Undo::Trashed(orig) => {
+                // trash_list da lo más reciente primero.
+                let item = self.trash_list()?.into_iter().find(|t| lower(&t.original) == lower(&orig)).ok_or(FsError::NotFound)?;
+                self.restore(&item.id).map(|_| ())
+            }
+        }
+    }
+}
+
+enum Undo {
+    Move { from: String, to: String },
+    Created(String),
+    Trashed(String),
 }
 
 fn lower(s: &str) -> String {
@@ -581,6 +668,46 @@ mod tests {
     use crate::block::{DiskError, BLOCK};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn portapapeles_y_deshacer() {
+        let mut f = Files::default();
+        let n = DateTime::default();
+        f.write("C:\\Documentos\\a.txt", b"hola", n).unwrap();
+        assert_eq!(f.undo_label(), None);
+        // Copiar y pegar en la misma carpeta: nombre libre; deshacer lo manda a la Papelera.
+        f.set_clip("C:\\Documentos\\a.txt", false);
+        let p = f.paste("C:\\Documentos", n).unwrap();
+        assert_eq!(p, "C:\\Documentos\\a (2).txt");
+        assert_eq!(f.undo_label(), Some("Copiar"));
+        f.undo(n).unwrap();
+        assert!(!f.exists(&p) && f.undo_label().is_none());
+        // Cortar y pegar en otra carpeta; deshacer lo devuelve.
+        f.set_clip("C:\\Documentos\\a.txt", true);
+        let p = f.paste("C:\\Escritorio", n).unwrap();
+        assert!(f.exists(&p) && !f.exists("C:\\Documentos\\a.txt") && f.clip().is_none());
+        assert_eq!(f.undo_label(), Some("Mover"));
+        f.undo(n).unwrap();
+        assert!(f.exists("C:\\Documentos\\a.txt"));
+        // Cortar y pegar en la misma carpeta no hace nada.
+        f.set_clip("C:\\Documentos\\a.txt", true);
+        assert_eq!(f.paste("C:\\documentos", n).unwrap(), "C:\\Documentos\\a.txt");
+        assert!(f.undo_label().is_none());
+        // Cambiar nombre, eliminar y crear.
+        f.user_rename("C:\\Documentos\\a.txt", "C:\\Documentos\\b.txt").unwrap();
+        f.undo(n).unwrap();
+        assert!(f.exists("C:\\Documentos\\a.txt"));
+        f.user_trash("C:\\Documentos\\a.txt", n).unwrap();
+        assert_eq!(f.undo_label(), Some("Eliminar"));
+        f.undo(n).unwrap();
+        assert_eq!(f.read("C:\\Documentos\\a.txt").unwrap(), b"hola");
+        f.user_create("C:\\Documentos\\n.txt", false, n).unwrap();
+        assert_eq!(f.user_create("C:\\Documentos\\n.txt", false, n), Err(FsError::Exists));
+        f.user_create("C:\\Documentos\\c", true, n).unwrap();
+        f.undo(n).unwrap();
+        assert!(!f.exists("C:\\Documentos\\c") && f.exists("C:\\Documentos\\n.txt"));
+        assert_eq!(f.undo(n), Err(FsError::NotFound));
+    }
 
     fn d(n: u8) -> DateTime {
         DateTime { year: 2026, month: 11, day: n, hour: 9, minute: 8, second: 7 }

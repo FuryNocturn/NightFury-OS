@@ -3,6 +3,7 @@
 use crate::dialogs::{DialogRequest, DialogResult};
 use crate::icons::Icon;
 use crate::input::KeyEvent;
+use crate::menu::MenuRequest;
 use crate::platform::Platform;
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -40,6 +41,10 @@ pub enum MouseEv {
     Down { x: i32, y: i32 },
     Up { x: i32, y: i32 },
     Move { x: i32, y: i32 },
+    /// Botón derecho pulsado (para el menú contextual).
+    RightDown { x: i32, y: i32 },
+    /// Rueda: `dz` en muescas, positivo = hacia abajo (el contenido sube).
+    Wheel { x: i32, y: i32, dz: i32 },
     /// El puntero ha salido del contenido.
     Leave,
 }
@@ -61,11 +66,15 @@ pub struct Ctx<'a> {
     /// La app pide abrir una ruta: una carpeta (o `files::TRASH`) se abre en el Explorador y
     /// un archivo en el Bloc de notas (`App::open_path` de una ventana nueva).
     pub open: Option<String>,
+    /// La app pide abrir una carpeta en una ventana NUEVA del Explorador.
+    pub open_new: Option<String>,
+    /// La app pide un menú contextual; la elección llega por `App::menu_result`.
+    pub menu: Option<MenuRequest>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(sys: &'a mut dyn Platform, theme: &'a mut Theme, now_ms: u64) -> Self {
-        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None }
+        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None, open_new: None, menu: None }
     }
 }
 
@@ -84,6 +93,8 @@ pub trait App {
     fn tick(&mut self, cx: &mut Ctx);
     /// Respuesta al diálogo pedido con `cx.dialog`.
     fn dialog_result(&mut self, _result: DialogResult, _cx: &mut Ctx) {}
+    /// Elemento elegido en el menú pedido con `cx.menu` (si se cierra sin elegir no se llama).
+    fn menu_result(&mut self, _tag: u32, _id: u32, _cx: &mut Ctx) {}
     /// Abre una ruta absoluta ("C:\\..." o `files::TRASH`) en esta ventana.
     fn open_path(&mut self, _path: &str, _cx: &mut Ctx) {}
     /// El usuario quiere cerrar la ventana. `true` = cerrar ya. `false` = la app se ocupa
