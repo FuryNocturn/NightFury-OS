@@ -1372,6 +1372,8 @@ mod tests {
         sys: TestPlatform,
         th: Theme,
         now: u64,
+        menu: Option<MenuRequest>,
+        open_new: Option<String>,
     }
 
     impl T {
@@ -1380,7 +1382,7 @@ mod tests {
             let now = sys.now();
             sys.files.write("C:\\Documentos\\nota.txt", b"hola", now).unwrap();
             sys.files.mkdir("C:\\Documentos\\Sub", now).unwrap();
-            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000 };
+            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None };
             t.draw();
             t
         }
@@ -1392,6 +1394,8 @@ mod tests {
         fn cx<R>(&mut self, f: impl FnOnce(&mut Explorer, &mut Ctx) -> R) -> (R, Option<DialogRequest>, Option<String>) {
             let mut cx = Ctx::new(&mut self.sys, &mut self.th, self.now);
             let r = f(&mut self.e, &mut cx);
+            self.menu = cx.menu.take();
+            self.open_new = cx.open_new.take();
             (r, cx.dialog.take(), cx.open.take())
         }
         fn key(&mut self, key: Key, ctrl: bool) -> (Option<DialogRequest>, Option<String>) {
@@ -1628,5 +1632,528 @@ mod tests {
         t.cx(|e, cx| e.mouse(MouseEv::Up { x: w - 5, y: 400 }, cx));
         assert_eq!(fmt_size(1536), "2 KB");
         assert_eq!(fmt_size(5 << 20), "5.0 MB");
+    }
+
+    // ---- menú contextual, orden, vistas, deshacer, propiedades, rueda, preferencias ----
+
+    fn texts(v: &[MenuItem]) -> Vec<String> {
+        v.iter()
+            .map(|m| {
+                if m.separator {
+                    String::from("-")
+                } else if !m.sub.is_empty() {
+                    format!("{} >", m.text)
+                } else {
+                    m.text.clone()
+                }
+            })
+            .collect()
+    }
+
+    fn dt(day: u8) -> DateTime {
+        DateTime { year: 2026, month: 11, day, hour: 9, minute: 0, second: 0 }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| String::from(*s)).collect()
+    }
+
+    impl T {
+        fn right(&mut self, x: i32, y: i32) -> Option<MenuRequest> {
+            self.cx(|e, cx| e.mouse(MouseEv::RightDown { x, y }, cx));
+            self.draw();
+            self.menu.take()
+        }
+        /// Elige `id` del menú de `tag` y devuelve el diálogo que pida.
+        fn pick(&mut self, tag: u32, id: u32) -> (Option<DialogRequest>, Option<String>) {
+            let (_, d, o) = self.cx(|e, cx| e.menu_result(tag, id, cx));
+            self.draw();
+            (d, o)
+        }
+        fn right_row(&mut self, name: &str) -> MenuRequest {
+            let i = self.rows().iter().position(|n| n == name).unwrap();
+            let r = self.e.item_rect(i);
+            self.right(r.x + 10, r.y + 5).expect("menú")
+        }
+        fn rows(&self) -> Vec<String> {
+            self.e.rows.iter().map(|r| r.name.clone()).collect()
+        }
+        fn sel_name(&self) -> Option<String> {
+            self.e.sel_row().map(|r| r.name.clone())
+        }
+        fn view(&mut self, id: u32) {
+            self.pick(TAG_MENU_BG, id);
+        }
+        fn many(&mut self, n: usize) {
+            let now = self.now_dt();
+            for i in 0..n {
+                self.sys.files.write(&format!("C:\\Documentos\\f{i:02}"), b"x", now).unwrap();
+            }
+            self.draw();
+        }
+        fn wheel(&mut self, dz: i32) {
+            self.cx(|e, cx| e.mouse(MouseEv::Wheel { x: 300, y: 200, dz }, cx));
+            self.draw();
+        }
+        fn click_item(&mut self, i: usize) {
+            let r = self.e.item_rect(i);
+            self.click(r.x + 10, r.y + 5);
+        }
+    }
+
+    const EMPTY: (i32, i32) = (300, 440);
+
+    #[test]
+    fn menu_de_archivo_y_carpeta() {
+        let mut t = T::new();
+        let m = t.right_row("nota.txt");
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_ITEM, t.e.item_rect(1).x + 10, t.e.item_rect(1).y + 5));
+        assert_eq!(
+            texts(&m.items),
+            ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"]
+        );
+        assert!(m.items[0].bold && !m.items[1].bold);
+        assert_eq!(texts(&m.items[1].sub), ["Bloc de notas"]);
+        assert_eq!(t.sel_name().as_deref(), Some("nota.txt"));
+        // Carpeta: Pegar desactivado sin portapapeles y activo con él.
+        let m = t.right_row("Sub");
+        assert_eq!(
+            texts(&m.items),
+            ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"]
+        );
+        assert!(m.items.iter().find(|i| i.id == M_PASTE).unwrap().disabled);
+        t.sys.files.set_clip("C:\\Documentos\\nota.txt", false);
+        let m = t.right_row("Sub");
+        assert!(!m.items.iter().find(|i| i.id == M_PASTE).unwrap().disabled);
+        // Fuera de la lista (cabecera, panel, barra de órdenes) no hay menú.
+        assert!(t.right(300, NAV_H + CMD_H + 5).is_none());
+        assert!(t.right(30, 200).is_none());
+        assert!(t.right(300, 10).is_none());
+    }
+
+    #[test]
+    fn menu_de_zona_vacia() {
+        let mut t = T::new();
+        t.click_item(0);
+        let m = t.right(EMPTY.0, EMPTY.1).expect("menú");
+        assert_eq!(t.sel_name(), None);
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_BG, EMPTY.0, EMPTY.1));
+        assert_eq!(
+            texts(&m.items),
+            ["Ver >", "Ordenar por >", "Actualizar", "-", "Pegar", "Deshacer", "-", "Nuevo >", "-", "Propiedades"]
+        );
+        assert_eq!(texts(&m.items[0].sub), ["Iconos grandes", "Lista", "Detalles"]);
+        assert_eq!(
+            texts(&m.items[1].sub),
+            ["Nombre", "Fecha de modificación", "Tipo", "Tamaño", "-", "Ascendente", "Descendente"]
+        );
+        assert_eq!(texts(&m.items[8 - 1].sub), ["Carpeta", "Documento de texto"]);
+        let ch = |v: &[MenuItem]| v.iter().filter(|i| i.checked).map(|i| i.text.clone()).collect::<Vec<_>>();
+        assert_eq!(ch(&m.items[0].sub), ["Detalles"]);
+        assert_eq!(ch(&m.items[1].sub), ["Nombre", "Ascendente"]);
+        let (pegar, deshacer) = (&m.items[4], &m.items[5]);
+        assert!(pegar.disabled && deshacer.disabled && deshacer.shortcut == "Ctrl+Z");
+        // Con algo que deshacer y en el portapapeles.
+        t.sys.files.set_clip("C:\\Documentos\\nota.txt", true);
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert!(!m.items[4].disabled);
+        assert_eq!((m.items[5].text.as_str(), m.items[5].disabled), ("Deshacer Eliminar", false));
+    }
+
+    #[test]
+    fn menu_en_la_papelera() {
+        let mut t = T::new();
+        t.open(files::TRASH);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert_eq!(texts(&m.items), ["Ordenar por >", "Actualizar", "-", "Vaciar Papelera"]);
+        assert!(m.items[3].disabled);
+        t.open("C:\\Documentos");
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        t.open(files::TRASH);
+        let m = t.right_row("nota.txt");
+        assert_eq!(texts(&m.items), ["Restaurar", "-", "Propiedades"]);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert!(!m.items[3].disabled);
+        // Propiedades de un elemento de la Papelera.
+        t.right_row("nota.txt");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_PROPS);
+        let Some(DialogRequest::Message { title, text, buttons, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!((title.as_str(), buttons), ("Propiedades de nota.txt", Buttons::Ok));
+        assert!(text.contains("Ubicación original: C:\\Documentos") && text.contains("Eliminado: 15/11/2026"), "{text}");
+        // Restaurar desde el menú.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_RESTORE);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        // Vaciar desde el menú pide confirmación.
+        t.open("C:\\Documentos");
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        t.open(files::TRASH);
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_EMPTY);
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_EMPTY, .. })));
+    }
+
+    #[test]
+    fn acciones_del_menu_de_elemento() {
+        let mut t = T::new();
+        t.right_row("nota.txt");
+        let (_, o) = t.pick(TAG_MENU_ITEM, M_OPEN);
+        assert_eq!(o.as_deref(), Some("C:\\Documentos\\nota.txt"));
+        let (_, o) = t.pick(TAG_MENU_ITEM, M_NOTEPAD);
+        assert_eq!(o.as_deref(), Some("C:\\Documentos\\nota.txt"));
+        // Copiar y pegar dentro de la carpeta del menú; cortar y pegar con el menú de zona vacía.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_COPY);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", false)));
+        t.right_row("Sub");
+        t.pick(TAG_MENU_ITEM, M_PASTE);
+        assert!(t.sys.files.exists("C:\\Documentos\\Sub\\nota.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("Sub"));
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_CUT);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", true)));
+        t.open("C:\\Escritorio");
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_PASTE);
+        assert!(t.sys.files.exists("C:\\Escritorio\\nota.txt") && !t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("nota.txt"));
+        // Ventana nueva, cambiar nombre y eliminar.
+        t.open("C:\\Documentos");
+        t.right_row("Sub");
+        t.pick(TAG_MENU_ITEM, M_OPEN_NEW);
+        assert_eq!(t.open_new.as_deref(), Some("C:\\Documentos\\Sub"));
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_RENAME);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
+        t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("Otra")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\Otra"));
+        assert_eq!(t.sys.files.undo_label(), Some("Cambiar nombre"));
+        t.right_row("Otra");
+        t.pick(TAG_MENU_ITEM, M_DELETE);
+        assert!(!t.sys.files.exists("C:\\Documentos\\Otra"));
+        // Actualizar recoge cambios externos sin esperar al tick.
+        let now = t.now_dt();
+        t.sys.files.mkdir("C:\\Documentos\\Externa", now).unwrap();
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_REFRESH);
+        assert!(t.rows().contains(&String::from("Externa")));
+    }
+
+    fn setup_orden(t: &mut T) {
+        let f = &mut t.sys.files;
+        f.write("C:\\Documentos\\b.bin", &[0; 100], dt(2)).unwrap();
+        f.write("C:\\Documentos\\A.txt", &[0; 50], dt(3)).unwrap();
+        f.write("C:\\Documentos\\c", &[0; 10], dt(1)).unwrap();
+        // nota.txt (4 bytes) y Sub ya existen, creados el 15/11.
+        f.mkdir("C:\\Documentos\\Zeta", dt(9)).unwrap();
+        t.draw();
+    }
+
+    #[test]
+    fn ordenar_por_cada_criterio() {
+        let mut t = T::new();
+        setup_orden(&mut t);
+        // Nombre (inicial): carpetas primero.
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "A.txt", "b.bin", "c", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Zeta", "Sub", "nota.txt", "c", "b.bin", "A.txt"]));
+        t.pick(TAG_MENU_BG, M_SORT_DATE);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "A.txt", "b.bin", "c"]));
+        t.pick(TAG_MENU_BG, M_ASC);
+        assert_eq!(t.rows(), strs(&["Zeta", "Sub", "c", "b.bin", "A.txt", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_SORT_SIZE);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "c", "A.txt", "b.bin"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "b.bin", "A.txt", "c", "nota.txt"]));
+        // Tipo: "Archivo" antes que "Documento de texto"; dentro, por nombre.
+        t.pick(TAG_MENU_BG, M_SORT_TYPE);
+        t.pick(TAG_MENU_BG, M_ASC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "b.bin", "c", "A.txt", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "A.txt", "nota.txt", "b.bin", "c"]));
+        // Las marcas del menú siguen al estado.
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        let sub = &m.items[1].sub;
+        assert!(sub[2].checked && !sub[0].checked && sub[6].checked && !sub[5].checked);
+    }
+
+    #[test]
+    fn ordenar_con_la_cabecera() {
+        let mut t = T::new();
+        setup_orden(&mut t);
+        let y = NAV_H + CMD_H + 5;
+        // Tamaño (columna 3): ascendente; segundo clic, descendente.
+        let x = t.e.col_x()[3] + 20;
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Size, false));
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "c", "A.txt", "b.bin"]));
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Size, true));
+        assert_eq!(t.rows()[2], "b.bin");
+        // Cambiar de columna vuelve a ascendente.
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Date, false));
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+        // En la Papelera la columna de ubicación no ordena.
+        t.open(files::TRASH);
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, y);
+        assert_eq!(t.e.sort, Sort::Date);
+    }
+
+    #[test]
+    fn vista_iconos_seleccion_y_teclado() {
+        let mut t = T::new();
+        t.many(60);
+        t.view(M_VIEW_ICONS);
+        assert_eq!(t.e.view, View::Icons);
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (7, 5, 9));
+        // Ratón: la celda 8 está en la fila 1, columna 1.
+        t.click_item(8);
+        assert_eq!(t.e.sel, Some(8));
+        let r8 = t.e.item_rect(8);
+        assert_eq!(t.e.item_at(r8.x + 40, r8.y + 70), Some(8));
+        // Zona vacía a la derecha de la última celda de la rejilla.
+        t.click(PANEL_W + 7 * CELL_W + 2, 150);
+        assert_eq!(t.e.sel, None);
+        t.click_item(8);
+        t.key(Key::Right, false);
+        assert_eq!(t.e.sel, Some(9));
+        t.key(Key::Down, false);
+        assert_eq!(t.e.sel, Some(16));
+        t.key(Key::Left, false);
+        t.key(Key::Up, false);
+        assert_eq!(t.e.sel, Some(8));
+        // Seguir bajando desplaza la rejilla para mantener visible la selección.
+        for _ in 0..5 {
+            t.key(Key::Down, false);
+        }
+        assert_eq!(t.e.sel, Some(43));
+        assert_eq!(t.e.top, 2);
+        let r = t.e.item_rect(43);
+        assert_eq!(t.e.area().intersect(r), r);
+        t.key(Key::End, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(61), 4));
+        t.key(Key::Home, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(0), 0));
+        t.key(Key::PageDown, false);
+        assert_eq!(t.e.sel, Some(35));
+        // Doble clic: abre la carpeta.
+        t.key(Key::Home, false);
+        t.click_item(0);
+        t.click_item(0);
+        assert_eq!(t.e.title(), "Sub");
+        t.open("C:\\Documentos");
+        // Clic derecho: selecciona y pide el menú de elemento.
+        let r = t.e.item_rect(3);
+        let m = t.right(r.x + 5, r.y + 5).unwrap();
+        assert_eq!((t.e.sel, m.tag), (Some(3), TAG_MENU_ITEM));
+        // Con la rueda se desplaza una fila de la rejilla por muesca.
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(-5);
+        assert_eq!(t.e.top, 0);
+        t.wheel(50);
+        assert_eq!(t.e.top, 4);
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+    }
+
+    #[test]
+    fn vista_lista_seleccion_y_teclado() {
+        let mut t = T::new();
+        t.many(60);
+        t.view(M_VIEW_LIST);
+        assert_eq!(t.e.view, View::List);
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (17, 3, 4));
+        t.click_item(20);
+        assert_eq!(t.e.sel, Some(20));
+        t.key(Key::Down, false);
+        assert_eq!(t.e.sel, Some(21));
+        t.key(Key::Right, false);
+        assert_eq!(t.e.sel, Some(38));
+        t.key(Key::Left, false);
+        t.key(Key::Up, false);
+        assert_eq!(t.e.sel, Some(20));
+        // Llegar a la última columna desplaza horizontalmente.
+        t.key(Key::End, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(61), 1));
+        let r = t.e.item_rect(61);
+        assert_eq!(t.e.item_at(r.x + 5, r.y + 5), Some(61));
+        t.key(Key::Home, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(0), 0));
+        // Rueda: una columna por muesca.
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(-1);
+        assert_eq!(t.e.top, 0);
+        // Barra horizontal: clic en la pista a la derecha del pulgar avanza una página.
+        let tr = t.e.track();
+        t.click(tr.right() - 3, tr.y + 4);
+        assert_eq!(t.e.top, 1);
+        // Zona vacía bajo la última columna (que tiene 10 elementos): menú de carpeta.
+        let r = t.e.item_rect(61);
+        let m = t.right(r.x + 5, r.y + 2 * ROW_H).unwrap();
+        assert_eq!((m.tag, t.sel_name()), (TAG_MENU_BG, None));
+    }
+
+    #[test]
+    fn vista_detalles_con_rueda() {
+        let mut t = T::new();
+        t.many(60);
+        assert_eq!(t.e.view, View::Details);
+        t.wheel(1);
+        assert_eq!(t.e.top, 3);
+        t.wheel(-1);
+        t.wheel(-1);
+        assert_eq!(t.e.top, 0);
+        t.wheel(100);
+        let top = t.e.max_top();
+        assert_eq!(t.e.top, top);
+        // Rueda fuera de la lista: nada.
+        t.cx(|e, cx| e.mouse(MouseEv::Wheel { x: 30, y: 200, dz: -1 }, cx));
+        assert_eq!(t.e.top, top);
+        // Clic derecho sobre una fila desplazada selecciona la correcta.
+        let r = t.e.item_rect(top + 10);
+        t.right(r.x + 5, r.y + 5);
+        assert_eq!(t.e.sel, Some(top + 10));
+    }
+
+    #[test]
+    fn deshacer_con_ctrl_z_y_menu() {
+        let mut t = T::new();
+        // Sin nada que deshacer: no pasa nada.
+        let (d, _) = t.key(Key::Char('z'), true);
+        assert!(d.is_none());
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        assert!(!t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        t.key(Key::Char('z'), true);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        assert_eq!(t.rows(), strs(&["Sub", "nota.txt"]));
+        // Desde el menú.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_DELETE);
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_UNDO);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        // Un error al deshacer se muestra: el nombre original ya lo ocupa otro archivo.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_RENAME);
+        t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("nuevo.txt")) });
+        let now = t.now_dt();
+        t.sys.files.write("C:\\Documentos\\nota.txt", b"otro", now).unwrap();
+        let (_, d, _) = t.cx(|e, cx| e.undo(cx));
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+    }
+
+    #[test]
+    fn documento_de_texto_nuevo() {
+        let mut t = T::new();
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_NEW_DOC);
+        let Some(DialogRequest::Input { tag, value, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!((tag, value.as_str()), (TAG_NEWDOC, "Nuevo documento de texto.txt"));
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(value) });
+        assert!(t.sys.files.exists("C:\\Documentos\\Nuevo documento de texto.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("Nuevo documento de texto.txt"));
+        // Se propone otro nombre libre la segunda vez; sin extensión se añade .txt.
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_NEW_DOC);
+        let Some(DialogRequest::Input { value, .. }) = d else { panic!() };
+        assert_eq!(value, "Nuevo documento de texto (2).txt");
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("apuntes")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\apuntes.txt"));
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("datos.csv")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\datos.csv"));
+        // Repetido o inválido: error.
+        let d = t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("apuntes.txt")) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+        let d = t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("a/b")) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+        // Deshacer manda a la Papelera el último documento creado.
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("ultimo")) });
+        t.key(Key::Char('z'), true);
+        assert!(!t.sys.files.exists("C:\\Documentos\\ultimo.txt"));
+    }
+
+    #[test]
+    fn propiedades_de_archivo_carpeta_y_zona() {
+        let mut t = T::new();
+        let now = t.now_dt();
+        t.sys.files.write("C:\\Documentos\\grande.bin", &vec![0; 1500], now).unwrap();
+        t.sys.files.write("C:\\Documentos\\Sub\\x", b"1", now).unwrap();
+        t.draw();
+        let msg = |d: Option<DialogRequest>| match d {
+            Some(DialogRequest::Message { title, text, buttons: Buttons::Ok, .. }) => (title, text),
+            o => panic!("{o:?}"),
+        };
+        t.right_row("grande.bin");
+        let (title, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert_eq!(title, "Propiedades de grande.bin");
+        assert_eq!(
+            text,
+            "Nombre: grande.bin\nTipo: Archivo\nUbicación: C:\\Documentos\nTamaño: 2 KB (1500 bytes)\nModificado: 15/11/2026 21:37"
+        );
+        t.right_row("nota.txt");
+        let (_, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert!(text.contains("Tipo: Documento de texto") && text.contains("Tamaño: 4 bytes"), "{text}");
+        t.right_row("Sub");
+        let (_, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert!(text.contains("Contiene: 1 elemento\n") && !text.contains("Tamaño"), "{text}");
+        t.right(EMPTY.0, EMPTY.1);
+        let (title, text) = msg(t.pick(TAG_MENU_BG, M_PROPS).0);
+        assert_eq!(title, "Propiedades de Documentos");
+        assert!(text.contains("Contiene: 3 elementos") && text.contains("Ubicación: C:\\"), "{text}");
+    }
+
+    #[test]
+    fn recordar_vista_y_orden() {
+        let mut t = T::new();
+        t.view(M_VIEW_ICONS);
+        t.pick(TAG_MENU_BG, M_SORT_SIZE);
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=iconos\norden=tamano\ndesc=1\n");
+        // Otra ventana lee lo guardado al abrirse.
+        let mut e2 = make();
+        let mut s = Surface::new(760, 480, 0);
+        e2.draw(&mut s, &t.th, &mut t.sys, true);
+        assert_eq!((e2.view, e2.sort, e2.desc), (View::Icons, Sort::Size, true));
+        // Los cambios por la cabecera también se guardan.
+        t.view(M_VIEW_DETAILS);
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, NAV_H + CMD_H + 5);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=detalles\norden=fecha\ndesc=0\n");
+        // Valores que no se entienden se ignoran.
+        let now = t.now_dt();
+        t.sys.files.write(PREFS, b"vista=raro\nbasura\norden=tipo\ndesc=1\n", now).unwrap();
+        let mut e3 = make();
+        e3.draw(&mut s, &t.th, &mut t.sys, true);
+        assert_eq!((e3.view, e3.sort, e3.desc), (View::Details, Sort::Type, true));
+    }
+
+    #[test]
+    fn dibuja_las_tres_vistas_y_la_barra_con_nombre_nuevo() {
+        let mut t = T::new();
+        t.many(40);
+        for id in [M_VIEW_ICONS, M_VIEW_LIST, M_VIEW_DETAILS] {
+            t.view(id);
+            let s = t.draw();
+            assert!(s.px.iter().any(|&p| p != 0));
+        }
+        // El botón se llama "Cambiar nombre" y se puede pulsar.
+        t.click_item(1);
+        let (x, y) = t.btn(Cmd::Rename);
+        let (d, _) = t.click(x, y);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
+        let r = t.e.hits.iter().find(|(_, h)| *h == Hit::Cmd(Cmd::Delete)).unwrap().0;
+        assert!(r.right() < 680 - 140);
     }
 }
