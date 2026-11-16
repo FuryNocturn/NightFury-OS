@@ -241,8 +241,8 @@ struct Explorer {
     prefs_loaded: bool,
     /// Hay algo en el portapapeles (se actualiza al dibujar y al ejecutar órdenes).
     has_clip: bool,
-    /// Estado de Ctrl y Mayús para el ratón. shortcut: `MouseEv` no lleva modificadores y el
-    /// escritorio aún no los envía; nadie los activa hasta que lo haga (ver informe, `set_mods`).
+    /// Estado de Ctrl y Mayús para el ratón (`MouseEv` no lleva modificadores): el escritorio lo
+    /// avisa con un `KeyEvent` de `Key::Other` cada vez que cambia.
     ctrl: bool,
     shift: bool,
 }
