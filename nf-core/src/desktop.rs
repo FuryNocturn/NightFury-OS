@@ -630,6 +630,11 @@ impl Desktop {
         if redraw {
             self.wins[i].dirty = true;
         }
+        let title = self.wins[i].app.title();
+        if title != self.wins[i].title {
+            self.wins[i].title = title;
+            self.dmg_all();
+        }
         if close {
             self.close(id);
         } else if let Some(req) = dialog {
