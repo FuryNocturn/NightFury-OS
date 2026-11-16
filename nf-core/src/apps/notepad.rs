@@ -7,6 +7,7 @@ use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::input::{Key, KeyEvent};
 use crate::platform::Platform;
+use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::Theme;
 use alloc::boxed::Box;
@@ -160,6 +161,7 @@ pub struct Notepad {
     pending: Pending,
     menu_open: bool,
     hover: Option<usize>,
+    sb: ScrollBar,
 }
 
 fn blank() -> Notepad {
@@ -179,6 +181,7 @@ fn blank() -> Notepad {
         pending: Pending::Ninguna,
         menu_open: false,
         hover: None,
+        sb: ScrollBar::new(false),
     }
 }
 
@@ -380,6 +383,16 @@ impl Notepad {
         self.ed.lines[row].iter().take(n).map(|&c| font::adv(c, SIZE, false)).sum()
     }
 
+    /// ¿No caben las líneas? Entonces hay barra vertical a la derecha del texto.
+    fn need_sb(&self) -> bool {
+        self.ed.lines.len() > self.vis
+    }
+
+    fn metrics(&self) -> Metrics {
+        let h = (self.h - STATUS_H - MENU_H).max(0);
+        Metrics { rect: Rect::new(self.w - SB_W, MENU_H, SB_W, h), total: self.ed.lines.len() as i32, page: self.vis as i32, pos: self.top as i32, line: 1 }
+    }
+
     fn follow_cursor(&mut self, view_w: i32, view_h: i32) {
         self.vis = ((view_h / Self::lh()).max(1)) as usize;
         if !self.follow {
@@ -420,11 +433,13 @@ impl App for Notepad {
         self.h = s.h;
         self.focused = focused;
         let text_h = (s.h - STATUS_H - MENU_H).max(0);
-        self.follow_cursor(s.w, text_h);
+        self.vis = ((text_h / Self::lh()).max(1)) as usize;
+        let sbw = if self.need_sb() { SB_W } else { 0 };
+        self.follow_cursor(s.w - sbw, text_h);
         let lh = Self::lh();
         s.fill_rect(s.bounds(), 0xFFFFFF);
 
-        s.set_clip(Rect::new(0, MENU_H, s.w, text_h));
+        s.set_clip(Rect::new(0, MENU_H, s.w - sbw, text_h));
         let last = (self.top + self.vis + 1).min(self.ed.lines.len());
         for row in self.top..last {
             let y = MENU_H + (row - self.top) as i32 * lh;
@@ -437,6 +452,9 @@ impl App for Notepad {
             s.fill_rect(Rect::new(x, y + 1, 1, lh - 2), 0x000000);
         }
         s.reset_clip();
+        if sbw > 0 {
+            self.sb.draw(s, &self.metrics(), _theme);
+        }
 
         // Barra de estado.
         let by = text_h + MENU_H;
@@ -497,6 +515,17 @@ impl App for Notepad {
     }
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+        if !self.menu_open && !matches!(ev, MouseEv::Wheel { .. }) {
+            let e = self.sb.mouse(ev, &self.metrics(), cx.now_ms);
+            if let Some(p) = e.pos {
+                self.top = p as usize;
+                self.follow = false;
+            }
+            cx.redraw |= e.redraw;
+            if e.captured {
+                return;
+            }
+        }
         match ev {
             MouseEv::Move { x, y } if self.menu_open => {
                 let h = Self::item_at(x, y);
@@ -592,6 +621,11 @@ impl App for Notepad {
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
+        if let Some(p) = self.sb.tick(&self.metrics(), cx.now_ms) {
+            self.top = p as usize;
+            self.follow = false;
+            cx.redraw = true;
+        }
         let on = !self.focused || (cx.now_ms.saturating_sub(self.t0) / BLINK_MS) % 2 == 0;
         if on != self.shown {
             self.shown = on;
@@ -755,6 +789,54 @@ mod tests {
             let mut s = Surface::new(300, 200, 0);
             np.draw(&mut s, &Theme::default(), &mut sys, true);
             assert!(np.ed.row >= np.top && np.ed.row < np.top + np.vis);
+        });
+    }
+
+    #[test]
+    fn barra_aparece_solo_si_hace_falta_y_mueve_el_texto() {
+        con_cx(|cx| {
+            let mut sys = TestPlatform::default();
+            let mut np = Notepad { focused: true, ..blank() };
+            let mut s = Surface::new(300, 200, 0);
+            np.draw(&mut s, &Theme::default(), &mut sys, true);
+            assert!(!np.need_sb());
+            assert_eq!(s.px[(60 * 300 + 290) as usize], 0xFFFFFF);
+            escribe(&mut np.ed, &"x
+".repeat(59)); // 60 líneas
+            np.draw(&mut s, &Theme::default(), &mut sys, true);
+            assert!(np.need_sb());
+            assert_ne!(s.px[(60 * 300 + 290) as usize], 0xFFFFFF);
+            let m = np.metrics();
+            let (bx, by) = (m.rect.x + 5, m.rect.y);
+            let top0 = np.top;
+            assert!(top0 > 0);
+            // Flecha de arriba: una línea menos; de abajo: vuelve.
+            np.mouse(MouseEv::Down { x: bx, y: by + 3 }, cx);
+            np.mouse(MouseEv::Up { x: bx, y: by + 3 }, cx);
+            assert_eq!(np.top, top0 - 1);
+            assert!(!np.follow);
+            let bot = m.rect.bottom() - 3;
+            np.mouse(MouseEv::Down { x: bx, y: bot }, cx);
+            np.mouse(MouseEv::Up { x: bx, y: bot }, cx);
+            assert_eq!(np.top, top0);
+            // Pista: una página arriba (el tirador está abajo).
+            np.mouse(MouseEv::Down { x: bx, y: by + 40 }, cx);
+            np.mouse(MouseEv::Up { x: bx, y: by + 40 }, cx);
+            assert_eq!(np.top, top0 - np.vis);
+            // Arrastrar el tirador hasta abajo y hasta arriba, aunque el ratón salga.
+            let (ts, _) = np.sb.thumb(&np.metrics());
+            np.mouse(MouseEv::Down { x: bx, y: by + ts + 2 }, cx);
+            np.mouse(MouseEv::Move { x: 900, y: 9000 }, cx);
+            assert_eq!(np.top, 60 - np.vis);
+            np.mouse(MouseEv::Move { x: -9, y: -9 }, cx);
+            assert_eq!(np.top, 0);
+            np.mouse(MouseEv::Up { x: -9, y: -9 }, cx);
+            assert!(!np.sb.active());
+            // El clic en la barra no mueve el cursor; la rueda sigue igual.
+            let pos = (np.ed.row, np.ed.col);
+            assert_eq!(pos, (59, 0));
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: 1 }, cx);
+            assert_eq!(np.top, 3);
         });
     }
 
