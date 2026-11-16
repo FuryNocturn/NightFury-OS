@@ -4,10 +4,22 @@
 //! Rutas absolutas canónicas: "C:\\" es la raíz; "C:\\Documentos\\nota.txt" un archivo (sin
 //! barra final salvo en la raíz). No se distinguen mayúsculas.
 //!
-//! La Papelera vive en la carpeta oculta `C:\$Papelera`: cada elemento borrado se mueve allí con
+//! Estructura (v0.5.0): `C:\Usuarios\<nombre>` (seis carpetas estándar, `.config` y `.papelera`,
+//! las dos últimas ocultas en los listados) y `C:\Sistema\{config,temp,lib,drivers,logs}`.
+//!
+//! Cada usuario tiene su Papelera en `<home>\.papelera`: cada elemento borrado se mueve allí con
 //! un número como nombre y un índice de texto (`indice`) guarda su ruta original y su fecha.
 //! Al enviar se escribe primero el índice y luego se mueve el elemento; al restaurar o vaciar,
 //! al revés: un corte solo puede dejar líneas de índice sin elemento, que se ignoran.
+//!
+//! Permisos (aquí pasan todas las apps y el Terminal): un usuario normal no entra en la carpeta de
+//! otro ni escribe en `C:\Sistema`; un administrador sí. Los errores de acceso son `FsError::Invalid`.
+//!
+//! Migración: al montar un disco con la estructura antigua (`Documentos`, `Imágenes`, `Escritorio`,
+//! `Sistema\config.txt`, `$Papelera` en la raíz) o al formatear el disco pendiente, queda un
+//! archivo de estado (`Sistema\config\migracion`) y lo antiguo lo adopta la primera cuenta. Solo se
+//! mueve (renombrar, atómico), nunca se sobrescribe ni se borra; si se corta, el siguiente arranque
+//! continúa donde se quedó.
 use crate::accounts::{self, Account, AccountError};
 use crate::block::{BlockDev, RamDisk};
 use crate::fs::{same, Entry, FsError, Nffs};
@@ -20,6 +32,9 @@ use alloc::vec::Vec;
 
 /// Ubicación especial que el Explorador muestra como la Papelera (no es una ruta de disco).
 pub const TRASH: &str = "Papelera";
+// Rutas de la estructura ANTIGUA: siguen aquí mientras otros módulos las usan; en la nueva no
+// existen (usa `Files::std_dir`, `config_file` y `explorer_prefs`). No llevan `#[deprecated]`
+// para no llenar de avisos de compilación a esos módulos.
 pub const DESKTOP_DIR: &str = "C:\\Escritorio";
 pub const DOCUMENTS_DIR: &str = "C:\\Documentos";
 pub const PICTURES_DIR: &str = "C:\\Imágenes";
@@ -69,11 +84,23 @@ impl Std {
     }
 }
 
-/// Almacén interno de la Papelera (relativo a la raíz) y su índice.
-const STORE: &str = "$Papelera";
-const INDEX: &str = "$Papelera\\indice";
+const USERS: &str = "Usuarios";
 const SYSTEM: &str = "Sistema";
-const FOLDERS: [&str; 4] = ["Documentos", "Imágenes", "Escritorio", SYSTEM];
+const SYS_SUBS: [&str; 5] = ["config", "temp", "lib", "drivers", "logs"];
+const HOME_CONFIG: &str = ".config";
+const HOME_TRASH: &str = ".papelera";
+const INDEX_NAME: &str = "indice";
+/// Estructura antigua: Papelera de la raíz y carpetas del usuario.
+const LEGACY_STORE: &str = "$Papelera";
+const LEGACY_DIRS: [&str; 3] = ["Documentos", "Imágenes", "Escritorio"];
+/// Archivos internos de la migración y de los cambios de nombre de cuenta.
+const VERSION_FILE: &str = "C:\\Sistema\\config\\version";
+const STATE_FILE: &str = "C:\\Sistema\\config\\migracion";
+const RENAME_FILE: &str = "C:\\Sistema\\config\\renombrar";
+/// Sitio de espera de lo suelto de `Sistema` que había en la estructura antigua.
+const OLD_DIR: &str = "C:\\Sistema\\config\\antiguo";
+/// Tamaño máximo del registro.
+const LOG_MAX: usize = 64 * 1024;
 /// Bloques del disco en memoria (4 MiB).
 const MEMORY_BLOCKS: u64 = 1024;
 
@@ -188,10 +215,22 @@ pub fn resolve(cwd: &str, input: &str) -> Result<String, FsError> {
 /// Ruta canónica (válida y fuera del almacén de la Papelera) de lo que pide una app.
 fn canon(path: &str) -> Result<String, FsError> {
     let c = resolve("C:\\", path)?;
-    if same(first(rel(&c)), STORE) {
+    // La Papelera de la estructura antigua (huérfana hasta que una cuenta la adopta) no se toca.
+    if same(first(rel(&c)), LEGACY_STORE) {
         return Err(FsError::BadPath);
     }
     Ok(c)
+}
+
+/// ¿Está `path` dentro de `C:\Sistema` (o es esa carpeta)? Para que las apps pidan confirmación.
+pub fn in_system(path: &str) -> bool {
+    resolve("C:\\", path).is_ok_and(|c| same(first(rel(&c)), SYSTEM))
+}
+
+/// ¿Es una carpeta que no se puede eliminar, mover ni renombrar? (raíz, `Usuarios`, `Sistema` y
+/// sus subcarpetas, la carpeta de cada cuenta y sus carpetas estándar, `.config` y `.papelera`).
+pub fn is_protected(path: &str) -> bool {
+    resolve("C:\\", path).is_ok_and(|c| protected(rel(&c)))
 }
 
 /// Ruta relativa a la raíz de una ruta canónica.
@@ -211,23 +250,80 @@ fn join_rel(dir: &str, name: &str) -> String {
     }
 }
 
-/// La raíz y `C:\Sistema` no se pueden borrar, mover ni renombrar.
-fn protected(rel: &str) -> bool {
-    rel.is_empty() || same(rel, SYSTEM)
+fn comps(rel: &str) -> Vec<&str> {
+    rel.split('\\').filter(|c| !c.is_empty()).collect()
 }
 
-fn init_folders(fs: &mut Nffs, now: DateTime) {
-    for f in FOLDERS.iter().chain([&STORE]) {
-        if fs.stat(f).is_err() {
-            let _ = fs.mkdir(f, now);
-        }
+fn is_home_sub(name: &str) -> bool {
+    same(name, HOME_CONFIG) || same(name, HOME_TRASH) || Std::ALL.iter().any(|s| same(name, s.name()))
+}
+
+/// No se pueden borrar, mover ni renombrar: la raíz, `Usuarios`, `Sistema` y sus subcarpetas, la
+/// carpeta de cada cuenta y las suyas estándar, `.config` y `.papelera`. Solo mira la ruta.
+fn protected(rel: &str) -> bool {
+    let c = comps(rel);
+    let Some(&top) = c.first() else { return true };
+    if same(top, USERS) {
+        return c.len() <= 2 || (c.len() == 3 && is_home_sub(c[2]));
     }
+    same(top, SYSTEM) && (c.len() == 1 || (c.len() == 2 && SYS_SUBS.iter().any(|s| same(s, c[1]))))
+}
+
+fn mk(fs: &mut Nffs, path: &str, now: DateTime) {
+    if fs.stat(path).is_err() {
+        let _ = fs.mkdir(path, now);
+    }
+}
+
+/// `Usuarios` y `Sistema` con sus subcarpetas.
+fn ensure_structure(fs: &mut Nffs, now: DateTime) {
+    mk(fs, USERS, now);
+    mk(fs, SYSTEM, now);
+    for s in SYS_SUBS {
+        mk(fs, &join_rel(SYSTEM, s), now);
+    }
+}
+
+/// La carpeta completa de una cuenta.
+fn ensure_home(fs: &mut Nffs, name: &str, now: DateTime) {
+    let home = join_rel(USERS, name);
+    mk(fs, &home, now);
+    for s in Std::ALL {
+        mk(fs, &join_rel(&home, s.name()), now);
+    }
+    mk(fs, &join_rel(&home, HOME_CONFIG), now);
+    mk(fs, &join_rel(&home, HOME_TRASH), now);
 }
 
 fn new_memory(now: DateTime) -> Nffs {
     let mut fs = Nffs::format(Box::new(RamDisk::new(MEMORY_BLOCKS)), now).expect("disco en memoria");
-    init_folders(&mut fs, now);
+    ensure_structure(&mut fs, now);
+    ensure_home(&mut fs, DEFAULT_USER, now);
+    let _ = fs.write(rel(VERSION_FILE), b"2\n", now);
     fs
+}
+
+/// ¿Quedan restos de la estructura antigua? (carpetas del usuario o Papelera en la raíz, o
+/// archivos sueltos en `Sistema`).
+fn legacy_items(fs: &mut Nffs) -> bool {
+    let root = fs.list("").unwrap_or_default();
+    let sys = fs.list(SYSTEM).unwrap_or_default();
+    root.iter().any(|e| same(&e.name, LEGACY_STORE) || LEGACY_DIRS.iter().any(|d| same(&e.name, d)))
+        || sys.iter().any(|e| !SYS_SUBS.iter().any(|s| same(s, &e.name)))
+}
+
+/// Sustituye el prefijo de `orig` según `pairs` (solo si coincide por componentes).
+fn rewrite(orig: &str, pairs: &[(String, String)]) -> String {
+    let lo = lower(orig);
+    for (from, to) in pairs {
+        let lf = lower(from);
+        if lo == lf || (lo.starts_with(&lf) && lo.as_bytes()[lf.len()] == b'\\') {
+            // `lower` puede cambiar la longitud en bytes: se cuenta por caracteres.
+            let rest: String = orig.chars().skip(lf.chars().count()).collect();
+            return format!("{to}{rest}");
+        }
+    }
+    String::from(orig)
 }
 
 /// Copia todo el contenido de `src` a `dst` (las carpetas que ya existan se respetan).
@@ -279,8 +375,10 @@ impl Files {
     /// - en blanco → queda pendiente de que el usuario acepte formatearlo; mientras, C: en memoria;
     /// - con otro contenido, o sin disco → se ignora; C: en memoria.
     ///
-    /// `Files::default()` es una unidad C: en memoria. Toda unidad nueva nace con las carpetas
-    /// Documentos, Imágenes, Escritorio y Sistema.
+    /// `Files::default()` es una unidad C: en memoria. Toda unidad nace con `Usuarios` y `Sistema`
+    /// (la de memoria, además con la carpeta de `DEFAULT_USER` y su sesión abierta). Al montar un
+    /// disco: crea lo que falte, vacía `Sistema\temp`, prepara la migración si el disco es antiguo
+    /// y, si ya hay cuentas, la completa.
     pub fn probe(dev: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
         let Some(mut dev) = dev else {
             return Files::memory(NOTICE_NO_DISK, None, now);
@@ -288,9 +386,10 @@ impl Files {
         if Nffs::is_formatted(&mut *dev) {
             // Con NFFS dañado no se formatea nunca: se deja el disco como está.
             return match Nffs::mount(dev) {
-                Ok(mut fs) => {
-                    init_folders(&mut fs, now);
-                    Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None }
+                Ok(fs) => {
+                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None };
+                    f.startup(now);
+                    f
                 }
                 Err(_) => Files::memory(NOTICE_DAMAGED, None, now),
             };
@@ -313,15 +412,24 @@ impl Files {
     }
 
     /// Formatea el disco pendiente y pasa a usarlo, copiando lo que hubiera en la unidad en memoria.
+    /// Después NO hay sesión (`user()` es `None`) y `needs_setup()` es `true`: la carpeta de
+    /// `DEFAULT_USER` que venía de la memoria la adopta la primera cuenta que se cree.
     pub fn format_pending(&mut self, now: DateTime) -> Result<(), FsError> {
         let dev = self.pending.take().ok_or(FsError::Invalid)?;
         let mut fs = Nffs::format(dev, now)?;
-        init_folders(&mut fs, now);
+        ensure_structure(&mut fs, now);
+        fs.write(rel(VERSION_FILE), b"2\n", now)?;
+        // El estado va antes de la copia: si se corta, lo que llegó al disco no queda sin dueño.
+        fs.write(rel(STATE_FILE), b"memoria\n", now)?;
         copy_all(&mut self.fs, &mut fs)?;
         self.fs = fs;
         self.persistent = true;
         self.notice = None;
+        self.user = None;
+        self.clip = None;
+        self.undo = None;
         self.generation += 1;
+        self.log("Disco formateado; lo de la memoria queda pendiente de la primera cuenta", now);
         Ok(())
     }
 
@@ -343,12 +451,22 @@ impl Files {
     }
 
     /// Entradas de una carpeta: carpetas primero, luego por nombre sin distinguir mayúsculas.
-    /// No incluye el almacén interno de la Papelera.
+    /// No incluye la Papelera antigua de la raíz ni, dentro de la carpeta de un usuario, lo que
+    /// empieza por punto (`.config`, `.papelera`). En `Usuarios`, un usuario normal solo ve la suya.
     pub fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
         let c = canon(dir)?;
+        self.guard(rel(&c), false)?;
         let mut v = self.fs.list(rel(&c))?;
-        if rel(&c).is_empty() {
-            v.retain(|e| !same(&e.name, STORE));
+        let depth = comps(rel(&c)).len();
+        if depth == 0 {
+            v.retain(|e| !same(&e.name, LEGACY_STORE));
+        } else if same(first(rel(&c)), USERS) {
+            if depth == 1 && !self.is_admin() {
+                let me = self.user().map(String::from);
+                v.retain(|e| me.as_deref().is_some_and(|m| same(m, &e.name)));
+            } else if depth == 2 {
+                v.retain(|e| !e.name.starts_with('.'));
+            }
         }
         v.sort_by_cached_key(|e| (!e.dir, e.name.chars().flat_map(char::to_lowercase).collect::<String>()));
         Ok(v)
@@ -356,6 +474,7 @@ impl Files {
 
     pub fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
         let c = canon(path)?;
+        self.guard(rel(&c), false)?;
         self.fs.stat(rel(&c))
     }
 
@@ -365,6 +484,7 @@ impl Files {
 
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
         let c = canon(path)?;
+        self.guard(rel(&c), false)?;
         self.fs.read(rel(&c))
     }
 
@@ -374,6 +494,7 @@ impl Files {
         if rel(&c).is_empty() {
             return Err(FsError::IsDir);
         }
+        self.guard(rel(&c), true)?;
         self.generation += 1;
         self.fs.write(rel(&c), data, now)
     }
@@ -383,6 +504,7 @@ impl Files {
         if rel(&c).is_empty() {
             return Err(FsError::Exists);
         }
+        self.guard(rel(&c), true)?;
         self.generation += 1;
         self.fs.mkdir(rel(&c), now)
     }
@@ -393,9 +515,11 @@ impl Files {
         if protected(rel(&f)) {
             return Err(FsError::Invalid);
         }
+        self.guard(rel(&f), true)?;
         if rel(&t).is_empty() {
             return Err(FsError::Exists);
         }
+        self.guard(rel(&t), true)?;
         self.generation += 1;
         self.fs.rename(rel(&f), rel(&t))
     }
@@ -404,6 +528,8 @@ impl Files {
     pub fn copy(&mut self, from: &str, to: &str, now: DateTime) -> Result<(), FsError> {
         let (f, t) = (canon(from)?, canon(to)?);
         let (f, t) = (rel(&f), rel(&t));
+        self.guard(f, false)?;
+        self.guard(t, true)?;
         let src = self.fs.stat(f)?;
         let inside = f.is_empty() || {
             let (lf, lt) = (lower(f), lower(t));
@@ -464,6 +590,7 @@ impl Files {
         if protected(rel(&c)) {
             return Err(FsError::Invalid);
         }
+        self.guard(rel(&c), true)?;
         self.generation += 1;
         self.rm_tree(rel(&c))
     }
@@ -494,10 +621,15 @@ impl Files {
         }
     }
 
-    // ---- Papelera ----
+    // ---- Papelera (una por usuario, en `<home>\.papelera`) ----
 
-    fn read_index(&mut self) -> Vec<(String, DateTime, String)> {
-        let text = self.fs.read(INDEX).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    /// Almacén de la Papelera del usuario de la sesión (relativo a la raíz); `None` sin sesión.
+    fn store(&self) -> Option<String> {
+        self.user().map(|u| join_rel(&join_rel(USERS, u), HOME_TRASH))
+    }
+
+    fn read_index_at(&mut self, store: &str) -> Vec<(String, DateTime, String)> {
+        let text = self.fs.read(&join_rel(store, INDEX_NAME)).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
         text.lines()
             .filter_map(|l| {
                 let mut p = l.splitn(3, '|');
@@ -517,7 +649,7 @@ impl Files {
             .collect()
     }
 
-    fn write_index(&mut self, idx: &[(String, DateTime, String)], now: DateTime) -> Result<(), FsError> {
+    fn write_index_at(&mut self, store: &str, idx: &[(String, DateTime, String)], now: DateTime) -> Result<(), FsError> {
         let mut s = String::new();
         for (id, d, orig) in idx {
             s.push_str(&format!(
@@ -525,42 +657,55 @@ impl Files {
                 d.year, d.month, d.day, d.hour, d.minute, d.second
             ));
         }
-        if self.fs.stat(STORE).is_err() {
-            self.fs.mkdir(STORE, now)?;
+        if self.fs.stat(store).is_err() {
+            self.fs.mkdir(store, now)?;
         }
-        self.fs.write(INDEX, s.as_bytes(), now)
+        self.fs.write(&join_rel(store, INDEX_NAME), s.as_bytes(), now)
     }
 
-    /// Envía un archivo o carpeta a la Papelera.
+    /// Siguiente identificador libre de un almacén (mayor del índice y de los elementos, más uno).
+    fn next_id(&mut self, store: &str, idx: &[(String, DateTime, String)]) -> String {
+        let mut next = idx.iter().filter_map(|(id, _, _)| id.parse::<u64>().ok()).max().unwrap_or(0);
+        for e in self.fs.list(store).unwrap_or_default() {
+            next = next.max(e.name.parse::<u64>().unwrap_or(0));
+        }
+        format!("{:08}", next + 1)
+    }
+
+    /// Envía un archivo o carpeta a la Papelera del usuario de la sesión (también lo que está
+    /// fuera de su carpeta, p. ej. en `C:\` si es administrador).
     pub fn trash(&mut self, path: &str, now: DateTime) -> Result<(), FsError> {
         let c = canon(path)?;
         let r = rel(&c);
         if protected(r) {
             return Err(FsError::Invalid);
         }
+        self.guard(r, true)?;
+        // Lo que ya está en una Papelera no se vuelve a enviar a ella.
+        if comps(r).iter().any(|x| same(x, HOME_TRASH)) {
+            return Err(FsError::Invalid);
+        }
+        let store = self.store().ok_or(FsError::Invalid)?;
         self.fs.stat(r)?;
         self.generation += 1;
-        let mut idx = self.read_index();
-        let mut next = idx.iter().filter_map(|(id, _, _)| id.parse::<u64>().ok()).max().unwrap_or(0);
-        for e in self.fs.list(STORE).unwrap_or_default() {
-            next = next.max(e.name.parse::<u64>().unwrap_or(0));
-        }
-        let id = format!("{:08}", next + 1);
+        let mut idx = self.read_index_at(&store);
+        let id = self.next_id(&store, &idx);
         idx.push((id.clone(), now, c.clone()));
-        self.write_index(&idx, now)?;
-        if let Err(e) = self.fs.rename(r, &join_rel(STORE, &id)) {
+        self.write_index_at(&store, &idx, now)?;
+        if let Err(e) = self.fs.rename(r, &join_rel(&store, &id)) {
             idx.pop();
-            let _ = self.write_index(&idx, now);
+            let _ = self.write_index_at(&store, &idx, now);
             return Err(e);
         }
         Ok(())
     }
 
-    /// Contenido de la Papelera, lo más reciente primero.
+    /// Contenido de la Papelera del usuario de la sesión, lo más reciente primero (vacío sin sesión).
     pub fn trash_list(&mut self) -> Result<Vec<TrashItem>, FsError> {
+        let Some(store) = self.store() else { return Ok(Vec::new()) };
         let mut out = Vec::new();
-        for (id, deleted, original) in self.read_index() {
-            if let Ok(e) = self.fs.stat(&join_rel(STORE, &id)) {
+        for (id, deleted, original) in self.read_index_at(&store) {
+            if let Ok(e) = self.fs.stat(&join_rel(&store, &id)) {
                 out.push(TrashItem {
                     name: String::from(file_name(&original)),
                     id,
@@ -578,13 +723,16 @@ impl Files {
     /// Devuelve un elemento a su sitio (con otro nombre libre si el original está ocupado,
     /// recreando la carpeta original si ya no existe). Devuelve la ruta restaurada.
     pub fn restore(&mut self, id: &str) -> Result<String, FsError> {
-        let mut idx = self.read_index();
+        let store = self.store().ok_or(FsError::Invalid)?;
+        let mut idx = self.read_index_at(&store);
         let pos = idx.iter().position(|(i, _, _)| i == id).ok_or(FsError::NotFound)?;
-        let item = join_rel(STORE, id);
+        let item = join_rel(&store, id);
         self.fs.stat(&item)?;
         let (deleted, original) = (idx[pos].1, idx[pos].2.clone());
-        self.generation += 1;
         let r = original.get(3..).unwrap_or("");
+        // Un índice manipulado no puede sacar nada a un sitio donde el usuario no puede escribir.
+        self.guard(r, true)?;
+        self.generation += 1;
         let (dir, name) = r.rsplit_once('\\').unwrap_or(("", r));
         let mut cur = String::new();
         for c in dir.split('\\').filter(|c| !c.is_empty()) {
@@ -599,18 +747,19 @@ impl Files {
         let dest = join_rel(dir, &self.free_rel(dir, name));
         self.fs.rename(&item, &dest)?;
         idx.remove(pos);
-        self.write_index(&idx, deleted)?;
+        self.write_index_at(&store, &idx, deleted)?;
         Ok(format!("C:\\{dest}"))
     }
 
     pub fn empty_trash(&mut self) -> Result<(), FsError> {
+        let store = self.store().ok_or(FsError::Invalid)?;
         self.generation += 1;
-        for e in self.fs.list(STORE)? {
-            if e.name != "indice" {
-                self.rm_tree(&join_rel(STORE, &e.name))?;
+        for e in self.fs.list(&store)? {
+            if e.name != INDEX_NAME {
+                self.rm_tree(&join_rel(&store, &e.name))?;
             }
         }
-        self.write_index(&[], DateTime::default())
+        self.write_index_at(&store, &[], DateTime::default())
     }
 
     /// (bytes totales, bytes libres) de la unidad C:.
@@ -788,26 +937,26 @@ enum Undo {
 
 // ---- Cuentas, sesión y rutas del usuario (v0.5.0) ----
 //
-// CONTRATO. Semántica final (la estructura del disco la completa `files.rs`):
+// CONTRATO. Semántica final:
 // - Unidad en memoria (sin disco): hay una sesión abierta de `DEFAULT_USER`, administrador, y
 //   no hay archivo de cuentas. `needs_setup()` es `false`.
 // - Disco montado: sin sesión hasta `login`. Si no hay ninguna cuenta, `needs_setup()` es `true`
 //   y `create_account` crea la primera, que siempre es administradora.
 // - Las rutas del usuario salen SIEMPRE de `home`, `std_dir`, `config_file` y `explorer_prefs`.
+// - Las funciones de este bloque funcionan sin sesión (acceden al disco sin pasar por los permisos).
 impl Files {
     /// Cuentas guardadas (vacío si no hay archivo).
     pub fn accounts(&mut self) -> Vec<Account> {
-        match self.read(ACCOUNTS_FILE) {
+        match self.fs.read(rel(ACCOUNTS_FILE)) {
             Ok(d) => accounts::parse(&String::from_utf8_lossy(&d)),
             Err(_) => Vec::new(),
         }
     }
 
     fn save_accounts(&mut self, list: &[Account], now: DateTime) -> Result<(), AccountError> {
-        if !self.exists(SYS_CONFIG_DIR) {
-            self.mkdir(SYS_CONFIG_DIR, now)?;
-        }
-        Ok(self.write(ACCOUNTS_FILE, accounts::serialize(list).as_bytes(), now)?)
+        mk(&mut self.fs, rel(SYS_CONFIG_DIR), now);
+        self.generation += 1;
+        Ok(self.fs.write(rel(ACCOUNTS_FILE), accounts::serialize(list).as_bytes(), now)?)
     }
 
     /// Hay disco pero ninguna cuenta: toca el asistente inicial.
@@ -830,6 +979,8 @@ impl Files {
         if !a.verify(password) {
             return Err(AccountError::WrongPassword);
         }
+        // Por si la carpeta falta (p. ej. un corte al crear la cuenta).
+        ensure_home(&mut self.fs, &a.name, DateTime::default());
         self.user = Some((a.name, a.admin));
         self.clip = None;
         self.undo = None;
@@ -862,8 +1013,10 @@ impl Files {
         self.accounts().iter().find(|a| same(&a.name, &name)).is_some_and(|a| a.has_password())
     }
 
-    /// Crea una cuenta. La primera es siempre administradora y no exige sesión; después solo
-    /// puede crear cuentas un administrador. `salt`: `accounts::salt_from` con `Platform::entropy`.
+    /// Crea una cuenta y su carpeta completa. La primera es siempre administradora y no exige
+    /// sesión; después solo puede crear cuentas un administrador. La primera cuenta adopta lo
+    /// que hubiera pendiente de la estructura antigua o de la memoria (ver la cabecera).
+    /// `salt`: `accounts::salt_from` con `Platform::entropy`.
     pub fn create_account(&mut self, name: &str, password: Option<&str>, admin: bool, salt: [u8; 16], now: DateTime) -> Result<(), AccountError> {
         let mut list = self.accounts();
         if !list.is_empty() && !self.is_admin() {
@@ -875,16 +1028,23 @@ impl Files {
         if list.iter().any(|a| same(&a.name, name)) {
             return Err(AccountError::Exists);
         }
-        let mut a = Account::new(name, admin || list.is_empty());
+        let first = list.is_empty();
+        let mut a = Account::new(name, admin || first);
         a.set_password(password, salt)?;
+        // Primero la carpeta: un corte deja una carpeta sin cuenta, que es inofensiva.
+        ensure_home(&mut self.fs, name, now);
         list.push(a);
-        self.save_accounts(&list, now)
+        self.save_accounts(&list, now)?;
+        self.log(&format!("Cuenta creada: {name}"), now);
+        if first {
+            self.run_adopt(now);
+        }
+        Ok(())
     }
 
     /// Elimina una cuenta (solo un administrador; no la de la sesión abierta ni la última
-    /// administradora). `keep_files == false` borra su carpeta para siempre.
+    /// administradora). `keep_files == false` borra su carpeta para siempre; `true` la conserva.
     pub fn delete_account(&mut self, name: &str, keep_files: bool, now: DateTime) -> Result<(), AccountError> {
-        let _ = keep_files; // la carpeta del usuario llega con la estructura nueva del disco
         if !self.is_admin() {
             return Err(AccountError::NotAdmin);
         }
@@ -896,8 +1056,40 @@ impl Files {
         if list[i].admin && list.iter().filter(|a| a.admin).count() == 1 {
             return Err(AccountError::LastAdmin);
         }
-        list.remove(i);
-        self.save_accounts(&list, now)
+        let gone = list.remove(i);
+        self.save_accounts(&list, now)?;
+        if !keep_files {
+            self.rm_tree(&join_rel(USERS, &gone.name))?;
+        }
+        self.log(&format!("Cuenta eliminada: {}{}", gone.name, if keep_files { " (carpeta conservada)" } else { " (con sus archivos)" }), now);
+        Ok(())
+    }
+
+    /// Cambia el nombre de una cuenta y el de su carpeta (solo un administrador). Si es la de la
+    /// sesión abierta, la sesión pasa a llamarse igual. Si se corta, el siguiente arranque lo termina.
+    pub fn rename_account(&mut self, old: &str, new: &str, now: DateTime) -> Result<(), AccountError> {
+        if !self.is_admin() {
+            return Err(AccountError::NotAdmin);
+        }
+        if !accounts::valid_user_name(new) {
+            return Err(AccountError::BadName);
+        }
+        let list = self.accounts();
+        let old = list.iter().find(|a| same(&a.name, old)).ok_or(AccountError::NotFound)?.name.clone();
+        if old == new {
+            return Ok(());
+        }
+        if !same(&old, new) && (list.iter().any(|a| same(&a.name, new)) || self.fs.stat(&join_rel(USERS, new)).is_ok()) {
+            return Err(AccountError::Exists);
+        }
+        self.fs.write(rel(RENAME_FILE), format!("{old}|{new}\n").as_bytes(), now)?;
+        self.resume_rename(now)?;
+        if let Some(u) = self.user.as_mut().filter(|u| same(&u.0, &old)) {
+            u.0 = String::from(new);
+        }
+        self.generation += 1;
+        self.log(&format!("Cuenta renombrada: {old} -> {new}"), now);
+        Ok(())
     }
 
     /// Hace administradora o normal a una cuenta (solo un administrador; debe quedar uno).
@@ -930,10 +1122,14 @@ impl Files {
         self.save_accounts(&list, now)
     }
 
-    /// Carpeta del usuario de la sesión abierta: `C:\Usuarios\<nombre>`.
-    /// shortcut: hasta que llegue la estructura nueva devuelve la raíz (estructura antigua).
+    /// Carpeta del usuario de la sesión abierta: `C:\Usuarios\<nombre>`. Sin sesión (pantalla de
+    /// inicio, asistente) devuelve `C:\Usuarios`, que no es de nadie: las rutas que salen de ella
+    /// no existen y los permisos impiden escribir.
     pub fn home(&self) -> String {
-        String::from("C:\\")
+        match self.user() {
+            Some(u) => join(USERS_DIR, u),
+            None => String::from(USERS_DIR),
+        }
     }
 
     /// Carpeta estándar del usuario: `C:\Usuarios\<nombre>\Documentos`, etc.
@@ -941,15 +1137,241 @@ impl Files {
         join(&self.home(), d.name())
     }
 
-    /// Configuración del usuario (`fondo=`, `enfasis=`, `iconos=`, `orden=`).
-    /// shortcut: ruta antigua hasta que llegue la estructura nueva (`<home>\.config\config.txt`).
+    /// Configuración del usuario (`fondo=`, `enfasis=`, `iconos=`, `orden=`): `<home>\.config\config.txt`.
     pub fn config_file(&self) -> String {
-        String::from(CONFIG_FILE)
+        join(&join(&self.home(), HOME_CONFIG), "config.txt")
     }
 
-    /// Preferencias del Explorador del usuario (`<home>\.config\explorador.txt`).
+    /// Preferencias del Explorador del usuario: `<home>\.config\explorador.txt`.
     pub fn explorer_prefs(&self) -> String {
-        String::from(EXPLORER_PREFS)
+        join(&join(&self.home(), HOME_CONFIG), "explorador.txt")
+    }
+}
+
+// ---- Permisos, registro, arranque y migración (internos salvo `log`) ----
+impl Files {
+    /// Permisos de la sesión sobre una ruta relativa canónica (ver la cabecera). `Invalid` si no.
+    fn guard(&self, r: &str, write: bool) -> Result<(), FsError> {
+        let c = comps(r);
+        let Some(&top) = c.first() else { return Ok(()) };
+        let admin = self.is_admin();
+        let denied = if same(top, USERS) {
+            // Crear o tocar algo directamente en `Usuarios` o en la carpeta de una cuenta es cosa del sistema.
+            let mine = c.len() >= 2 && self.user().is_some_and(|u| same(u, c[1]));
+            (c.len() <= 2 && write) || (c.len() >= 2 && !mine && !admin)
+        } else if same(top, SYSTEM) {
+            let accounts_file = c.len() >= 3 && same(c[1], "config") && same(c[2], "cuentas");
+            !admin && (write || accounts_file)
+        } else {
+            write && self.user.is_none()
+        };
+        if denied {
+            Err(FsError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Añade una línea con fecha a `C:\Sistema\logs\sistema.log` (se queda en ~64 KB: lo más viejo
+    /// se descarta). Nunca pases claves. Funciona sin sesión y no puede fallar hacia fuera.
+    pub fn log(&mut self, text: &str, now: DateTime) {
+        let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let line = format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {text}\n",
+            now.year, now.month, now.day, now.hour, now.minute, now.second
+        );
+        let mut data = self.fs.read(rel(LOG_FILE)).unwrap_or_default();
+        data.extend_from_slice(line.as_bytes());
+        if data.len() > LOG_MAX {
+            let cut = data.len() - LOG_MAX;
+            let start = data[cut..].iter().position(|&b| b == b'\n').map_or(data.len(), |i| cut + i + 1);
+            data.drain(..start);
+        }
+        mk(&mut self.fs, rel(SYS_LOGS_DIR), now);
+        let _ = self.fs.write(rel(LOG_FILE), &data, now);
+    }
+
+    /// Al montar un disco: estructura, migración pendiente y limpieza. Nunca falla hacia fuera;
+    /// lo que no pueda hacer ahora lo reintenta el siguiente arranque.
+    fn startup(&mut self, now: DateTime) {
+        ensure_structure(&mut self.fs, now);
+        if self.fs.stat(rel(VERSION_FILE)).is_err() {
+            // Primera vez con la estructura nueva: ¿era un disco antiguo?
+            let legacy = legacy_items(&mut self.fs);
+            if !legacy || self.fs.write(rel(STATE_FILE), b"antigua\n", now).is_ok() {
+                if legacy {
+                    self.log("Disco con la estructura antigua: su contenido pasará a la primera cuenta", now);
+                }
+                let _ = self.fs.write(rel(VERSION_FILE), b"2\n", now);
+            }
+        }
+        if self.resume_rename(now).is_err() {
+            self.log("No se pudo terminar de renombrar una cuenta; se reintentará", now);
+        }
+        self.stage_old(now);
+        // `Sistema\temp` se vacía en cada arranque (solo su contenido).
+        for e in self.fs.list(rel(SYS_TEMP_DIR)).unwrap_or_default() {
+            let _ = self.rm_tree(&join_rel(rel(SYS_TEMP_DIR), &e.name));
+        }
+        for a in self.accounts() {
+            ensure_home(&mut self.fs, &a.name, now);
+        }
+        self.run_adopt(now);
+        self.log("Arranque", now);
+    }
+
+    fn state_has(&mut self, what: &str) -> bool {
+        self.fs.read(rel(STATE_FILE)).is_ok_and(|b| String::from_utf8_lossy(&b).lines().any(|l| l.trim() == what))
+    }
+
+    /// Estructura antigua: lo suelto de `Sistema` (config.txt, explorador.txt...) pasa a un sitio de espera.
+    fn stage_old(&mut self, now: DateTime) {
+        if !self.state_has("antigua") {
+            return;
+        }
+        for e in self.fs.list(SYSTEM).unwrap_or_default() {
+            if SYS_SUBS.iter().any(|s| same(s, &e.name)) {
+                continue;
+            }
+            mk(&mut self.fs, rel(OLD_DIR), now);
+            let dest = join_rel(rel(OLD_DIR), &self.free_rel(rel(OLD_DIR), &e.name));
+            match self.fs.rename(&join_rel(SYSTEM, &e.name), &dest) {
+                Ok(()) => self.log(&format!("Movido a un lado: Sistema\\{} -> {}", e.name, dest), now),
+                Err(_) => self.log(&format!("No se pudo mover Sistema\\{}", e.name), now),
+            }
+        }
+    }
+
+    /// Completa la adopción pendiente si ya hay cuentas; anota el resultado.
+    fn run_adopt(&mut self, now: DateTime) {
+        if let Err(e) = self.adopt(now) {
+            self.log(&format!("Migración interrumpida: {}; continuará en el próximo arranque", e.message()), now);
+        }
+    }
+
+    /// Mueve a la primera cuenta lo que quedó huérfano: la estructura antigua (carpetas, ajustes y
+    /// Papelera) y/o lo que había en la memoria. Cada movimiento es un renombrado atómico y se
+    /// puede repetir: tras un corte, continúa donde se quedó. Al terminar quita el archivo de estado.
+    fn adopt(&mut self, now: DateTime) -> Result<(), FsError> {
+        let (old, mem) = (self.state_has("antigua"), self.state_has("memoria"));
+        if !old && !mem {
+            return Ok(());
+        }
+        let Some(first) = self.accounts().into_iter().next() else { return Ok(()) };
+        ensure_home(&mut self.fs, &first.name, now);
+        let home = join_rel(USERS, &first.name);
+        let abs_home = format!("C:\\{home}");
+        let trash = join_rel(&home, HOME_TRASH);
+        if old {
+            let mut pairs = Vec::new();
+            for n in LEGACY_DIRS {
+                let to = join_rel(&home, n);
+                self.merge(n, &to)?;
+                self.log(&format!("Migrado: {n} -> {to}"), now);
+                pairs.push((format!("C:\\{n}"), format!("C:\\{to}")));
+            }
+            for f in ["config.txt", "explorador.txt"] {
+                let to = join_rel(&join_rel(&home, HOME_CONFIG), f);
+                self.merge(&join_rel(rel(OLD_DIR), f), &to)?;
+            }
+            self.adopt_trash(LEGACY_STORE, &trash, &pairs, now)?;
+            let _ = self.fs.remove(rel(OLD_DIR)); // solo si quedó vacía
+            self.log("Migrado: ajustes y Papelera antiguos", now);
+        }
+        if mem && !same(DEFAULT_USER, &first.name) {
+            let src = join_rel(USERS, DEFAULT_USER);
+            if self.fs.stat(&src).is_ok() {
+                for e in self.fs.list(&src)? {
+                    if !same(&e.name, HOME_TRASH) {
+                        self.merge(&join_rel(&src, &e.name), &join_rel(&home, &e.name))?;
+                    }
+                }
+                let pairs = [(format!("C:\\{src}"), abs_home)];
+                self.adopt_trash(&join_rel(&src, HOME_TRASH), &trash, &pairs, now)?;
+                let _ = self.fs.remove(&src); // solo si quedó vacía
+                self.log(&format!("Migrado: lo de la memoria -> {home}"), now);
+            }
+        }
+        self.fs.remove(rel(STATE_FILE))?;
+        self.log(&format!("Migración completa; propietaria: {}", first.name), now);
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// Mueve `src` a `dst` sin pisar nada. Si `dst` no existe, se renombra. Si ambos son
+    /// carpetas, el contenido de `src` pasa uno a uno a `dst` (con nombre libre si choca) y `src`
+    /// se quita cuando queda vacía. Si `dst` existe y no son dos carpetas, `src` va a un nombre libre.
+    fn merge(&mut self, src: &str, dst: &str) -> Result<(), FsError> {
+        let s = match self.fs.stat(src) {
+            Ok(s) => s,
+            Err(FsError::NotFound) => return Ok(()), // ya hecho
+            Err(e) => return Err(e),
+        };
+        let (dir, name) = dst.rsplit_once('\\').unwrap_or(("", dst));
+        match self.fs.stat(dst) {
+            Err(FsError::NotFound) => return self.fs.rename(src, dst),
+            Err(e) => return Err(e),
+            Ok(d) if !(s.dir && d.dir) => {
+                let n = self.free_rel(dir, name);
+                return self.fs.rename(src, &join_rel(dir, &n));
+            }
+            Ok(_) => {}
+        }
+        for e in self.fs.list(src)? {
+            let n = self.free_rel(dst, &e.name);
+            self.fs.rename(&join_rel(src, &e.name), &join_rel(dst, &n))?;
+        }
+        self.fs.remove(src)
+    }
+
+    /// Pasa los elementos de una Papelera (`src`) a otra (`dst`) con identificadores nuevos y las
+    /// rutas originales reescritas según `pairs`, para que Restaurar siga funcionando. Por cada
+    /// elemento: índice de destino, mover, quitar la línea de origen; un corte solo deja líneas
+    /// sin elemento, que se ignoran.
+    fn adopt_trash(&mut self, src: &str, dst: &str, pairs: &[(String, String)], now: DateTime) -> Result<(), FsError> {
+        if self.fs.stat(src).is_err() {
+            return Ok(());
+        }
+        let mut idx = self.read_index_at(src);
+        while !idx.is_empty() {
+            let (id, date, orig) = idx[0].clone();
+            let item = join_rel(src, &id);
+            if self.fs.stat(&item).is_ok() {
+                let mut d = self.read_index_at(dst);
+                let nid = self.next_id(dst, &d);
+                d.push((nid.clone(), date, rewrite(&orig, pairs)));
+                self.write_index_at(dst, &d, now)?;
+                self.fs.rename(&item, &join_rel(dst, &nid))?;
+            }
+            idx.remove(0);
+            self.write_index_at(src, &idx, now)?;
+        }
+        // Si no queda nada más que el índice, se quitan. Si hay elementos sin línea de índice, se dejan.
+        if self.fs.list(src)?.iter().all(|e| e.name == INDEX_NAME) {
+            let _ = self.fs.remove(&join_rel(src, INDEX_NAME));
+            let _ = self.fs.remove(src);
+        }
+        Ok(())
+    }
+
+    /// Termina un cambio de nombre de cuenta empezado (carpeta y línea de cuentas), si lo hay.
+    fn resume_rename(&mut self, now: DateTime) -> Result<(), FsError> {
+        let Ok(raw) = self.fs.read(rel(RENAME_FILE)) else { return Ok(()) };
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        if let Some((old, new)) = text.trim().split_once('|') {
+            let (ro, rn) = (join_rel(USERS, old), join_rel(USERS, new));
+            if self.fs.stat(&ro).is_ok() && (same(old, new) || self.fs.stat(&rn).is_err()) {
+                self.fs.rename(&ro, &rn)?;
+            }
+            let mut list = self.accounts();
+            if !list.iter().any(|a| same(&a.name, new) && !same(old, new)) {
+                if let Some(a) = list.iter_mut().find(|a| same(&a.name, old)) {
+                    a.name = String::from(new);
+                    self.save_accounts(&list, now).map_err(|_| FsError::Disk)?;
+                }
+            }
+        }
+        self.fs.remove(rel(RENAME_FILE))
     }
 }
 
