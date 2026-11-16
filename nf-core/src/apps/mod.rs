@@ -70,11 +70,13 @@ pub struct Ctx<'a> {
     pub open_new: Option<String>,
     /// La app pide un menú contextual; la elección llega por `App::menu_result`.
     pub menu: Option<MenuRequest>,
+    /// La app pide abrir un Terminal nuevo situado en esta carpeta (`App::open_path`).
+    pub open_terminal: Option<String>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(sys: &'a mut dyn Platform, theme: &'a mut Theme, now_ms: u64) -> Self {
-        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None, open_new: None, menu: None }
+        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None, open_new: None, menu: None, open_terminal: None }
     }
 }
 
@@ -110,7 +112,7 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
         AppKind::Notepad => (640, 420),
         AppKind::Calc => (320, 470),
         AppKind::Settings => (780, 520),
-        AppKind::Files => (760, 480),
+        AppKind::Files => (1000, 520),
         AppKind::Terminal => (680, 400),
     }
 }
