@@ -100,12 +100,45 @@ fn main() {
     let dir = std::env::args().nth(1).expect("falta la carpeta de salida");
     std::fs::create_dir_all(&dir).unwrap();
     let mut sys = TestPlatform { size: (W as u32, H as u32), ..Default::default() };
+    let now = sys.now();
+    sys.files.mkdir("C:\\Escritorio\\Proyectos", now).unwrap();
+    sys.files.write("C:\\Escritorio\\notas.txt", b"hola", now).unwrap();
+    sys.files.write("C:\\Escritorio\\datos.bin", b"1234", now).unwrap();
     let d = Desktop::new(W, H, &mut sys);
     let mut s = Shots { dir, d, sys };
 
     // 1. Escritorio vacío.
     s.mv(900, 400);
     s.save("1_vacio");
+
+    // 1b. Menú del fondo con el submenú Ver abierto; 1c. iconos grandes; 1d. menú de un archivo.
+    s.mv(700, 300);
+    s.d.right_button(true, &mut s.sys);
+    s.d.right_button(false, &mut s.sys);
+    let it = s.d.menu().expect("menú del fondo").item_rect(0);
+    s.mv(it.x + 20, it.y + 10);
+    let sr = s.d.menu().and_then(|m| m.sub_item_rect(0)).expect("submenú Ver");
+    s.mv(sr.x + 20, sr.y + 10);
+    s.save("1b_menu_fondo");
+    s.click((sr.x + 20, sr.y + 10));
+    s.mv(900, 600);
+    s.save("1c_iconos_grandes");
+    s.mv(6 + 100 + 50, 6 + 40);
+    s.d.right_button(true, &mut s.sys);
+    s.d.right_button(false, &mut s.sys);
+    let m = s.d.menu().expect("menú del archivo");
+    let it = m.item_rect(1);
+    s.mv(it.x + 20, it.y + 10);
+    s.save("1d_menu_archivo");
+    s.key(Key::Escape);
+    // Vuelve a iconos medianos para el resto de escenas.
+    s.mv(700, 300);
+    s.d.right_button(true, &mut s.sys);
+    s.d.right_button(false, &mut s.sys);
+    let it = s.d.menu().unwrap().item_rect(0);
+    s.mv(it.x + 20, it.y + 10);
+    let sr = s.d.menu().and_then(|m| m.sub_item_rect(1)).unwrap();
+    s.click((sr.x + 20, sr.y + 10));
 
     // 2. Menú de inicio con el ratón sobre un mosaico.
     s.key(Key::Super);
