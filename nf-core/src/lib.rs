@@ -18,6 +18,7 @@ pub mod input;
 pub mod math;
 pub mod menu;
 pub mod platform;
+pub mod scrollbar;
 pub mod surface;
 pub mod sync;
 pub mod theme;
