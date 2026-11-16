@@ -664,7 +664,7 @@ impl Desktop {
     }
 
     /// Bloquea: las ventanas siguen abiertas pero no se ven ni reciben nada.
-    fn lock(&mut self, sys: &mut dyn Platform) {
+    pub fn lock(&mut self, sys: &mut dyn Platform) {
         let Some(name) = sys.files().user().map(String::from) else { return };
         let has = sys.files().has_password();
         self.login.start_lock(&name, has);
