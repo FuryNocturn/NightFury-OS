@@ -107,7 +107,7 @@ fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> 
                     out.push(format!("{}  {:>10}  {}", date, e.size, e.name));
                 }
             }
-            out.push(format!("Archivos: {}, carpetas: {}, total {}. Libre: {}", nf, nd, units(bytes), units(f.space().1)));
+            out.push(format!("Archivos: {}, carpetas: {}, {} bytes. Libre: {}", nf, nd, bytes,units(f.space().1)));
             Ok(out)
         })(),
         "lista" | "dir" => uso("lista [ruta]"),
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(l[0], "Carpeta C:\\Documentos");
         assert!(l[1].starts_with("15/11/2026 21:37") && l[1].contains("<CARPETA>") && l[1].ends_with("sub"));
         assert!(l[2].contains(" 6  a.txt"), "{:?}", l[2]);
-        assert!(l[3].starts_with("Archivos: 1, carpetas: 1, total 0,0 KB. Libre: "), "{:?}", l[3]);
+        assert!(l[3].starts_with("Archivos: 1, carpetas: 1, 6 bytes. Libre: "), "{:?}", l[3]);
         assert_eq!(o[3].len(), 4 + 2);
         assert_eq!(o[4], ["Uso: lista [ruta]"]);
         assert_eq!(o[5], [FsError::NotFound.message()]);

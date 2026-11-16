@@ -46,7 +46,16 @@ fn main() {
             "Canción de otoño\nEl veloz murciélago hindú comía feliz cardillo y kiwi.\n¿Qué tal, ñandú? ¡Ñu, niño, año, pingüino!\n\tCon tabulador y acentos: áéíóú ÁÉÍÓÚ ü\nUna línea muy larga para comprobar el desplazamiento horizontal del cursor, que debe seguir visible sin cortarse.",
             &mut cx,
         );
-        for o in ["ayuda", "info", "memoria", "tiempo", "eco Hola, mundo ñ", "patata"] {
+        for o in [
+            "info",
+            "escribir Documentos\\nota.txt Hola desde el Terminal ñ",
+            "carpeta Documentos\\Fotos",
+            "lista Documentos",
+            "ir Documentos",
+            "ver nota.txt",
+            "disco",
+            "patata",
+        ] {
             escribe(&mut *term, &format!("{o}\n"), &mut cx);
         }
     }
