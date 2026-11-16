@@ -275,6 +275,8 @@ fn build_ribbon(trash: bool) -> Ribbon {
         },
     ];
     if trash {
+        // "Nuevo" no sirve en la Papelera: su sitio lo ocupa el grupo de la Papelera.
+        inicio.remove(2);
         inicio.insert(
             0,
             Group { title: "Papelera", items: vec![item(R_RESTORE, "Restaurar", Icon::Abrir).large(), item(R_EMPTY, "Vaciar Papelera", Icon::Trash).large()] },
@@ -1760,6 +1762,8 @@ mod tests {
         now: u64,
         menu: Option<MenuRequest>,
         open_new: Option<String>,
+        term: Option<String>,
+        closed: bool,
     }
 
     impl T {
@@ -1768,7 +1772,7 @@ mod tests {
             let now = sys.now();
             sys.files.write("C:\\Documentos\\nota.txt", b"hola", now).unwrap();
             sys.files.mkdir("C:\\Documentos\\Sub", now).unwrap();
-            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None };
+            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None, term: None, closed: false };
             t.draw();
             t
         }
@@ -1782,6 +1786,8 @@ mod tests {
             let r = f(&mut self.e, &mut cx);
             self.menu = cx.menu.take();
             self.open_new = cx.open_new.take();
+            self.term = cx.open_terminal.take();
+            self.closed |= cx.close;
             (r, cx.dialog.take(), cx.open.take())
         }
         fn key(&mut self, key: Key, ctrl: bool) -> (Option<DialogRequest>, Option<String>) {
@@ -2548,5 +2554,529 @@ mod tests {
         assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
         let r = t.e.rib.item_rect(R_DEL, 760).unwrap();
         assert!(r.right() < 760);
+    }
+    // ---- cinta, selección múltiple, lotes, Mover a / Copiar a, vistas, extensiones y barra ----
+
+    impl T {
+        fn ks(&mut self, key: Key, shift: bool) {
+            let ev = KeyEvent { key, ch: None, down: true, shift, ctrl: false, alt: false };
+            self.cx(|e, cx| e.key(&ev, cx));
+            self.draw();
+        }
+        /// Como el escritorio: aviso de Ctrl y Mayús con `Key::Other`.
+        fn mods(&mut self, ctrl: bool, shift: bool) {
+            let ev = KeyEvent { key: Key::Other, ch: None, down: ctrl || shift, shift, ctrl, alt: false };
+            self.cx(|e, cx| e.key(&ev, cx));
+        }
+        fn marked(&self) -> Vec<usize> {
+            self.e.marked.clone()
+        }
+        fn select_range(&mut self, a: usize, b: usize) {
+            self.click_item(a);
+            self.mods(false, true);
+            self.click_item(b);
+            self.mods(false, false);
+        }
+        fn up_(&mut self, x: i32, y: i32) {
+            self.cx(|e, cx| e.mouse(MouseEv::Up { x, y }, cx));
+            self.draw();
+        }
+    }
+
+    #[test]
+    fn la_cinta_mide_lo_que_se_reserva() {
+        assert_eq!(build_ribbon(false).height(), RIB_H);
+        assert_eq!(build_ribbon(true).height(), RIB_H);
+        let t = T::new();
+        // Inicio pide 1010 px: a 1000 (tamaño por defecto) el final del último grupo se recorta.
+        assert!(t.e.rib.content_width() <= 1010, "{}", t.e.rib.content_width());
+        assert_eq!(t.e.rib.active(), 0);
+    }
+
+    #[test]
+    fn cinta_inicio_un_boton_de_cada_grupo() {
+        let mut t = T::new();
+        t.many(1); // Sub, f00, nota.txt
+        t.click_item(2);
+        // Portapapeles: Copiar, Cortar y Pegar.
+        t.rib(R_COPY);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", false)));
+        t.rib(R_CUT);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", true)));
+        t.rib(R_COPY);
+        t.rib(R_PASTE);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota (2).txt"));
+        // Organizar: Cambiar nombre y Eliminar.
+        t.click_item(2);
+        let (d, _) = t.rib(R_REN);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
+        t.rib(R_DEL);
+        assert!(!t.sys.files.exists("C:\\Documentos\\nota (2).txt") || !t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        // Nuevo: carpeta y documento.
+        let (d, _) = t.rib(R_NEWD);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_NEWDOC, .. })));
+        let (d, _) = t.rib(R_NEWF);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_NEW, .. })));
+        // Abrir: Propiedades y Abrir.
+        t.click_item(0);
+        let (d, _) = t.rib(R_PROPS);
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_PROPS, .. })));
+        t.rib(R_OPEN);
+        assert_eq!(t.e.title(), "Sub");
+        t.open("C:\\Documentos");
+        // Seleccionar.
+        t.rib(R_SELALL);
+        assert_eq!(t.marked().len(), t.e.rows.len());
+        t.rib(R_SELNONE);
+        assert!(t.marked().is_empty());
+    }
+
+    #[test]
+    fn cinta_estados_segun_seleccion_portapapeles_y_papelera() {
+        let mut t = T::new();
+        let uno = [Cmd::Copy, Cmd::Cut, Cmd::Delete, Cmd::MoveTo, Cmd::CopyTo, Cmd::Rename, Cmd::Open];
+        for c in uno {
+            assert!(!t.e.enabled(c), "{c:?}");
+        }
+        assert!(!t.e.enabled(Cmd::Paste) && !t.e.enabled(Cmd::SelNone) && t.e.enabled(Cmd::NewFolder));
+        // Un botón gris no hace nada.
+        t.rib(R_COPY);
+        assert!(t.sys.files.clip().is_none());
+        t.click_item(1);
+        for c in uno {
+            assert!(t.e.enabled(c), "{c:?}");
+        }
+        // Varios: Cambiar nombre y Abrir en gris.
+        t.many(2);
+        t.select_range(1, 2);
+        assert!(t.e.enabled(Cmd::Copy) && t.e.enabled(Cmd::MoveTo) && !t.e.enabled(Cmd::Rename) && !t.e.enabled(Cmd::Open));
+        let (d, _) = t.rib(R_REN);
+        assert!(d.is_none());
+        let (d, o) = t.rib(R_OPEN);
+        assert!(d.is_none() && o.is_none());
+        // Pegar se activa con algo en el portapapeles.
+        assert!(!t.e.enabled(Cmd::Paste));
+        t.rib(R_COPY);
+        assert!(t.e.enabled(Cmd::Paste));
+        // Papelera: lo de siempre en gris, Restaurar y Vaciar según el caso.
+        t.rib(R_DEL);
+        t.open(files::TRASH);
+        t.rib(R_SELALL);
+        for c in [Cmd::Copy, Cmd::Cut, Cmd::Paste, Cmd::Rename, Cmd::NewFolder, Cmd::NewDoc, Cmd::MoveTo, Cmd::CopyTo, Cmd::Delete, Cmd::Open] {
+            assert!(!t.e.enabled(c), "{c:?}");
+        }
+        assert!(t.e.enabled(Cmd::Restore) && t.e.enabled(Cmd::EmptyTrash) && t.e.enabled(Cmd::Props));
+        let (d, _) = t.rib(R_EMPTY);
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_EMPTY, .. })));
+        // Restaurar actúa sobre todos los seleccionados.
+        let n = t.sys.files.trash_list().unwrap().len();
+        assert_eq!(n, 2);
+        t.rib(R_RESTORE);
+        assert!(t.sys.files.trash_list().unwrap().is_empty());
+        assert!(t.sys.files.exists("C:\\Documentos\\f00") && t.sys.files.exists("C:\\Documentos\\f01"));
+    }
+
+    #[test]
+    fn menu_archivo_de_la_cinta() {
+        let mut t = T::new();
+        let r = t.e.rib.file_rect();
+        let (x, y) = (r.x + r.w / 2, r.y + r.h / 2);
+        t.cx(|e, cx| {
+            e.mouse(MouseEv::Move { x, y }, cx);
+            e.mouse(MouseEv::Down { x, y }, cx);
+            e.mouse(MouseEv::Up { x, y }, cx);
+        });
+        let m = t.menu.take().expect("menú Archivo");
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_FILE, r.x, r.bottom()));
+        assert_eq!(texts(&m.items), ["Abrir ventana nueva", "Abrir Terminal aquí", "-", "Cerrar"]);
+        assert!(!m.items[1].disabled);
+        t.pick(TAG_MENU_FILE, M_FILE_NEWWIN);
+        assert_eq!(t.open_new.as_deref(), Some("C:\\Documentos"));
+        t.pick(TAG_MENU_FILE, M_FILE_TERM);
+        assert_eq!(t.term.as_deref(), Some("C:\\Documentos"));
+        assert!(!t.closed);
+        t.pick(TAG_MENU_FILE, M_FILE_CLOSE);
+        assert!(t.closed);
+        // En la Papelera no hay terminal.
+        t.open(files::TRASH);
+        t.term = None;
+        t.pick(TAG_MENU_FILE, M_FILE_TERM);
+        assert!(t.term.is_none());
+    }
+
+    #[test]
+    fn seleccion_multiple_con_teclado_y_botones() {
+        let mut t = T::new();
+        t.many(5); // Sub, f00..f04, nota.txt
+        t.key(Key::Char('a'), true);
+        assert_eq!(t.marked(), (0..7).collect::<Vec<_>>());
+        t.rib(R_SELNONE);
+        assert!(t.marked().is_empty() && t.e.sel.is_none());
+        t.click_item(1);
+        t.rib(R_INVERT);
+        assert_eq!(t.marked(), [0, 2, 3, 4, 5, 6]);
+        t.rib(R_SELALL);
+        assert_eq!(t.marked().len(), 7);
+        // Mayús + flechas amplía y reduce desde el ancla.
+        t.click_item(2);
+        t.ks(Key::Down, true);
+        t.ks(Key::Down, true);
+        assert_eq!(t.marked(), [2, 3, 4]);
+        t.ks(Key::Up, true);
+        assert_eq!(t.marked(), [2, 3]);
+        t.ks(Key::End, true);
+        assert_eq!(t.marked(), [2, 3, 4, 5, 6]);
+        // Una flecha sola vuelve a la selección simple.
+        t.ks(Key::Up, false);
+        assert_eq!(t.marked(), [5]);
+    }
+
+    #[test]
+    fn seleccion_multiple_con_ctrl_y_mayus_clic() {
+        let mut t = T::new();
+        t.many(5);
+        t.select_range(2, 5);
+        assert_eq!(t.marked(), [2, 3, 4, 5]);
+        t.mods(true, false);
+        t.click_item(0);
+        t.click_item(3);
+        t.mods(false, false);
+        assert_eq!(t.marked(), [0, 2, 4, 5]);
+        // Un clic normal deja solo ese.
+        t.click_item(4);
+        assert_eq!(t.marked(), [4]);
+        // Ctrl+clic sobre el único seleccionado lo quita.
+        t.mods(true, false);
+        t.click_item(4);
+        t.mods(false, false);
+        assert!(t.marked().is_empty() && t.e.sel.is_none());
+        // El estado de teclas se vacía al soltarlas.
+        assert!(!t.e.ctrl && !t.e.shift);
+    }
+
+    #[test]
+    fn estado_con_varios_seleccionados() {
+        let mut t = T::new();
+        t.many(3);
+        t.select_range(1, 3);
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+        assert_eq!(t.e.marked.len(), 3);
+        assert_eq!(count_text(t.e.rows.len()), "5 elementos");
+    }
+
+    #[test]
+    fn lotes_copiar_cortar_pegar_eliminar_y_deshacer() {
+        let mut t = T::new();
+        t.many(3); // Sub, f00, f01, f02, nota.txt
+        t.select_range(1, 3);
+        t.key(Key::Char('c'), true);
+        assert_eq!(t.sys.files.clip_paths().0.len(), 3);
+        t.open("C:\\Imágenes");
+        t.key(Key::Char('v'), true);
+        for n in ["f00", "f01", "f02"] {
+            assert!(t.sys.files.exists(&format!("C:\\Imágenes\\{n}")));
+        }
+        assert_eq!(t.marked().len(), 3); // lo pegado queda seleccionado
+        t.key(Key::Char('z'), true);
+        assert!(!t.sys.files.exists("C:\\Imágenes\\f01"), "Deshacer quita todo el lote");
+        // Pegar en la misma carpeta deja los nuevos seleccionados.
+        t.open("C:\\Documentos");
+        t.select_range(1, 2);
+        t.key(Key::Char('c'), true);
+        t.key(Key::Char('v'), true);
+        assert_eq!(t.marked().len(), 2, "{:?}", t.rows());
+        // Cortar y pegar varios en otra carpeta.
+        t.key(Key::Char('a'), true);
+        t.key(Key::Char('x'), true);
+        t.open("C:\\Escritorio");
+        t.key(Key::Char('v'), true);
+        assert!(t.sys.files.list("C:\\Documentos").unwrap().is_empty());
+        t.key(Key::Char('z'), true);
+        assert!(t.sys.files.list("C:\\Escritorio").unwrap().is_empty());
+        assert!(!t.sys.files.list("C:\\Documentos").unwrap().is_empty());
+        // Eliminar varios de una vez y deshacer el lote.
+        t.open("C:\\Documentos");
+        let antes = t.names();
+        let en_papelera = t.sys.files.trash_list().unwrap().len();
+        t.key(Key::Char('a'), true);
+        let (d, _) = t.key(Key::Delete, false);
+        assert!(d.is_none(), "sin confirmación, como con uno");
+        assert!(t.names().is_empty());
+        assert_eq!(t.sys.files.trash_list().unwrap().len(), en_papelera + antes.len());
+        t.key(Key::Char('z'), true);
+        assert_eq!(t.names(), antes);
+    }
+
+    #[test]
+    fn menu_contextual_con_varios() {
+        let mut t = T::new();
+        t.many(2); // Sub, f00, f01, nota.txt
+        t.select_range(1, 2);
+        let m = t.right_row("f01");
+        assert_eq!(t.marked(), [1, 2], "conserva la selección");
+        assert_eq!(
+            texts(&m.items),
+            ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"]
+        );
+        let off: Vec<&str> = m.items.iter().filter(|i| i.disabled).map(|i| i.text.as_str()).collect();
+        assert_eq!(off, ["Abrir", "Abrir con", "Cambiar nombre"]);
+        t.pick(TAG_MENU_ITEM, M_COPY);
+        assert_eq!(t.sys.files.clip_paths().0.len(), 2);
+        // Sobre uno no seleccionado: solo ese.
+        t.right_row("nota.txt");
+        assert_eq!(t.marked(), [3]);
+        // Zona vacía: sin selección.
+        t.right(EMPTY.0, EMPTY.1);
+        assert!(t.marked().is_empty());
+    }
+
+    #[test]
+    fn mover_a_y_copiar_a() {
+        let mut t = T::new();
+        t.many(2); // Sub, f00, f01, nota.txt
+        t.key(Key::Char('a'), true);
+        let (d, _) = t.rib(R_MOVE);
+        let Some(DialogRequest::Folder { tag, title, dir }) = d else { panic!("sin selector") };
+        assert_eq!((tag, title.as_str(), dir.as_str()), (TAG_MOVETO, "Mover a", "C:\\Documentos"));
+        t.answer(DialogResult::Path { tag: TAG_MOVETO, path: Some(String::from("C:\\Imágenes")) });
+        assert!(t.sys.files.list("C:\\Documentos").unwrap().is_empty());
+        assert_eq!(t.sys.files.list("C:\\Imágenes").unwrap().len(), 4);
+        assert_eq!(t.sys.files.undo_label(), Some("Mover"));
+        t.key(Key::Char('z'), true);
+        assert_eq!(t.sys.files.list("C:\\Documentos").unwrap().len(), 4);
+        // Copiar a.
+        t.key(Key::Char('a'), true);
+        let (d, _) = t.rib(R_COPYTO);
+        let Some(DialogRequest::Folder { tag, title, .. }) = d else { panic!("sin selector") };
+        assert_eq!((tag, title.as_str()), (TAG_COPYTO, "Copiar a"));
+        t.answer(DialogResult::Path { tag: TAG_COPYTO, path: Some(String::from("C:\\Escritorio")) });
+        assert_eq!(t.sys.files.list("C:\\Escritorio").unwrap().len(), 4);
+        assert_eq!(t.sys.files.list("C:\\Documentos").unwrap().len(), 4);
+        assert_eq!(t.sys.files.undo_label(), Some("Copiar"));
+        // Cancelar no hace nada; un destino que falla muestra el error.
+        let antes = t.sys.files.list("C:\\Imágenes").unwrap().len();
+        t.rib(R_COPYTO);
+        t.answer(DialogResult::Path { tag: TAG_COPYTO, path: None });
+        assert!(t.e.pending.is_empty());
+        t.rib(R_COPYTO);
+        let d = t.answer(DialogResult::Path { tag: TAG_COPYTO, path: Some(String::from("C:\\NoExiste")) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })), "{d:?}");
+        assert_eq!(t.sys.files.list("C:\\Imágenes").unwrap().len(), antes);
+    }
+
+    #[test]
+    fn propiedades_de_varios() {
+        let mut t = T::new();
+        t.many(2); // f00 y f01 de 1 byte, nota.txt de 4, y la carpeta Sub
+        t.key(Key::Char('a'), true);
+        let (d, _) = t.rib(R_PROPS);
+        let Some(DialogRequest::Message { title, text, buttons: Buttons::Ok, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!(title, "Propiedades de 4 elementos");
+        assert!(text.contains("Elementos: 4") && text.contains("Archivos: 3") && text.contains("Carpetas: 1"), "{text}");
+        assert!(text.contains("Tamaño total de los archivos: 6 bytes"), "{text}");
+        // Con uno sigue como antes; sin selección, la carpeta actual.
+        t.click_item(3);
+        let (d, _) = t.rib(R_PROPS);
+        assert!(matches!(d, Some(DialogRequest::Message { title, .. }) if title == "Propiedades de nota.txt"));
+        t.rib(R_SELNONE);
+        let (d, _) = t.rib(R_PROPS);
+        assert!(matches!(d, Some(DialogRequest::Message { title, .. }) if title == "Propiedades de Documentos"));
+    }
+
+    #[test]
+    fn ordenar_por_de_la_cinta() {
+        let mut t = T::new();
+        t.tab(1);
+        t.rib(R_SORT);
+        let m = t.menu.take().expect("menú de orden");
+        let r = t.e.rib.item_rect(R_SORT, t.e.w).unwrap();
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_SORT, r.x, r.bottom()));
+        assert_eq!(texts(&m.items), ["Nombre", "Fecha de modificación", "Tipo", "Tamaño", "-", "Ascendente", "Descendente"]);
+        let on: Vec<&str> = m.items.iter().filter(|i| i.checked).map(|i| i.text.as_str()).collect();
+        assert_eq!(on, ["Nombre", "Ascendente"]);
+        t.pick(TAG_MENU_SORT, M_SORT_SIZE);
+        t.pick(TAG_MENU_SORT, M_DESC);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Size, true));
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=detalles\norden=tamano\ndesc=1\n");
+    }
+
+    #[test]
+    fn casilla_de_extensiones_y_cambiar_nombre() {
+        let mut t = T::new();
+        t.view(M_VIEW_ICONS);
+        t.tab(1);
+        t.rib(R_EXT);
+        assert!(!t.e.show_ext && !t.sys.files.show_ext());
+        let p = String::from_utf8(t.sys.files.read(PREFS).unwrap()).unwrap();
+        assert!(p.contains("extensiones=no") && p.contains("vista=iconos"), "{p}");
+        // Los cambios de vista conservan la línea de extensiones.
+        t.view(M_VIEW_LIST);
+        let p = String::from_utf8(t.sys.files.read(PREFS).unwrap()).unwrap();
+        assert!(p.contains("extensiones=no") && p.contains("vista=lista"), "{p}");
+        // El diálogo propone el nombre sin extensión y la extensión se conserva.
+        t.tab(0);
+        t.click_item(1);
+        let (d, _) = t.key(Key::F(2), false);
+        let Some(DialogRequest::Input { value, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!(value, "nota");
+        t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("apuntes")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\apuntes.txt") && !t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("apuntes.txt"));
+        // Una carpeta no tiene extensión que ocultar.
+        t.click_item(0);
+        let (d, _) = t.key(Key::F(2), false);
+        assert!(matches!(d, Some(DialogRequest::Input { value, .. }) if value == "Sub"));
+        // Sin nombre no se renombra.
+        t.click_item(1);
+        t.key(Key::F(2), false);
+        let d = t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::new()) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+        // Vuelve a mostrarlas.
+        t.tab(1);
+        t.rib(R_EXT);
+        assert!(t.e.show_ext && t.sys.files.show_ext());
+        let p = String::from_utf8(t.sys.files.read(PREFS).unwrap()).unwrap();
+        assert!(p.contains("extensiones=si") && !p.contains("extensiones=no"), "{p}");
+        t.tab(0);
+        t.click_item(1);
+        let (d, _) = t.key(Key::F(2), false);
+        assert!(matches!(d, Some(DialogRequest::Input { value, .. }) if value == "apuntes.txt"));
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+    }
+
+    #[test]
+    fn vistas_medianos_y_pequenos_con_su_guardado() {
+        let mut t = T::new();
+        t.many(60);
+        t.tab(1);
+        t.rib(R_V_MEDIUM);
+        assert_eq!(t.e.view, View::Medium);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=iconos-medianos\norden=nombre\ndesc=0\n");
+        assert_eq!((t.e.item_rect(0).w, t.e.item_rect(0).h), (80, 68));
+        assert_eq!(t.e.per_line(), (1000 - PANEL_W - SB_W) as usize / 80);
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+        t.rib(R_V_SMALL);
+        assert_eq!(t.e.view, View::Small);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=iconos-pequenos\norden=nombre\ndesc=0\n");
+        assert_eq!((t.e.item_rect(0).w, t.e.item_rect(0).h), (176, 22));
+        // Selección y teclado en la rejilla pequeña.
+        t.click_item(5);
+        assert_eq!(t.marked(), [5]);
+        t.ks(Key::Down, false);
+        assert_eq!(t.e.sel, Some(5 + t.e.per_line()));
+        t.ks(Key::Right, true);
+        assert_eq!(t.marked().len(), 2);
+        // Otra ventana lee los nombres nuevos.
+        let mut e2 = make();
+        let mut s = Surface::new(1000, 520, 0);
+        e2.draw(&mut s, &t.th, &mut t.sys, true);
+        assert_eq!(e2.view, View::Small);
+        // La vista activa queda marcada en la cinta y la de la rueda funciona.
+        t.wheel(1);
+        // El menú "Ver" ofrece las cinco, con la actual marcada.
+        let m = MenuRequest { tag: TAG_MENU_BG, x: 0, y: 0, items: t.e.bg_menu(false, None) };
+        let ch: Vec<&str> = m.items[0].sub.iter().filter(|i| i.checked).map(|i| i.text.as_str()).collect();
+        assert_eq!(ch, ["Iconos pequeños"]);
+        t.pick(TAG_MENU_BG, M_VIEW_MEDIUM);
+        assert_eq!(t.e.view, View::Medium);
+    }
+
+    #[test]
+    fn barra_solo_si_hace_falta_y_se_maneja() {
+        let mut t = T::new();
+        assert!(!t.e.need_sb() && !t.e.metrics().needed());
+        assert_eq!(t.e.area().w, 1000 - PANEL_W);
+        t.many(60);
+        assert!(t.e.need_sb());
+        let m = t.e.metrics();
+        assert_eq!((m.rect.w, m.total, m.pos), (SB_W, 62, 0));
+        assert_eq!(t.e.area().w, 1000 - PANEL_W - SB_W);
+        // Flecha de abajo: una línea; mantenida, se repite con tick.
+        let (x, y) = (m.rect.x + 4, m.rect.bottom() - 4);
+        t.click(x, y);
+        assert_eq!(t.e.top, 1);
+        t.now += 450;
+        t.cx(|e, cx| e.tick(cx));
+        assert!(t.e.top >= 2);
+        t.up_(x, y);
+        let top = t.e.top;
+        t.now += 1000;
+        t.cx(|e, cx| e.tick(cx));
+        assert_eq!(t.e.top, top, "soltado: no repite");
+        // Pista: una página.
+        let page = t.e.page();
+        let (_, len) = t.e.sb_v.thumb(&t.e.metrics());
+        t.click(x, m.rect.y + SB_W + 8 + len + 20);
+        t.up_(x, y);
+        assert_eq!(t.e.top, top + page);
+        // Flecha de arriba.
+        t.click(x, m.rect.y + 4);
+        t.up_(x, y);
+        assert_eq!(t.e.top, top + page - 1);
+        // La rueda y el teclado siguen igual.
+        t.wheel(-100);
+        assert_eq!(t.e.top, 0);
+        t.key(Key::End, false);
+        assert_eq!(t.e.top, t.e.max_top());
+        // Los clics en la barra no tocan la selección.
+        let sel = t.marked();
+        t.click(x, y);
+        t.up_(x, y);
+        assert_eq!(t.marked(), sel);
+        // Al quedar pocos elementos, desaparece.
+        for i in 0..60 {
+            let _ = t.sys.files.delete(&format!("C:\\Documentos\\f{i:02}"));
+        }
+        t.draw();
+        assert!(!t.e.need_sb() && t.e.top == 0);
+    }
+
+    #[test]
+    fn barra_horizontal_en_lista() {
+        let mut t = T::new();
+        t.many(100);
+        t.view(M_VIEW_LIST);
+        assert!(t.e.horiz() && t.e.need_sb());
+        let m = t.e.metrics();
+        assert_eq!((m.rect.h, m.rect.w), (SB_W, 1000 - PANEL_W));
+        let (x, y) = (m.rect.right() - 4, m.rect.y + 4);
+        t.click(x, y);
+        t.up_(x, y);
+        assert_eq!(t.e.top, 1);
+        t.click(m.rect.x + 4, y);
+        t.up_(x, y);
+        assert_eq!(t.e.top, 0);
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+    }
+    /// Capturas para revisar a ojo: `NF_CAPTURAS=carpeta cargo test -p nf-core capturas -- --ignored`.
+    #[test]
+    #[ignore]
+    fn capturas_de_la_ventana() {
+        let Ok(dir) = std::env::var("NF_CAPTURAS") else { return };
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut t = T::new();
+        t.many(14);
+        let now = t.now_dt();
+        t.sys.files.write("C:\\Documentos\\Lista de la compra con un nombre bastante largo.txt", b"leche", now).unwrap();
+        let guarda = |s: &Surface, n: &str| std::fs::write(format!("{dir}/{n}.bmp"), crate::bmp::encode(s)).unwrap();
+        t.select_range(2, 5);
+        guarda(&t.draw(), "inicio_varios");
+        t.tab(1);
+        t.rib(R_V_MEDIUM);
+        guarda(&t.draw(), "vista_medianos");
+        t.rib(R_V_SMALL);
+        guarda(&t.draw(), "vista_pequenos");
+        t.rib(R_V_LIST);
+        guarda(&t.draw(), "vista_lista");
+        t.rib(R_EXT);
+        t.rib(R_V_DETAILS);
+        guarda(&t.draw(), "vista_sin_extensiones");
+        t.tab(0);
+        t.open(files::TRASH);
+        guarda(&t.draw(), "papelera");
     }
 }
