@@ -2,9 +2,10 @@
 //! Uso: cargo run --release -p nf-core --example preview -- carpeta
 use nf_core::apps::AppKind;
 use nf_core::desktop::Desktop;
+use nf_core::dialogs::{Buttons, DialogRequest};
 use nf_core::geom::Rect;
 use nf_core::input::{Event, Key, KeyEvent};
-use nf_core::platform::TestPlatform;
+use nf_core::platform::{Platform, TestPlatform};
 
 const W: i32 = 1280;
 const H: i32 = 800;
@@ -104,4 +105,20 @@ fn main() {
     s.d.left_button(false, &mut s.sys);
     s.save("6_arrastre");
     let _ = center(r);
+
+    // 7. Diálogo "Guardar como" con archivos y una carpeta, y un mensaje de pregunta.
+    let now = s.sys.now();
+    s.sys.files.mkdir("C:\\Documentos\\Proyectos", now).unwrap();
+    s.sys.files.write("C:\\Documentos\\nota.txt", b"hola", now).unwrap();
+    s.sys.files.write("C:\\Documentos\\datos.bin", b"1234", now).unwrap();
+    let dir = String::from("C:\\Documentos");
+    s.d.request_dialog(DialogRequest::Save { tag: 1, title: "Guardar como".into(), dir, name: "nota".into() }, &mut s.sys);
+    s.mv(640, 400);
+    s.key(Key::Tab);
+    s.key(Key::Down);
+    s.save("7_dialogo_guardar");
+    let text = "Se ha encontrado un disco sin formato. ¿Quieres prepararlo para NightFury?".into();
+    s.d.request_dialog(DialogRequest::Message { tag: 2, title: "Disco nuevo".into(), text, buttons: Buttons::YesNo }, &mut s.sys);
+    s.mv(660, 420);
+    s.save("8_dialogo_mensaje");
 }
