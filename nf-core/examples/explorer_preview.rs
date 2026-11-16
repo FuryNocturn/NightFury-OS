@@ -1,7 +1,7 @@
 //! Vista previa del Explorador de archivos:
 //! `cargo run -p nf-core --example explorer_preview -- carpeta`
 //! Guarda BMP de una carpeta con contenido, de la Papelera y del tamaño mínimo.
-use nf_core::apps::{self, AppKind, Ctx};
+use nf_core::apps::{self, AppKind, Ctx, MouseEv};
 use nf_core::files;
 use nf_core::platform::{Platform, TestPlatform};
 use nf_core::surface::Surface;
@@ -50,4 +50,19 @@ fn main() {
     let mut s = Surface::new(w, h, 0);
     app.draw(&mut s, &theme, &mut sys, true);
     guarda(&dir, "escritorio_barra", &s);
+    // Vistas Iconos grandes y Lista (menú de zona vacía: Ver; 2 = menú de zona vacía, 22/21 = Iconos/Lista),
+    // con un elemento seleccionado y con la carpeta de muchas filas (barra de desplazamiento).
+    let mut ms = 0; // cada clic en un instante distinto para que no cuente como doble clic
+    for (nombre, id) in [("iconos", 22), ("lista", 21)] {
+        app.menu_result(2, id, &mut Ctx::new(&mut sys, &mut theme, 0));
+        for (carpeta, sufijo) in [(files::DOCUMENTS_DIR, "carpeta"), (files::DESKTOP_DIR, "barra")] {
+            app.open_path(carpeta, &mut Ctx::new(&mut sys, &mut theme, 0));
+            let mut s = Surface::new(w, h, 0);
+            app.draw(&mut s, &theme, &mut sys, true); // las zonas activas se calculan al dibujar
+            ms += 10_000;
+            app.mouse(MouseEv::Down { x: 160, y: 80 }, &mut Ctx::new(&mut sys, &mut theme, ms));
+            app.draw(&mut s, &theme, &mut sys, true);
+            guarda(&dir, &format!("{nombre}_{sufijo}"), &s);
+        }
+    }
 }

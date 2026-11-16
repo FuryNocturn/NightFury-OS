@@ -1,21 +1,24 @@
-//! Explorador de archivos: navegación, lista, Papelera y operaciones básicas sobre `Files`.
+//! Explorador de archivos: navegación, lista (detalles, lista o iconos), Papelera, menú contextual
+//! y operaciones sobre `Files`.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 use super::{App, AppKind, Ctx, MouseEv};
-use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
-use crate::files::{self, file_name, join, parent, valid_name};
+use crate::dialogs::{self, Answer, Buttons, DialogRequest, DialogResult};
+use crate::files::{self, file_name, join, parent, valid_name, Files};
 use crate::font::{self, Align};
 use crate::fs::FsError;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
+use crate::menu::{MenuItem, MenuRequest};
 use crate::platform::{DateTime, Platform};
 use crate::surface::{blend, Surface};
-use crate::sync::SpinLock;
 use crate::theme::Theme;
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 const NAV_H: i32 = 34;
 const CMD_H: i32 = 32;
@@ -25,6 +28,14 @@ const STATUS_H: i32 = 22;
 const PANEL_W: i32 = 140;
 const SB_W: i32 = 10;
 const COL_W: [i32; 3] = [152, 152, 76];
+/// Iconos grandes: celda de la rejilla y tamaño del icono.
+const CELL_W: i32 = 84;
+const CELL_H: i32 = 76;
+const BIG: i32 = 48;
+/// Lista: ancho de cada columna.
+const LCOL_W: i32 = 190;
+/// Filas que mueve la rueda por muesca en Detalles (en Iconos, una fila de la rejilla; en Lista, una columna).
+const WHEEL_ROWS: i32 = 3;
 const DOUBLE_MS: u64 = 500;
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
@@ -37,13 +48,41 @@ const PLACES: [(&str, &str, Icon); 5] = [
     ("Disco local (C:)", "C:\\", Icon::Drive),
     ("Papelera", files::TRASH, Icon::Trash),
 ];
+/// Dónde se recuerdan la vista y el orden.
+const PREFS: &str = "C:\\Sistema\\explorador.txt";
 const TAG_NEW: u32 = 1;
 const TAG_RENAME: u32 = 2;
 const TAG_EMPTY: u32 = 3;
 const TAG_ERROR: u32 = 4;
-
-/// Portapapeles compartido entre ventanas: (ruta, es cortar).
-static CLIP: SpinLock<Option<(String, bool)>> = SpinLock::new(None);
+const TAG_PROPS: u32 = 5;
+const TAG_NEWDOC: u32 = 6;
+/// Menús: sobre un elemento / sobre la zona vacía.
+const TAG_MENU_ITEM: u32 = 1;
+const TAG_MENU_BG: u32 = 2;
+const M_OPEN: u32 = 1;
+const M_OPEN_NEW: u32 = 2;
+const M_NOTEPAD: u32 = 3;
+const M_CUT: u32 = 4;
+const M_COPY: u32 = 5;
+const M_PASTE: u32 = 6;
+const M_DELETE: u32 = 7;
+const M_RENAME: u32 = 8;
+const M_PROPS: u32 = 9;
+const M_RESTORE: u32 = 10;
+const M_EMPTY: u32 = 11;
+const M_REFRESH: u32 = 12;
+const M_UNDO: u32 = 13;
+const M_NEW_FOLDER: u32 = 14;
+const M_NEW_DOC: u32 = 15;
+const M_VIEW_DETAILS: u32 = 20;
+const M_VIEW_LIST: u32 = 21;
+const M_VIEW_ICONS: u32 = 22;
+const M_SORT_NAME: u32 = 30;
+const M_SORT_DATE: u32 = 31;
+const M_SORT_TYPE: u32 = 32;
+const M_SORT_SIZE: u32 = 33;
+const M_ASC: u32 = 34;
+const M_DESC: u32 = 35;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Cmd {
@@ -57,6 +96,21 @@ enum Cmd {
     EmptyTrash,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Details,
+    List,
+    Icons,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sort {
+    Name,
+    Date,
+    Type,
+    Size,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Hit {
     Back,
@@ -64,6 +118,7 @@ enum Hit {
     Crumb(String),
     Cmd(Cmd),
     Place(usize),
+    Head(Sort),
 }
 
 struct Row {
@@ -83,6 +138,7 @@ struct Explorer {
     back: Vec<String>,
     rows: Vec<Row>,
     sel: Option<usize>,
+    /// Primera línea visible: fila (Detalles), fila de la rejilla (Iconos) o columna (Lista).
     top: usize,
     gen: u64,
     w: i32,
@@ -95,6 +151,12 @@ struct Explorer {
     /// Nombre a seleccionar en la próxima recarga.
     want: Option<String>,
     rename_from: String,
+    view: View,
+    sort: Sort,
+    desc: bool,
+    prefs_loaded: bool,
+    /// Hay algo en el portapapeles (se actualiza al dibujar y al ejecutar órdenes).
+    has_clip: bool,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -117,6 +179,11 @@ fn make() -> Explorer {
         drag: None,
         want: None,
         rename_from: String::new(),
+        view: View::Details,
+        sort: Sort::Name,
+        desc: false,
+        prefs_loaded: false,
+        has_clip: false,
     }
 }
 
@@ -132,6 +199,15 @@ fn fmt_size(b: u64) -> String {
     }
 }
 
+/// "2 KB (1500 bytes)"; por debajo de 1 KB solo los bytes.
+fn size_text(b: u64) -> String {
+    if b < 1024 {
+        fmt_size(b)
+    } else {
+        format!("{} ({b} bytes)", fmt_size(b))
+    }
+}
+
 fn fmt_date(d: DateTime) -> String {
     if d.year == 0 {
         return String::new();
@@ -143,8 +219,34 @@ fn is_txt(name: &str) -> bool {
     name.len() > 4 && name[name.len() - 4..].eq_ignore_ascii_case(".txt")
 }
 
+fn kind_of(name: &str, dir: bool) -> &'static str {
+    if dir {
+        "Carpeta de archivos"
+    } else if is_txt(name) {
+        "Documento de texto"
+    } else {
+        "Archivo"
+    }
+}
+
+fn count_text(n: usize) -> String {
+    if n == 1 {
+        String::from("1 elemento")
+    } else {
+        format!("{n} elementos")
+    }
+}
+
 fn same(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+fn cmp_name(a: &str, b: &str) -> Ordering {
+    a.chars().flat_map(char::to_lowercase).cmp(b.chars().flat_map(char::to_lowercase))
+}
+
+fn date_key(d: DateTime) -> (u16, u8, u8, u8, u8, u8) {
+    (d.year, d.month, d.day, d.hour, d.minute, d.second)
 }
 
 fn clipped(s: &mut Surface, r: Rect, text: &str, color: u32, align: Align) {
@@ -167,15 +269,198 @@ impl Explorer {
         self.sel.and_then(|i| self.rows.get(i))
     }
 
-    fn vis(&self) -> usize {
-        (((self.h - STATUS_H - NAV_H - CMD_H - HEAD_H) / ROW_H).max(1)) as usize
+    // ---- recordar vista y orden ----
+
+    fn load_prefs(&mut self, f: &mut Files) {
+        self.prefs_loaded = true;
+        let Ok(bytes) = f.read(PREFS) else { return };
+        let text = String::from_utf8_lossy(&bytes);
+        for l in text.lines() {
+            match l.split_once('=') {
+                Some(("vista", "detalles")) => self.view = View::Details,
+                Some(("vista", "lista")) => self.view = View::List,
+                Some(("vista", "iconos")) => self.view = View::Icons,
+                Some(("orden", "nombre")) => self.sort = Sort::Name,
+                Some(("orden", "fecha")) => self.sort = Sort::Date,
+                Some(("orden", "tipo")) => self.sort = Sort::Type,
+                Some(("orden", "tamano")) => self.sort = Sort::Size,
+                Some(("desc", "0")) => self.desc = false,
+                Some(("desc", "1")) => self.desc = true,
+                _ => {}
+            }
+        }
+    }
+
+    fn save_prefs(&self, sys: &mut dyn Platform) {
+        let v = match self.view {
+            View::Details => "detalles",
+            View::List => "lista",
+            View::Icons => "iconos",
+        };
+        let o = match self.sort {
+            Sort::Name => "nombre",
+            Sort::Date => "fecha",
+            Sort::Type => "tipo",
+            Sort::Size => "tamano",
+        };
+        let text = format!("vista={v}\norden={o}\ndesc={}\n", self.desc as u8);
+        let now = sys.now();
+        let _ = sys.files().write(PREFS, text.as_bytes(), now);
+    }
+
+    /// Tras cambiar vista u orden: se guarda, se reordena y se redibuja.
+    fn prefs_changed(&mut self, cx: &mut Ctx) {
+        self.top = 0;
+        self.save_prefs(cx.sys);
+        self.reload(cx.sys);
+        if let Some(i) = self.sel {
+            self.select(i);
+        }
+        cx.redraw = true;
+    }
+
+    fn sort_rows(&mut self) {
+        let (key, desc) = (self.sort, self.desc);
+        self.rows.sort_by(|a, b| {
+            b.dir.cmp(&a.dir).then_with(|| {
+                let o = match key {
+                    Sort::Name => cmp_name(&a.name, &b.name),
+                    Sort::Date => date_key(a.date).cmp(&date_key(b.date)),
+                    Sort::Type => kind_of(&a.name, a.dir).cmp(kind_of(&b.name, b.dir)),
+                    Sort::Size => a.size.cmp(&b.size),
+                };
+                (if desc { o.reverse() } else { o }).then_with(|| cmp_name(&a.name, &b.name))
+            })
+        });
+    }
+
+    // ---- geometría (depende de la vista) ----
+
+    fn top_y(&self) -> i32 {
+        NAV_H + CMD_H + if self.view == View::Details { HEAD_H } else { 0 }
+    }
+
+    fn avail_h(&self) -> i32 {
+        (self.h - STATUS_H - self.top_y() - if self.view == View::List { SB_W } else { 0 }).max(1)
+    }
+
+    fn avail_w(&self) -> i32 {
+        self.w - PANEL_W - if self.view == View::Icons { SB_W } else { 0 }
+    }
+
+    /// Elementos por línea: 1 (Detalles), columnas de la rejilla (Iconos) o filas por columna (Lista).
+    fn per_line(&self) -> usize {
+        match self.view {
+            View::Details => 1,
+            View::Icons => (self.avail_w() / CELL_W).max(1) as usize,
+            View::List => (self.avail_h() / ROW_H).max(1) as usize,
+        }
+    }
+
+    fn lines(&self) -> usize {
+        self.rows.len().div_ceil(self.per_line())
+    }
+
+    /// Líneas que caben a la vez.
+    fn page(&self) -> usize {
+        match self.view {
+            View::Details => (self.avail_h() / ROW_H).max(1) as usize,
+            View::Icons => (self.avail_h() / CELL_H).max(1) as usize,
+            View::List => (self.avail_w() / LCOL_W).max(1) as usize,
+        }
     }
 
     fn max_top(&self) -> usize {
-        self.rows.len().saturating_sub(self.vis())
+        self.lines().saturating_sub(self.page())
     }
 
+    fn need_sb(&self) -> bool {
+        self.lines() > self.page()
+    }
+
+    fn horiz(&self) -> bool {
+        self.view == View::List
+    }
+
+    /// Zona donde se dibujan los elementos (sin barra de desplazamiento).
+    fn area(&self) -> Rect {
+        let vs = match self.view {
+            View::Details if self.need_sb() => SB_W,
+            View::Icons => SB_W,
+            _ => 0,
+        };
+        Rect::new(PANEL_W, self.top_y(), self.w - PANEL_W - vs, self.avail_h())
+    }
+
+    fn track(&self) -> Rect {
+        let y = self.top_y();
+        if self.horiz() {
+            Rect::new(PANEL_W, self.h - STATUS_H - SB_W, self.w - PANEL_W, SB_W)
+        } else {
+            Rect::new(self.w - SB_W, y, SB_W, (self.h - STATUS_H - y).max(1))
+        }
+    }
+
+    /// Pulgar de la barra: (inicio, largo) a lo largo de la pista.
+    fn thumb(&self) -> (i32, i32) {
+        let t = self.track();
+        let (start, tl) = if self.horiz() { (t.x, t.w) } else { (t.y, t.h) };
+        let n = self.lines() as i32;
+        let len = (tl * self.page() as i32 / n.max(1)).clamp(20.min(tl), tl);
+        let max = self.max_top() as i32;
+        let pos = if max == 0 { 0 } else { (tl - len) * self.top as i32 / max };
+        (start + pos, len)
+    }
+
+    fn col_x(&self) -> [i32; 4] {
+        let lw = self.w - PANEL_W - if self.need_sb() { SB_W } else { 0 };
+        let size = PANEL_W + lw - COL_W[2];
+        let b = size - COL_W[1];
+        let a = b - COL_W[0];
+        [PANEL_W, a, b, size]
+    }
+
+    /// Rectángulo del elemento `i` (puede quedar fuera de la zona si no está visible).
+    fn item_rect(&self, i: usize) -> Rect {
+        let a = self.area();
+        let pl = self.per_line();
+        let (line, slot) = ((i / pl) as i32 - self.top as i32, (i % pl) as i32);
+        match self.view {
+            View::Details => Rect::new(a.x, a.y + line * ROW_H, a.w, ROW_H),
+            View::Icons => Rect::new(a.x + slot * CELL_W, a.y + line * CELL_H, CELL_W, CELL_H),
+            View::List => Rect::new(a.x + line * LCOL_W, a.y + slot * ROW_H, LCOL_W, ROW_H),
+        }
+    }
+
+    fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+        let a = self.area();
+        if !a.contains(x, y) {
+            return None;
+        }
+        let (dx, dy) = (x - a.x, y - a.y);
+        let (line, slot) = match self.view {
+            View::Details => (dy / ROW_H, 0),
+            View::Icons => (dy / CELL_H, dx / CELL_W),
+            View::List => (dx / LCOL_W, dy / ROW_H),
+        };
+        let pl = self.per_line();
+        if line as usize >= self.page() || slot as usize >= pl {
+            return None;
+        }
+        let i = (self.top + line as usize) * pl + slot as usize;
+        (i < self.rows.len()).then_some(i)
+    }
+
+    fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
+        self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h.clone())
+    }
+
+    // ---- carga y operaciones ----
+
     fn reload(&mut self, sys: &mut dyn Platform) {
+        if !self.prefs_loaded {
+            self.load_prefs(sys.files());
+        }
         let keep = self.want.take().or_else(|| self.sel_row().map(|r| r.name.clone()));
         let f = sys.files();
         self.gen = f.generation();
@@ -209,6 +494,7 @@ impl Explorer {
                 }
             }
         }
+        self.sort_rows();
         self.sel = keep.and_then(|k| self.rows.iter().position(|r| r.name == k));
         self.top = self.top.min(self.max_top());
     }
@@ -277,15 +563,18 @@ impl Explorer {
 
     fn enabled(&self, c: Cmd) -> bool {
         let sel = self.sel.is_some();
+        let trash = self.trash();
         match c {
-            Cmd::NewFolder => true,
-            Cmd::Rename | Cmd::Copy | Cmd::Cut | Cmd::Delete | Cmd::Restore => sel,
-            Cmd::Paste => CLIP.lock().is_some(),
+            Cmd::NewFolder => !trash,
+            Cmd::Rename | Cmd::Copy | Cmd::Cut | Cmd::Delete => sel && !trash,
+            Cmd::Restore => sel,
+            Cmd::Paste => self.has_clip && !trash,
             Cmd::EmptyTrash => !self.rows.is_empty(),
         }
     }
 
     fn run(&mut self, c: Cmd, cx: &mut Ctx) {
+        self.has_clip = cx.sys.files().clip().is_some();
         if !self.enabled(c) {
             return;
         }
@@ -311,10 +600,13 @@ impl Explorer {
                     value: name,
                 });
             }
-            Cmd::Copy | Cmd::Cut => *CLIP.lock() = Some((path, c == Cmd::Cut)),
-            Cmd::Paste => self.paste(now, cx),
+            Cmd::Copy | Cmd::Cut => cx.sys.files().set_clip(&path, c == Cmd::Cut),
+            Cmd::Paste => {
+                let dir = self.cwd.clone();
+                self.paste_into(&dir, cx);
+            }
             Cmd::Delete => {
-                let r = cx.sys.files().trash(&path, now);
+                let r = cx.sys.files().user_trash(&path, now);
                 self.done(r, cx);
             }
             Cmd::Restore => {
@@ -334,26 +626,35 @@ impl Explorer {
         cx.redraw = true;
     }
 
-    fn paste(&mut self, now: DateTime, cx: &mut Ctx) {
-        let Some((src, cut)) = CLIP.lock().clone() else { return };
-        let name = String::from(file_name(&src));
-        let f = cx.sys.files();
-        let r = if cut && parent(&src).is_some_and(|p| same(&p, &self.cwd)) {
-            Ok(()) // mover a la misma carpeta: nada que hacer
-        } else {
-            let name = if f.exists(&join(&self.cwd, &name)) { f.free_name(&self.cwd, &name) } else { name };
-            self.want = Some(name.clone());
-            let dst = join(&self.cwd, &name);
-            if cut {
-                f.rename(&src, &dst)
-            } else {
-                f.copy(&src, &dst, now)
-            }
-        };
-        if cut && r.is_ok() {
-            *CLIP.lock() = None;
+    fn paste_into(&mut self, dir: &str, cx: &mut Ctx) {
+        let now = cx.sys.now();
+        let r = cx.sys.files().paste(dir, now);
+        if let (Ok(p), true) = (&r, same(dir, &self.cwd)) {
+            self.want = Some(String::from(file_name(p)));
         }
+        self.done(r.map(|_| ()), cx);
+    }
+
+    fn undo(&mut self, cx: &mut Ctx) {
+        if cx.sys.files().undo_label().is_none() {
+            return;
+        }
+        let now = cx.sys.now();
+        let r = cx.sys.files().undo(now);
         self.done(r, cx);
+    }
+
+    fn new_doc(&mut self, cx: &mut Ctx) {
+        if self.trash() {
+            return;
+        }
+        let name = cx.sys.files().free_name(&self.cwd, "Nuevo documento de texto.txt");
+        cx.dialog = Some(DialogRequest::Input {
+            tag: TAG_NEWDOC,
+            title: String::from("Nuevo documento de texto"),
+            label: String::from("Nombre del documento:"),
+            value: name,
+        });
     }
 
     fn select(&mut self, i: usize) {
@@ -362,59 +663,162 @@ impl Explorer {
         }
         let i = i.min(self.rows.len() - 1);
         self.sel = Some(i);
-        let vis = self.vis();
-        if i < self.top {
-            self.top = i;
-        } else if i >= self.top + vis {
-            self.top = i + 1 - vis;
+        let (line, page) = (i / self.per_line(), self.page());
+        if line < self.top {
+            self.top = line;
+        } else if line >= self.top + page {
+            self.top = line + 1 - page;
         }
     }
 
+    /// Mueve la selección `d` elementos (sin selección: primero o último).
     fn step(&mut self, d: i32) {
-        let cur = self.sel.map_or(if d > 0 { -1 } else { self.rows.len() as i32 }, |i| i as i32);
-        self.select((cur + d).clamp(0, self.rows.len() as i32 - 1).max(0) as usize);
-    }
-
-    // ---- geometría ----
-
-    fn need_sb(&self) -> bool {
-        self.rows.len() > self.vis()
-    }
-
-    fn track(&self) -> Rect {
-        let y = NAV_H + CMD_H + HEAD_H;
-        Rect::new(self.w - SB_W, y, SB_W, (self.h - STATUS_H - y).max(1))
-    }
-
-    /// Pulgar de la barra: (inicio, largo) dentro de la pista.
-    fn thumb(&self) -> (i32, i32) {
-        let t = self.track();
         let n = self.rows.len() as i32;
-        let len = (t.h * self.vis() as i32 / n.max(1)).clamp(20.min(t.h), t.h);
-        let max = self.max_top() as i32;
-        let pos = if max == 0 { 0 } else { (t.h - len) * self.top as i32 / max };
-        (t.y + pos, len)
-    }
-
-    fn col_x(&self) -> [i32; 4] {
-        let lw = self.w - PANEL_W - if self.need_sb() { SB_W } else { 0 };
-        let size = PANEL_W + lw - COL_W[2];
-        let b = size - COL_W[1];
-        let a = b - COL_W[0];
-        [PANEL_W, a, b, size]
-    }
-
-    fn row_at(&self, x: i32, y: i32) -> Option<usize> {
-        let y0 = NAV_H + CMD_H + HEAD_H;
-        if x < PANEL_W || y < y0 || y >= self.h - STATUS_H || (self.need_sb() && x >= self.w - SB_W) {
-            return None;
+        if n == 0 {
+            return;
         }
-        let i = self.top + ((y - y0) / ROW_H) as usize;
-        (i < self.rows.len()).then_some(i)
+        let i = match self.sel {
+            None if d > 0 => 0,
+            None => n - 1,
+            Some(c) => (c as i32 + d).clamp(0, n - 1),
+        };
+        self.select(i as usize);
     }
 
-    fn hit_at(&self, x: i32, y: i32) -> Option<Hit> {
-        self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h.clone())
+    // ---- menús ----
+
+    fn sort_menu(&self) -> MenuItem {
+        let k = |s: Sort, id: u32, t: &str| MenuItem::new(id, t).checked(self.sort == s);
+        MenuItem::submenu(
+            "Ordenar por",
+            vec![
+                k(Sort::Name, M_SORT_NAME, "Nombre"),
+                k(Sort::Date, M_SORT_DATE, "Fecha de modificación"),
+                k(Sort::Type, M_SORT_TYPE, "Tipo"),
+                k(Sort::Size, M_SORT_SIZE, "Tamaño"),
+                MenuItem::sep(),
+                MenuItem::new(M_ASC, "Ascendente").checked(!self.desc),
+                MenuItem::new(M_DESC, "Descendente").checked(self.desc),
+            ],
+        )
+    }
+
+    fn item_menu(&self, dir: bool, has_clip: bool) -> Vec<MenuItem> {
+        let n = MenuItem::new;
+        if self.trash() {
+            return vec![n(M_RESTORE, "Restaurar"), MenuItem::sep(), n(M_PROPS, "Propiedades")];
+        }
+        let mut v = vec![n(M_OPEN, "Abrir").bold()];
+        if dir {
+            v.push(n(M_OPEN_NEW, "Abrir en ventana nueva"));
+        } else {
+            v.push(MenuItem::submenu("Abrir con", vec![n(M_NOTEPAD, "Bloc de notas")]));
+        }
+        v.push(MenuItem::sep());
+        v.push(n(M_CUT, "Cortar"));
+        v.push(n(M_COPY, "Copiar"));
+        if dir {
+            v.push(n(M_PASTE, "Pegar").disabled(!has_clip));
+        }
+        v.extend([
+            MenuItem::sep(),
+            n(M_DELETE, "Eliminar"),
+            n(M_RENAME, "Cambiar nombre"),
+            MenuItem::sep(),
+            n(M_PROPS, "Propiedades"),
+        ]);
+        v
+    }
+
+    fn bg_menu(&self, has_clip: bool, undo: Option<&'static str>) -> Vec<MenuItem> {
+        let n = MenuItem::new;
+        if self.trash() {
+            return vec![
+                self.sort_menu(),
+                n(M_REFRESH, "Actualizar"),
+                MenuItem::sep(),
+                n(M_EMPTY, "Vaciar Papelera").disabled(self.rows.is_empty()),
+            ];
+        }
+        let undo = match undo {
+            Some(l) => n(M_UNDO, &format!("Deshacer {l}")),
+            None => n(M_UNDO, "Deshacer").disabled(true),
+        };
+        vec![
+            MenuItem::submenu(
+                "Ver",
+                vec![
+                    n(M_VIEW_ICONS, "Iconos grandes").checked(self.view == View::Icons),
+                    n(M_VIEW_LIST, "Lista").checked(self.view == View::List),
+                    n(M_VIEW_DETAILS, "Detalles").checked(self.view == View::Details),
+                ],
+            ),
+            self.sort_menu(),
+            n(M_REFRESH, "Actualizar"),
+            MenuItem::sep(),
+            n(M_PASTE, "Pegar").disabled(!has_clip),
+            undo.shortcut("Ctrl+Z"),
+            MenuItem::sep(),
+            MenuItem::submenu("Nuevo", vec![n(M_NEW_FOLDER, "Carpeta"), n(M_NEW_DOC, "Documento de texto")]),
+            MenuItem::sep(),
+            n(M_PROPS, "Propiedades"),
+        ]
+    }
+
+    /// Cuadro "Propiedades" del elemento seleccionado (`item`) o de la carpeta actual.
+    fn props(&self, item: bool, cx: &mut Ctx) {
+        let (title, text) = if let (true, Some(r)) = (item, self.sel_row()) {
+            let ty = kind_of(&r.name, r.dir);
+            let mut t = format!("Nombre: {}\nTipo: {ty}\n", r.name);
+            if self.trash() {
+                t += &format!("Ubicación original: {}\n", r.loc);
+                if !r.dir {
+                    t += &format!("Tamaño: {}\n", size_text(r.size));
+                }
+                t += &format!("Eliminado: {}", fmt_date(r.date));
+            } else {
+                let path = join(&self.cwd, &r.name);
+                t += &format!("Ubicación: {}\n", self.cwd);
+                if r.dir {
+                    let n = cx.sys.files().list(&path).map_or(0, |v| v.len());
+                    t += &format!("Contiene: {}\n", count_text(n));
+                } else {
+                    t += &format!("Tamaño: {}\n", size_text(r.size));
+                }
+                t += &format!("Modificado: {}", fmt_date(r.date));
+            }
+            (r.name.clone(), t)
+        } else {
+            let name = match file_name(&self.cwd) {
+                "" => "Disco local (C:)",
+                n => n,
+            };
+            let mut t = format!("Nombre: {name}\nTipo: Carpeta de archivos\n");
+            if let Some(p) = parent(&self.cwd) {
+                t += &format!("Ubicación: {p}\n");
+            }
+            t += &format!("Contiene: {}", count_text(self.rows.len()));
+            if let Ok(e) = cx.sys.files().stat(&self.cwd) {
+                t += &format!("\nModificado: {}", fmt_date(e.modified));
+            }
+            (String::from(name), t)
+        };
+        cx.dialog = Some(DialogRequest::Message {
+            tag: TAG_PROPS,
+            title: format!("Propiedades de {title}"),
+            text,
+            buttons: Buttons::Ok,
+        });
+    }
+
+    fn head_sort(&self, k: usize) -> Option<Sort> {
+        match (self.trash(), k) {
+            (_, 0) => Some(Sort::Name),
+            (true, 2) | (false, 1) => Some(Sort::Date),
+            (false, 2) => Some(Sort::Type),
+            (_, 3) => Some(Sort::Size),
+            _ => None,
+        }
     }
 
     // ---- dibujo ----
@@ -501,7 +905,7 @@ impl Explorer {
         } else {
             &[
                 (Cmd::NewFolder, "Nueva carpeta"),
-                (Cmd::Rename, "Renombrar"),
+                (Cmd::Rename, "Cambiar nombre"),
                 (Cmd::Copy, "Copiar"),
                 (Cmd::Cut, "Cortar"),
                 (Cmd::Paste, "Pegar"),
@@ -542,34 +946,57 @@ impl Explorer {
         }
     }
 
-    fn list(&mut self, s: &mut Surface, theme: &Theme) {
-        let trash = self.trash();
+    /// Cabecera de columnas de Detalles; cada título es un botón de orden.
+    fn heads(&mut self, s: &mut Surface, end: i32) {
         let y0 = NAV_H + CMD_H;
         let cx = self.col_x();
-        s.fill_rect(Rect::new(PANEL_W, y0, self.w - PANEL_W, self.h - y0 - STATUS_H), 0xFFFFFF);
-        let heads: [&str; 4] = if trash {
+        let heads: [&str; 4] = if self.trash() {
             ["Nombre", "Ubicación original", "Fecha de eliminación", "Tamaño"]
         } else {
             ["Nombre", "Fecha de modificación", "Tipo", "Tamaño"]
         };
-        let end = if self.need_sb() { self.w - SB_W } else { self.w };
         for (k, h) in heads.iter().enumerate() {
             let x1 = if k == 3 { end } else { cx[k + 1] };
-            let r = Rect::new(cx[k] + 6, y0, x1 - cx[k] - 10, HEAD_H);
+            let cell = Rect::new(cx[k], y0, x1 - cx[k], HEAD_H);
+            let sort = self.head_sort(k);
+            if let Some(so) = sort {
+                if self.hover == Some(Hit::Head(so)) {
+                    s.fill_rect(cell, 0xE5F1FB);
+                }
+                self.hits.push((cell, Hit::Head(so)));
+            }
+            let mut r = Rect::new(cx[k] + 6, y0, x1 - cx[k] - 10, HEAD_H);
+            if sort == Some(self.sort) {
+                // Flecha ↑ (ascendente) o ↓ (descendente); a la izquierda en la columna alineada a la derecha.
+                let ax = if k == 3 { r.x + 5 } else { r.right() - 5 } as f32;
+                let (ay, d) = ((y0 + HEAD_H / 2) as f32, if self.desc { 1.0 } else { -1.0 });
+                s.stroke(&[(ax - 3.0, ay - 1.5 * d), (ax, ay + 1.5 * d), (ax + 3.0, ay - 1.5 * d)], 1.0, TEXT);
+                if k == 3 {
+                    r.x += 12;
+                }
+                r.w -= 12;
+            }
             clipped(s, r, h, GRAY, if k == 3 { Align::Right } else { Align::Left });
             if k > 0 {
                 s.fill_rect(Rect::new(cx[k], y0 + 3, 1, HEAD_H - 6), LINE);
             }
         }
-        let vis = self.vis();
-        for (n, row) in self.rows.iter().enumerate().skip(self.top).take(vis + 1) {
-            let y = y0 + HEAD_H + (n - self.top) as i32 * ROW_H;
-            if y + ROW_H > self.h - STATUS_H {
-                break;
-            }
-            if self.sel == Some(n) {
-                s.fill_rect(Rect::new(PANEL_W, y, end - PANEL_W, ROW_H), blend(0xFFFFFF, theme.accent, 55));
-            }
+    }
+
+    fn list(&mut self, s: &mut Surface, theme: &Theme) {
+        let trash = self.trash();
+        let y0 = NAV_H + CMD_H;
+        let a = self.area();
+        s.fill_rect(Rect::new(PANEL_W, y0, self.w - PANEL_W, self.h - y0 - STATUS_H), 0xFFFFFF);
+        if self.view == View::Details {
+            self.heads(s, a.right());
+        }
+        let cx = self.col_x();
+        let (pl, page) = (self.per_line(), self.page());
+        let old = s.clip();
+        s.set_clip(old.intersect(a));
+        for (n, row) in self.rows.iter().enumerate().skip(self.top * pl).take(page * pl) {
+            let r = self.item_rect(n);
             let icon = if row.dir {
                 Icon::Folder
             } else if is_txt(&row.name) {
@@ -577,36 +1004,56 @@ impl Explorer {
             } else {
                 Icon::FileBlank
             };
-            icons::draw(s, icon, PANEL_W + 6, y + 3, 16, 0x444444);
-            clipped(s, Rect::new(PANEL_W + 28, y, cx[1] - PANEL_W - 32, ROW_H), &row.name, TEXT, Align::Left);
-            let (c1, c2) = if trash {
-                (row.loc.clone(), fmt_date(row.date))
-            } else {
-                let ty = if row.dir {
-                    "Carpeta de archivos"
-                } else if is_txt(&row.name) {
-                    "Documento de texto"
-                } else {
-                    "Archivo"
-                };
-                (fmt_date(row.date), String::from(ty))
-            };
-            clipped(s, Rect::new(cx[1] + 6, y, cx[2] - cx[1] - 10, ROW_H), &c1, GRAY, Align::Left);
-            clipped(s, Rect::new(cx[2] + 6, y, cx[3] - cx[2] - 10, ROW_H), &c2, GRAY, Align::Left);
-            if !row.dir {
-                clipped(s, Rect::new(cx[3] + 6, y, end - cx[3] - 10, ROW_H), &fmt_size(row.size), GRAY, Align::Right);
+            let hl = blend(0xFFFFFF, theme.accent, 55);
+            match self.view {
+                View::Details => {
+                    if self.sel == Some(n) {
+                        s.fill_rect(r, hl);
+                    }
+                    let y = r.y;
+                    icons::draw(s, icon, PANEL_W + 6, y + 3, 16, 0x444444);
+                    clipped(s, Rect::new(PANEL_W + 28, y, cx[1] - PANEL_W - 32, ROW_H), &row.name, TEXT, Align::Left);
+                    let (c1, c2) = if trash {
+                        (row.loc.clone(), fmt_date(row.date))
+                    } else {
+                        (fmt_date(row.date), String::from(kind_of(&row.name, row.dir)))
+                    };
+                    clipped(s, Rect::new(cx[1] + 6, y, cx[2] - cx[1] - 10, ROW_H), &c1, GRAY, Align::Left);
+                    clipped(s, Rect::new(cx[2] + 6, y, cx[3] - cx[2] - 10, ROW_H), &c2, GRAY, Align::Left);
+                    if !row.dir {
+                        let sz = Rect::new(cx[3] + 6, y, a.right() - cx[3] - 10, ROW_H);
+                        clipped(s, sz, &fmt_size(row.size), GRAY, Align::Right);
+                    }
+                }
+                View::List => {
+                    if self.sel == Some(n) {
+                        s.fill_rect(Rect::new(r.x, r.y, r.w - 4, r.h), hl);
+                    }
+                    icons::draw(s, icon, r.x + 4, r.y + 3, 16, 0x444444);
+                    clipped(s, Rect::new(r.x + 26, r.y, r.w - 34, r.h), &row.name, TEXT, Align::Left);
+                }
+                View::Icons => {
+                    if self.sel == Some(n) {
+                        s.fill_rect(Rect::new(r.x + 2, r.y + 2, r.w - 4, r.h - 4), hl);
+                    }
+                    icons::draw(s, icon, r.x + (r.w - BIG) / 2, r.y + 5, BIG, 0x444444);
+                    let name = dialogs::fit(&row.name, 9, r.w - 10);
+                    clipped(s, Rect::new(r.x + 3, r.y + BIG + 8, r.w - 6, 18), &name, TEXT, Align::Center);
+                }
             }
         }
+        s.set_clip(old);
         if self.need_sb() {
             let t = self.track();
             s.fill_rect(t, 0xF0F0F0);
-            let (ty, len) = self.thumb();
+            let (ts, len) = self.thumb();
             let c = if self.drag.is_some() { 0x7A7A7A } else { 0xB4B4B4 };
-            s.fill_rect(Rect::new(t.x + 2, ty, t.w - 4, len), c);
+            let thumb = if self.horiz() { Rect::new(ts, t.y + 2, len, t.h - 4) } else { Rect::new(t.x + 2, ts, t.w - 4, len) };
+            s.fill_rect(thumb, c);
         }
         if self.rows.is_empty() {
             let t = if trash { "La Papelera está vacía." } else { "Esta carpeta está vacía." };
-            font::draw_in(s, Rect::new(PANEL_W, y0 + HEAD_H + 10, end - PANEL_W, 20), t, 9, false, GRAY, Align::Center);
+            font::draw_in(s, Rect::new(PANEL_W, a.y + 10, a.w, 20), t, 9, false, GRAY, Align::Center);
         }
     }
 
@@ -614,8 +1061,7 @@ impl Explorer {
         let y = self.h - STATUS_H;
         s.fill_rect(Rect::new(0, y, self.w, STATUS_H), 0xF7F7F7);
         s.fill_rect(Rect::new(0, y, self.w, 1), LINE);
-        let n = self.rows.len();
-        let t = if n == 1 { String::from("1 elemento") } else { format!("{n} elementos") };
+        let t = count_text(self.rows.len());
         font::draw_in(s, Rect::new(10, y, 200, STATUS_H), &t, 9, false, GRAY, Align::Left);
         let (total, free) = sys.files().space();
         let t = format!("{} libres de {}", fmt_size(free), fmt_size(total));
@@ -647,6 +1093,7 @@ impl App for Explorer {
         if sys.files().generation() != self.gen {
             self.reload(sys);
         }
+        self.has_clip = sys.files().clip().is_some();
         self.top = self.top.min(self.max_top());
         self.hits.clear();
         let b = s.bounds();
@@ -659,22 +1106,31 @@ impl App for Explorer {
     }
 
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
-        let vis = self.vis() as i32;
         if ev.ctrl {
             match ev.key {
                 Key::Char('c') => self.run(Cmd::Copy, cx),
                 Key::Char('x') => self.run(Cmd::Cut, cx),
                 Key::Char('v') => self.run(Cmd::Paste, cx),
+                Key::Char('z') => self.undo(cx),
                 _ => {}
             }
             return;
         }
         let trash = self.trash();
+        let (pl, page) = (self.per_line() as i32, self.page() as i32);
+        // Desplazamientos de la selección según la vista: (arriba, abajo, izquierda, derecha, página).
+        let (up, down, left, right, pg) = match self.view {
+            View::Details => (-1, 1, 0, 0, page),
+            View::Icons => (-pl, pl, -1, 1, pl * page),
+            View::List => (-1, 1, -pl, pl, pl * page),
+        };
         match ev.key {
-            Key::Up => self.step(-1),
-            Key::Down => self.step(1),
-            Key::PageUp => self.step(-vis),
-            Key::PageDown => self.step(vis),
+            Key::Up => self.step(up),
+            Key::Down => self.step(down),
+            Key::Left if left != 0 => self.step(left),
+            Key::Right if right != 0 => self.step(right),
+            Key::PageUp => self.step(-pg),
+            Key::PageDown => self.step(pg),
             Key::Home => self.select(0),
             Key::End => self.select(usize::MAX),
             Key::Enter => self.open_sel(cx),
@@ -689,7 +1145,31 @@ impl App for Explorer {
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         match ev {
-            MouseEv::RightDown { .. } | MouseEv::Wheel { .. } => {}
+            MouseEv::RightDown { x, y } => {
+                let has_clip = cx.sys.files().clip().is_some();
+                let (tag, items) = if let Some(i) = self.item_at(x, y) {
+                    self.sel = Some(i);
+                    self.last_click = None;
+                    (TAG_MENU_ITEM, self.item_menu(self.rows[i].dir, has_clip))
+                } else if self.area().contains(x, y) {
+                    self.sel = None;
+                    (TAG_MENU_BG, self.bg_menu(has_clip, cx.sys.files().undo_label()))
+                } else {
+                    return;
+                };
+                cx.menu = Some(MenuRequest { tag, x, y, items });
+                cx.redraw = true;
+            }
+            MouseEv::Wheel { x, y, dz } => {
+                if x >= PANEL_W && y >= NAV_H + CMD_H && y < self.h - STATUS_H {
+                    let step = if self.view == View::Details { WHEEL_ROWS } else { 1 };
+                    let t = (self.top as i32 + dz * step).clamp(0, self.max_top() as i32) as usize;
+                    if t != self.top {
+                        self.top = t;
+                        cx.redraw = true;
+                    }
+                }
+            }
             MouseEv::Leave => {
                 if self.hover.take().is_some() {
                     cx.redraw = true;
@@ -698,9 +1178,10 @@ impl App for Explorer {
             MouseEv::Move { x, y } => {
                 if let Some(off) = self.drag {
                     let t = self.track();
+                    let (start, tl, p) = if self.horiz() { (t.x, t.w, x) } else { (t.y, t.h, y) };
                     let (_, len) = self.thumb();
-                    let span = (t.h - len).max(1);
-                    let p = (y - off - t.y).clamp(0, span);
+                    let span = (tl - len).max(1);
+                    let p = (p - off - start).clamp(0, span);
                     self.top = (p as usize * self.max_top() + span as usize / 2) / span as usize;
                     cx.redraw = true;
                     return;
@@ -725,20 +1206,29 @@ impl App for Explorer {
                         Hit::Crumb(p) => self.go(&p, true, cx),
                         Hit::Cmd(c) => self.run(c, cx),
                         Hit::Place(i) => self.go(PLACES[i].1, true, cx),
+                        Hit::Head(so) => {
+                            if self.sort == so {
+                                self.desc = !self.desc;
+                            } else {
+                                (self.sort, self.desc) = (so, false);
+                            }
+                            self.prefs_changed(cx);
+                        }
                     }
                     return;
                 }
                 if self.need_sb() && self.track().contains(x, y) {
-                    let (ty, len) = self.thumb();
-                    if y >= ty && y < ty + len {
-                        self.drag = Some(y - ty);
+                    let (ts, len) = self.thumb();
+                    let p = if self.horiz() { x } else { y };
+                    if p >= ts && p < ts + len {
+                        self.drag = Some(p - ts);
                     } else {
-                        let v = self.vis();
-                        self.top = if y < ty { self.top.saturating_sub(v) } else { (self.top + v).min(self.max_top()) };
+                        let v = self.page();
+                        self.top = if p < ts { self.top.saturating_sub(v) } else { (self.top + v).min(self.max_top()) };
                     }
                     return;
                 }
-                match self.row_at(x, y) {
+                match self.item_at(x, y) {
                     Some(i) => {
                         self.sel = Some(i);
                         if self.last_click.is_some_and(|(j, t)| j == i && cx.now_ms.saturating_sub(t) < DOUBLE_MS) {
@@ -749,7 +1239,7 @@ impl App for Explorer {
                         }
                     }
                     None => {
-                        if x >= PANEL_W && y >= NAV_H + CMD_H + HEAD_H && y < self.h - STATUS_H {
+                        if self.area().contains(x, y) {
                             self.sel = None;
                         }
                     }
@@ -771,7 +1261,19 @@ impl App for Explorer {
             DialogResult::Text { tag: TAG_NEW, value: Some(v) } => {
                 let r = if valid_name(&v) {
                     self.want = Some(v.clone());
-                    cx.sys.files().mkdir(&join(&self.cwd, &v), now)
+                    cx.sys.files().user_create(&join(&self.cwd, &v), true, now)
+                } else {
+                    Err(FsError::BadName)
+                };
+                self.done(r, cx);
+            }
+            DialogResult::Text { tag: TAG_NEWDOC, value: Some(mut v) } => {
+                if !v.rsplit_once('.').is_some_and(|(a, b)| !a.is_empty() && !b.is_empty()) {
+                    v.push_str(".txt");
+                }
+                let r = if valid_name(&v) {
+                    self.want = Some(v.clone());
+                    cx.sys.files().user_create(&join(&self.cwd, &v), false, now)
                 } else {
                     Err(FsError::BadName)
                 };
@@ -786,7 +1288,7 @@ impl App for Explorer {
                 } else {
                     let to = join(&parent(&from).unwrap_or_default(), &v);
                     self.want = Some(v);
-                    cx.sys.files().rename(&from, &to)
+                    cx.sys.files().user_rename(&from, &to)
                 };
                 self.done(r, cx);
             }
@@ -796,6 +1298,62 @@ impl App for Explorer {
             }
             _ => {}
         }
+    }
+
+    fn menu_result(&mut self, tag: u32, id: u32, cx: &mut Ctx) {
+        let item = tag == TAG_MENU_ITEM;
+        let path = self.sel_row().map(|r| join(&self.cwd, &r.name));
+        let dir = self.sel_row().is_some_and(|r| r.dir);
+        match id {
+            M_OPEN => self.open_sel(cx),
+            M_OPEN_NEW if dir => cx.open_new = path,
+            M_NOTEPAD if !dir => cx.open = path,
+            M_CUT => self.run(Cmd::Cut, cx),
+            M_COPY => self.run(Cmd::Copy, cx),
+            M_PASTE => {
+                self.has_clip = cx.sys.files().clip().is_some();
+                match path {
+                    Some(p) if item && dir && self.has_clip => self.paste_into(&p, cx),
+                    _ if self.enabled(Cmd::Paste) => {
+                        let dir = self.cwd.clone();
+                        self.paste_into(&dir, cx);
+                    }
+                    _ => {}
+                }
+            }
+            M_DELETE => self.run(Cmd::Delete, cx),
+            M_RENAME => self.run(Cmd::Rename, cx),
+            M_PROPS => self.props(item, cx),
+            M_RESTORE => self.run(Cmd::Restore, cx),
+            M_EMPTY => self.run(Cmd::EmptyTrash, cx),
+            M_REFRESH => self.reload(cx.sys),
+            M_UNDO => self.undo(cx),
+            M_NEW_FOLDER => self.run(Cmd::NewFolder, cx),
+            M_NEW_DOC => self.new_doc(cx),
+            M_VIEW_DETAILS | M_VIEW_LIST | M_VIEW_ICONS => {
+                self.view = match id {
+                    M_VIEW_DETAILS => View::Details,
+                    M_VIEW_LIST => View::List,
+                    _ => View::Icons,
+                };
+                self.prefs_changed(cx);
+            }
+            M_SORT_NAME | M_SORT_DATE | M_SORT_TYPE | M_SORT_SIZE => {
+                self.sort = match id {
+                    M_SORT_NAME => Sort::Name,
+                    M_SORT_DATE => Sort::Date,
+                    M_SORT_TYPE => Sort::Type,
+                    _ => Sort::Size,
+                };
+                self.prefs_changed(cx);
+            }
+            M_ASC | M_DESC => {
+                self.desc = id == M_DESC;
+                self.prefs_changed(cx);
+            }
+            _ => {}
+        }
+        cx.redraw = true;
     }
 
     fn open_path(&mut self, path: &str, cx: &mut Ctx) {
@@ -808,14 +1366,14 @@ mod tests {
     use super::*;
     use crate::platform::TestPlatform;
 
-    /// Los tests comparten el portapapeles: se serializan.
-    static SERIAL: SpinLock<()> = SpinLock::new(());
 
     struct T {
         e: Explorer,
         sys: TestPlatform,
         th: Theme,
         now: u64,
+        menu: Option<MenuRequest>,
+        open_new: Option<String>,
     }
 
     impl T {
@@ -824,7 +1382,7 @@ mod tests {
             let now = sys.now();
             sys.files.write("C:\\Documentos\\nota.txt", b"hola", now).unwrap();
             sys.files.mkdir("C:\\Documentos\\Sub", now).unwrap();
-            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000 };
+            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None };
             t.draw();
             t
         }
@@ -836,6 +1394,8 @@ mod tests {
         fn cx<R>(&mut self, f: impl FnOnce(&mut Explorer, &mut Ctx) -> R) -> (R, Option<DialogRequest>, Option<String>) {
             let mut cx = Ctx::new(&mut self.sys, &mut self.th, self.now);
             let r = f(&mut self.e, &mut cx);
+            self.menu = cx.menu.take();
+            self.open_new = cx.open_new.take();
             (r, cx.dialog.take(), cx.open.take())
         }
         fn key(&mut self, key: Key, ctrl: bool) -> (Option<DialogRequest>, Option<String>) {
@@ -878,7 +1438,6 @@ mod tests {
 
     #[test]
     fn navega_y_vuelve_atras() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         assert_eq!(t.e.title(), "Documentos");
         t.open("C:\\");
@@ -902,7 +1461,6 @@ mod tests {
 
     #[test]
     fn doble_clic_carpeta_y_archivo() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         // Orden: carpeta Sub, archivo nota.txt.
         t.click(300, T::row_y(1));
@@ -924,7 +1482,6 @@ mod tests {
 
     #[test]
     fn nueva_carpeta_y_renombrar() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         let (x, y) = t.btn(Cmd::NewFolder);
         let (d, _) = t.click(x, y);
@@ -957,7 +1514,6 @@ mod tests {
 
     #[test]
     fn copiar_y_pegar() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         selecciona(&mut t, "nota.txt");
         t.key(Key::Char('c'), true);
@@ -975,7 +1531,6 @@ mod tests {
 
     #[test]
     fn cortar_y_pegar() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         selecciona(&mut t, "nota.txt");
         t.key(Key::Char('x'), true);
@@ -993,7 +1548,6 @@ mod tests {
 
     #[test]
     fn eliminar_restaurar_y_vaciar() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         selecciona(&mut t, "nota.txt");
         t.key(Key::Delete, false);
@@ -1027,7 +1581,6 @@ mod tests {
 
     #[test]
     fn teclado_y_recarga() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         t.key(Key::End, false);
         t.key(Key::Home, false);
@@ -1059,7 +1612,6 @@ mod tests {
 
     #[test]
     fn panel_izquierdo_y_barra() {
-        let _g = SERIAL.lock();
         let mut t = T::new();
         t.click(30, NAV_H + CMD_H + 8 + 4); // Escritorio
         assert_eq!(t.e.title(), "Escritorio");
@@ -1080,5 +1632,528 @@ mod tests {
         t.cx(|e, cx| e.mouse(MouseEv::Up { x: w - 5, y: 400 }, cx));
         assert_eq!(fmt_size(1536), "2 KB");
         assert_eq!(fmt_size(5 << 20), "5.0 MB");
+    }
+
+    // ---- menú contextual, orden, vistas, deshacer, propiedades, rueda, preferencias ----
+
+    fn texts(v: &[MenuItem]) -> Vec<String> {
+        v.iter()
+            .map(|m| {
+                if m.separator {
+                    String::from("-")
+                } else if !m.sub.is_empty() {
+                    format!("{} >", m.text)
+                } else {
+                    m.text.clone()
+                }
+            })
+            .collect()
+    }
+
+    fn dt(day: u8) -> DateTime {
+        DateTime { year: 2026, month: 11, day, hour: 9, minute: 0, second: 0 }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| String::from(*s)).collect()
+    }
+
+    impl T {
+        fn right(&mut self, x: i32, y: i32) -> Option<MenuRequest> {
+            self.cx(|e, cx| e.mouse(MouseEv::RightDown { x, y }, cx));
+            self.draw();
+            self.menu.take()
+        }
+        /// Elige `id` del menú de `tag` y devuelve el diálogo que pida.
+        fn pick(&mut self, tag: u32, id: u32) -> (Option<DialogRequest>, Option<String>) {
+            let (_, d, o) = self.cx(|e, cx| e.menu_result(tag, id, cx));
+            self.draw();
+            (d, o)
+        }
+        fn right_row(&mut self, name: &str) -> MenuRequest {
+            let i = self.rows().iter().position(|n| n == name).unwrap();
+            let r = self.e.item_rect(i);
+            self.right(r.x + 10, r.y + 5).expect("menú")
+        }
+        fn rows(&self) -> Vec<String> {
+            self.e.rows.iter().map(|r| r.name.clone()).collect()
+        }
+        fn sel_name(&self) -> Option<String> {
+            self.e.sel_row().map(|r| r.name.clone())
+        }
+        fn view(&mut self, id: u32) {
+            self.pick(TAG_MENU_BG, id);
+        }
+        fn many(&mut self, n: usize) {
+            let now = self.now_dt();
+            for i in 0..n {
+                self.sys.files.write(&format!("C:\\Documentos\\f{i:02}"), b"x", now).unwrap();
+            }
+            self.draw();
+        }
+        fn wheel(&mut self, dz: i32) {
+            self.cx(|e, cx| e.mouse(MouseEv::Wheel { x: 300, y: 200, dz }, cx));
+            self.draw();
+        }
+        fn click_item(&mut self, i: usize) {
+            let r = self.e.item_rect(i);
+            self.click(r.x + 10, r.y + 5);
+        }
+    }
+
+    const EMPTY: (i32, i32) = (300, 440);
+
+    #[test]
+    fn menu_de_archivo_y_carpeta() {
+        let mut t = T::new();
+        let m = t.right_row("nota.txt");
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_ITEM, t.e.item_rect(1).x + 10, t.e.item_rect(1).y + 5));
+        assert_eq!(
+            texts(&m.items),
+            ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"]
+        );
+        assert!(m.items[0].bold && !m.items[1].bold);
+        assert_eq!(texts(&m.items[1].sub), ["Bloc de notas"]);
+        assert_eq!(t.sel_name().as_deref(), Some("nota.txt"));
+        // Carpeta: Pegar desactivado sin portapapeles y activo con él.
+        let m = t.right_row("Sub");
+        assert_eq!(
+            texts(&m.items),
+            ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"]
+        );
+        assert!(m.items.iter().find(|i| i.id == M_PASTE).unwrap().disabled);
+        t.sys.files.set_clip("C:\\Documentos\\nota.txt", false);
+        let m = t.right_row("Sub");
+        assert!(!m.items.iter().find(|i| i.id == M_PASTE).unwrap().disabled);
+        // Fuera de la lista (cabecera, panel, barra de órdenes) no hay menú.
+        assert!(t.right(300, NAV_H + CMD_H + 5).is_none());
+        assert!(t.right(30, 200).is_none());
+        assert!(t.right(300, 10).is_none());
+    }
+
+    #[test]
+    fn menu_de_zona_vacia() {
+        let mut t = T::new();
+        t.click_item(0);
+        let m = t.right(EMPTY.0, EMPTY.1).expect("menú");
+        assert_eq!(t.sel_name(), None);
+        assert_eq!((m.tag, m.x, m.y), (TAG_MENU_BG, EMPTY.0, EMPTY.1));
+        assert_eq!(
+            texts(&m.items),
+            ["Ver >", "Ordenar por >", "Actualizar", "-", "Pegar", "Deshacer", "-", "Nuevo >", "-", "Propiedades"]
+        );
+        assert_eq!(texts(&m.items[0].sub), ["Iconos grandes", "Lista", "Detalles"]);
+        assert_eq!(
+            texts(&m.items[1].sub),
+            ["Nombre", "Fecha de modificación", "Tipo", "Tamaño", "-", "Ascendente", "Descendente"]
+        );
+        assert_eq!(texts(&m.items[8 - 1].sub), ["Carpeta", "Documento de texto"]);
+        let ch = |v: &[MenuItem]| v.iter().filter(|i| i.checked).map(|i| i.text.clone()).collect::<Vec<_>>();
+        assert_eq!(ch(&m.items[0].sub), ["Detalles"]);
+        assert_eq!(ch(&m.items[1].sub), ["Nombre", "Ascendente"]);
+        let (pegar, deshacer) = (&m.items[4], &m.items[5]);
+        assert!(pegar.disabled && deshacer.disabled && deshacer.shortcut == "Ctrl+Z");
+        // Con algo que deshacer y en el portapapeles.
+        t.sys.files.set_clip("C:\\Documentos\\nota.txt", true);
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert!(!m.items[4].disabled);
+        assert_eq!((m.items[5].text.as_str(), m.items[5].disabled), ("Deshacer Eliminar", false));
+    }
+
+    #[test]
+    fn menu_en_la_papelera() {
+        let mut t = T::new();
+        t.open(files::TRASH);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert_eq!(texts(&m.items), ["Ordenar por >", "Actualizar", "-", "Vaciar Papelera"]);
+        assert!(m.items[3].disabled);
+        t.open("C:\\Documentos");
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        t.open(files::TRASH);
+        let m = t.right_row("nota.txt");
+        assert_eq!(texts(&m.items), ["Restaurar", "-", "Propiedades"]);
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        assert!(!m.items[3].disabled);
+        // Propiedades de un elemento de la Papelera.
+        t.right_row("nota.txt");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_PROPS);
+        let Some(DialogRequest::Message { title, text, buttons, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!((title.as_str(), buttons), ("Propiedades de nota.txt", Buttons::Ok));
+        assert!(text.contains("Ubicación original: C:\\Documentos") && text.contains("Eliminado: 15/11/2026"), "{text}");
+        // Restaurar desde el menú.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_RESTORE);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        // Vaciar desde el menú pide confirmación.
+        t.open("C:\\Documentos");
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        t.open(files::TRASH);
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_EMPTY);
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_EMPTY, .. })));
+    }
+
+    #[test]
+    fn acciones_del_menu_de_elemento() {
+        let mut t = T::new();
+        t.right_row("nota.txt");
+        let (_, o) = t.pick(TAG_MENU_ITEM, M_OPEN);
+        assert_eq!(o.as_deref(), Some("C:\\Documentos\\nota.txt"));
+        let (_, o) = t.pick(TAG_MENU_ITEM, M_NOTEPAD);
+        assert_eq!(o.as_deref(), Some("C:\\Documentos\\nota.txt"));
+        // Copiar y pegar dentro de la carpeta del menú; cortar y pegar con el menú de zona vacía.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_COPY);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", false)));
+        t.right_row("Sub");
+        t.pick(TAG_MENU_ITEM, M_PASTE);
+        assert!(t.sys.files.exists("C:\\Documentos\\Sub\\nota.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("Sub"));
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_CUT);
+        assert_eq!(t.sys.files.clip(), Some(("C:\\Documentos\\nota.txt", true)));
+        t.open("C:\\Escritorio");
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_PASTE);
+        assert!(t.sys.files.exists("C:\\Escritorio\\nota.txt") && !t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("nota.txt"));
+        // Ventana nueva, cambiar nombre y eliminar.
+        t.open("C:\\Documentos");
+        t.right_row("Sub");
+        t.pick(TAG_MENU_ITEM, M_OPEN_NEW);
+        assert_eq!(t.open_new.as_deref(), Some("C:\\Documentos\\Sub"));
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_RENAME);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
+        t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("Otra")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\Otra"));
+        assert_eq!(t.sys.files.undo_label(), Some("Cambiar nombre"));
+        t.right_row("Otra");
+        t.pick(TAG_MENU_ITEM, M_DELETE);
+        assert!(!t.sys.files.exists("C:\\Documentos\\Otra"));
+        // Actualizar recoge cambios externos sin esperar al tick.
+        let now = t.now_dt();
+        t.sys.files.mkdir("C:\\Documentos\\Externa", now).unwrap();
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_REFRESH);
+        assert!(t.rows().contains(&String::from("Externa")));
+    }
+
+    fn setup_orden(t: &mut T) {
+        let f = &mut t.sys.files;
+        f.write("C:\\Documentos\\b.bin", &[0; 100], dt(2)).unwrap();
+        f.write("C:\\Documentos\\A.txt", &[0; 50], dt(3)).unwrap();
+        f.write("C:\\Documentos\\c", &[0; 10], dt(1)).unwrap();
+        // nota.txt (4 bytes) y Sub ya existen, creados el 15/11.
+        f.mkdir("C:\\Documentos\\Zeta", dt(9)).unwrap();
+        t.draw();
+    }
+
+    #[test]
+    fn ordenar_por_cada_criterio() {
+        let mut t = T::new();
+        setup_orden(&mut t);
+        // Nombre (inicial): carpetas primero.
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "A.txt", "b.bin", "c", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Zeta", "Sub", "nota.txt", "c", "b.bin", "A.txt"]));
+        t.pick(TAG_MENU_BG, M_SORT_DATE);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "A.txt", "b.bin", "c"]));
+        t.pick(TAG_MENU_BG, M_ASC);
+        assert_eq!(t.rows(), strs(&["Zeta", "Sub", "c", "b.bin", "A.txt", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_SORT_SIZE);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "c", "A.txt", "b.bin"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "b.bin", "A.txt", "c", "nota.txt"]));
+        // Tipo: "Archivo" antes que "Documento de texto"; dentro, por nombre.
+        t.pick(TAG_MENU_BG, M_SORT_TYPE);
+        t.pick(TAG_MENU_BG, M_ASC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "b.bin", "c", "A.txt", "nota.txt"]));
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "A.txt", "nota.txt", "b.bin", "c"]));
+        // Las marcas del menú siguen al estado.
+        let m = t.right(EMPTY.0, EMPTY.1).unwrap();
+        let sub = &m.items[1].sub;
+        assert!(sub[2].checked && !sub[0].checked && sub[6].checked && !sub[5].checked);
+    }
+
+    #[test]
+    fn ordenar_con_la_cabecera() {
+        let mut t = T::new();
+        setup_orden(&mut t);
+        let y = NAV_H + CMD_H + 5;
+        // Tamaño (columna 3): ascendente; segundo clic, descendente.
+        let x = t.e.col_x()[3] + 20;
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Size, false));
+        assert_eq!(t.rows(), strs(&["Sub", "Zeta", "nota.txt", "c", "A.txt", "b.bin"]));
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Size, true));
+        assert_eq!(t.rows()[2], "b.bin");
+        // Cambiar de columna vuelve a ascendente.
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, y);
+        assert_eq!((t.e.sort, t.e.desc), (Sort::Date, false));
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+        // En la Papelera la columna de ubicación no ordena.
+        t.open(files::TRASH);
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, y);
+        assert_eq!(t.e.sort, Sort::Date);
+    }
+
+    #[test]
+    fn vista_iconos_seleccion_y_teclado() {
+        let mut t = T::new();
+        t.many(60);
+        t.view(M_VIEW_ICONS);
+        assert_eq!(t.e.view, View::Icons);
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (7, 5, 9));
+        // Ratón: la celda 8 está en la fila 1, columna 1.
+        t.click_item(8);
+        assert_eq!(t.e.sel, Some(8));
+        let r8 = t.e.item_rect(8);
+        assert_eq!(t.e.item_at(r8.x + 40, r8.y + 70), Some(8));
+        // Zona vacía a la derecha de la última celda de la rejilla.
+        t.click(PANEL_W + 7 * CELL_W + 2, 150);
+        assert_eq!(t.e.sel, None);
+        t.click_item(8);
+        t.key(Key::Right, false);
+        assert_eq!(t.e.sel, Some(9));
+        t.key(Key::Down, false);
+        assert_eq!(t.e.sel, Some(16));
+        t.key(Key::Left, false);
+        t.key(Key::Up, false);
+        assert_eq!(t.e.sel, Some(8));
+        // Seguir bajando desplaza la rejilla para mantener visible la selección.
+        for _ in 0..5 {
+            t.key(Key::Down, false);
+        }
+        assert_eq!(t.e.sel, Some(43));
+        assert_eq!(t.e.top, 2);
+        let r = t.e.item_rect(43);
+        assert_eq!(t.e.area().intersect(r), r);
+        t.key(Key::End, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(61), 4));
+        t.key(Key::Home, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(0), 0));
+        t.key(Key::PageDown, false);
+        assert_eq!(t.e.sel, Some(35));
+        // Doble clic: abre la carpeta.
+        t.key(Key::Home, false);
+        t.click_item(0);
+        t.click_item(0);
+        assert_eq!(t.e.title(), "Sub");
+        t.open("C:\\Documentos");
+        // Clic derecho: selecciona y pide el menú de elemento.
+        let r = t.e.item_rect(3);
+        let m = t.right(r.x + 5, r.y + 5).unwrap();
+        assert_eq!((t.e.sel, m.tag), (Some(3), TAG_MENU_ITEM));
+        // Con la rueda se desplaza una fila de la rejilla por muesca.
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(-5);
+        assert_eq!(t.e.top, 0);
+        t.wheel(50);
+        assert_eq!(t.e.top, 4);
+        let s = t.draw();
+        assert!(s.px.iter().any(|&p| p != 0));
+    }
+
+    #[test]
+    fn vista_lista_seleccion_y_teclado() {
+        let mut t = T::new();
+        t.many(60);
+        t.view(M_VIEW_LIST);
+        assert_eq!(t.e.view, View::List);
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (17, 3, 4));
+        t.click_item(20);
+        assert_eq!(t.e.sel, Some(20));
+        t.key(Key::Down, false);
+        assert_eq!(t.e.sel, Some(21));
+        t.key(Key::Right, false);
+        assert_eq!(t.e.sel, Some(38));
+        t.key(Key::Left, false);
+        t.key(Key::Up, false);
+        assert_eq!(t.e.sel, Some(20));
+        // Llegar a la última columna desplaza horizontalmente.
+        t.key(Key::End, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(61), 1));
+        let r = t.e.item_rect(61);
+        assert_eq!(t.e.item_at(r.x + 5, r.y + 5), Some(61));
+        t.key(Key::Home, false);
+        assert_eq!((t.e.sel, t.e.top), (Some(0), 0));
+        // Rueda: una columna por muesca.
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(1);
+        assert_eq!(t.e.top, 1);
+        t.wheel(-1);
+        assert_eq!(t.e.top, 0);
+        // Barra horizontal: clic en la pista a la derecha del pulgar avanza una página.
+        let tr = t.e.track();
+        t.click(tr.right() - 3, tr.y + 4);
+        assert_eq!(t.e.top, 1);
+        // Zona vacía bajo la última columna (que tiene 10 elementos): menú de carpeta.
+        let r = t.e.item_rect(61);
+        let m = t.right(r.x + 5, r.y + 2 * ROW_H).unwrap();
+        assert_eq!((m.tag, t.sel_name()), (TAG_MENU_BG, None));
+    }
+
+    #[test]
+    fn vista_detalles_con_rueda() {
+        let mut t = T::new();
+        t.many(60);
+        assert_eq!(t.e.view, View::Details);
+        t.wheel(1);
+        assert_eq!(t.e.top, 3);
+        t.wheel(-1);
+        t.wheel(-1);
+        assert_eq!(t.e.top, 0);
+        t.wheel(100);
+        let top = t.e.max_top();
+        assert_eq!(t.e.top, top);
+        // Rueda fuera de la lista: nada.
+        t.cx(|e, cx| e.mouse(MouseEv::Wheel { x: 30, y: 200, dz: -1 }, cx));
+        assert_eq!(t.e.top, top);
+        // Clic derecho sobre una fila desplazada selecciona la correcta.
+        let r = t.e.item_rect(top + 10);
+        t.right(r.x + 5, r.y + 5);
+        assert_eq!(t.e.sel, Some(top + 10));
+    }
+
+    #[test]
+    fn deshacer_con_ctrl_z_y_menu() {
+        let mut t = T::new();
+        // Sin nada que deshacer: no pasa nada.
+        let (d, _) = t.key(Key::Char('z'), true);
+        assert!(d.is_none());
+        t.click_item(1);
+        t.key(Key::Delete, false);
+        assert!(!t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        t.key(Key::Char('z'), true);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        assert_eq!(t.rows(), strs(&["Sub", "nota.txt"]));
+        // Desde el menú.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_DELETE);
+        t.right(EMPTY.0, EMPTY.1);
+        t.pick(TAG_MENU_BG, M_UNDO);
+        assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
+        // Un error al deshacer se muestra: el nombre original ya lo ocupa otro archivo.
+        t.right_row("nota.txt");
+        t.pick(TAG_MENU_ITEM, M_RENAME);
+        t.answer(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("nuevo.txt")) });
+        let now = t.now_dt();
+        t.sys.files.write("C:\\Documentos\\nota.txt", b"otro", now).unwrap();
+        let (_, d, _) = t.cx(|e, cx| e.undo(cx));
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+    }
+
+    #[test]
+    fn documento_de_texto_nuevo() {
+        let mut t = T::new();
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_NEW_DOC);
+        let Some(DialogRequest::Input { tag, value, .. }) = d else { panic!("sin diálogo") };
+        assert_eq!((tag, value.as_str()), (TAG_NEWDOC, "Nuevo documento de texto.txt"));
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(value) });
+        assert!(t.sys.files.exists("C:\\Documentos\\Nuevo documento de texto.txt"));
+        assert_eq!(t.sel_name().as_deref(), Some("Nuevo documento de texto.txt"));
+        // Se propone otro nombre libre la segunda vez; sin extensión se añade .txt.
+        t.right(EMPTY.0, EMPTY.1);
+        let (d, _) = t.pick(TAG_MENU_BG, M_NEW_DOC);
+        let Some(DialogRequest::Input { value, .. }) = d else { panic!() };
+        assert_eq!(value, "Nuevo documento de texto (2).txt");
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("apuntes")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\apuntes.txt"));
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("datos.csv")) });
+        assert!(t.sys.files.exists("C:\\Documentos\\datos.csv"));
+        // Repetido o inválido: error.
+        let d = t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("apuntes.txt")) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+        let d = t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("a/b")) });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_ERROR, .. })));
+        // Deshacer manda a la Papelera el último documento creado.
+        t.answer(DialogResult::Text { tag: TAG_NEWDOC, value: Some(String::from("ultimo")) });
+        t.key(Key::Char('z'), true);
+        assert!(!t.sys.files.exists("C:\\Documentos\\ultimo.txt"));
+    }
+
+    #[test]
+    fn propiedades_de_archivo_carpeta_y_zona() {
+        let mut t = T::new();
+        let now = t.now_dt();
+        t.sys.files.write("C:\\Documentos\\grande.bin", &vec![0; 1500], now).unwrap();
+        t.sys.files.write("C:\\Documentos\\Sub\\x", b"1", now).unwrap();
+        t.draw();
+        let msg = |d: Option<DialogRequest>| match d {
+            Some(DialogRequest::Message { title, text, buttons: Buttons::Ok, .. }) => (title, text),
+            o => panic!("{o:?}"),
+        };
+        t.right_row("grande.bin");
+        let (title, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert_eq!(title, "Propiedades de grande.bin");
+        assert_eq!(
+            text,
+            "Nombre: grande.bin\nTipo: Archivo\nUbicación: C:\\Documentos\nTamaño: 2 KB (1500 bytes)\nModificado: 15/11/2026 21:37"
+        );
+        t.right_row("nota.txt");
+        let (_, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert!(text.contains("Tipo: Documento de texto") && text.contains("Tamaño: 4 bytes"), "{text}");
+        t.right_row("Sub");
+        let (_, text) = msg(t.pick(TAG_MENU_ITEM, M_PROPS).0);
+        assert!(text.contains("Contiene: 1 elemento\n") && !text.contains("Tamaño"), "{text}");
+        t.right(EMPTY.0, EMPTY.1);
+        let (title, text) = msg(t.pick(TAG_MENU_BG, M_PROPS).0);
+        assert_eq!(title, "Propiedades de Documentos");
+        assert!(text.contains("Contiene: 3 elementos") && text.contains("Ubicación: C:\\"), "{text}");
+    }
+
+    #[test]
+    fn recordar_vista_y_orden() {
+        let mut t = T::new();
+        t.view(M_VIEW_ICONS);
+        t.pick(TAG_MENU_BG, M_SORT_SIZE);
+        t.pick(TAG_MENU_BG, M_DESC);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=iconos\norden=tamano\ndesc=1\n");
+        // Otra ventana lee lo guardado al abrirse.
+        let mut e2 = make();
+        let mut s = Surface::new(760, 480, 0);
+        e2.draw(&mut s, &t.th, &mut t.sys, true);
+        assert_eq!((e2.view, e2.sort, e2.desc), (View::Icons, Sort::Size, true));
+        // Los cambios por la cabecera también se guardan.
+        t.view(M_VIEW_DETAILS);
+        let x = t.e.col_x()[1] + 20;
+        t.click(x, NAV_H + CMD_H + 5);
+        assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=detalles\norden=fecha\ndesc=0\n");
+        // Valores que no se entienden se ignoran.
+        let now = t.now_dt();
+        t.sys.files.write(PREFS, b"vista=raro\nbasura\norden=tipo\ndesc=1\n", now).unwrap();
+        let mut e3 = make();
+        e3.draw(&mut s, &t.th, &mut t.sys, true);
+        assert_eq!((e3.view, e3.sort, e3.desc), (View::Details, Sort::Type, true));
+    }
+
+    #[test]
+    fn dibuja_las_tres_vistas_y_la_barra_con_nombre_nuevo() {
+        let mut t = T::new();
+        t.many(40);
+        for id in [M_VIEW_ICONS, M_VIEW_LIST, M_VIEW_DETAILS] {
+            t.view(id);
+            let s = t.draw();
+            assert!(s.px.iter().any(|&p| p != 0));
+        }
+        // El botón se llama "Cambiar nombre" y se puede pulsar.
+        t.click_item(1);
+        let (x, y) = t.btn(Cmd::Rename);
+        let (d, _) = t.click(x, y);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
+        let r = t.e.hits.iter().find(|(_, h)| *h == Hit::Cmd(Cmd::Delete)).unwrap().0;
+        assert!(r.right() < 680 - 140);
     }
 }
