@@ -27,7 +27,15 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/input.rs` | Códigos de tecla y distribución ES | Tabla pública "scan code set 1"; distribución de teclado española |
 | `nf-core/src/glyphs.rs` | Tipografía | Diseño propio, trazo a trazo |
 | `nf-core/src/icons.rs`, `theme.rs` | Iconos, logo, fondos | Diseño propio, generado por código |
+| `nf-core/src/crypto.rs` | SHA-256, HMAC-SHA-256, PBKDF2 | FIPS 180-4; RFC 2104 y RFC 4231 (vectores); RFC 8018. Código propio, comprobado con los vectores oficiales |
+| `nf-core/src/cipher.rs` | AES-256, modos CTR y XTS | FIPS 197 (la caja S se calcula, no se copia); NIST SP 800-38A; IEEE 1619 / NIST SP 800-38E. Código propio, comprobado con los vectores oficiales |
+| `nf-core/src/keys.rs`, `accounts.rs` | Llaves envueltas, acumulador de aleatoriedad, cuentas | Diseño propio sobre las primitivas anteriores |
+| `kernel/src/main.rs` (`entropy`) | RDRAND, contador de ciclos | Intel SDM vol. 2 (RDRAND, RDTSC, CPUID.01H:ECX bit 30) |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
+
+## Criptografía
+Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa
+tablas (tiempos dependientes de los datos); se acepta mientras el sistema sea un solo programa. Sirve para uso personal.
 
 ## Pendiente antes de publicar
 - El nombre "NightFury" coincide con un personaje de DreamWorks: cambiarlo.

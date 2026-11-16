@@ -45,6 +45,8 @@ pub enum AccountError {
     LastAdmin,
     /// La cuenta tiene la sesión abierta.
     InUse,
+    /// La carpeta de la cuenta está cifrada: antes hay que quitar el cifrado.
+    Encrypted,
     Fs(FsError),
 }
 
@@ -66,6 +68,7 @@ impl AccountError {
             AccountError::NotAdmin => "Hace falta ser administrador.",
             AccountError::LastAdmin => "Tiene que quedar al menos una cuenta administradora.",
             AccountError::InUse => "Esa cuenta tiene la sesión abierta.",
+            AccountError::Encrypted => "La carpeta de esa cuenta está cifrada: quita antes el cifrado.",
             AccountError::Fs(_) => "No se han podido guardar los cambios en el disco.",
         }
     }

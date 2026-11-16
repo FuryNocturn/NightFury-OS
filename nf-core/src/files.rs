@@ -23,6 +23,7 @@
 use crate::accounts::{self, Account, AccountError};
 use crate::block::{BlockDev, RamDisk};
 use crate::fs::{same, Entry, FsError, Nffs};
+use crate::keys::{KeyError, Pool};
 use crate::platform::DateTime;
 use alloc::boxed::Box;
 use alloc::format;
@@ -1371,6 +1372,117 @@ impl Files {
     }
 }
 
+
+// ---- Cifrado (v0.6.0). CONTRATO: firmas fijas; ver docs/PLAN-estructura.md, entrega 2. ----
+//
+// Cifrado total: todo el disco con una llave maestra que abre la CLAVE DEL DISCO (o su código
+// de recuperación). Un disco cifrado se detecta al arrancar y queda "bloqueado" (C: en memoria
+// mientras tanto) hasta `unlock_disk`. Activarlo o quitarlo convierte el disco en el sitio, por
+// pasos (`convert_step` desde `tick`), y se reanuda solo si se corta.
+//
+// Cifrado de usuario: la carpeta de una cuenta con clave se cifra con su propia llave maestra,
+// que abre la clave de la cuenta (`login`) o su código de recuperación. Las apps no notan nada:
+// leen y escriben por las mismas rutas.
+//
+// Las funciones que generan llaves reciben un `Pool` que debe estar `ready()` (pantalla del
+// ratón) y devuelven el código de recuperación, que se muestra UNA vez y no se guarda en claro.
+impl Files {
+    /// Hay un disco cifrado esperando su clave (mientras, C: está en memoria).
+    pub fn disk_locked(&self) -> bool {
+        false
+    }
+
+    /// Abre el disco cifrado con la clave del disco (`recovery == false`) o con su código de
+    /// recuperación. Tras abrirlo no hay sesión: sigue el inicio de sesión normal.
+    pub fn unlock_disk(&mut self, _secret: &str, _recovery: bool, _now: DateTime) -> Result<(), KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// El usuario prefiere seguir sin abrir el disco cifrado (archivos solo en memoria).
+    pub fn skip_locked_disk(&mut self) {}
+
+    /// El disco en uso está cifrado (o se está cifrando).
+    pub fn disk_encrypted(&self) -> bool {
+        false
+    }
+
+    /// Conversión del disco en curso: (bloques hechos, total, `true` = cifrando).
+    pub fn disk_conversion(&self) -> Option<(u64, u64, bool)> {
+        None
+    }
+
+    /// Activa el cifrado total (solo administrador). Devuelve el código de recuperación y deja
+    /// una conversión en curso.
+    pub fn encrypt_disk(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
+        Err(KeyError::Unavailable)
+    }
+
+    /// Quita el cifrado total (solo administrador; pide la clave del disco). Deja una conversión en curso.
+    pub fn decrypt_disk(&mut self, _password: &str, _now: DateTime) -> Result<(), KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// Avanza la conversión del disco como mucho `blocks` bloques. `Ok(true)` cuando ha terminado.
+    pub fn convert_step(&mut self, _blocks: u32, _now: DateTime) -> Result<bool, KeyError> {
+        Ok(true)
+    }
+
+    /// Cambia la clave del disco (solo administrador). No recifra datos.
+    pub fn change_disk_password(&mut self, _old: &str, _new: &str, _pool: &mut Pool, _now: DateTime) -> Result<(), KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// Código de recuperación nuevo para el disco (invalida el anterior). Pide la clave del disco.
+    pub fn new_disk_recovery(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// La carpeta de la cuenta `name` está cifrada (o se está cifrando).
+    pub fn account_encrypted(&mut self, _name: &str) -> bool {
+        false
+    }
+
+    /// La carpeta de la sesión abierta está cifrada.
+    pub fn home_encrypted(&mut self) -> bool {
+        false
+    }
+
+    /// Cifra la carpeta de la sesión abierta. `password` debe ser la clave actual de la cuenta
+    /// (sin clave no hay cifrado). Devuelve el código de recuperación y deja una conversión en curso.
+    pub fn encrypt_home(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
+        Err(KeyError::Unavailable)
+    }
+
+    /// Quita el cifrado de la carpeta de la sesión abierta. Deja una conversión en curso.
+    pub fn decrypt_home(&mut self, _password: &str, _now: DateTime) -> Result<(), KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// Conversión de la carpeta de la sesión en curso: (archivos hechos, total, `true` = cifrando).
+    pub fn home_conversion(&self) -> Option<(u64, u64, bool)> {
+        None
+    }
+
+    /// Avanza la conversión de la carpeta como mucho `files` archivos. `Ok(true)` cuando ha terminado.
+    pub fn home_convert_step(&mut self, _files: u32, _now: DateTime) -> Result<bool, KeyError> {
+        Ok(true)
+    }
+
+    /// Código de recuperación nuevo para la carpeta de la sesión (invalida el anterior).
+    pub fn new_home_recovery(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// Sin sesión: con el código de recuperación de la cuenta `name` le pone una clave nueva
+    /// (y vuelve a envolver su llave). No abre la sesión.
+    pub fn recover_account(&mut self, _name: &str, _recovery: &str, _new_password: &str, _pool: &mut Pool, _now: DateTime) -> Result<(), KeyError> {
+        Err(KeyError::NotEncrypted)
+    }
+
+    /// Bloqueo de pantalla: borra de la memoria la llave de la carpeta de la sesión. Mientras,
+    /// leer o escribir en ella falla con `Denied`. `verify_password` con la clave correcta la recupera.
+    pub fn lock_keys(&mut self) {}
+}
 
 fn lower(s: &str) -> String {
     s.chars().flat_map(char::to_lowercase).collect()
