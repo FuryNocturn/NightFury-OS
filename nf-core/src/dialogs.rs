@@ -45,13 +45,16 @@ pub enum DialogRequest {
     Message { tag: u32, title: String, text: String, buttons: Buttons },
     /// Pide una línea de texto (p. ej. un nombre). `value` es el texto inicial.
     Input { tag: u32, title: String, label: String, value: String },
-    /// Elegir un archivo existente. `dir` es la carpeta inicial ("C:\\Documentos").
+    /// Pide una clave: igual que `Input` pero el campo muestra puntos, no se puede copiar y el
+    /// búfer se borra al cerrar. Responde `Text` (`None` si se cancela).
+    Password { tag: u32, title: String, label: String },
+    /// Elegir un archivo existente. `dir` es la carpeta inicial (normalmente `Documentos` del usuario).
     Open { tag: u32, title: String, dir: String },
     /// Elegir dónde guardar. `name` es el nombre propuesto. Si el archivo ya existe, el propio
     /// diálogo pregunta si se reemplaza antes de responder.
     Save { tag: u32, title: String, dir: String, name: String },
     /// Elegir una carpeta. `dir` es la carpeta inicial. Solo lista carpetas (sin la Papelera ni
-    /// `C:\Sistema`); "Nueva carpeta" crea una en la carpeta actual.
+    /// `C:\Sistema`, salvo a un administrador); "Nueva carpeta" crea una en la carpeta actual.
     Folder { tag: u32, title: String, dir: String },
 }
 
@@ -59,7 +62,7 @@ pub enum DialogRequest {
 pub enum DialogResult {
     /// Respuesta a `Message`.
     Answer { tag: u32, answer: Answer },
-    /// Respuesta a `Input`; `None` si se canceló.
+    /// Respuesta a `Input` y `Password`; `None` si se canceló.
     Text { tag: u32, value: Option<String> },
     /// Respuesta a `Open`, `Save` y `Folder`: ruta absoluta; `None` si se canceló.
     Path { tag: u32, path: Option<String> },
@@ -140,11 +143,33 @@ pub fn fit(text: &str, size: u32, maxw: i32) -> String {
 struct Field {
     text: String,
     cur: usize,
+    /// Muestra puntos en vez del texto (claves).
+    mask: bool,
 }
 
 impl Field {
     fn new(t: &str) -> Field {
-        Field { text: String::from(t), cur: t.chars().count() }
+        Field { text: String::from(t), cur: t.chars().count(), mask: false }
+    }
+    /// Texto tal como se ve: el real o un punto por carácter.
+    fn shown(&self) -> String {
+        if self.mask {
+            self.text.chars().map(|_| '•').collect()
+        } else {
+            self.text.clone()
+        }
+    }
+    /// Entrega el contenido y deja el campo vacío.
+    fn take(&mut self) -> String {
+        self.cur = 0;
+        core::mem::take(&mut self.text)
+    }
+    /// Borra el búfer (claves).
+    fn wipe(&mut self) {
+        // SAFETY: se escriben ceros, que son UTF-8 válido.
+        crate::crypto::wipe(unsafe { self.text.as_bytes_mut() });
+        self.text.clear();
+        self.cur = 0;
     }
     fn len(&self) -> usize {
         self.text.chars().count()
@@ -181,13 +206,13 @@ impl Field {
     }
     /// Desplazamiento horizontal para que el cursor quede a la vista en `inner_w` píxeles.
     fn shift(&self, inner_w: i32) -> i32 {
-        let head: String = self.text.chars().take(self.cur).collect();
+        let head: String = self.shown().chars().take(self.cur).collect();
         (font::width(&head, FS, false) - (inner_w - 2)).max(0)
     }
     fn click(&mut self, x: i32, inner_w: i32) {
         let x = x + self.shift(inner_w);
         let (mut acc, mut n) = (0, 0);
-        for c in self.text.chars() {
+        for c in self.shown().chars() {
             let a = font::adv(c, FS, false);
             if acc + a / 2 > x {
                 break;
@@ -204,9 +229,9 @@ impl Field {
         let shift = self.shift(inner.w);
         let old = s.clip();
         s.set_clip(old.intersect(inner));
-        font::draw(s, inner.x - shift, r.y + (r.h - font::line_h(FS)) / 2, &self.text, FS, false, INK);
+        font::draw(s, inner.x - shift, r.y + (r.h - font::line_h(FS)) / 2, &self.shown(), FS, false, INK);
         if focused {
-            let head: String = self.text.chars().take(self.cur).collect();
+            let head: String = self.shown().chars().take(self.cur).collect();
             let x = inner.x + font::width(&head, FS, false) - shift;
             s.fill_rect(Rect::new(x, r.y + 5, 1, r.h - 10), INK);
         }
@@ -218,6 +243,7 @@ impl Field {
 enum Mode {
     Message,
     Input,
+    Password,
     Open,
     Save,
     Folder,
@@ -255,6 +281,13 @@ pub struct Dialog {
     sb: ScrollBar,
     last_click: (usize, u64),
     dirty: bool,
+}
+
+impl Drop for Dialog {
+    /// Las claves no se quedan en la memoria al cerrar el diálogo.
+    fn drop(&mut self) {
+        self.field.wipe();
+    }
 }
 
 impl Dialog {
@@ -301,6 +334,14 @@ impl Dialog {
                 d.title = title;
                 d.lines = vec![fit(&label, FS, d.w - 2 * PAD)];
                 d.field = Field::new(&value);
+                d.h = PAD + lh + 8 + 28 + 24 + BTN_H + 16;
+            }
+            DialogRequest::Password { tag, title, label } => {
+                d.tag = tag;
+                d.mode = Mode::Password;
+                d.title = title;
+                d.lines = vec![fit(&label, FS, d.w - 2 * PAD)];
+                d.field.mask = true;
                 d.h = PAD + lh + 8 + 28 + 24 + BTN_H + 16;
             }
             DialogRequest::Open { tag, title, dir } => {
@@ -356,14 +397,14 @@ impl Dialog {
             Mode::Save => vec!["Guardar", "Cancelar"],
             Mode::Open => vec!["Abrir", "Cancelar"],
             Mode::Folder => vec!["Seleccionar carpeta", "Cancelar", "Nueva carpeta"],
-            Mode::Input => vec!["Aceptar", "Cancelar"],
+            Mode::Input | Mode::Password => vec!["Aceptar", "Cancelar"],
         }
     }
     /// Elementos con foco que no son botones.
     fn nbefore(&self) -> usize {
         match self.mode {
             Mode::Message => 0,
-            Mode::Input | Mode::Folder => 1,
+            Mode::Input | Mode::Password | Mode::Folder => 1,
             _ if self.confirm.is_some() => 0,
             _ => 2,
         }
@@ -394,7 +435,7 @@ impl Dialog {
     }
     fn field_rect(&self) -> Rect {
         match self.mode {
-            Mode::Input => Rect::new(PAD, PAD + font::line_h(FS) + 8, self.w - 2 * PAD, 28),
+            Mode::Input | Mode::Password => Rect::new(PAD, PAD + font::line_h(FS) + 8, self.w - 2 * PAD, 28),
             _ => Rect::new(76, self.name_y(), self.w - 88, 28),
         }
     }
@@ -435,7 +476,7 @@ impl Dialog {
                     text_in(s, Rect::new(PAD, PAD + i as i32 * lh, self.w - 2 * PAD, lh), l, INK, Align::Left);
                 }
             }
-            Mode::Input => {
+            Mode::Input | Mode::Password => {
                 text_in(s, Rect::new(PAD, PAD, self.w - 2 * PAD, lh), &self.lines[0], INK, Align::Left);
                 self.field.draw(s, self.field_rect(), self.focus == 0, theme);
             }
@@ -539,7 +580,7 @@ impl Dialog {
                 };
                 DialogResult::Answer { tag, answer }
             }
-            Mode::Input => DialogResult::Text { tag, value: None },
+            Mode::Input | Mode::Password => DialogResult::Text { tag, value: None },
             _ => DialogResult::Path { tag, path: None },
         }
     }
@@ -555,14 +596,15 @@ impl Dialog {
     /// Lista `dir` y pasa a ella; `false` (con el error anotado) si no se puede.
     fn go(&mut self, dir: &str, sys: &mut dyn Platform) -> bool {
         let target = files::resolve("C:\\", dir).unwrap_or_else(|_| String::from("C:\\"));
-        if self.mode == Mode::Folder && is_system(&target) {
+        let admin = sys.files().is_admin();
+        if self.mode == Mode::Folder && is_system(&target) && !admin {
             self.error = Some(String::from("Esa carpeta es del sistema."));
             return false;
         }
         match sys.files().list(dir) {
             Ok(mut v) => {
                 if self.mode == Mode::Folder {
-                    v.retain(|e| e.dir && !(target.len() == 3 && e.name.eq_ignore_ascii_case(SYSTEM)));
+                    v.retain(|e| e.dir && (admin || !(target.len() == 3 && e.name.eq_ignore_ascii_case(SYSTEM))));
                 }
                 self.dir = target;
                 self.entries = v;
@@ -681,6 +723,11 @@ impl Dialog {
         match self.mode {
             Mode::Message => Some(DialogResult::Answer { tag, answer: self.btns[i].1 }),
             Mode::Input => Some(DialogResult::Text { tag, value: if i == 0 { Some(self.field.text.clone()) } else { None } }),
+            Mode::Password => {
+                let value = if i == 0 { Some(self.field.take()) } else { None };
+                self.field.wipe();
+                Some(DialogResult::Text { tag, value })
+            }
             _ if self.confirm.is_some() => {
                 if i == 0 {
                     return Some(DialogResult::Path { tag, path: self.confirm.take() });
@@ -717,7 +764,7 @@ impl Dialog {
                     return self.press(self.focus - nb, sys);
                 }
                 return match self.mode {
-                    Mode::Input => self.press(0, sys),
+                    Mode::Input | Mode::Password => self.press(0, sys),
                     _ if self.focus == 0 => match self.sel {
                         Some(i) => self.activate(i, sys),
                         None => self.accept(sys),
@@ -795,7 +842,7 @@ impl Dialog {
                 let f = self.field_rect();
                 if self.mode != Mode::Message && self.mode != Mode::Folder {
                     if f.contains(x, y) {
-                        self.focus = if self.mode == Mode::Input { 0 } else { 1 };
+                        self.focus = if matches!(self.mode, Mode::Input | Mode::Password) { 0 } else { 1 };
                         self.field.click(x - f.x - 6, f.w - 12);
                         return None;
                     }
@@ -846,7 +893,29 @@ impl Dialog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::TestPlatform;
+    use crate::block::RamDisk;
+    use crate::files::Files;
+    use crate::platform::{DateTime, TestPlatform};
+
+    fn docs() -> String {
+        files::join(&files::join(files::USERS_DIR, files::DEFAULT_USER), files::Std::Documents.name())
+    }
+    fn dj(name: &str) -> String {
+        files::join(&docs(), name)
+    }
+    /// Plataforma con disco: administradora Ana y usuario normal Luis, con la sesión de `quien`.
+    fn two_users(quien: &str) -> (TestPlatform, DateTime) {
+        let n = DateTime::default();
+        let mut f = Files::probe(Some(alloc::boxed::Box::new(RamDisk::new(2048))), n);
+        f.format_pending(n).unwrap();
+        f.create_account("Ana", None, true, [1; 16], n).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], n).unwrap();
+        f.login(quien, "").unwrap();
+        let mut sys = TestPlatform::default();
+        sys.files = f;
+        (sys, n)
+    }
 
     fn kev(key: Key, ch: Option<char>) -> KeyEvent {
         KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt: false }
@@ -953,7 +1022,7 @@ mod tests {
     }
 
     fn save(name: &str, sys: &mut TestPlatform) -> Dialog {
-        Dialog::new(DialogRequest::Save { tag: 5, title: "G".into(), dir: "C:\\Documentos".into(), name: name.into() }, sys)
+        Dialog::new(DialogRequest::Save { tag: 5, title: "G".into(), dir: docs(), name: name.into() }, sys)
     }
     fn path(p: Option<&str>) -> Option<DialogResult> {
         Some(DialogResult::Path { tag: 5, path: p.map(String::from) })
@@ -963,9 +1032,9 @@ mod tests {
     fn save_adds_extension_rejects_bad_names_and_confirms_replace() {
         let mut sys = TestPlatform::default();
         let mut d = save("nota", &mut sys);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\nota.txt")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&dj("nota.txt"))));
         let mut d = save("datos.csv", &mut sys);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\datos.csv")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&dj("datos.csv"))));
         // Nombre inválido: error y sigue abierto.
         let mut d = save("a*b", &mut sys);
         assert!(press(&mut d, &mut sys, Key::Enter).is_none());
@@ -980,7 +1049,7 @@ mod tests {
         assert!(d.error.is_none());
         // Reemplazo.
         let now = sys.now();
-        sys.files.write("C:\\Documentos\\viejo.txt", b"x", now).unwrap();
+        sys.files.write(&dj("viejo.txt"), b"x", now).unwrap();
         let mut d = save("viejo", &mut sys);
         assert!(press(&mut d, &mut sys, Key::Enter).is_none());
         assert!(d.confirm.is_some());
@@ -993,7 +1062,7 @@ mod tests {
         press(&mut d, &mut sys, Key::Right); // No
         assert!(press(&mut d, &mut sys, Key::Enter).is_none() && d.confirm.is_none());
         press(&mut d, &mut sys, Key::Enter);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\viejo.txt")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&dj("viejo.txt"))));
         // Cancelar.
         let mut d = save("x", &mut sys);
         assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
@@ -1004,9 +1073,9 @@ mod tests {
         let mut sys = TestPlatform::default();
         let now = sys.now();
         for i in 0..30 {
-            sys.files.write(&format!("C:\\Documentos\\f{i:02}.txt"), b"x", now).unwrap();
+            sys.files.write(&dj(&format!("f{i:02}.txt")), b"x", now).unwrap();
         }
-        let mut d = Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\Documentos".into() }, &mut sys);
+        let mut d = Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: docs() }, &mut sys);
         let max = d.entries.len() - d.rows();
         assert!(max > 6);
         let w = |dz| MouseEv::Wheel { x: 50, y: 50, dz };
@@ -1033,22 +1102,22 @@ mod tests {
     fn open_navigates_and_picks_files() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        sys.files.mkdir("C:\\Documentos\\sub", now).unwrap();
-        sys.files.write("C:\\Documentos\\sub\\a.txt", b"a", now).unwrap();
-        sys.files.write("C:\\Documentos\\b.txt", b"b", now).unwrap();
-        let open = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\Documentos".into() }, sys);
+        sys.files.mkdir(&dj("sub"), now).unwrap();
+        sys.files.write(&dj("sub\\a.txt"), b"a", now).unwrap();
+        sys.files.write(&dj("b.txt"), b"b", now).unwrap();
+        let open = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: docs() }, sys);
         let mut d = open(&mut sys);
         assert_eq!(d.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["sub", "b.txt"]);
         // Enter en la carpeta entra; Retroceso sube.
         press(&mut d, &mut sys, Key::Down);
         assert!(press(&mut d, &mut sys, Key::Enter).is_none());
-        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        assert_eq!(d.dir, dj("sub"));
         press(&mut d, &mut sys, Key::Backspace);
-        assert_eq!(d.dir, "C:\\Documentos");
+        assert_eq!(d.dir, docs());
         // Enter en un archivo lo elige.
         press(&mut d, &mut sys, Key::Down);
         press(&mut d, &mut sys, Key::Down);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\b.txt")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&dj("b.txt"))));
         // Doble clic en carpeta, botón ↑ y Abrir con el nombre escrito.
         let mut d = open(&mut sys);
         let l = d.list_rect();
@@ -1056,11 +1125,11 @@ mod tests {
         d.mouse(MouseEv::Down { x: p.0, y: p.1 }, &mut sys);
         d.mouse(MouseEv::Up { x: p.0, y: p.1 }, &mut sys);
         d.mouse(MouseEv::Down { x: p.0, y: p.1 }, &mut sys);
-        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        assert_eq!(d.dir, dj("sub"));
         let u = d.up_rect();
         d.mouse(MouseEv::Down { x: u.x + 3, y: u.y + 3 }, &mut sys);
         d.mouse(MouseEv::Up { x: u.x + 3, y: u.y + 3 }, &mut sys);
-        assert_eq!(d.dir, "C:\\Documentos");
+        assert_eq!(d.dir, docs());
         // Nombre que no existe: error.
         press(&mut d, &mut sys, Key::Tab);
         type_str(&mut d, &mut sys, "zzz");
@@ -1074,7 +1143,7 @@ mod tests {
     fn barra_en_la_lista_solo_si_hace_falta() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        let open = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\Documentos".into() }, sys);
+        let open = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: docs() }, sys);
         let mut d = open(&mut sys);
         assert!(!d.need_sb());
         let (w, h) = d.size();
@@ -1084,7 +1153,7 @@ mod tests {
         let probe = (m.rect.y + 40) as usize * w as usize + (m.rect.x + 8) as usize;
         assert_eq!(s.px[probe], 0xFFFFFF);
         for i in 0..30 {
-            sys.files.write(&format!("C:\\Documentos\\f{i:02}.txt"), b"x", now).unwrap();
+            sys.files.write(&dj(&format!("f{i:02}.txt")), b"x", now).unwrap();
         }
         let mut d = open(&mut sys);
         assert!(d.need_sb());
@@ -1131,16 +1200,16 @@ mod tests {
     fn carpeta_navega_y_solo_lista_carpetas() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        sys.files.mkdir("C:\\Documentos\\sub", now).unwrap();
-        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
-        let mut d = folder("C:\\Documentos", &mut sys);
+        sys.files.mkdir(&dj("sub"), now).unwrap();
+        sys.files.write(&dj("a.txt"), b"a", now).unwrap();
+        let mut d = folder(&docs(), &mut sys);
         assert_eq!(names(&d), ["sub"]);
         // Enter con la carpeta resaltada entra; Retroceso sube.
         press(&mut d, &mut sys, Key::Down);
         assert!(press(&mut d, &mut sys, Key::Enter).is_none());
-        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        assert_eq!(d.dir, dj("sub"));
         press(&mut d, &mut sys, Key::Backspace);
-        assert_eq!(d.dir, "C:\\Documentos");
+        assert_eq!(d.dir, docs());
         // Doble clic entra y el botón de subir vuelve.
         let l = d.list_rect();
         let p = (l.x + 40, l.y + 5);
@@ -1148,11 +1217,11 @@ mod tests {
             d.mouse(MouseEv::Down { x: p.0, y: p.1 }, &mut sys);
             d.mouse(MouseEv::Up { x: p.0, y: p.1 }, &mut sys);
         }
-        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        assert_eq!(d.dir, dj("sub"));
         let u = d.up_rect();
         d.mouse(MouseEv::Down { x: u.x + 3, y: u.y + 3 }, &mut sys);
         d.mouse(MouseEv::Up { x: u.x + 3, y: u.y + 3 }, &mut sys);
-        assert_eq!(d.dir, "C:\\Documentos");
+        assert_eq!(d.dir, docs());
         let mut s = Surface::new(d.size().0, d.size().1, 0);
         d.draw(&mut s, &Theme::default());
     }
@@ -1161,25 +1230,25 @@ mod tests {
     fn carpeta_elige_la_actual_o_la_resaltada_y_cancela() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        sys.files.mkdir("C:\\Documentos\\sub", now).unwrap();
+        sys.files.mkdir(&dj("sub"), now).unwrap();
         // Sin selección: la carpeta actual.
-        let mut d = folder("C:\\Documentos", &mut sys);
+        let mut d = folder(&docs(), &mut sys);
         press(&mut d, &mut sys, Key::Tab);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos")));
-        let mut d = folder("C:\\Documentos", &mut sys);
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&docs())));
+        let mut d = folder(&docs(), &mut sys);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&docs())));
         // Con una resaltada: esa.
-        let mut d = folder("C:\\Documentos", &mut sys);
+        let mut d = folder(&docs(), &mut sys);
         press(&mut d, &mut sys, Key::Down);
         let r = d.btn_rect(0, 3);
         d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
-        assert_eq!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys), path(Some("C:\\Documentos\\sub")));
+        assert_eq!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys), path(Some(&dj("sub"))));
         // Cancelar con el botón y con Esc.
-        let mut d = folder("C:\\Documentos", &mut sys);
+        let mut d = folder(&docs(), &mut sys);
         let r = d.btn_rect(1, 3);
         d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
         assert_eq!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys), path(None));
-        let mut d = folder("C:\\Documentos", &mut sys);
+        let mut d = folder(&docs(), &mut sys);
         assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
         assert_eq!(Some(d.cancel()), path(None));
     }
@@ -1187,37 +1256,134 @@ mod tests {
     #[test]
     fn carpeta_nueva_con_nombre_libre_y_seleccionada() {
         let mut sys = TestPlatform::default();
-        let mut d = folder("C:\\Documentos", &mut sys);
+        let mut d = folder(&docs(), &mut sys);
         let r = d.btn_rect(2, 3);
         for esperado in ["Nueva carpeta", "Nueva carpeta (2)"] {
             d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
             assert!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys).is_none());
-            assert!(sys.files.stat(&format!("C:\\Documentos\\{esperado}")).unwrap().dir);
+            assert!(sys.files.stat(&dj(esperado)).unwrap().dir);
             assert_eq!(d.sel.map(|i| d.entries[i].name.as_str()), Some(esperado));
         }
         // Elegir ahora devuelve la recién creada.
         d.focus = 1;
-        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\Nueva carpeta (2)")));
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some(&dj("Nueva carpeta (2)"))));
         // Con teclado: Tab hasta "Nueva carpeta".
-        let mut d = folder("C:\\Imágenes", &mut sys);
+        let pics = sys.files.std_dir(files::Std::Pictures);
+        let mut d = folder(&pics, &mut sys);
         for _ in 0..3 {
             press(&mut d, &mut sys, Key::Tab);
         }
         press(&mut d, &mut sys, Key::Enter);
-        assert!(sys.files.stat("C:\\Imágenes\\Nueva carpeta").is_ok());
+        assert!(sys.files.stat(&files::join(&pics, "Nueva carpeta")).is_ok());
     }
 
     #[test]
-    fn carpeta_oculta_sistema_y_papelera() {
-        let mut sys = TestPlatform::default();
+    fn carpeta_oculta_sistema_y_papelera_a_un_usuario_normal() {
+        let (mut sys, _) = two_users("Luis");
+        assert!(!sys.files.is_admin());
         let d = folder("C:\\", &mut sys);
         let n = names(&d);
-        assert!(n.contains(&"Documentos") && !n.contains(&"Sistema") && !n.iter().any(|x| x.starts_with('$')));
+        assert!(n.contains(&"Usuarios") && !n.contains(&"Sistema") && !n.iter().any(|x| x.starts_with('$')));
         // Pedir C:\Sistema o la Papelera cae en la raíz.
-        let d = folder("C:\\Sistema", &mut sys);
+        let d = folder(files::SYSTEM_DIR, &mut sys);
         assert_eq!(d.dir, "C:\\");
         let d = folder(crate::files::TRASH, &mut sys);
         assert_eq!(d.dir, "C:\\");
         assert!(d.entries.iter().all(|e| e.dir));
+        // Dentro de su carpeta no se ven las ocultas (.config, .papelera).
+        let d = folder(&sys.files.home(), &mut sys);
+        assert!(names(&d).contains(&"Documentos") && !names(&d).iter().any(|x| x.starts_with('.')));
+    }
+
+    #[test]
+    fn carpeta_deja_entrar_en_sistema_solo_a_un_administrador() {
+        let (mut sys, _) = two_users("Ana");
+        assert!(sys.files.is_admin());
+        let d = folder("C:\\", &mut sys);
+        assert!(names(&d).contains(&"Sistema"));
+        let d = folder(files::SYS_CONFIG_DIR, &mut sys);
+        assert_eq!(d.dir, files::SYS_CONFIG_DIR);
+    }
+
+    #[test]
+    fn denegado_muestra_el_mensaje_y_no_cambia_de_carpeta() {
+        let (mut sys, _) = two_users("Luis");
+        let ana = files::join(files::USERS_DIR, "Ana");
+        for mut d in [
+            Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: sys.files.std_dir(files::Std::Documents) }, &mut sys),
+            folder(&sys.files.std_dir(files::Std::Documents), &mut sys),
+        ] {
+            let antes = d.dir.clone();
+            assert!(!d.go(&ana, &mut sys));
+            assert_eq!(d.dir, antes);
+            assert_eq!(d.error.as_deref(), Some(FsError::Denied.message()));
+            let mut s = Surface::new(d.size().0, d.size().1, 0);
+            d.draw(&mut s, &Theme::default());
+        }
+        // Pedirla desde el principio cae en la raíz.
+        let d = Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: ana }, &mut sys);
+        assert_eq!(d.dir, "C:\\");
+    }
+
+    fn clave(sys: &mut TestPlatform) -> Dialog {
+        Dialog::new(DialogRequest::Password { tag: 9, title: "Clave".into(), label: "Clave actual:".into() }, sys)
+    }
+    fn texto(v: &str) -> Option<DialogResult> {
+        Some(DialogResult::Text { tag: 9, value: Some(v.into()) })
+    }
+
+    #[test]
+    fn clave_se_enmascara_y_responde_con_enter() {
+        let mut sys = TestPlatform::default();
+        let mut d = clave(&mut sys);
+        type_str(&mut d, &mut sys, "ñandú1");
+        assert_eq!(d.field.text, "ñandú1");
+        assert_eq!(d.field.shown(), "••••••");
+        // Ctrl+C no hace nada y la tecla no escribe.
+        let ctrl_c = KeyEvent { key: Key::Char('c'), ch: Some('c'), down: true, shift: false, ctrl: true, alt: false };
+        d.key(&ctrl_c, &mut sys);
+        assert_eq!(d.field.text, "ñandú1");
+        press(&mut d, &mut sys, Key::Backspace);
+        type_str(&mut d, &mut sys, "2");
+        // Dibujar no falla y el texto real no se pinta (el dibujo con puntos y con letras difiere).
+        let mut a = Surface::new(d.size().0, d.size().1, 0);
+        d.draw(&mut a, &Theme::default());
+        let mut abierto = clave(&mut sys);
+        abierto.field.mask = false;
+        type_str(&mut abierto, &mut sys, "ñandú2");
+        let mut b = Surface::new(d.size().0, d.size().1, 0);
+        abierto.draw(&mut b, &Theme::default());
+        assert_ne!(a.px, b.px);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), texto("ñandú2"));
+        // El búfer queda vacío tras responder.
+        assert!(d.field.text.is_empty());
+    }
+
+    #[test]
+    fn clave_cancelada_con_esc_o_boton_da_none() {
+        let mut sys = TestPlatform::default();
+        let mut d = clave(&mut sys);
+        type_str(&mut d, &mut sys, "secreta");
+        assert_eq!(press(&mut d, &mut sys, Key::Escape), Some(DialogResult::Text { tag: 9, value: None }));
+        let mut d = clave(&mut sys);
+        type_str(&mut d, &mut sys, "secreta");
+        press(&mut d, &mut sys, Key::Tab);
+        press(&mut d, &mut sys, Key::Tab);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), Some(DialogResult::Text { tag: 9, value: None }));
+        assert!(d.field.text.is_empty());
+        assert_eq!(d.cancel(), DialogResult::Text { tag: 9, value: None });
+    }
+
+    #[test]
+    fn clave_el_borrado_deja_ceros_en_el_buffer() {
+        let mut f = Field::new("");
+        f.mask = true;
+        f.text.push_str("abc123");
+        let p = f.text.as_ptr();
+        f.wipe();
+        assert!(f.text.is_empty());
+        // SAFETY: el búfer sigue reservado (clear no libera) y se lee dentro de su capacidad.
+        let raw = unsafe { core::slice::from_raw_parts(p, 6) };
+        assert_eq!(raw, [0u8; 6]);
     }
 }
