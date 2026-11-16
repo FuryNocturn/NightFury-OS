@@ -89,8 +89,19 @@ fn al_raton(b: u8) {
     }
 }
 
-/// Con las interrupciones cerradas.
-pub fn init() {
+/// Ratón con rueda: fija la frecuencia de muestreo a 200, 100 y 80 (secuencia pública del
+/// protocolo PS/2 con rueda) y pide el identificador; 3 = paquetes de 4 bytes.
+fn rueda() -> bool {
+    for f in [200, 100, 80] {
+        al_raton(0xF3);
+        al_raton(f);
+    }
+    al_raton(0xF2);
+    espera_leer() && unsafe { inb(DATO) } == 3
+}
+
+/// Con las interrupciones cerradas. Devuelve `true` si el ratón envía paquetes de 4 bytes (rueda).
+pub fn init() -> bool {
     orden(0xAD);
     orden(0xA7);
     vaciar();
@@ -107,8 +118,10 @@ pub fn init() {
         unsafe { inb(DATO) };
     }
     al_raton(0xF6);
+    let con_rueda = rueda();
     al_raton(0xF4);
     vaciar();
+    con_rueda
 }
 
 /// Manejador de las IRQ 1 y 12: vacía el 8042 hacia la cola que toque.

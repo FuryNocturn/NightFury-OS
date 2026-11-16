@@ -1715,7 +1715,7 @@ mod tests {
         let z = d.render(&mut sys);
         assert_eq!(z, [Rect::new(0, 0, 1280, 800)]);
         assert!(d.render(&mut sys).is_empty());
-        d.event(Event::Mouse(MousePacket { dx: 5000, dy: 5000, buttons: 0 }), &mut sys);
+        d.event(Event::Mouse(MousePacket { dx: 5000, dy: 5000, buttons: 0, dz: 0 }), &mut sys);
         let z = d.render(&mut sys);
         assert!(!z.is_empty() && z.len() <= 6);
         assert!(z.iter().all(|r| !r.is_empty() && Rect::new(0, 0, 1280, 800).intersect(*r) == *r));

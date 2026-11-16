@@ -38,13 +38,15 @@ pub struct KeyEvent {
     pub alt: bool,
 }
 
-/// Paquete de ratón: desplazamiento en píxeles de pantalla (dy positivo = hacia abajo)
-/// y botones (bit 0 izquierdo, bit 1 derecho, bit 2 central).
+/// Paquete de ratón: desplazamiento en píxeles de pantalla (dy positivo = hacia abajo),
+/// botones (bit 0 izquierdo, bit 1 derecho, bit 2 central) y rueda `dz` en muescas
+/// (positivo = hacia abajo; siempre 0 si el ratón no tiene rueda).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct MousePacket {
     pub dx: i32,
     pub dy: i32,
     pub buttons: u8,
+    pub dz: i32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -291,10 +293,12 @@ impl Keyboard {
     }
 }
 
-/// Decodificador de ratón PS/2 (paquetes de 3 bytes).
+/// Decodificador de ratón PS/2: paquetes de 3 bytes, o de 4 si el ratón tiene rueda
+/// (protocolo PS/2 con rueda, identificador 3).
 pub struct Ps2Mouse {
-    buf: [u8; 3],
+    buf: [u8; 4],
     n: usize,
+    wheel: bool,
 }
 
 impl Default for Ps2Mouse {
@@ -305,7 +309,12 @@ impl Default for Ps2Mouse {
 
 impl Ps2Mouse {
     pub const fn new() -> Self {
-        Ps2Mouse { buf: [0; 3], n: 0 }
+        Ps2Mouse { buf: [0; 4], n: 0, wheel: false }
+    }
+    /// Activa el paquete de 4 bytes (cuarto byte = rueda). Solo si el ratón respondió con el id 3.
+    pub fn set_wheel(&mut self, on: bool) {
+        self.wheel = on;
+        self.n = 0;
     }
     /// Recibe un byte del ratón; devuelve un paquete cuando se completa.
     pub fn feed(&mut self, byte: u8) -> Option<MousePacket> {
@@ -315,7 +324,7 @@ impl Ps2Mouse {
         }
         self.buf[self.n] = byte;
         self.n += 1;
-        if self.n < 3 {
+        if self.n < if self.wheel { 4 } else { 3 } {
             return None;
         }
         self.n = 0;
@@ -326,8 +335,11 @@ impl Ps2Mouse {
             dx = self.buf[1] as i32 - if b0 & 0x10 != 0 { 256 } else { 0 };
             dy = self.buf[2] as i32 - if b0 & 0x20 != 0 { 256 } else { 0 };
         }
+        // Rueda: el cuarto byte es un entero con signo. Convención del protocolo: positivo = la
+        // rueda gira hacia el usuario (el contenido sube), que es nuestro `dz` positivo = abajo.
+        let dz = if self.wheel { self.buf[3] as i8 as i32 } else { 0 };
         // El ratón da Y positivo hacia arriba; la pantalla, hacia abajo.
-        Some(MousePacket { dx, dy: -dy, buttons: b0 & 7 })
+        Some(MousePacket { dx, dy: -dy, buttons: b0 & 7, dz })
     }
 }
 
@@ -540,13 +552,31 @@ mod tests {
         assert_eq!(m.feed(0x08), None);
         assert_eq!(m.feed(5), None);
         // Y arriba (+3) = dy -3 en pantalla.
-        assert_eq!(m.feed(3), Some(MousePacket { dx: 5, dy: -3, buttons: 0 }));
+        assert_eq!(m.feed(3), Some(MousePacket { dx: 5, dy: -3, buttons: 0, dz: 0 }));
         // X = -2 (0xFE con signo), Y = -4 (0xFC con signo) -> dy +4.
         let p = [0x08 | 0x10 | 0x20, 0xFE, 0xFC].map(|b| m.feed(b));
-        assert_eq!(p[2], Some(MousePacket { dx: -2, dy: 4, buttons: 0 }));
+        assert_eq!(p[2], Some(MousePacket { dx: -2, dy: 4, buttons: 0, dz: 0 }));
         // Valor extremo -256 y +255.
         let p = [0x08 | 0x10, 0x00, 0xFF].map(|b| m.feed(b));
-        assert_eq!(p[2], Some(MousePacket { dx: -256, dy: -255, buttons: 0 }));
+        assert_eq!(p[2], Some(MousePacket { dx: -256, dy: -255, buttons: 0, dz: 0 }));
+    }
+
+    #[test]
+    fn raton_rueda_cuatro_bytes() {
+        let mut m = Ps2Mouse::new();
+        m.set_wheel(true);
+        assert_eq!([0x08, 1, 2].map(|b| m.feed(b)), [None; 3]);
+        // Cuarto byte +1 = hacia abajo; 0xFF = -1 = hacia arriba.
+        assert_eq!(m.feed(1), Some(MousePacket { dx: 1, dy: -2, buttons: 0, dz: 1 }));
+        let p = [0x0A, 0, 0, 0xFF].map(|b| m.feed(b));
+        assert_eq!(p[3], Some(MousePacket { dx: 0, dy: 0, buttons: 2, dz: -1 }));
+        let p = [0x08, 0, 0, 0xFD].map(|b| m.feed(b));
+        assert_eq!(p[3].unwrap().dz, -3);
+        // Sin rueda, el decodificador sigue en 3 bytes y dz = 0.
+        m.set_wheel(false);
+        m.feed(0x08);
+        m.feed(0);
+        assert_eq!(m.feed(0).unwrap().dz, 0);
     }
 
     #[test]
@@ -561,13 +591,13 @@ mod tests {
         assert_eq!(m.feed(0x00), None);
         m.feed(0x08);
         m.feed(1);
-        assert_eq!(m.feed(2), Some(MousePacket { dx: 1, dy: -2, buttons: 0 }));
+        assert_eq!(m.feed(2), Some(MousePacket { dx: 1, dy: -2, buttons: 0, dz: 0 }));
         // Desbordamiento: sin movimiento, con botones.
         for ov in [0x40, 0x80, 0xC0] {
             m.feed(0x08 | 0x01 | ov);
             m.feed(100);
             let p = m.feed(100).unwrap();
-            assert_eq!(p, MousePacket { dx: 0, dy: 0, buttons: 1 });
+            assert_eq!(p, MousePacket { dx: 0, dy: 0, buttons: 1, dz: 0 });
         }
     }
 }

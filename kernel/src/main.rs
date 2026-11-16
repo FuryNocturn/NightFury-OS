@@ -193,7 +193,7 @@ extern "C" fn kmain() -> ! {
     arch::init_pit();
 
     pantalla_de_arranque(&fb);
-    ps2::init();
+    let con_rueda = ps2::init();
 
     let disco = elegir_disco();
     let files = Files::probe(disco, rtc::now());
@@ -227,6 +227,7 @@ extern "C" fn kmain() -> ! {
 
     let mut teclado = Keyboard::new();
     let mut raton = Ps2Mouse::new();
+    raton.set_wheel(con_rueda);
     let mut ultimo = u64::MAX;
     loop {
         while let Some(b) = ps2::TECLADO.pop() {
