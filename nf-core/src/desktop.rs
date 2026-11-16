@@ -47,8 +47,26 @@ const CURSOR: [&str; 19] = [
     ".......##...",
     "............",
 ];
-const CURSOR_W: i32 = 12;
-const CURSOR_H: i32 = 18;
+/// Zona que puede ocupar el puntero en (x, y), sea la flecha o una flecha doble de redimensionado.
+fn cursor_rect(x: i32, y: i32) -> Rect {
+    Rect::new(x - 11, y - 11, 24, 30)
+}
+
+/// Puntero para los bordes agarrados `edge` (bit 0 izquierdo, 1 derecho, 2 superior, 3 inferior):
+/// 1 horizontal, 2 vertical, 3 diagonal de arriba-izquierda a abajo-derecha, 4 la otra diagonal.
+fn resize_cursor(edge: u8) -> u8 {
+    match (edge & 3 != 0, edge & 12 != 0) {
+        (true, true) => {
+            if (edge & 1 != 0) == (edge & 4 != 0) {
+                3
+            } else {
+                4
+            }
+        }
+        (true, false) => 1,
+        _ => 2,
+    }
+}
 
 /// Qué hay bajo el puntero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -150,6 +168,8 @@ pub struct Desktop {
     next_clock: u64,
     clock: DateTime,
     last_active: Option<u32>,
+    /// Forma del puntero: 0 flecha; 1..=4 flechas dobles de redimensionado (ver `resize_cursor`).
+    cur: u8,
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -226,6 +246,7 @@ impl Desktop {
             next_clock: 0,
             clock: sys.now(),
             last_active: None,
+            cur: 0,
         }
     }
 
@@ -275,10 +296,10 @@ impl Desktop {
         if (x, y) == (self.mx, self.my) {
             return;
         }
-        self.dmg(Rect::new(self.mx, self.my, CURSOR_W, CURSOR_H));
+        self.dmg(cursor_rect(self.mx, self.my));
         self.mx = x;
         self.my = y;
-        self.dmg(Rect::new(x, y, CURSOR_W, CURSOR_H));
+        self.dmg(cursor_rect(x, y));
         match self.drag {
             Drag::Move { id, ox, oy } => {
                 if let Some(i) = self.pos(id) {
@@ -702,6 +723,14 @@ impl Desktop {
     /// Tras cualquier cambio: actualiza el resaltado y avisa a la app que el puntero abandona.
     fn after(&mut self, sys: &mut dyn Platform) {
         let hit = self.hit(self.mx, self.my);
+        let cur = match (self.drag, hit) {
+            (Drag::Resize { edge, .. }, _) | (Drag::None, Hit::Edge(_, edge)) => resize_cursor(edge),
+            _ => 0,
+        };
+        if cur != self.cur {
+            self.cur = cur;
+            self.dmg(cursor_rect(self.mx, self.my));
+        }
         if !matches!(self.drag, Drag::Move { .. } | Drag::Resize { .. }) {
             let hot = Self::hot_of(hit);
             if hot != self.hot {
@@ -885,8 +914,22 @@ impl Desktop {
         if self.shut_open {
             self.paint_shut(s);
         }
-        let c = Rect::new(self.mx, self.my, CURSOR_W, CURSOR_H);
-        if c.intersects(s.clip()) {
+        if !cursor_rect(self.mx, self.my).intersects(s.clip()) {
+            return;
+        }
+        if self.cur != 0 {
+            // Flecha doble centrada en el puntero: contorno negro y trazo blanco.
+            let (dx, dy) = [(1.0, 0.0), (0.0, 1.0), (0.707, 0.707), (0.707, -0.707)][self.cur as usize - 1];
+            let (cx, cy) = (self.mx as f32 + 0.5, self.my as f32 + 0.5);
+            let p = |a: f32, b: f32| (cx + a * dx - b * dy, cy + a * dy + b * dx);
+            for (t, col) in [(3.6, 0x000000), (1.4, 0xFFFFFF)] {
+                s.stroke(&[p(-8.0, 0.0), p(8.0, 0.0)], t, col);
+                s.stroke(&[p(4.0, -4.0), p(8.0, 0.0), p(4.0, 4.0)], t, col);
+                s.stroke(&[p(-4.0, -4.0), p(-8.0, 0.0), p(-4.0, 4.0)], t, col);
+            }
+            return;
+        }
+        {
             for (j, row) in CURSOR.iter().enumerate() {
                 for (i, ch) in row.bytes().enumerate() {
                     let col = match ch {
@@ -1445,5 +1488,45 @@ mod tests {
             }
             assert_eq!((d.back().w, d.back().h), (w, h));
         }
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use crate::platform::TestPlatform;
+
+    #[test]
+    fn resize_cursor_follows_the_edge() {
+        assert_eq!(resize_cursor(1), 1);
+        assert_eq!(resize_cursor(2), 1);
+        assert_eq!(resize_cursor(4), 2);
+        assert_eq!(resize_cursor(8), 2);
+        assert_eq!(resize_cursor(1 | 4), 3);
+        assert_eq!(resize_cursor(2 | 8), 3);
+        assert_eq!(resize_cursor(2 | 4), 4);
+        assert_eq!(resize_cursor(1 | 8), 4);
+    }
+
+    #[test]
+    fn pointer_changes_on_edges_and_while_resizing() {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.launch(AppKind::Notepad, &mut sys);
+        let r = d.window_rects()[0];
+        d.mouse_to(r.x + r.w / 2, r.y + r.h / 2, &mut sys);
+        assert_eq!(d.cur, 0);
+        d.mouse_to(r.right() - 2, r.y + r.h / 2, &mut sys);
+        assert_eq!(d.cur, 1);
+        d.mouse_to(r.right() - 2, r.bottom() - 2, &mut sys);
+        assert_eq!(d.cur, 3);
+        // Durante el arrastre se mantiene aunque el puntero se aleje del borde.
+        d.left_button(true, &mut sys);
+        d.mouse_to(r.right() + 80, r.bottom() + 60, &mut sys);
+        assert_eq!(d.cur, 3);
+        assert!(d.window_rects()[0].w > r.w);
+        d.left_button(false, &mut sys);
+        d.mouse_to(600, 700, &mut sys);
+        assert_eq!(d.cur, 0);
     }
 }
