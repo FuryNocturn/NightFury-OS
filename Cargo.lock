@@ -4,18 +4,18 @@ version = 4
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "nfdisk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nf-core",
 ]
