@@ -409,6 +409,36 @@ fn save_config(sys: &mut dyn Platform, theme: &Theme, size: IconSize, order: Ord
     let _ = f.write(files::CONFIG_FILE, text.as_bytes(), now);
 }
 
+/// (título, texto) del cuadro "Propiedades de <nombre>".
+fn props_text(sys: &mut dyn Platform, path: &str) -> Result<(String, String), FsError> {
+    let e = sys.files().stat(path)?;
+    let kind = if e.dir {
+        "Carpeta de archivos"
+    } else if e.name.to_lowercase().ends_with(".txt") {
+        "Documento de texto"
+    } else {
+        "Archivo"
+    };
+    let size = if e.dir {
+        let n = sys.files().list(path).map_or(0, |v| v.len());
+        format!("Contiene: {n} {}", if n == 1 { "elemento" } else { "elementos" })
+    } else {
+        format!("Tamaño: {}", size_text(e.size))
+    };
+    let m = e.modified;
+    let text = format!(
+        "Nombre: {}\nTipo: {kind}\nUbicación: {}\n{size}\nModificado: {:02}/{:02}/{:04} {:02}:{:02}",
+        e.name,
+        files::parent(path).unwrap_or_default(),
+        m.day,
+        m.month,
+        m.year,
+        m.hour,
+        m.minute
+    );
+    Ok((format!("Propiedades de {}", e.name), text))
+}
+
 fn size_text(b: u64) -> String {
     let human = if b < 1024 {
         return format!("{b} bytes");
@@ -853,37 +883,11 @@ impl Desktop {
 
     /// Cuadro "Propiedades de <nombre>".
     fn properties(&mut self, path: &str, sys: &mut dyn Platform) {
-        let e = match sys.files().stat(path) {
-            Ok(e) => e,
-            Err(e) => return self.info("Propiedades", e.message(), sys),
-        };
-        let kind = if e.dir {
-            "Carpeta de archivos"
-        } else if e.name.to_lowercase().ends_with(".txt") {
-            "Documento de texto"
-        } else {
-            "Archivo"
-        };
-        let size = if e.dir {
-            let n = sys.files().list(path).map_or(0, |v| v.len());
-            format!("Contiene: {n} {}", if n == 1 { "elemento" } else { "elementos" })
-        } else {
-            format!("Tamaño: {}", size_text(e.size))
-        };
-        let m = e.modified;
-        let text = format!(
-            "Nombre: {}\nTipo: {kind}\nUbicación: {}\n{size}\nModificado: {:02}/{:02}/{:04} {:02}:{:02}",
-            e.name,
-            files::parent(path).unwrap_or_default(),
-            m.day,
-            m.month,
-            m.year,
-            m.hour,
-            m.minute
-        );
-        self.info(&format!("Propiedades de {}", e.name), &text, sys);
+        match props_text(sys, path) {
+            Ok((title, text)) => self.info(&title, &text, sys),
+            Err(e) => self.info("Propiedades", e.message(), sys),
+        }
     }
-
     /// Teclas con el foco en el escritorio (ninguna ventana abierta a la vista).
     fn desktop_key(&mut self, k: KeyEvent, sys: &mut dyn Platform) {
         let path = self.sel.and_then(|i| self.icon_path(i));
@@ -3094,5 +3098,434 @@ mod modal_tests {
         key(&mut d, &mut sys, Key::Down, None, false);
         key(&mut d, &mut sys, Key::Right, None, false);
         check(&mut d, &mut sys, "borde");
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+    use crate::platform::TestPlatform;
+
+    /// Escritorio con una carpeta y un archivo de texto: iconos 0..5 apps, 5 Papelera, 6 Carpeta, 7 nota.txt.
+    fn setup() -> (Desktop, TestPlatform) {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files.mkdir("C:\\Escritorio\\Carpeta", now).unwrap();
+        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.booted = true;
+        (d, sys)
+    }
+
+    fn texts(items: &[MenuItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| if i.separator { String::from("-") } else if i.sub.is_empty() { i.text.clone() } else { format!("{} >", i.text) })
+            .collect()
+    }
+
+    fn key(d: &mut Desktop, sys: &mut TestPlatform, key: Key, ch: Option<char>, ctrl: bool) {
+        d.event(Event::Key(KeyEvent { key, ch, down: true, shift: false, ctrl, alt: false }), sys);
+    }
+
+    fn right_click(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+        d.right_button(true, sys);
+        d.right_button(false, sys);
+    }
+
+    fn center(r: Rect) -> (i32, i32) {
+        (r.x + r.w / 2, r.y + r.h / 2)
+    }
+
+    fn pick(d: &mut Desktop, sys: &mut TestPlatform, icon: Option<usize>, id: u32) {
+        match icon {
+            Some(i) => {
+                d.sel = Some(i);
+                d.desktop_menu_result(MENU_ICON, id, sys);
+            }
+            None => d.desktop_menu_result(MENU_DESK, id, sys),
+        }
+    }
+
+    /// Un clic sobre el icono `i`; avanza el reloj para que no cuente como doble clic.
+    fn click_icon(d: &mut Desktop, sys: &mut TestPlatform, i: usize) {
+        d.event(Event::Tick(d.now_ms + 1000), sys);
+        click_at(d, sys, center(d.icon_cell(i)));
+    }
+
+    fn answer_text(d: &mut Desktop, sys: &mut TestPlatform, tag: u32, v: &str) {
+        d.system_result(DialogResult::Text { tag, value: Some(String::from(v)) }, sys);
+    }
+
+    #[test]
+    fn icon_menus_have_the_right_items() {
+        let (d, mut sys) = setup();
+        assert_eq!(d.icons[6].name, "Carpeta");
+        assert_eq!(d.icons[7].name, "nota.txt");
+        // App: solo Abrir, en negrita.
+        let it = d.icon_items(0, &mut sys);
+        assert_eq!(texts(&it), ["Abrir"]);
+        assert!(it[0].bold);
+        // Papelera vacía: Vaciar desactivado; con algo dentro, activo.
+        let it = d.icon_items(5, &mut sys);
+        assert_eq!(texts(&it), ["Abrir", "Vaciar Papelera"]);
+        assert!(it[1].disabled);
+        let now = sys.now();
+        sys.files.write("C:\\Escritorio\\viejo.txt", b"x", now).unwrap();
+        sys.files.trash("C:\\Escritorio\\viejo.txt", now).unwrap();
+        assert!(!d.icon_items(5, &mut sys)[1].disabled);
+        // Archivo.
+        let it = d.icon_items(7, &mut sys);
+        let want = ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
+        assert_eq!(texts(&it), want);
+        assert!(it[0].bold && it.iter().all(|i| !i.disabled));
+        assert_eq!(it[1].sub[0].text, "Bloc de notas");
+        // Carpeta: Pegar desactivado hasta que haya portapapeles.
+        let it = d.icon_items(6, &mut sys);
+        let want = ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
+        assert_eq!(texts(&it), want);
+        assert!(it[5].disabled);
+        sys.files.set_clip("C:\\Escritorio\\nota.txt", false);
+        assert!(!d.icon_items(6, &mut sys)[5].disabled);
+    }
+
+    #[test]
+    fn background_menu_items_marks_and_undo() {
+        let (mut d, mut sys) = setup();
+        let it = d.bg_items(&mut sys);
+        assert_eq!(texts(&it), ["Ver >", "Ordenar por >", "Actualizar", "-", "Pegar", "Deshacer", "-", "Nuevo >", "-", "Personalizar"]);
+        assert_eq!(texts(&it[0].sub), ["Iconos grandes", "Iconos medianos", "Iconos pequeños"]);
+        assert_eq!(texts(&it[1].sub), ["Nombre", "Tamaño", "Tipo", "Fecha de modificación"]);
+        assert_eq!(texts(&it[7].sub), ["Carpeta", "Documento de texto"]);
+        let checked = |l: &[MenuItem]| l.iter().map(|i| i.checked).collect::<Vec<_>>();
+        assert_eq!(checked(&it[0].sub), [false, true, false]);
+        assert_eq!(checked(&it[1].sub), [true, false, false, false]);
+        assert!(it[4].disabled && it[5].disabled);
+        assert_eq!(it[5].shortcut, "Ctrl+Z");
+        // Con portapapeles y algo que deshacer.
+        sys.files.set_clip("C:\\Escritorio\\nota.txt", false);
+        let now = sys.now();
+        sys.files.user_trash("C:\\Escritorio\\nota.txt", now).unwrap();
+        let it = d.bg_items(&mut sys);
+        assert!(!it[4].disabled);
+        assert_eq!((it[5].text.as_str(), it[5].disabled), ("Deshacer Eliminar", false));
+        // Las marcas siguen a las opciones.
+        pick(&mut d, &mut sys, None, M_VIEW + 2);
+        pick(&mut d, &mut sys, None, M_SORT + 3);
+        let it = d.bg_items(&mut sys);
+        assert_eq!(checked(&it[0].sub), [false, false, true]);
+        assert_eq!(checked(&it[1].sub), [false, false, false, true]);
+    }
+
+    #[test]
+    fn right_click_selects_icon_opens_menu_and_open_works() {
+        let (mut d, mut sys) = setup();
+        { let p = center(d.icon_cell(7)); right_click(&mut d, &mut sys, p); }
+        assert_eq!(d.sel, Some(7));
+        let m = d.menu().expect("menú del icono");
+        let r = m.item_rect(0);
+        click_at(&mut d, &mut sys, center(r));
+        assert!(d.menu().is_none());
+        assert_eq!(d.wins.last().unwrap().kind, AppKind::Notepad);
+        // Sobre el fondo: menú del fondo y sin selección.
+        d.close(d.wins[0].id);
+        right_click(&mut d, &mut sys, (900, 500));
+        assert!(d.menu().is_some() && d.sel.is_none());
+        d.close_menu();
+        // Sobre una ventana no se abre el menú del escritorio.
+        d.launch(AppKind::Calc, &mut sys);
+        let c = d.wins[0].content_rect();
+        right_click(&mut d, &mut sys, (c.x + 20, c.y + 20));
+        assert!(d.menu().is_none());
+    }
+
+    fn click_at(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+        d.left_button(true, sys);
+        d.left_button(false, sys);
+    }
+
+    #[test]
+    fn copy_cut_paste_delete_and_undo() {
+        let (mut d, mut sys) = setup();
+        // Copiar y pegar dentro de la carpeta.
+        pick(&mut d, &mut sys, Some(7), M_COPY);
+        pick(&mut d, &mut sys, Some(6), M_PASTE_IN);
+        assert!(sys.files.exists("C:\\Escritorio\\Carpeta\\nota.txt"));
+        // Pegar en el fondo: nombre libre.
+        pick(&mut d, &mut sys, None, M_PASTE);
+        assert!(sys.files.exists("C:\\Escritorio\\nota (2).txt"));
+        assert_eq!(sys.files.undo_label(), Some("Copiar"));
+        pick(&mut d, &mut sys, None, M_UNDO);
+        assert!(!sys.files.exists("C:\\Escritorio\\nota (2).txt"));
+        // Cortar y pegar en la carpeta mueve.
+        pick(&mut d, &mut sys, Some(7), M_CUT);
+        pick(&mut d, &mut sys, Some(6), M_PASTE_IN);
+        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists("C:\\Escritorio\\Carpeta\\nota (2).txt"));
+        pick(&mut d, &mut sys, None, M_UNDO);
+        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        // Eliminar manda a la Papelera, los iconos se actualizan y se puede deshacer.
+        let n = d.icons.len();
+        let i = d.icons.iter().position(|x| x.name == "nota.txt").unwrap();
+        pick(&mut d, &mut sys, Some(i), M_DELETE);
+        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert_eq!(d.icons.len(), n - 1);
+        assert_eq!(sys.files.trash_list().unwrap().len(), 2);
+        pick(&mut d, &mut sys, None, M_UNDO);
+        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert_eq!(d.icons.len(), n);
+        // Sin nada que deshacer: mensaje de error, sin colgarse.
+        assert_eq!(d.dialog_count(), 0);
+        pick(&mut d, &mut sys, None, M_UNDO);
+        assert_eq!(d.dialog_count(), 1);
+    }
+
+    #[test]
+    fn rename_and_create_with_dialogs() {
+        let (mut d, mut sys) = setup();
+        // Cambiar nombre: el diálogo guarda la ruta.
+        pick(&mut d, &mut sys, Some(7), M_RENAME);
+        assert_eq!((d.dialog_count(), d.pending.as_deref()), (1, Some("C:\\Escritorio\\nota.txt")));
+        answer_text(&mut d, &mut sys, TAG_RENAME, "lista.txt");
+        assert!(sys.files.exists("C:\\Escritorio\\lista.txt") && d.pending.is_none());
+        assert_eq!(sys.files.undo_label(), Some("Cambiar nombre"));
+        // Nombre inválido: error y no cambia nada.
+        let before = d.dialog_count();
+        pick(&mut d, &mut sys, Some(7), M_RENAME);
+        answer_text(&mut d, &mut sys, TAG_RENAME, "a/b");
+        assert_eq!(d.dialog_count(), before + 2);
+        assert!(sys.files.exists("C:\\Escritorio\\lista.txt"));
+        // Cancelar no hace nada y limpia lo pendiente.
+        pick(&mut d, &mut sys, Some(7), M_RENAME);
+        d.system_result(DialogResult::Text { tag: TAG_RENAME, value: None }, &mut sys);
+        assert!(d.pending.is_none());
+        // Documento sin extensión: se añade .txt. Con extensión se respeta.
+        answer_text(&mut d, &mut sys, TAG_NEWDOC, "apuntes");
+        assert!(sys.files.exists("C:\\Escritorio\\apuntes.txt"));
+        answer_text(&mut d, &mut sys, TAG_NEWDOC, "datos.csv");
+        assert!(sys.files.exists("C:\\Escritorio\\datos.csv"));
+        // Ya existe: error.
+        let n = d.dialog_count();
+        answer_text(&mut d, &mut sys, TAG_NEWDOC, "apuntes");
+        assert_eq!(d.dialog_count(), n + 1);
+        answer_text(&mut d, &mut sys, TAG_NEWDIR, "Cosas");
+        assert!(sys.files.stat("C:\\Escritorio\\Cosas").unwrap().dir);
+        assert!(d.icons.iter().any(|i| i.name == "Cosas"));
+        pick(&mut d, &mut sys, None, M_UNDO);
+        assert!(!sys.files.exists("C:\\Escritorio\\Cosas"));
+    }
+
+    #[test]
+    fn new_folder_dialog_proposes_free_name_and_accepts_typing() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.mkdir("C:\\Escritorio\\Nueva carpeta", now).unwrap();
+        pick(&mut d, &mut sys, None, M_NEWDIR);
+        assert_eq!(d.dialog_count(), 1);
+        key(&mut d, &mut sys, Key::Char('z'), Some('z'), false);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!(d.dialog_count(), 0);
+        // Proponía "Nueva carpeta (2)" y se le ha añadido la z.
+        assert!(sys.files.exists("C:\\Escritorio\\Nueva carpeta (2)z"));
+    }
+
+    #[test]
+    fn empty_trash_asks_first() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.user_trash("C:\\Escritorio\\nota.txt", now).unwrap();
+        pick(&mut d, &mut sys, Some(5), M_EMPTY);
+        assert_eq!(d.dialog_count(), 1);
+        // No (o cerrar) no vacía.
+        d.system_result(DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::No }, &mut sys);
+        assert_eq!(sys.files.trash_list().unwrap().len(), 1);
+        d.system_result(DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes }, &mut sys);
+        assert!(sys.files.trash_list().unwrap().is_empty());
+        // Abrir la Papelera desde su menú.
+        pick(&mut d, &mut sys, Some(5), M_OPEN);
+        assert_eq!(d.wins.iter().filter(|w| w.kind == AppKind::Files && w.dlg.is_none()).count(), 1);
+    }
+
+    #[test]
+    fn open_actions_and_customize() {
+        let (mut d, mut sys) = setup();
+        pick(&mut d, &mut sys, Some(6), M_NEWWIN);
+        pick(&mut d, &mut sys, Some(6), M_NEWWIN);
+        assert_eq!(d.wins.iter().filter(|w| w.kind == AppKind::Files).count(), 2);
+        pick(&mut d, &mut sys, Some(7), M_NOTEPAD);
+        assert_eq!(d.wins.last().unwrap().kind, AppKind::Notepad);
+        pick(&mut d, &mut sys, Some(0), M_OPEN);
+        pick(&mut d, &mut sys, None, M_CUSTOM);
+        pick(&mut d, &mut sys, None, M_CUSTOM);
+        assert_eq!(d.wins.iter().filter(|w| w.kind == AppKind::Settings).count(), 1);
+    }
+
+    #[test]
+    fn properties_text() {
+        let (mut d, mut sys) = setup();
+        let (title, text) = props_text(&mut sys, "C:\\Escritorio\\nota.txt").unwrap();
+        assert_eq!(title, "Propiedades de nota.txt");
+        let want = "Nombre: nota.txt\nTipo: Documento de texto\nUbicación: C:\\Escritorio\nTamaño: 4 bytes\nModificado: 15/11/2026 21:37";
+        assert_eq!(text, want);
+        let now = sys.now();
+        sys.files.write("C:\\Escritorio\\Carpeta\\a.bin", &[0u8; 2000], now).unwrap();
+        let (_, text) = props_text(&mut sys, "C:\\Escritorio\\Carpeta").unwrap();
+        assert!(text.contains("Tipo: Carpeta de archivos") && text.contains("Contiene: 1 elemento\n"), "{text}");
+        let (_, text) = props_text(&mut sys, "C:\\Escritorio\\Carpeta\\a.bin").unwrap();
+        assert!(text.contains("Tipo: Archivo") && text.contains("Tamaño: 2 KB (2000 bytes)"), "{text}");
+        pick(&mut d, &mut sys, Some(7), M_PROPS);
+        assert_eq!(d.dialog_count(), 1);
+        assert_eq!(size_text(5 << 20), "5.0 MB (5242880 bytes)");
+    }
+
+    #[test]
+    fn icon_sizes_change_the_grid_and_hit_areas() {
+        let (mut d, mut sys) = setup();
+        assert_eq!((d.icon_cell(1).h, d.icon_cell(1).y), (84, 90));
+        pick(&mut d, &mut sys, None, M_VIEW);
+        let big = d.icon_cell(1);
+        assert_eq!((big.w, big.h, big.y), (100, 100, 106));
+        assert_eq!(d.hit(center(big).0, center(big).1), Hit::Icon(1));
+        assert_eq!(d.hit(6 + 90, 6 + 10), Hit::Icon(0), "la celda grande llega a 100 px");
+        pick(&mut d, &mut sys, None, M_VIEW + 2);
+        let small = d.icon_cell(1);
+        assert_eq!((small.w, small.h), (76, 62));
+        assert_eq!(d.hit(center(small).0, center(small).1), Hit::Icon(1));
+        // Cada tamaño cabe en su celda: icono y texto dentro.
+        for e in IconSize::ALL {
+            let (cw, ch, isz, iy, ty) = e.0.metrics();
+            assert!(iy + isz <= ty && ty + font::line_h(8) <= ch && isz <= cw, "{:?}", e.0);
+        }
+        // Columnas nuevas cuando no caben en pantalla.
+        let mut d2 = Desktop::new(1280, 300, &mut sys);
+        d2.size = IconSize::Big;
+        assert_eq!((d2.icon_cell(1).x, d2.icon_cell(2).x, d2.icon_cell(4).x), (6, 106, 206));
+    }
+
+    #[test]
+    fn order_sorts_desktop_files_after_apps_and_trash() {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut t = sys.now();
+        sys.files.mkdir("C:\\Escritorio\\Zeta", t).unwrap();
+        t.month = 1;
+        sys.files.write("C:\\Escritorio\\a.txt", b"12345", t).unwrap();
+        t.month = 3;
+        sys.files.write("C:\\Escritorio\\b.bin", b"1", t).unwrap();
+        t.month = 2;
+        sys.files.write("C:\\Escritorio\\c.abc", b"123", t).unwrap();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.booted = true;
+        let names = |d: &Desktop| d.icons.iter().skip(6).map(|i| i.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&d), ["Zeta", "a.txt", "b.bin", "c.abc"]);
+        pick(&mut d, &mut sys, None, M_SORT + 1);
+        assert_eq!(names(&d), ["Zeta", "b.bin", "c.abc", "a.txt"]);
+        pick(&mut d, &mut sys, None, M_SORT + 2);
+        assert_eq!(names(&d), ["Zeta", "c.abc", "b.bin", "a.txt"]);
+        pick(&mut d, &mut sys, None, M_SORT + 3);
+        assert_eq!(names(&d), ["Zeta", "b.bin", "c.abc", "a.txt"]);
+        pick(&mut d, &mut sys, None, M_SORT);
+        assert_eq!(names(&d), ["Zeta", "a.txt", "b.bin", "c.abc"]);
+        // Las apps y la Papelera siguen primero y en su orden.
+        assert_eq!(d.icons[5].name, "Papelera");
+        assert_eq!(d.icons[0].name, "Bloc de notas");
+        // La selección sigue al icono al reordenar.
+        d.sel = Some(7);
+        pick(&mut d, &mut sys, None, M_SORT + 1);
+        assert_eq!(d.icons[d.sel.unwrap()].name, "a.txt");
+    }
+
+    #[test]
+    fn size_and_order_are_saved_loaded_and_foreign_lines_kept() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.write(files::CONFIG_FILE, b"explorador=lista\nfondo=1\n", now).unwrap();
+        pick(&mut d, &mut sys, None, M_VIEW);
+        pick(&mut d, &mut sys, None, M_SORT + 2);
+        let text = String::from_utf8(sys.files.read(files::CONFIG_FILE).unwrap()).unwrap();
+        assert_eq!(text, "fondo=0\nenfasis=0078D4\niconos=grande\norden=tipo\nexplorador=lista\n".replace("0078D4", &format!("{:06X}", d.theme.accent & 0xFFFFFF)));
+        let d2 = Desktop::new(1280, 800, &mut sys);
+        assert_eq!((d2.size, d2.order), (IconSize::Big, Order::Kind));
+        // Valores no válidos se ignoran.
+        sys.files.write(files::CONFIG_FILE, b"iconos=enorme\norden=azar\n", now).unwrap();
+        let d3 = Desktop::new(1280, 800, &mut sys);
+        assert_eq!((d3.size, d3.order), (IconSize::Mid, Order::Name));
+        sys.files.write(files::CONFIG_FILE, b"iconos=pequeno\norden=fecha\n", now).unwrap();
+        let d4 = Desktop::new(1280, 800, &mut sys);
+        assert_eq!((d4.size, d4.order), (IconSize::Small, Order::Date));
+    }
+
+    #[test]
+    fn desktop_keys_undo_delete_rename_only_without_windows() {
+        let (mut d, mut sys) = setup();
+        sys.files.user_rename("C:\\Escritorio\\nota.txt", "C:\\Escritorio\\otra.txt").unwrap();
+        // Con una ventana enfocada, Ctrl+Z no es del escritorio.
+        d.launch(AppKind::Calc, &mut sys);
+        key(&mut d, &mut sys, Key::Char('z'), None, true);
+        assert!(sys.files.exists("C:\\Escritorio\\otra.txt"));
+        d.close(d.wins[0].id);
+        key(&mut d, &mut sys, Key::Char('z'), None, true);
+        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        // Supr sobre el icono seleccionado: a la Papelera.
+        click_icon(&mut d, &mut sys, 7);
+        key(&mut d, &mut sys, Key::Delete, None, false);
+        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert_eq!(sys.files.trash_list().unwrap().len(), 1);
+        key(&mut d, &mut sys, Key::Char('z'), None, true);
+        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        // F2 pide el nombre; sobre una app o la Papelera no hace nada.
+        click_icon(&mut d, &mut sys, 7);
+        key(&mut d, &mut sys, Key::F(2), None, false);
+        assert_eq!((d.dialog_count(), d.pending.is_some()), (1, true));
+        d.system_result(DialogResult::Text { tag: TAG_RENAME, value: None }, &mut sys);
+        click_icon(&mut d, &mut sys, 5);
+        let n = d.dialog_count();
+        key(&mut d, &mut sys, Key::Delete, None, false);
+        key(&mut d, &mut sys, Key::F(2), None, false);
+        assert_eq!(d.dialog_count(), n);
+    }
+
+    #[test]
+    fn incremental_equals_full_with_desktop_menus() {
+        let (mut d, mut sys) = setup();
+        d.render(&mut sys);
+        let check = |d: &mut Desktop, sys: &mut TestPlatform, what: &str| {
+            d.render(sys);
+            let inc = d.back().px.clone();
+            d.invalidate();
+            d.render(sys);
+            assert!(inc == d.back().px, "incremental distinto del completo: {what}");
+        };
+        right_click(&mut d, &mut sys, (900, 400));
+        check(&mut d, &mut sys, "menú del fondo");
+        let r = d.menu().unwrap().item_rect(0);
+        d.mouse_to(r.x + 10, r.y + 5, &mut sys);
+        let s = d.menu().unwrap().sub_item_rect(0).unwrap();
+        d.mouse_to(s.x + 10, s.y + 5, &mut sys);
+        check(&mut d, &mut sys, "submenú Ver");
+        click_at(&mut d, &mut sys, (s.x + 10, s.y + 5));
+        check(&mut d, &mut sys, "iconos grandes");
+        { let p = center(d.icon_cell(7)); right_click(&mut d, &mut sys, p); }
+        check(&mut d, &mut sys, "menú de icono");
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        pick(&mut d, &mut sys, None, M_VIEW + 2);
+        check(&mut d, &mut sys, "iconos pequeños");
+        pick(&mut d, &mut sys, None, M_VIEW + 1);
+        check(&mut d, &mut sys, "iconos medianos");
+        let now = sys.now();
+        sys.files.write("C:\\Escritorio\\nuevo.txt", b"n", now).unwrap();
+        d.event(Event::Tick(10), &mut sys);
+        check(&mut d, &mut sys, "archivo creado");
+        sys.files.delete("C:\\Escritorio\\nuevo.txt").unwrap();
+        d.event(Event::Tick(20), &mut sys);
+        check(&mut d, &mut sys, "archivo eliminado");
+        pick(&mut d, &mut sys, None, M_SORT + 1);
+        check(&mut d, &mut sys, "orden");
+        { let p = center(d.icon_cell(7)); click_at(&mut d, &mut sys, p); }
+        key(&mut d, &mut sys, Key::Delete, None, false);
+        check(&mut d, &mut sys, "supr");
+        key(&mut d, &mut sys, Key::Char('z'), None, true);
+        check(&mut d, &mut sys, "deshacer");
     }
 }
