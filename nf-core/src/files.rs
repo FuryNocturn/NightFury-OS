@@ -32,16 +32,6 @@ use alloc::vec::Vec;
 
 /// Ubicación especial que el Explorador muestra como la Papelera (no es una ruta de disco).
 pub const TRASH: &str = "Papelera";
-// Rutas de la estructura ANTIGUA: siguen aquí mientras otros módulos las usan; en la nueva no
-// existen (usa `Files::std_dir`, `config_file` y `explorer_prefs`). No llevan `#[deprecated]`
-// para no llenar de avisos de compilación a esos módulos.
-pub const DESKTOP_DIR: &str = "C:\\Escritorio";
-pub const DOCUMENTS_DIR: &str = "C:\\Documentos";
-pub const PICTURES_DIR: &str = "C:\\Imágenes";
-/// Archivo de configuración del sistema (texto, líneas `clave=valor`).
-pub const CONFIG_FILE: &str = "C:\\Sistema\\config.txt";
-/// Preferencias del Explorador: `vista=`, `orden=`, `desc=`, `extensiones=`.
-pub const EXPLORER_PREFS: &str = "C:\\Sistema\\explorador.txt";
 
 // ---- Estructura del disco (v0.5.0). Ningún otro módulo escribe estas rutas a mano. ----
 pub const USERS_DIR: &str = "C:\\Usuarios";
@@ -1815,8 +1805,8 @@ mod tests {
         assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos", "C:\\"), Err(FsError::Invalid));
         assert!(f.exists("C:\\Sistema"));
         // dentro de Sistema sí se puede trabajar
-        f.write(CONFIG_FILE, b"fondo=1\n", d(1)).unwrap();
-        f.delete(CONFIG_FILE).unwrap();
+        f.write("C:\\Sistema\\temp\\x.txt", b"fondo=1\n", d(1)).unwrap();
+        f.delete("C:\\Sistema\\temp\\x.txt").unwrap();
     }
 
     #[test]
