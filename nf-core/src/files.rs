@@ -2093,4 +2093,444 @@ mod tests {
         f.format_pending(d(2)).unwrap();
         assert_eq!(f.read("C:\\a.txt").unwrap(), b"1");
     }
+
+    // ---- v0.5.0: estructura, permisos, cuentas y migración ----
+
+    use std::cell::Cell;
+
+    const ANA: &str = "C:\\Usuarios\\Ana";
+
+    /// Disco que deja de escribir tras `left` bloques (un corte de corriente).
+    struct Cut {
+        disk: Disk,
+        left: Rc<Cell<u32>>,
+        failed: Rc<Cell<bool>>,
+    }
+    impl BlockDev for Cut {
+        fn blocks(&self) -> u64 {
+            self.disk.blocks()
+        }
+        fn read(&mut self, n: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+            self.disk.read(n, buf)
+        }
+        fn write(&mut self, n: u64, buf: &[u8]) -> Result<(), DiskError> {
+            if self.left.get() == 0 {
+                self.failed.set(true);
+                return Err(DiskError::Io);
+            }
+            self.left.set(self.left.get() - 1);
+            self.disk.write(n, buf)
+        }
+    }
+
+    /// Imagen con la estructura de la v0.4: carpetas en la raíz, ajustes en Sistema y Papelera con dos elementos.
+    fn old_disk() -> Disk {
+        let disk = Disk::new(2048);
+        let mut fs = Nffs::format(Box::new(disk.clone()), d(1)).unwrap();
+        for p in ["Documentos", "Documentos\\sub", "Imágenes", "Escritorio", "Sistema", "$Papelera", "$Papelera\\00000002"] {
+            fs.mkdir(p, d(1)).unwrap();
+        }
+        fs.write("Documentos\\a.txt", b"A", d(2)).unwrap();
+        fs.write("Documentos\\sub\\b.bin", &vec![3u8; 9000], d(2)).unwrap();
+        fs.write("Imágenes\\f.bmp", b"BM", d(2)).unwrap();
+        fs.write("Escritorio\\e.txt", b"E", d(2)).unwrap();
+        fs.write("Sistema\\config.txt", b"fondo=3\n", d(2)).unwrap();
+        fs.write("Sistema\\explorador.txt", b"vista=lista\n", d(2)).unwrap();
+        fs.write("$Papelera\\00000001", b"borrado", d(2)).unwrap();
+        fs.write("$Papelera\\00000002\\x.txt", b"X", d(2)).unwrap();
+        fs.write(
+            "$Papelera\\indice",
+            b"00000001|2026-11-8-1-2-3|C:\\Documentos\\borrado.txt\n00000002|2026-11-9-1-2-3|C:\\Escritorio\\carp\n",
+            d(2),
+        )
+        .unwrap();
+        disk
+    }
+
+    /// Comprueba que `Ana` tiene todo lo de `old_disk` y que no queda nada antiguo.
+    fn check_migrated(f: &mut Files) {
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\a.txt")).unwrap(), b"A");
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\sub\\b.bin")).unwrap(), vec![3u8; 9000]);
+        assert_eq!(f.read(&format!("{ANA}\\Imágenes\\f.bmp")).unwrap(), b"BM");
+        assert_eq!(f.read(&format!("{ANA}\\Escritorio\\e.txt")).unwrap(), b"E");
+        assert_eq!(f.read(&f.config_file()).unwrap(), b"fondo=3\n");
+        assert_eq!(f.read(&f.explorer_prefs()).unwrap(), b"vista=lista\n");
+        for old in ["Documentos", "Imágenes", "Escritorio", "$Papelera", "Sistema\\config.txt", "Sistema\\explorador.txt", "Sistema\\config\\migracion", "Sistema\\config\\antiguo"] {
+            assert!(!f.exists_raw(old), "{old}");
+        }
+        // La Papelera antigua se restaura a las rutas nuevas.
+        let items = f.trash_list().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].original, format!("{ANA}\\Escritorio\\carp"));
+        assert_eq!(items[1].original, format!("{ANA}\\Documentos\\borrado.txt"));
+        assert_eq!(f.restore(&items[0].id).unwrap(), format!("{ANA}\\Escritorio\\carp"));
+        assert_eq!(f.read(&format!("{ANA}\\Escritorio\\carp\\x.txt")).unwrap(), b"X");
+        assert_eq!(f.restore(&items[1].id).unwrap(), format!("{ANA}\\Documentos\\borrado.txt"));
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\borrado.txt")).unwrap(), b"borrado");
+        assert!(f.trash_list().unwrap().is_empty());
+    }
+
+    /// Disco formateado y montado, sin cuentas.
+    fn fresh(disk: &Disk) -> Files {
+        drop(Nffs::format(Box::new(disk.clone()), d(1)).unwrap());
+        Files::probe(Some(Box::new(disk.clone())), d(1))
+    }
+
+    #[test]
+    fn estructura_inicial_en_memoria_y_en_disco() {
+        let mut m = Files::default();
+        assert_eq!(names(&mut m, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut m, "C:\\Sistema"), ["config", "drivers", "lib", "logs", "temp"]);
+        assert_eq!(names(&mut m, "C:\\Usuarios"), [DEFAULT_USER]);
+        assert_eq!(m.home(), "C:\\Usuarios\\Usuario");
+        let h = m.home();
+        assert_eq!(names(&mut m, &h), ["Descargas", "Documentos", "Escritorio", "Imágenes", "Música", "Vídeos"]);
+        assert_eq!(m.config_file(), "C:\\Usuarios\\Usuario\\.config\\config.txt");
+        assert_eq!(m.explorer_prefs(), "C:\\Usuarios\\Usuario\\.config\\explorador.txt");
+        // Las carpetas con punto no se listan pero se leen y escriben por ruta.
+        let cfg = m.config_file();
+        m.write(&cfg, b"fondo=1\n", d(1)).unwrap();
+        assert_eq!(m.read(&cfg).unwrap(), b"fondo=1\n");
+        assert!(m.stat("C:\\Usuarios\\Usuario\\.papelera").unwrap().dir);
+        // En disco: sin cuentas ni carpetas de usuario, y sin sesión `home` es `C:\Usuarios`.
+        let disk = Disk::new(1024);
+        drop(Nffs::format(Box::new(disk.clone()), d(1)).unwrap());
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(2));
+        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(f.home(), "C:\\Usuarios");
+        assert!(f.user().is_none() && f.needs_setup());
+        assert_eq!(f.write("C:\\x.txt", b"1", d(2)), Err(FsError::Invalid), "sin sesión no se escribe");
+        assert_eq!(f.write("C:\\Usuarios\\x.txt", b"1", d(2)), Err(FsError::Invalid));
+        assert_eq!(f.read("C:\\Sistema\\config\\cuentas"), Err(FsError::Invalid));
+        // Cada cuenta crea su carpeta completa; la sesión da las rutas.
+        f.create_account("Ana", None, true, [1; 16], d(3)).unwrap();
+        f.create_account("Ana", None, true, [1; 16], d(3)).unwrap_err();
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.home(), ANA);
+        assert_eq!(f.std_dir(Std::Music), format!("{ANA}\\Música"));
+        assert_eq!(names(&mut f, ANA), ["Descargas", "Documentos", "Escritorio", "Imágenes", "Música", "Vídeos"]);
+        for p in [".config", ".papelera"] {
+            assert!(f.stat(&format!("{ANA}\\{p}")).unwrap().dir);
+        }
+        assert!(f.exists_raw("Usuarios\\Ana\\.config") && f.exists_raw("Usuarios\\Ana\\.papelera"));
+        assert_eq!(f.write(&f.config_file(), b"a", d(3)), Ok(()));
+        assert_eq!(f.write(&f.explorer_prefs(), b"b", d(3)), Ok(()));
+    }
+
+    #[test]
+    fn papelera_por_usuario() {
+        let disk = Disk::new(2048);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
+        f.format_pending(d(1)).unwrap();
+        f.create_account("Ana", None, true, [1; 16], d(1)).unwrap();
+        f.create_account("Luis", None, true, [2; 16], d(1)).unwrap_err(); // sin sesión
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], d(1)).unwrap();
+        f.write(&format!("{ANA}\\Documentos\\a.txt"), b"A", d(2)).unwrap();
+        f.write("C:\\suelto.txt", b"S", d(2)).unwrap();
+        f.trash(&format!("{ANA}\\Documentos\\a.txt"), d(3)).unwrap();
+        f.trash("C:\\suelto.txt", d(3)).unwrap(); // fuera de su carpeta: va a la Papelera de quien lo borra
+        assert_eq!(f.trash_list().unwrap().len(), 2);
+        assert!(f.exists_raw("Usuarios\\Ana\\.papelera\\indice"));
+        f.logout();
+        assert!(f.trash_list().unwrap().is_empty(), "sin sesión no hay Papelera");
+        assert_eq!(f.empty_trash(), Err(FsError::Invalid));
+        f.login("Luis", "").unwrap();
+        assert!(f.trash_list().unwrap().is_empty(), "Luis no ve lo de Ana");
+        f.write("C:\\Usuarios\\Luis\\Documentos\\l.txt", b"L", d(4)).unwrap();
+        f.trash("C:\\Usuarios\\Luis\\Documentos\\l.txt", d(4)).unwrap();
+        assert_eq!(f.trash_list().unwrap().len(), 1);
+        // Lo que ya está en una Papelera no se vuelve a enviar a otra.
+        let id = f.trash_list().unwrap()[0].id.clone();
+        assert_eq!(f.trash("C:\\Usuarios\\Luis\\.papelera\\".to_string().as_str(), d(4)), Err(FsError::Invalid));
+        assert_eq!(f.trash(&format!("C:\\Usuarios\\Luis\\.papelera\\{id}"), d(4)), Err(FsError::Invalid));
+        // Un índice manipulado no saca nada a la carpeta de otro.
+        f.fs.write("Usuarios\\Luis\\.papelera\\indice", format!("{id}|2026-11-3-1-2-3|{ANA}\\Documentos\\mala.txt\n").as_bytes(), d(5)).unwrap();
+        assert_eq!(f.restore(&id), Err(FsError::Invalid));
+        f.empty_trash().unwrap();
+        assert!(f.trash_list().unwrap().is_empty());
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.trash_list().unwrap().len(), 2, "vaciar la de Luis no toca la de Ana");
+        let items = f.trash_list().unwrap();
+        assert_eq!(f.restore(&items[0].id).unwrap(), "C:\\suelto.txt");
+        assert_eq!(f.restore(&items[1].id).unwrap(), format!("{ANA}\\Documentos\\a.txt"));
+    }
+
+    #[test]
+    fn permisos_entre_usuarios() {
+        let disk = Disk::new(2048);
+        let mut f = fresh(&disk);
+        f.create_account("Ana", None, true, [1; 16], d(1)).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], d(1)).unwrap();
+        // El administrador entra y escribe en la carpeta de otro y en Sistema.
+        f.write("C:\\Usuarios\\Luis\\Documentos\\l.txt", b"L", d(2)).unwrap();
+        assert_eq!(names(&mut f, "C:\\Usuarios"), ["Ana", "Luis"]);
+        assert!(f.write("C:\\Sistema\\temp\\t.txt", b"t", d(2)).is_ok());
+        assert!(in_system("c:/sistema/temp/t.txt") && in_system("C:\\Sistema") && !in_system("C:\\Usuarios\\Ana"));
+        f.write(&format!("{ANA}\\Documentos\\a.txt"), b"A", d(2)).unwrap();
+        // Un usuario normal solo ve y usa lo suyo.
+        f.login("Luis", "").unwrap();
+        assert!(!f.is_admin());
+        assert_eq!(names(&mut f, "C:\\Usuarios"), ["Luis"]);
+        let a = format!("{ANA}\\Documentos\\a.txt");
+        assert_eq!(f.read(&a), Err(FsError::Invalid));
+        assert_eq!(f.stat(ANA), Err(FsError::Invalid));
+        assert_eq!(f.list(ANA).err(), Some(FsError::Invalid));
+        assert_eq!(f.write(&a, b"x", d(3)), Err(FsError::Invalid));
+        assert_eq!(f.mkdir(&format!("{ANA}\\Documentos\\n"), d(3)), Err(FsError::Invalid));
+        assert_eq!(f.delete(&a), Err(FsError::Invalid));
+        assert_eq!(f.trash(&a, d(3)), Err(FsError::Invalid));
+        assert_eq!(f.rename(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt"), Err(FsError::Invalid));
+        assert_eq!(f.copy(&a, "C:\\Usuarios\\Luis\\Documentos\\a.txt", d(3)), Err(FsError::Invalid));
+        assert_eq!(f.copy("C:\\Usuarios\\Luis\\Documentos\\l.txt", &format!("{ANA}\\Documentos\\l.txt"), d(3)), Err(FsError::Invalid));
+        assert!(f.transfer(&[String::from("C:\\Usuarios\\Luis\\Documentos\\l.txt")], &format!("{ANA}\\Escritorio"), true, d(3)).is_err());
+        assert_eq!(f.read("C:\\Usuarios\\Luis\\Documentos\\l.txt").unwrap(), b"L");
+        assert!(f.user_rename(&a, &format!("{ANA}\\Documentos\\b.txt")).is_err());
+        assert!(f.user_trash(&a, d(3)).is_err() && f.user_create(&format!("{ANA}\\Documentos\\z"), true, d(3)).is_err());
+        // Lo suyo sí, y Sistema se lee pero no se escribe; las cuentas no se leen.
+        f.write("C:\\Usuarios\\Luis\\Documentos\\m.txt", b"M", d(3)).unwrap();
+        f.trash("C:\\Usuarios\\Luis\\Documentos\\m.txt", d(3)).unwrap();
+        assert!(f.read("C:\\Sistema\\temp\\t.txt").is_ok());
+        assert_eq!(f.write("C:\\Sistema\\temp\\u.txt", b"u", d(3)), Err(FsError::Invalid));
+        assert_eq!(f.delete("C:\\Sistema\\temp\\t.txt"), Err(FsError::Invalid));
+        assert_eq!(f.mkdir("C:\\Sistema\\nueva", d(3)), Err(FsError::Invalid));
+        assert_eq!(f.rename("C:\\Sistema\\temp\\t.txt", "C:\\Usuarios\\Luis\\t.txt"), Err(FsError::Invalid));
+        assert_eq!(f.read(ACCOUNTS_FILE), Err(FsError::Invalid));
+        // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Invalid));
+        assert!(f.read(ACCOUNTS_FILE).is_ok());
+    }
+
+    #[test]
+    fn proteccion_de_carpetas_por_todas_las_vias() {
+        let mut f = Files::default();
+        let h = f.home();
+        let mut prot: Vec<String> = ["C:\\", "C:\\Usuarios", "C:\\Sistema", h.as_str()].iter().map(|s| s.to_string()).collect();
+        for s in SYS_SUBS {
+            prot.push(format!("C:\\Sistema\\{s}"));
+        }
+        for s in Std::ALL {
+            prot.push(f.std_dir(s));
+        }
+        prot.push(format!("{h}\\.config"));
+        prot.push(format!("{h}\\.papelera"));
+        let n = d(1);
+        let dest = f.std_dir(Std::Documents);
+        for p in &prot {
+            assert!(is_protected(p), "{p}");
+            assert_eq!(f.delete(p), Err(FsError::Invalid), "delete {p}");
+            assert_eq!(f.rename(p, "C:\\otro"), Err(FsError::Invalid), "rename {p}");
+            assert_eq!(f.trash(p, n), Err(FsError::Invalid), "trash {p}");
+            assert!(f.user_rename(p, "C:\\otro").is_err() && f.user_trash(p, n).is_err(), "user_ {p}");
+            assert!(f.user_trash_many(&[p.clone()], n).is_err());
+            assert!(f.transfer(&[p.clone()], &dest, true, n).is_err() || p == &dest, "transfer {p}");
+            assert!(f.exists(p), "{p}");
+            // Tampoco como destino de una sobrescritura.
+            f.write("C:\\Usuarios\\Usuario\\Documentos\\x", b"x", n).unwrap();
+            assert!(f.rename("C:\\Usuarios\\Usuario\\Documentos\\x", p).is_err(), "destino {p}");
+            f.delete("C:\\Usuarios\\Usuario\\Documentos\\x").unwrap();
+        }
+        // Lo de dentro sí se puede mover y borrar.
+        assert!(!is_protected(&format!("{h}\\Documentos\\a")) && !is_protected("C:\\Sistema\\config\\cuentas"));
+        assert!(!is_protected(&format!("{h}\\.config\\config.txt")));
+        // La carpeta de otra cuenta también está protegida (aunque no exista como cuenta).
+        assert!(is_protected("C:\\Usuarios\\Otra") && is_protected("C:\\Usuarios\\Otra\\Vídeos"));
+    }
+
+    #[test]
+    fn migracion_completa_y_repetida() {
+        let disk = old_disk();
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(5));
+        assert!(f.persistent() && f.needs_setup() && f.user().is_none());
+        // Sin cuenta, lo antiguo espera donde estaba y lo suelto de Sistema, apartado.
+        assert!(f.exists_raw("Documentos\\a.txt") && f.exists_raw("$Papelera\\indice"));
+        assert!(f.exists_raw("Sistema\\config\\antiguo\\config.txt") && !f.exists_raw("Sistema\\config.txt"));
+        assert!(f.exists_raw("Sistema\\config\\migracion"));
+        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Sistema", "Usuarios"]);
+        // Reiniciar sin cuenta no cambia nada (idempotente).
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(6));
+        assert!(f.exists_raw("Documentos\\a.txt") && f.exists_raw("Sistema\\config\\antiguo\\explorador.txt"));
+        f.create_account("Ana", None, false, [1; 16], d(7)).unwrap();
+        check_migrated(&mut f);
+        // Y repetir el arranque tras migrar no vuelve a tocar nada ni resucita carpetas antiguas.
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(9));
+        f.login("Ana", "").unwrap();
+        f.mkdir("C:\\Documentos", d(9)).unwrap();
+        f.write("C:\\Documentos\\mio.txt", b"m", d(9)).unwrap();
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk)), d(10));
+        f.login("Ana", "").unwrap();
+        assert!(f.exists("C:\\Documentos\\mio.txt"), "una carpeta creada después no se vuelve a migrar");
+        assert!(!f.exists(&format!("{ANA}\\Documentos\\mio.txt")));
+        let log = String::from_utf8(f.read(LOG_FILE).unwrap()).unwrap();
+        assert!(log.contains("Migración completa") && log.contains("2026-11-07"), "{log}");
+    }
+
+    #[test]
+    fn migracion_con_nombres_repetidos_en_destino() {
+        let disk = old_disk();
+        {
+            // Ana ya existe y ya tiene un a.txt y un config.txt propios.
+            let mut fs = Nffs::mount(Box::new(disk.clone())).unwrap();
+            fs.mkdir("Usuarios", d(1)).unwrap();
+            fs.mkdir("Sistema\\config", d(1)).unwrap();
+            fs.write("Sistema\\config\\cuentas", b"Ana|admin|50||\n", d(1)).unwrap();
+            for p in ["Usuarios\\Ana", "Usuarios\\Ana\\Documentos", "Usuarios\\Ana\\.config"] {
+                fs.mkdir(p, d(1)).unwrap();
+            }
+            fs.write("Usuarios\\Ana\\Documentos\\a.txt", b"NUEVO", d(1)).unwrap();
+            fs.mkdir("Usuarios\\Ana\\Documentos\\sub", d(1)).unwrap();
+            fs.write("Usuarios\\Ana\\.config\\config.txt", b"propio", d(1)).unwrap();
+        }
+        let mut f = Files::probe(Some(Box::new(disk)), d(2));
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\a.txt")).unwrap(), b"NUEVO");
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\a (2).txt")).unwrap(), b"A");
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\sub\\b.bin")).is_err(), true, "la carpeta vieja no se mezcla con la nueva");
+        assert_eq!(f.read(&format!("{ANA}\\Documentos\\sub (2)\\b.bin")).unwrap().len(), 9000);
+        assert_eq!(f.read(&f.config_file()).unwrap(), b"propio");
+        assert_eq!(f.read(&format!("{ANA}\\.config\\config (2).txt")).unwrap(), b"fondo=3\n");
+        assert_eq!(f.trash_list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migracion_cortada_en_cada_paso_y_reanudada() {
+        let snapshot = old_disk().0.borrow().clone();
+        let mut cuts = 0;
+        for n in 0..4000u32 {
+            let disk = Disk(Rc::new(RefCell::new(snapshot.clone())));
+            let failed = Rc::new(Cell::new(false));
+            {
+                let dev = Cut { disk: disk.clone(), left: Rc::new(Cell::new(n)), failed: failed.clone() };
+                let mut f = Files::probe(Some(Box::new(dev)), d(1));
+                if f.persistent() && f.accounts().is_empty() {
+                    let _ = f.create_account("Ana", None, true, [1; 16], d(2));
+                }
+            }
+            if failed.get() {
+                cuts += 1;
+            }
+            // Siguiente arranque, ya sin cortes: termina igual, haya o no cuenta.
+            let mut f = Files::probe(Some(Box::new(disk.clone())), d(3));
+            assert!(f.persistent(), "n={n}");
+            if f.accounts().is_empty() {
+                f.create_account("Ana", None, true, [1; 16], d(4)).unwrap();
+            }
+            check_migrated(&mut f);
+            // Y un arranque más, sin tocar nada.
+            drop(f);
+            let mut f = Files::probe(Some(Box::new(disk)), d(5));
+            f.login("Ana", "").unwrap();
+            assert!(!f.exists_raw("Sistema\\config\\migracion"), "n={n}");
+            if !failed.get() {
+                break;
+            }
+        }
+        assert!(cuts > 30, "se probaron pocos cortes: {cuts}");
+    }
+
+    #[test]
+    fn format_pending_cortado_falla_sin_perder_la_memoria() {
+        let disk = Disk::new(2048);
+        let failed = Rc::new(Cell::new(false));
+        let mut f = Files::probe(Some(Box::new(Cut { disk: disk.clone(), left: Rc::new(Cell::new(60)), failed: failed.clone() })), d(1));
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"uno", d(2)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande.bin", &vec![1u8; 300_000], d(2)).unwrap();
+        assert!(f.format_pending(d(3)).is_err() && failed.get(), "el corte tiene que ocurrir durante la copia");
+        assert!(!f.persistent());
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt").unwrap(), b"uno");
+    }
+
+    #[test]
+    fn rename_y_delete_de_cuentas() {
+        let disk = Disk::new(2048);
+        let mut f = fresh(&disk);
+        f.create_account("Ana", None, true, [1; 16], d(1)).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], d(1)).unwrap();
+        f.create_account("Eva", None, false, [3; 16], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Luis\\Documentos\\l.txt", b"L", d(2)).unwrap();
+        f.write("C:\\Usuarios\\Eva\\Documentos\\e.txt", b"E", d(2)).unwrap();
+        assert_eq!(f.rename_account("Luis", "Eva", d(3)), Err(AccountError::Exists));
+        assert_eq!(f.rename_account("Luis", "a|b", d(3)), Err(AccountError::BadName));
+        assert_eq!(f.rename_account("Nadie", "Pepe", d(3)), Err(AccountError::NotFound));
+        f.rename_account("luis", "Pepe", d(3)).unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Pepe\\Documentos\\l.txt").unwrap(), b"L");
+        assert!(!f.exists("C:\\Usuarios\\Luis") && f.accounts().iter().any(|a| a.name == "Pepe"));
+        assert_eq!(f.login("Luis", ""), Err(AccountError::NotFound));
+        // La propia cuenta: la sesión pasa a llamarse igual y las rutas cambian con ella.
+        f.write(&format!("{ANA}\\Documentos\\a.txt"), b"A", d(3)).unwrap();
+        f.rename_account("Ana", "Anita", d(4)).unwrap();
+        assert_eq!(f.user(), Some("Anita"));
+        assert_eq!(f.home(), "C:\\Usuarios\\Anita");
+        assert_eq!(f.read("C:\\Usuarios\\Anita\\Documentos\\a.txt").unwrap(), b"A");
+        // Un usuario normal no renombra.
+        f.login("Pepe", "").unwrap();
+        assert_eq!(f.rename_account("Pepe", "Otro", d(5)), Err(AccountError::NotAdmin));
+        // Un cambio de nombre cortado (el diario escrito, nada más) se termina al arrancar.
+        f.login("Anita", "").unwrap();
+        f.fs.write("Sistema\\config\\renombrar", b"Pepe|Pablo\n", d(5)).unwrap();
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(6));
+        let nombres: Vec<String> = f.accounts().into_iter().map(|a| a.name).collect();
+        assert_eq!(nombres, ["Anita", "Pablo", "Eva"]);
+        assert!(f.exists_raw("Usuarios\\Pablo\\Documentos\\l.txt") && !f.exists_raw("Usuarios\\Pepe") && !f.exists_raw("Sistema\\config\\renombrar"));
+        // Eliminar: conservando la carpeta, y con sus archivos.
+        f.login("Anita", "").unwrap();
+        f.delete_account("Pablo", true, d(7)).unwrap();
+        assert!(f.exists_raw("Usuarios\\Pablo\\Documentos\\l.txt") && f.accounts().len() == 2);
+        f.delete_account("Eva", false, d(7)).unwrap();
+        assert!(!f.exists_raw("Usuarios\\Eva") && f.accounts().len() == 1);
+        assert_eq!(f.delete_account("Eva", false, d(7)), Err(AccountError::NotFound));
+        // Una carpeta conservada que nadie adopta sigue ahí tras reiniciar.
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk)), d(8));
+        assert!(f.exists_raw("Usuarios\\Pablo\\Documentos\\l.txt"));
+        let log = String::from_utf8(f.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
+        assert!(log.contains("Cuenta renombrada: Luis -> Pepe") && log.contains("Cuenta eliminada: Eva (con sus archivos)"));
+        assert!(!log.contains("secreta"));
+    }
+
+    #[test]
+    fn temporales_vaciados_al_montar() {
+        let disk = Disk::new(1024);
+        let mut f = fresh(&disk);
+        f.create_account("Ana", None, true, [1; 16], d(1)).unwrap();
+        f.login("Ana", "").unwrap();
+        f.mkdir("C:\\Sistema\\temp\\sub", d(1)).unwrap();
+        f.write("C:\\Sistema\\temp\\sub\\t.txt", b"t", d(1)).unwrap();
+        f.write("C:\\Sistema\\temp\\u.txt", b"u", d(1)).unwrap();
+        f.write("C:\\Sistema\\lib\\keep.txt", b"k", d(1)).unwrap();
+        drop(f);
+        let mut f = Files::probe(Some(Box::new(disk)), d(2));
+        assert!(f.fs.list("Sistema\\temp").unwrap().is_empty());
+        assert!(f.exists_raw("Sistema\\temp") && f.exists_raw("Sistema\\lib\\keep.txt"));
+    }
+
+    #[test]
+    fn registro_recortado_sin_claves() {
+        let mut f = Files::default();
+        for i in 0..3000 {
+            f.log(&format!("linea numero {i} con relleno de texto para que ocupe\nbastante"), d(1));
+        }
+        let data = f.read(LOG_FILE).unwrap();
+        assert!(data.len() <= LOG_MAX && data.len() > LOG_MAX - 200, "{}", data.len());
+        let text = String::from_utf8(data).unwrap();
+        assert!(text.starts_with("2026-11-01 09:08:07 linea numero "), "empieza en una línea entera");
+        assert!(text.trim_end().ends_with("numero 2999 con relleno de texto para que ocupe bastante"));
+        assert_eq!(text.lines().count(), text.matches('\n').count());
+        // Las claves no llegan al registro al crear cuentas ni cambiar la clave.
+        let disk = Disk::new(1024);
+        let mut f = fresh(&disk);
+        f.create_account("Ana", Some("secreta1"), true, [1; 16], d(1)).unwrap();
+        f.login("Ana", "secreta1").unwrap();
+        f.set_password("secreta1", Some("otraclave"), [2; 16], d(1)).unwrap();
+        let log = String::from_utf8(f.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
+        assert!(log.contains("Cuenta creada: Ana") && !log.contains("secreta1") && !log.contains("otraclave"));
+    }
 }
