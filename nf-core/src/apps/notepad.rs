@@ -753,4 +753,186 @@ mod tests {
             assert!(np.shown && cx.redraw);
         });
     }
+
+    fn ctrl(c: char, shift: bool) -> KeyEvent {
+        KeyEvent { key: Key::Char(c), ch: None, down: true, shift, ctrl: true, alt: false }
+    }
+
+    fn resp(tag: u32, a: Answer) -> DialogResult {
+        DialogResult::Answer { tag, answer: a }
+    }
+
+    fn ruta(p: &str) -> DialogResult {
+        DialogResult::Path { tag: TAG_SAVE, path: Some(String::from(p)) }
+    }
+
+    const DOC: &str = "C:\\Documentos\\a.txt";
+
+    #[test]
+    fn guardar_nuevo_escribe_crlf_y_actualiza_titulo() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut np = blank();
+        assert_eq!(np.title(), "Sin título: Bloc de notas");
+        escribe(&mut np.ed, "uno\ndos ñ");
+        np.key(&ev(Key::Char('x'), Some('x')), &mut cx);
+        assert_eq!(np.title(), "*Sin título: Bloc de notas");
+        np.key(&ctrl('s', false), &mut cx);
+        let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!("sin Guardar como") };
+        assert_eq!((dir.as_str(), name.as_str()), (DOCUMENTS_DIR, "Sin título.txt"));
+        np.dialog_result(ruta(DOC), &mut cx);
+        assert_eq!(cx.sys.files().read(DOC).unwrap(), "uno\r\ndos ñx".as_bytes());
+        assert!(!np.modified);
+        assert_eq!(np.title(), "a.txt: Bloc de notas");
+        // Con ruta, Ctrl+S escribe sin diálogo.
+        np.key(&ev(Key::Char('y'), Some('y')), &mut cx);
+        np.key(&ctrl('s', false), &mut cx);
+        assert!(cx.dialog.is_none() && !np.modified);
+        assert_eq!(cx.sys.files().read(DOC).unwrap(), "uno\r\ndos ñxy".as_bytes());
+        // Guardar como propone el nombre actual en su carpeta.
+        np.key(&ctrl('s', true), &mut cx);
+        let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!() };
+        assert_eq!((dir.as_str(), name.as_str()), (DOCUMENTS_DIR, "a.txt"));
+    }
+
+    #[test]
+    fn abrir_acepta_lf_y_tabuladores() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let now = cx.sys.now();
+        cx.sys.files().write(DOC, "a\tb\nc\r\nd".as_bytes(), now).unwrap();
+        let mut np = blank();
+        np.key(&ctrl('o', false), &mut cx);
+        let Some(DialogRequest::Open { dir, .. }) = cx.dialog.take() else { panic!() };
+        assert_eq!(dir, DOCUMENTS_DIR);
+        np.dialog_result(DialogResult::Path { tag: TAG_OPEN, path: Some(String::from(DOC)) }, &mut cx);
+        assert_eq!(texto(&np.ed), "a    b\nc\nd");
+        assert!(!np.modified && np.title() == "a.txt: Bloc de notas");
+    }
+
+    #[test]
+    fn rechaza_no_utf8_y_demasiado_grande() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let now = cx.sys.now();
+        cx.sys.files().write(DOC, &[0xFF, 0xFE, 0x41], now).unwrap();
+        cx.sys.files().write("C:\\Documentos\\g.txt", &vec![b'a'; MAX_FILE + 1], now).unwrap();
+        let mut np = blank();
+        escribe(&mut np.ed, "previo");
+        np.open_path(DOC, &mut cx);
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { text, .. }) if text.contains("no es un archivo de texto")));
+        np.open_path("C:\\Documentos\\g.txt", &mut cx);
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { text, .. }) if text.contains("1 MiB")));
+        assert_eq!(texto(&np.ed), "previo");
+        assert!(np.path.is_none());
+    }
+
+    #[test]
+    fn open_path_carga_el_archivo() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let now = cx.sys.now();
+        cx.sys.files().write(DOC, b"hola", now).unwrap();
+        let mut np = new();
+        np.open_path(DOC, &mut cx);
+        assert_eq!(np.title(), "a.txt: Bloc de notas");
+        assert!(cx.dialog.is_none());
+    }
+
+    #[test]
+    fn cerrar_con_cambios_pregunta() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut np = blank();
+        assert!(np.request_close(&mut cx) && cx.dialog.is_none());
+        np.key(&ev(Key::Char('a'), Some('a')), &mut cx);
+        assert!(!np.request_close(&mut cx));
+        let Some(DialogRequest::Message { tag, buttons, text, .. }) = cx.dialog.take() else { panic!() };
+        assert_eq!((tag, buttons), (TAG_ASK, Buttons::YesNoCancel));
+        assert_eq!(text, "¿Quieres guardar los cambios de Sin título?");
+        // Cancelar: nada.
+        np.dialog_result(resp(TAG_ASK, Answer::Cancel), &mut cx);
+        assert!(!cx.close && np.modified && np.pending == Pending::Ninguna);
+        // No: cierra sin guardar.
+        np.request_close(&mut cx);
+        cx.dialog = None;
+        np.dialog_result(resp(TAG_ASK, Answer::No), &mut cx);
+        assert!(cx.close);
+        // Sí: Guardar como, y al guardar cierra.
+        cx.close = false;
+        np.request_close(&mut cx);
+        cx.dialog = None;
+        np.dialog_result(resp(TAG_ASK, Answer::Yes), &mut cx);
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Save { .. })) && !cx.close);
+        np.dialog_result(ruta(DOC), &mut cx);
+        assert!(cx.close && !np.modified);
+    }
+
+    #[test]
+    fn guardar_como_cancelado_descarta_la_accion() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut np = blank();
+        np.key(&ev(Key::Char('a'), Some('a')), &mut cx);
+        np.key(&ctrl('n', false), &mut cx);
+        cx.dialog = None;
+        np.dialog_result(resp(TAG_ASK, Answer::Yes), &mut cx);
+        cx.dialog = None;
+        np.dialog_result(DialogResult::Path { tag: TAG_SAVE, path: None }, &mut cx);
+        assert_eq!(np.pending, Pending::Ninguna);
+        assert!(np.modified && texto(&np.ed) == "a");
+    }
+
+    #[test]
+    fn nuevo_y_error_de_escritura() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut np = blank();
+        np.key(&ev(Key::Char('a'), Some('a')), &mut cx);
+        // Error de escritura (carpeta inexistente): mensaje y sigue modificado.
+        np.dialog_result(ruta("C:\\NoExiste\\x.txt"), &mut cx);
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { tag: TAG_MSG, .. })));
+        assert!(np.modified && np.path.is_none());
+        // Nuevo + No: documento vacío.
+        np.key(&ctrl('n', false), &mut cx);
+        np.dialog_result(resp(TAG_ASK, Answer::No), &mut cx);
+        assert_eq!(texto(&np.ed), "");
+        assert!(!np.modified);
+    }
+
+    #[test]
+    fn menu_con_raton() {
+        let mut sys = TestPlatform::default();
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut np = Notepad { w: 400, h: 300, focused: true, ..blank() };
+        np.mouse(MouseEv::Down { x: 10, y: 5 }, &mut cx);
+        assert!(np.menu_open);
+        np.mouse(MouseEv::Move { x: 20, y: MENU_H + 2 + ITEM_H + 3 }, &mut cx);
+        assert_eq!(np.hover, Some(1));
+        let mut s = Surface::new(400, 300, 0);
+        np.draw(&mut s, &Theme::default(), &mut sys_dummy(), true);
+        np.mouse(MouseEv::Down { x: 350, y: 200 }, &mut cx); // fuera: cierra
+        assert!(!np.menu_open && cx.dialog.is_none());
+        np.mouse(MouseEv::Down { x: 10, y: 5 }, &mut cx);
+        np.key(&ev(Key::Escape, None), &mut cx);
+        assert!(!np.menu_open);
+        np.mouse(MouseEv::Down { x: 10, y: 5 }, &mut cx);
+        np.mouse(MouseEv::Down { x: 20, y: MENU_H + 2 + ITEM_H + 3 }, &mut cx); // Abrir…
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Open { .. })) && !np.menu_open);
+        np.mouse(MouseEv::Down { x: 10, y: 5 }, &mut cx);
+        np.mouse(MouseEv::Down { x: 20, y: MENU_H + 2 + 4 * ITEM_H + 3 }, &mut cx); // Salir
+        assert!(cx.close);
+    }
+
+    fn sys_dummy() -> TestPlatform {
+        TestPlatform::default()
+    }
 }
