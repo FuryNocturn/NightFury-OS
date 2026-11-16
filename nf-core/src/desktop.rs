@@ -6,6 +6,7 @@
 use crate::apps::{self, App, AppKind, Ctx, MouseEv, APPS};
 use crate::dialogs::{self, Answer, Buttons, Dialog, DialogRequest, DialogResult};
 use crate::files;
+use crate::fs::FsError;
 use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
@@ -154,6 +155,72 @@ struct DIcon {
 /// Etiquetas de los diálogos del sistema (sin dueña).
 const TAG_FORMAT: u32 = 0xFFFF_FF01;
 const TAG_SYS: u32 = 0xFFFF_FF02;
+/// Diálogos de los menús del escritorio; la ruta afectada va en `Desktop::pending`.
+const TAG_RENAME: u32 = 0xFFFF_FF10;
+const TAG_NEWDIR: u32 = 0xFFFF_FF11;
+const TAG_NEWDOC: u32 = 0xFFFF_FF12;
+const TAG_EMPTY: u32 = 0xFFFF_FF13;
+/// Mensajes de información o error sin respuesta que tratar.
+const TAG_INFO: u32 = 0xFFFF_FF14;
+
+/// Etiquetas e identificadores de los menús contextuales del escritorio.
+const MENU_ICON: u32 = 1;
+const MENU_DESK: u32 = 2;
+const M_OPEN: u32 = 1;
+const M_NEWWIN: u32 = 2;
+const M_NOTEPAD: u32 = 3;
+const M_CUT: u32 = 4;
+const M_COPY: u32 = 5;
+const M_PASTE_IN: u32 = 6;
+const M_DELETE: u32 = 7;
+const M_RENAME: u32 = 8;
+const M_PROPS: u32 = 9;
+const M_EMPTY: u32 = 10;
+/// Tamaños de icono: M_VIEW + 0..3. Orden: M_SORT + 0..4.
+const M_VIEW: u32 = 20;
+const M_SORT: u32 = 30;
+const M_REFRESH: u32 = 40;
+const M_PASTE: u32 = 41;
+const M_UNDO: u32 = 42;
+const M_NEWDIR: u32 = 43;
+const M_NEWDOC: u32 = 44;
+const M_CUSTOM: u32 = 45;
+
+/// Tamaño de los iconos del escritorio.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IconSize {
+    Big,
+    Mid,
+    Small,
+}
+
+impl IconSize {
+    const ALL: [(IconSize, &'static str, &'static str); 3] =
+        [(IconSize::Big, "grande", "Iconos grandes"), (IconSize::Mid, "mediano", "Iconos medianos"), (IconSize::Small, "pequeno", "Iconos pequeños")];
+
+    /// (ancho de celda, alto de celda, lado del icono, y del icono, y del texto).
+    fn metrics(self) -> (i32, i32, i32, i32, i32) {
+        match self {
+            IconSize::Big => (100, 100, 64, 6, 74),
+            IconSize::Mid => (84, 84, 40, 8, 52),
+            IconSize::Small => (76, 62, 32, 4, 38),
+        }
+    }
+}
+
+/// Criterio de orden de los archivos del escritorio.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Order {
+    Name,
+    Size,
+    Kind,
+    Date,
+}
+
+impl Order {
+    const ALL: [(Order, &'static str, &'static str); 4] =
+        [(Order::Name, "nombre", "Nombre"), (Order::Size, "tamano", "Tamaño"), (Order::Kind, "tipo", "Tipo"), (Order::Date, "fecha", "Fecha de modificación")];
+}
 
 impl Window {
     fn bw(&self) -> i32 {
@@ -228,6 +295,10 @@ pub struct Desktop {
     menu: Option<OpenMenu>,
     /// Estado del botón derecho.
     rbtn: bool,
+    size: IconSize,
+    order: Order,
+    /// Ruta afectada por el diálogo del sistema que está abierto (cambiar nombre).
+    pending: Option<String>,
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -278,8 +349,8 @@ fn normalize(list: Vec<Rect>, screen: Rect) -> Vec<Rect> {
     v
 }
 
-/// Aplica `fondo=<n>` y `enfasis=<RRGGBB>` de `C:\Sistema\config.txt` si son válidos.
-fn load_config(sys: &mut dyn Platform, theme: &mut Theme) {
+/// Aplica `fondo=`, `enfasis=`, `iconos=` y `orden=` de `C:\Sistema\config.txt` si son válidos.
+fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, order: &mut Order) {
     let Ok(bytes) = sys.files().read(files::CONFIG_FILE) else { return };
     let Ok(text) = core::str::from_utf8(&bytes) else { return };
     for line in text.lines() {
@@ -299,25 +370,82 @@ fn load_config(sys: &mut dyn Platform, theme: &mut Theme) {
                     }
                 }
             }
+            Some(("iconos", v)) => {
+                if let Some(e) = IconSize::ALL.iter().find(|e| e.1 == v.trim()) {
+                    *size = e.0;
+                }
+            }
+            Some(("orden", v)) => {
+                if let Some(e) = Order::ALL.iter().find(|e| e.1 == v.trim()) {
+                    *order = e.0;
+                }
+            }
             _ => {}
         }
     }
 }
 
-/// Guarda fondo y énfasis; los errores se ignoran.
-fn save_config(sys: &mut dyn Platform, theme: &Theme) {
+/// Guarda fondo, énfasis, tamaño de icono y orden; respeta las demás líneas (otras apps guardan
+/// ahí sus cosas). Los errores se ignoran.
+fn save_config(sys: &mut dyn Platform, theme: &Theme, size: IconSize, order: Order) {
     let now = sys.now();
     let f = sys.files();
     let _ = f.mkdir("C:\\Sistema", now);
-    let text = format!("fondo={}\nenfasis={:06X}\n", theme.wallpaper, theme.accent & 0xFFFFFF);
+    let old = f.read(files::CONFIG_FILE).ok().and_then(|b| String::from_utf8(b).ok()).unwrap_or_default();
+    let mut text = format!(
+        "fondo={}\nenfasis={:06X}\niconos={}\norden={}\n",
+        theme.wallpaper,
+        theme.accent & 0xFFFFFF,
+        IconSize::ALL.iter().find(|e| e.0 == size).map_or("mediano", |e| e.1),
+        Order::ALL.iter().find(|e| e.0 == order).map_or("nombre", |e| e.1)
+    );
+    for line in old.lines() {
+        let ours = matches!(line.split_once('=').map(|p| p.0.trim()), Some("fondo" | "enfasis" | "iconos" | "orden"));
+        if !ours && !line.trim().is_empty() {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
     let _ = f.write(files::CONFIG_FILE, text.as_bytes(), now);
 }
 
-/// Apps, Papelera y el contenido de `C:\Escritorio`.
-fn build_icons(sys: &mut dyn Platform) -> Vec<DIcon> {
+fn size_text(b: u64) -> String {
+    let human = if b < 1024 {
+        return format!("{b} bytes");
+    } else if b < 1 << 20 {
+        format!("{} KB", b.div_ceil(1024))
+    } else if b < 1 << 30 {
+        format!("{}.{} MB", b >> 20, (b & 0xF_FFFF) * 10 >> 20)
+    } else {
+        format!("{}.{} GB", b >> 30, (b & 0x3FFF_FFFF) * 10 >> 30)
+    };
+    format!("{human} ({b} bytes)")
+}
+
+fn date_key(d: DateTime) -> (u16, u8, u8, u8, u8, u8) {
+    (d.year, d.month, d.day, d.hour, d.minute, d.second)
+}
+
+fn ext(name: &str) -> String {
+    name.rsplit_once('.').map_or(String::new(), |(_, e)| e.to_lowercase())
+}
+
+/// Apps, Papelera y el contenido de `C:\Escritorio` (carpetas antes que archivos, según `order`).
+fn build_icons(sys: &mut dyn Platform, order: Order) -> Vec<DIcon> {
     let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
     v.push(DIcon { name: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
-    for e in sys.files().list(files::DESKTOP_DIR).unwrap_or_default() {
+    let mut list = sys.files().list(files::DESKTOP_DIR).unwrap_or_default();
+    list.sort_by(|a, b| {
+        let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+        b.dir.cmp(&a.dir).then_with(|| match order {
+            Order::Name => by_name,
+            Order::Size => a.size.cmp(&b.size).then(by_name),
+            Order::Kind => ext(&a.name).cmp(&ext(&b.name)).then(by_name),
+            // Lo más reciente primero.
+            Order::Date => date_key(b.modified).cmp(&date_key(a.modified)).then(by_name),
+        })
+    });
+    for e in list {
         let icon = if e.dir {
             Icon::Folder
         } else if e.name.to_lowercase().ends_with(".txt") {
@@ -333,7 +461,8 @@ fn build_icons(sys: &mut dyn Platform) -> Vec<DIcon> {
 impl Desktop {
     pub fn new(w: i32, h: i32, sys: &mut dyn Platform) -> Self {
         let mut theme = Theme::default();
-        load_config(sys, &mut theme);
+        let (mut size, mut order) = (IconSize::Mid, Order::Name);
+        load_config(sys, &mut theme, &mut size, &mut order);
         Desktop {
             w,
             h,
@@ -358,7 +487,10 @@ impl Desktop {
             clock: sys.now(),
             last_active: None,
             cur: 0,
-            icons: build_icons(sys),
+            icons: build_icons(sys, order),
+            size,
+            order,
+            pending: None,
             files_gen: sys.files().generation(),
             booted: false,
             menu: None,
@@ -522,12 +654,249 @@ impl Desktop {
         self.menu.as_ref().map(|m| &m.menu)
     }
 
-    /// Punto de enganche del menú del fondo y de los iconos del escritorio (otra tanda):
-    /// debe llamar a `open_menu(None, tag, x, y, items)`.
-    fn desktop_menu(&mut self, _x: i32, _y: i32, _sys: &mut dyn Platform) {}
+    /// Menú de clic derecho sobre un icono (lo selecciona) o sobre el fondo del escritorio.
+    fn desktop_menu(&mut self, x: i32, y: i32, sys: &mut dyn Platform) {
+        self.set_start(false);
+        self.set_shut(false);
+        match self.hit(x, y) {
+            Hit::Icon(i) => {
+                self.select(Some(i));
+                let items = self.icon_items(i, sys);
+                self.open_menu(None, MENU_ICON, x, y, items);
+            }
+            _ => {
+                self.select(None);
+                let items = self.bg_items(sys);
+                self.open_menu(None, MENU_DESK, x, y, items);
+            }
+        }
+    }
 
-    /// Elección en un menú del escritorio (`owner == None`). Otra tanda.
-    fn desktop_menu_result(&mut self, _tag: u32, _id: u32, _sys: &mut dyn Platform) {}
+    fn select(&mut self, i: Option<usize>) {
+        if self.sel != i {
+            if let Some(o) = self.sel {
+                self.dmg(self.icon_cell(o));
+            }
+            if let Some(n) = i {
+                self.dmg(self.icon_cell(n));
+            }
+            self.sel = i;
+        }
+    }
+
+    /// Ruta del icono `i` si es un archivo o carpeta de `C:\Escritorio` (no app ni Papelera).
+    fn icon_path(&self, i: usize) -> Option<String> {
+        match self.icons.get(i).map(|d| &d.act) {
+            Some(Act::Path(p)) if p != files::TRASH => Some(p.clone()),
+            _ => None,
+        }
+    }
+
+    fn icon_items(&self, i: usize, sys: &mut dyn Platform) -> Vec<MenuItem> {
+        let open = MenuItem::new(M_OPEN, "Abrir").bold();
+        let Some(DIcon { act, icon, .. }) = self.icons.get(i) else { return Vec::new() };
+        let Act::Path(p) = act else { return vec![open] };
+        if p == files::TRASH {
+            let empty = sys.files().trash_list().map_or(true, |v| v.is_empty());
+            return vec![open, MenuItem::new(M_EMPTY, "Vaciar Papelera").disabled(empty)];
+        }
+        let dir = *icon == Icon::Folder;
+        let mut v = vec![open];
+        if dir {
+            v.push(MenuItem::new(M_NEWWIN, "Abrir en ventana nueva"));
+        } else {
+            v.push(MenuItem::submenu("Abrir con", vec![MenuItem::new(M_NOTEPAD, "Bloc de notas")]));
+        }
+        v.extend([MenuItem::sep(), MenuItem::new(M_CUT, "Cortar"), MenuItem::new(M_COPY, "Copiar")]);
+        if dir {
+            v.push(MenuItem::new(M_PASTE_IN, "Pegar").disabled(sys.files().clip().is_none()));
+        }
+        v.extend([
+            MenuItem::sep(),
+            MenuItem::new(M_DELETE, "Eliminar"),
+            MenuItem::new(M_RENAME, "Cambiar nombre"),
+            MenuItem::sep(),
+            MenuItem::new(M_PROPS, "Propiedades"),
+        ]);
+        v
+    }
+
+    fn bg_items(&self, sys: &mut dyn Platform) -> Vec<MenuItem> {
+        let view = IconSize::ALL.iter().enumerate().map(|(k, e)| MenuItem::new(M_VIEW + k as u32, e.2).checked(self.size == e.0)).collect();
+        let sort = Order::ALL.iter().enumerate().map(|(k, e)| MenuItem::new(M_SORT + k as u32, e.2).checked(self.order == e.0)).collect();
+        let f = sys.files();
+        let undo = match f.undo_label() {
+            Some(l) => MenuItem::new(M_UNDO, &format!("Deshacer {l}")),
+            None => MenuItem::new(M_UNDO, "Deshacer").disabled(true),
+        };
+        vec![
+            MenuItem::submenu("Ver", view),
+            MenuItem::submenu("Ordenar por", sort),
+            MenuItem::new(M_REFRESH, "Actualizar"),
+            MenuItem::sep(),
+            MenuItem::new(M_PASTE, "Pegar").disabled(f.clip().is_none()),
+            undo.shortcut("Ctrl+Z"),
+            MenuItem::sep(),
+            MenuItem::submenu("Nuevo", vec![MenuItem::new(M_NEWDIR, "Carpeta"), MenuItem::new(M_NEWDOC, "Documento de texto")]),
+            MenuItem::sep(),
+            MenuItem::new(M_CUSTOM, "Personalizar"),
+        ]
+    }
+
+    /// Elección en un menú del escritorio (`owner == None`).
+    fn desktop_menu_result(&mut self, tag: u32, id: u32, sys: &mut dyn Platform) {
+        if tag == MENU_ICON {
+            if let Some(i) = self.sel {
+                self.icon_action(i, id, sys);
+            }
+        } else {
+            self.bg_action(id, sys);
+        }
+        self.refresh_icons(sys);
+    }
+
+    fn icon_action(&mut self, i: usize, id: u32, sys: &mut dyn Platform) {
+        let now = sys.now();
+        let path = self.icon_path(i);
+        match (id, path) {
+            (M_OPEN, _) => self.activate_icon(i, sys),
+            (M_EMPTY, None) => {
+                let text = String::from("¿Quieres eliminar para siempre todos los elementos de la Papelera? No se podrán recuperar.");
+                let req = DialogRequest::Message { tag: TAG_EMPTY, title: String::from("Vaciar Papelera"), text, buttons: Buttons::YesNo };
+                self.open_dialog(None, req, sys);
+            }
+            (M_NEWWIN, Some(p)) => self.open_new_explorer(&p, sys),
+            (M_NOTEPAD, Some(p)) => {
+                let id = self.launch_id(AppKind::Notepad, sys);
+                self.with_app(id, sys, |a, cx| a.open_path(&p, cx));
+            }
+            (M_CUT | M_COPY, Some(p)) => sys.files().set_clip(&p, id == M_CUT),
+            (M_PASTE_IN, Some(p)) => {
+                if let Err(e) = sys.files().paste(&p, now) {
+                    self.info("No se puede pegar", e.message(), sys);
+                }
+            }
+            (M_DELETE, Some(p)) => self.trash_path(&p, sys),
+            (M_RENAME, Some(p)) => self.start_rename(&p, sys),
+            (M_PROPS, Some(p)) => self.properties(&p, sys),
+            _ => {}
+        }
+    }
+
+    fn bg_action(&mut self, id: u32, sys: &mut dyn Platform) {
+        let now = sys.now();
+        match id {
+            M_VIEW..=29 => {
+                if let Some(e) = IconSize::ALL.get((id - M_VIEW) as usize) {
+                    self.size = e.0;
+                    // Cambia la rejilla: se repinta toda la zona de iconos.
+                    self.dmg(Rect::new(0, 0, self.w, self.bar_y()));
+                    save_config(sys, &self.theme, self.size, self.order);
+                }
+            }
+            M_SORT..=39 => {
+                if let Some(e) = Order::ALL.get((id - M_SORT) as usize) {
+                    self.order = e.0;
+                    self.reload_icons(sys);
+                    save_config(sys, &self.theme, self.size, self.order);
+                }
+            }
+            M_REFRESH => {
+                self.reload_icons(sys);
+                self.dmg_all();
+            }
+            M_PASTE => {
+                if let Err(e) = sys.files().paste(files::DESKTOP_DIR, now) {
+                    self.info("No se puede pegar", e.message(), sys);
+                }
+            }
+            M_UNDO => self.undo(sys),
+            M_NEWDIR | M_NEWDOC => {
+                let (tag, title, name) =
+                    if id == M_NEWDIR { (TAG_NEWDIR, "Nueva carpeta", "Nueva carpeta") } else { (TAG_NEWDOC, "Nuevo documento de texto", "Nuevo documento de texto.txt") };
+                let value = sys.files().free_name(files::DESKTOP_DIR, name);
+                let req = DialogRequest::Input { tag, title: String::from(title), label: String::from("Nombre:"), value };
+                self.open_dialog(None, req, sys);
+            }
+            M_CUSTOM => self.launch(AppKind::Settings, sys),
+            _ => {}
+        }
+    }
+
+    /// Mensaje informativo o de error del sistema.
+    fn info(&mut self, title: &str, text: &str, sys: &mut dyn Platform) {
+        let req = DialogRequest::Message { tag: TAG_INFO, title: String::from(title), text: String::from(text), buttons: Buttons::Ok };
+        self.open_dialog(None, req, sys);
+    }
+
+    fn undo(&mut self, sys: &mut dyn Platform) {
+        let now = sys.now();
+        if let Err(e) = sys.files().undo(now) {
+            self.info("No se puede deshacer", e.message(), sys);
+        }
+        self.refresh_icons(sys);
+    }
+
+    fn trash_path(&mut self, path: &str, sys: &mut dyn Platform) {
+        let now = sys.now();
+        if let Err(e) = sys.files().user_trash(path, now) {
+            self.info("No se puede eliminar", e.message(), sys);
+        }
+    }
+
+    fn start_rename(&mut self, path: &str, sys: &mut dyn Platform) {
+        self.pending = Some(String::from(path));
+        let value = String::from(files::file_name(path));
+        let req = DialogRequest::Input { tag: TAG_RENAME, title: String::from("Cambiar nombre"), label: String::from("Nuevo nombre:"), value };
+        self.open_dialog(None, req, sys);
+    }
+
+    /// Cuadro "Propiedades de <nombre>".
+    fn properties(&mut self, path: &str, sys: &mut dyn Platform) {
+        let e = match sys.files().stat(path) {
+            Ok(e) => e,
+            Err(e) => return self.info("Propiedades", e.message(), sys),
+        };
+        let kind = if e.dir {
+            "Carpeta de archivos"
+        } else if e.name.to_lowercase().ends_with(".txt") {
+            "Documento de texto"
+        } else {
+            "Archivo"
+        };
+        let size = if e.dir {
+            let n = sys.files().list(path).map_or(0, |v| v.len());
+            format!("Contiene: {n} {}", if n == 1 { "elemento" } else { "elementos" })
+        } else {
+            format!("Tamaño: {}", size_text(e.size))
+        };
+        let m = e.modified;
+        let text = format!(
+            "Nombre: {}\nTipo: {kind}\nUbicación: {}\n{size}\nModificado: {:02}/{:02}/{:04} {:02}:{:02}",
+            e.name,
+            files::parent(path).unwrap_or_default(),
+            m.day,
+            m.month,
+            m.year,
+            m.hour,
+            m.minute
+        );
+        self.info(&format!("Propiedades de {}", e.name), &text, sys);
+    }
+
+    /// Teclas con el foco en el escritorio (ninguna ventana abierta a la vista).
+    fn desktop_key(&mut self, k: KeyEvent, sys: &mut dyn Platform) {
+        let path = self.sel.and_then(|i| self.icon_path(i));
+        match (k.key, path) {
+            (Key::Char('z'), _) if k.ctrl => self.undo(sys),
+            (Key::Delete, Some(p)) => {
+                self.trash_path(&p, sys);
+                self.refresh_icons(sys);
+            }
+            (Key::F(2), Some(p)) => self.start_rename(&p, sys),
+            _ => {}
+        }
+    }
 
     /// Abre un menú en coordenadas de pantalla; sustituye al que hubiera.
     fn open_menu(&mut self, owner: Option<u32>, tag: u32, x: i32, y: i32, items: Vec<MenuItem>) {
@@ -761,7 +1130,7 @@ impl Desktop {
                 w.dirty = true;
             }
             self.dmg_all();
-            save_config(sys, &self.theme);
+            save_config(sys, &self.theme, self.size, self.order);
         }
         if redraw {
             self.wins[i].dirty = true;
@@ -853,7 +1222,7 @@ impl Desktop {
                 if answer == Answer::Yes {
                     let now = sys.now();
                     match sys.files().format_pending(now) {
-                        Ok(()) => save_config(sys, &self.theme),
+                        Ok(()) => save_config(sys, &self.theme, self.size, self.order),
                         Err(e) => {
                             let text = format!("No se ha podido preparar el disco: {}", e.message());
                             let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Disco nuevo"), text, buttons: Buttons::Ok };
@@ -868,6 +1237,47 @@ impl Desktop {
                 self.show_notice(sys);
             }
             DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
+                if let Err(e) = sys.files().empty_trash() {
+                    self.info("No se puede vaciar la Papelera", e.message(), sys);
+                }
+                self.refresh_icons(sys);
+            }
+            DialogResult::Text { tag: TAG_RENAME, value } => {
+                let from = self.pending.take();
+                if let (Some(from), Some(v)) = (from, value) {
+                    let name = v.trim();
+                    if name == files::file_name(&from) {
+                        return;
+                    }
+                    let res = if files::valid_name(name) {
+                        let to = files::join(&files::parent(&from).unwrap_or_default(), name);
+                        sys.files().user_rename(&from, &to)
+                    } else {
+                        Err(FsError::BadName)
+                    };
+                    if let Err(e) = res {
+                        self.info("No se puede cambiar el nombre", e.message(), sys);
+                    }
+                    self.refresh_icons(sys);
+                }
+            }
+            DialogResult::Text { tag: tag @ (TAG_NEWDIR | TAG_NEWDOC), value: Some(v) } => {
+                let mut name = String::from(v.trim());
+                if tag == TAG_NEWDOC && !name.contains('.') {
+                    name.push_str(".txt");
+                }
+                let now = sys.now();
+                let res = if files::valid_name(&name) {
+                    sys.files().user_create(&files::join(files::DESKTOP_DIR, &name), tag == TAG_NEWDIR, now)
+                } else {
+                    Err(FsError::BadName)
+                };
+                if let Err(e) = res {
+                    self.info("No se puede crear", e.message(), sys);
+                }
+                self.refresh_icons(sys);
+            }
             _ => {}
         }
     }
@@ -1071,8 +1481,9 @@ impl Desktop {
     }
     /// Iconos en columnas, de arriba abajo; pasan a la columna siguiente si no caben.
     fn icon_cell(&self, i: usize) -> Rect {
-        let rows = ((self.h - BAR_H - 6) / 84).max(1) as usize;
-        Rect::new(6 + 84 * (i / rows) as i32, 6 + 84 * (i % rows) as i32, 84, 84)
+        let (cw, ch, ..) = self.size.metrics();
+        let rows = ((self.h - BAR_H - 6) / ch).max(1) as usize;
+        Rect::new(6 + cw * (i / rows) as i32, 6 + ch * (i % rows) as i32, cw, ch)
     }
 
     /// Refresca los iconos del escritorio si ha cambiado algo en los archivos.
@@ -1082,7 +1493,12 @@ impl Desktop {
             return;
         }
         self.files_gen = g;
-        let new = build_icons(sys);
+        self.reload_icons(sys);
+    }
+
+    /// Reconstruye los iconos; si cambian, repinta y conserva la selección por nombre.
+    fn reload_icons(&mut self, sys: &mut dyn Platform) {
+        let new = build_icons(sys, self.order);
         let same = new.len() == self.icons.len()
             && new.iter().zip(&self.icons).all(|(a, b)| a.name == b.name && a.icon == b.icon);
         if same {
@@ -1091,10 +1507,9 @@ impl Desktop {
         for i in 0..self.icons.len().max(new.len()) {
             self.dmg(self.icon_cell(i));
         }
+        let name = self.sel.and_then(|s| self.icons.get(s)).map(|d| d.name.clone());
         self.icons = new;
-        if self.sel.is_some_and(|s| s >= self.icons.len()) {
-            self.sel = None;
-        }
+        self.sel = name.and_then(|n| self.icons.iter().position(|d| d.name == n));
     }
 
     /// Abre el icono `i` del escritorio.
@@ -1372,6 +1787,8 @@ impl Desktop {
             if let Some(id) = self.active_id() {
                 self.request_close(id, sys);
             }
+        } else if !self.start_open && self.active_id().is_none() {
+            self.desktop_key(k, sys);
         } else if !self.start_open {
             if let Some(id) = self.active_id() {
                 if self.pos(id).is_some_and(|i| self.wins[i].dlg.is_some()) {
@@ -1464,9 +1881,10 @@ impl Desktop {
                 s.blend_rect(c, self.theme.accent, 110);
                 s.frame(c, lighten(self.theme.accent, 70));
             }
-            icons::draw(s, *icon, c.x + 22, c.y + 8, 40, 0xFFFFFF);
+            let (_, _, isz, iy, ty) = self.size.metrics();
+            icons::draw(s, *icon, c.x + (c.w - isz) / 2, c.y + iy, isz, 0xFFFFFF);
             let name = dialogs::fit(name, 8, c.w - 6);
-            let t = Rect::new(c.x, c.y + 52, c.w, font::line_h(8));
+            let t = Rect::new(c.x, c.y + ty, c.w, font::line_h(8));
             text_in(s, Rect::new(t.x + 1, t.y + 1, t.w, t.h), &name, 8, 0x000000, Align::Center);
             text_in(s, t, &name, 8, 0xFFFFFF, Align::Center);
         }
@@ -2320,7 +2738,7 @@ mod modal_tests {
             cx.theme.wallpaper = 1;
             cx.theme_changed = true;
         });
-        assert_eq!(sys.files.read(files::CONFIG_FILE).unwrap(), b"fondo=1\nenfasis=6B8E23\n");
+        assert_eq!(sys.files.read(files::CONFIG_FILE).unwrap(), b"fondo=1\nenfasis=6B8E23\niconos=mediano\norden=nombre\n");
         let d2 = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d2.theme.wallpaper, d2.theme.accent), (1, ACCENTS[3]));
     }
@@ -2589,8 +3007,11 @@ mod modal_tests {
         let t = d.wins[1].title_rect();
         right_click(&mut d, &mut sys, (t.x + 50, t.y + 5));
         right_click(&mut d, &mut sys, (600, 790));
-        right_click(&mut d, &mut sys, (500, 500));
         assert!(d.menu().is_none() && log2.borrow().is_empty());
+        // El fondo sí abre el menú del escritorio (no llega a las apps); se cierra.
+        right_click(&mut d, &mut sys, (500, 500));
+        assert!(d.menu().is_some() && log2.borrow().is_empty());
+        d.close_menu();
         // Rueda sobre la ventana de atrás (sin foco) y sobre la activa.
         d.mouse_to(c0.x + 10, c0.y + 10, &mut sys);
         d.event(Event::Mouse(crate::input::MousePacket { dx: 0, dy: 0, buttons: 0, dz: -2 }), &mut sys);
