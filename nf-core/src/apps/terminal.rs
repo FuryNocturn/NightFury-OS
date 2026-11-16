@@ -495,7 +495,13 @@ impl App for Terminal {
         cx.redraw = true;
     }
 
-    fn mouse(&mut self, _ev: MouseEv, _cx: &mut Ctx) {}
+    fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+        if let MouseEv::Wheel { dz, .. } = ev {
+            // dz > 0 = hacia abajo (líneas recientes); `scroll` cuenta filas desde el final.
+            self.scroll = (self.scroll as i64 - dz as i64 * 3).clamp(0, self.max_scroll as i64) as usize;
+            cx.redraw = true;
+        }
+    }
 
     fn tick(&mut self, cx: &mut Ctx) {
         let on = !self.focused || (cx.now_ms.saturating_sub(self.t0) / BLINK_MS) % 2 == 0;
@@ -793,6 +799,32 @@ mod tests {
             }
             assert_eq!(t.out.len(), MAX_LINES);
             assert_eq!(t.out.last().unwrap(), "699");
+        });
+    }
+
+    #[test]
+    fn rueda_desplaza_el_historial() {
+        let mut sys = TestPlatform::default();
+        let mut t = Terminal::new();
+        con_cx(|cx| {
+            for i in 0..60 {
+                escribe(&mut t, &format!("eco {}", i), cx);
+            }
+            let mut s = Surface::new(320, 160, 0);
+            t.draw(&mut s, &Theme::default(), &mut sys, true);
+            assert!(t.max_scroll > 6);
+            t.mouse(MouseEv::Wheel { x: 5, y: 5, dz: 1 }, cx); // abajo en el final: tope
+            assert_eq!(t.scroll, 0);
+            t.mouse(MouseEv::Wheel { x: 5, y: 5, dz: -1 }, cx);
+            assert_eq!(t.scroll, 3);
+            t.mouse(MouseEv::Wheel { x: 5, y: 5, dz: -1 }, cx);
+            assert_eq!(t.scroll, 6);
+            t.mouse(MouseEv::Wheel { x: 5, y: 5, dz: 1 }, cx);
+            assert_eq!(t.scroll, 3);
+            t.mouse(MouseEv::Wheel { x: 5, y: 5, dz: -1000 }, cx); // arriba: tope
+            assert_eq!(t.scroll, t.max_scroll);
+            t.key(&ev(Key::Char('x'), Some('x')), cx);
+            assert_eq!(t.scroll, 0);
         });
     }
 

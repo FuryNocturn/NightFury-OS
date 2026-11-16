@@ -145,6 +145,8 @@ pub struct Notepad {
     ed: Editor,
     top: usize,
     scroll_x: i32,
+    /// La vista sigue al cursor (la rueda lo desactiva hasta la siguiente acción).
+    follow: bool,
     /// Líneas que caben a la vista (última vez dibujado).
     vis: usize,
     w: i32,
@@ -165,6 +167,7 @@ fn blank() -> Notepad {
         ed: Editor::new(),
         top: 0,
         scroll_x: 0,
+        follow: true,
         vis: 10,
         w: 0,
         h: 0,
@@ -227,6 +230,7 @@ impl Notepad {
                 self.ed = Editor::new();
                 self.top = 0;
                 self.scroll_x = 0;
+                self.follow = true;
                 self.path = None;
                 self.modified = false;
             }
@@ -309,6 +313,7 @@ impl Notepad {
         self.ed.lines = parse(text);
         self.top = 0;
         self.scroll_x = 0;
+        self.follow = true;
         self.path = Some(String::from(path));
         self.modified = false;
         cx.redraw = true;
@@ -366,6 +371,7 @@ impl Notepad {
     fn touch(&mut self, cx: &mut Ctx) {
         self.t0 = cx.now_ms;
         self.shown = true;
+        self.follow = true;
         cx.redraw = true;
     }
 
@@ -376,6 +382,9 @@ impl Notepad {
 
     fn follow_cursor(&mut self, view_w: i32, view_h: i32) {
         self.vis = ((view_h / Self::lh()).max(1)) as usize;
+        if !self.follow {
+            return;
+        }
         if self.ed.row < self.top {
             self.top = self.ed.row;
         } else if self.ed.row >= self.top + self.vis {
@@ -500,6 +509,15 @@ impl App for Notepad {
             MouseEv::Leave if self.menu_open => {
                 self.hover = None;
                 cx.redraw = true;
+                return;
+            }
+            MouseEv::Wheel { dz, .. } => {
+                if !self.menu_open {
+                    let max = self.ed.lines.len().saturating_sub(self.vis);
+                    self.top = (self.top as i64 + dz as i64 * 3).clamp(0, max as i64) as usize;
+                    self.follow = false;
+                    cx.redraw = true;
+                }
                 return;
             }
             MouseEv::Down { x, y } => {
@@ -703,6 +721,40 @@ mod tests {
             assert_eq!((np.ed.row, np.ed.col), (0, 0));
             np.mouse(MouseEv::Down { x: 290, y: MENU_H + 150 }, cx); // más allá del texto
             assert_eq!((np.ed.row, np.ed.col), (1, 5));
+        });
+    }
+
+    #[test]
+    fn rueda_desplaza_sin_mover_el_cursor() {
+        con_cx(|cx| {
+            let mut np = Notepad { w: 300, h: 200, vis: 10, ..blank() };
+            escribe(&mut np.ed, &"x
+".repeat(29)); // 30 líneas, cursor al final
+            let (r, c) = (np.ed.row, np.ed.col);
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: -1 }, cx); // arriba en el inicio: tope
+            assert_eq!(np.top, 0);
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: 1 }, cx);
+            assert_eq!(np.top, 3);
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: 2 }, cx);
+            assert_eq!(np.top, 9);
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: 100 }, cx); // abajo: tope
+            assert_eq!(np.top, 20);
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: -1 }, cx);
+            assert_eq!(np.top, 17);
+            assert_eq!((np.ed.row, np.ed.col), (r, c));
+            assert!(!np.modified && !np.follow);
+            // Con el menú abierto no hace nada.
+            np.menu_open = true;
+            np.mouse(MouseEv::Wheel { x: 5, y: 50, dz: 1 }, cx);
+            assert_eq!(np.top, 17);
+            np.menu_open = false;
+            // Escribir vuelve a seguir al cursor.
+            np.key(&ev(Key::Char('a'), Some('a')), cx);
+            assert!(np.follow);
+            let mut sys = TestPlatform::default();
+            let mut s = Surface::new(300, 200, 0);
+            np.draw(&mut s, &Theme::default(), &mut sys, true);
+            assert!(np.ed.row >= np.top && np.ed.row < np.top + np.vis);
         });
     }
 

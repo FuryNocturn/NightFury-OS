@@ -718,6 +718,11 @@ impl Dialog {
                     _ => {}
                 }
             }
+            MouseEv::Wheel { dz, .. } if self.is_file() && self.confirm.is_none() => {
+                let max = self.entries.len().saturating_sub(self.rows());
+                self.scroll = (self.scroll as i64 + dz as i64 * 3).clamp(0, max as i64) as usize;
+                self.dirty = true;
+            }
             _ => {}
         }
         None
@@ -878,6 +883,36 @@ mod tests {
         // Cancelar.
         let mut d = save("x", &mut sys);
         assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
+    }
+
+    #[test]
+    fn wheel_scrolls_file_list_only() {
+        let mut sys = TestPlatform::default();
+        let now = sys.now();
+        for i in 0..30 {
+            sys.files.write(&format!("C:\\Documentos\\f{i:02}.txt"), b"x", now).unwrap();
+        }
+        let mut d = Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\Documentos".into() }, &mut sys);
+        let max = d.entries.len() - d.rows();
+        assert!(max > 6);
+        let w = |dz| MouseEv::Wheel { x: 50, y: 50, dz };
+        assert!(d.mouse(w(-1), &mut sys).is_none() && d.scroll == 0);
+        assert!(d.mouse(w(1), &mut sys).is_none() && d.scroll == 3);
+        d.mouse(w(1), &mut sys);
+        assert_eq!(d.scroll, 6);
+        d.mouse(w(-1), &mut sys);
+        assert_eq!(d.scroll, 3);
+        d.mouse(w(1000), &mut sys);
+        assert_eq!(d.scroll, max);
+        d.dirty = false;
+        d.mouse(w(-1000), &mut sys);
+        assert!(d.scroll == 0 && d.dirty);
+        assert!(d.mouse(MouseEv::RightDown { x: 50, y: 50 }, &mut sys).is_none() && d.scroll == 0);
+        let (mut m, mut sys) = msg(Buttons::Ok);
+        assert!(m.mouse(w(1), &mut sys).is_none() && m.scroll == 0);
+        assert!(m.mouse(MouseEv::RightDown { x: 5, y: 5 }, &mut sys).is_none());
+        let mut i = Dialog::new(DialogRequest::Input { tag: 3, title: "N".into(), label: "N".into(), value: "ab".into() }, &mut sys);
+        assert!(i.mouse(w(1), &mut sys).is_none() && i.scroll == 0);
     }
 
     #[test]
