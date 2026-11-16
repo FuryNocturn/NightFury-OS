@@ -4,13 +4,15 @@
 //! `back` es la imagen final: todo se compone ahí, incluido el puntero. Cada cambio añade una zona
 //! a `damage`; `render` redibuja lo sucio, normaliza las zonas y recompone solo dentro de cada una.
 use crate::apps::{self, App, AppKind, Ctx, MouseEv, APPS};
+use crate::dialogs::{self, Answer, Buttons, Dialog, DialogRequest, DialogResult};
+use crate::files;
 use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
 use crate::platform::{DateTime, Platform};
 use crate::surface::{blend, lighten, Surface};
-use crate::theme::{self, Theme};
+use crate::theme::{self, Theme, WALLPAPERS};
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
@@ -111,7 +113,46 @@ struct Window {
     dirty: bool,
     min: bool,
     max: bool,
+    /// Si es un cuadro de diálogo: su contenido (la app es un relleno sin uso).
+    dlg: Option<Dialog>,
+    /// Ventana a la que está ligado el diálogo (`None` = diálogo del sistema).
+    owner: Option<u32>,
 }
+
+/// App de relleno para las ventanas de diálogo.
+struct NoApp(AppKind);
+
+impl App for NoApp {
+    fn kind(&self) -> AppKind {
+        self.0
+    }
+    fn title(&self) -> String {
+        String::new()
+    }
+    fn min_size(&self) -> (i32, i32) {
+        (0, 0)
+    }
+    fn draw(&mut self, _s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {}
+    fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
+    fn mouse(&mut self, _ev: MouseEv, _cx: &mut Ctx) {}
+    fn tick(&mut self, _cx: &mut Ctx) {}
+}
+
+/// Qué hace un icono del escritorio al abrirse.
+enum Act {
+    App(AppKind),
+    Path(String),
+}
+
+struct DIcon {
+    name: String,
+    icon: Icon,
+    act: Act,
+}
+
+/// Etiquetas de los diálogos del sistema (sin dueña).
+const TAG_FORMAT: u32 = 0xFFFF_FF01;
+const TAG_SYS: u32 = 0xFFFF_FF02;
 
 impl Window {
     fn bw(&self) -> i32 {
@@ -170,6 +211,11 @@ pub struct Desktop {
     last_active: Option<u32>,
     /// Forma del puntero: 0 flecha; 1..=4 flechas dobles de redimensionado (ver `resize_cursor`).
     cur: u8,
+    /// Iconos del escritorio: apps, Papelera y lo que haya en `C:\Escritorio`.
+    icons: Vec<DIcon>,
+    files_gen: u64,
+    /// ¿Ya se hizo el flujo de arranque del disco (primer tick)?
+    booted: bool,
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -220,9 +266,62 @@ fn normalize(list: Vec<Rect>, screen: Rect) -> Vec<Rect> {
     v
 }
 
+/// Aplica `fondo=<n>` y `enfasis=<RRGGBB>` de `C:\Sistema\config.txt` si son válidos.
+fn load_config(sys: &mut dyn Platform, theme: &mut Theme) {
+    let Ok(bytes) = sys.files().read(files::CONFIG_FILE) else { return };
+    let Ok(text) = core::str::from_utf8(&bytes) else { return };
+    for line in text.lines() {
+        match line.trim().split_once('=') {
+            Some(("fondo", v)) => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    if n < WALLPAPERS.len() {
+                        theme.wallpaper = n as u8;
+                    }
+                }
+            }
+            Some(("enfasis", v)) => {
+                let v = v.trim();
+                if v.len() == 6 {
+                    if let Ok(c) = u32::from_str_radix(v, 16) {
+                        theme.accent = c;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Guarda fondo y énfasis; los errores se ignoran.
+fn save_config(sys: &mut dyn Platform, theme: &Theme) {
+    let now = sys.now();
+    let f = sys.files();
+    let _ = f.mkdir("C:\\Sistema", now);
+    let text = format!("fondo={}\nenfasis={:06X}\n", theme.wallpaper, theme.accent & 0xFFFFFF);
+    let _ = f.write(files::CONFIG_FILE, text.as_bytes(), now);
+}
+
+/// Apps, Papelera y el contenido de `C:\Escritorio`.
+fn build_icons(sys: &mut dyn Platform) -> Vec<DIcon> {
+    let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
+    v.push(DIcon { name: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
+    for e in sys.files().list(files::DESKTOP_DIR).unwrap_or_default() {
+        let icon = if e.dir {
+            Icon::Folder
+        } else if e.name.to_lowercase().ends_with(".txt") {
+            Icon::FileText
+        } else {
+            Icon::FileBlank
+        };
+        v.push(DIcon { act: Act::Path(files::join(files::DESKTOP_DIR, &e.name)), name: e.name, icon });
+    }
+    v
+}
+
 impl Desktop {
     pub fn new(w: i32, h: i32, sys: &mut dyn Platform) -> Self {
-        let theme = Theme::default();
+        let mut theme = Theme::default();
+        load_config(sys, &mut theme);
         Desktop {
             w,
             h,
@@ -247,6 +346,9 @@ impl Desktop {
             clock: sys.now(),
             last_active: None,
             cur: 0,
+            icons: build_icons(sys),
+            files_gen: sys.files().generation(),
+            booted: false,
         }
     }
 
@@ -345,17 +447,44 @@ impl Desktop {
     }
 
     /// Abre una app (o trae al frente Configuración si ya está abierta).
-    pub fn launch(&mut self, kind: AppKind, _sys: &mut dyn Platform) {
+    pub fn launch(&mut self, kind: AppKind, sys: &mut dyn Platform) {
+        self.launch_id(kind, sys);
+    }
+
+    /// Para pruebas: abre una app propia (por ejemplo, una que pide diálogos).
+    pub fn launch_app(&mut self, app: Box<dyn App>, _sys: &mut dyn Platform) {
+        self.push_window(app.kind(), app, None);
+    }
+
+    /// Para pruebas: abre un diálogo del sistema (sin dueña) y su respuesta la trata el escritorio.
+    pub fn request_dialog(&mut self, req: DialogRequest, sys: &mut dyn Platform) {
+        self.open_dialog(None, req, sys);
+    }
+
+    /// Ventanas abiertas que son diálogos.
+    pub fn dialog_count(&self) -> usize {
+        self.wins.iter().filter(|w| w.dlg.is_some()).count()
+    }
+
+    fn launch_id(&mut self, kind: AppKind, _sys: &mut dyn Platform) -> u32 {
         self.set_start(false);
         self.set_shut(false);
         if kind == AppKind::Settings {
-            if let Some(w) = self.wins.iter().find(|w| w.kind == kind) {
+            if let Some(w) = self.wins.iter().find(|w| w.kind == kind && w.dlg.is_none()) {
                 let id = w.id;
                 self.raise(id);
-                return;
+                return id;
             }
         }
-        let (dw, dh) = apps::default_size(kind);
+        self.push_window(kind, apps::create(kind), None)
+    }
+
+    /// Crea la ventana de una app con el tamaño por defecto de su tipo.
+    fn push_window(&mut self, kind: AppKind, app: Box<dyn App>, dlg: Option<Dialog>) -> u32 {
+        let (dw, dh) = match &dlg {
+            Some(d) => d.size(),
+            None => apps::default_size(kind),
+        };
         let cw = dw.min(self.w - 2).max(1);
         let ch = dh.min(self.h - BAR_H - TITLE_H - 2).max(1);
         let (ow, oh) = (cw + 2, ch + TITLE_H + 2);
@@ -363,13 +492,12 @@ impl Desktop {
         // Empieza a la derecha de la columna de iconos del escritorio.
         let x = (110 + 30 * n).min(self.w - ow).max(0);
         let y = (30 + 30 * n).min(self.h - BAR_H - oh).max(0);
-        let app = apps::create(kind);
         let rect = Rect::new(x, y, ow, oh);
         self.launched += 1;
         self.wins.push(Window {
             id: self.launched,
             kind,
-            title: app.title(),
+            title: dlg.as_ref().map_or_else(|| app.title(), |d| String::from(d.title())),
             app,
             rect,
             restore: rect,
@@ -377,8 +505,28 @@ impl Desktop {
             dirty: true,
             min: false,
             max: false,
+            dlg,
+            owner: None,
         });
         self.dmg_all();
+        self.launched
+    }
+
+    /// Abre un diálogo ligado a la ventana `owner` (o del sistema) centrado sobre ella.
+    fn open_dialog(&mut self, owner: Option<u32>, req: DialogRequest, sys: &mut dyn Platform) {
+        if let Some(o) = owner {
+            self.close_dialogs_of(o);
+        }
+        let dlg = Dialog::new(req, sys);
+        let kind = owner.and_then(|o| self.pos(o)).map_or(AppKind::Files, |i| self.wins[i].kind);
+        let area = owner.and_then(|o| self.pos(o)).map_or(Rect::new(0, 0, self.w, self.h - BAR_H), |i| self.wins[i].rect);
+        let id = self.push_window(kind, Box::new(NoApp(kind)), Some(dlg));
+        let i = self.pos(id).unwrap();
+        let r = self.wins[i].rect;
+        let x = (area.x + (area.w - r.w) / 2).clamp(0, (self.w - r.w).max(0));
+        let y = (area.y + (area.h - r.h) / 2).clamp(0, (self.h - BAR_H - r.h).max(0));
+        self.wins[i].rect = Rect::new(x, y, r.w, r.h);
+        self.wins[i].owner = owner;
     }
 
     /// Recompone en la imagen final las zonas que han cambiado y devuelve esas zonas
@@ -396,7 +544,10 @@ impl Desktop {
         }
         for w in self.wins.iter_mut() {
             if w.dirty && !w.min {
-                w.app.draw(&mut w.content, &self.theme, sys, Some(w.id) == act);
+                match w.dlg.as_mut() {
+                    Some(d) => d.draw(&mut w.content, &self.theme),
+                    None => w.app.draw(&mut w.content, &self.theme, sys, Some(w.id) == act),
+                }
                 w.dirty = false;
                 self.damage.push(w.content_rect());
             }
@@ -439,11 +590,26 @@ impl Desktop {
         self.wins.iter().rev().find(|w| !w.min).map(|w| w.id)
     }
 
-    /// Ventanas por orden de apertura (el de la barra de tareas).
+    /// Ventanas por orden de apertura (el de la barra de tareas); los diálogos no cuentan.
     fn task_ids(&self) -> Vec<u32> {
-        let mut v: Vec<u32> = self.wins.iter().map(|w| w.id).collect();
+        let mut v: Vec<u32> = self.wins.iter().filter(|w| w.dlg.is_none()).map(|w| w.id).collect();
         v.sort_unstable();
         v
+    }
+
+    /// Diálogo ligado a la ventana `id`, si lo hay (la deja bloqueada).
+    fn modal_of(&self, id: u32) -> Option<u32> {
+        self.wins.iter().find(|w| w.owner == Some(id)).map(|w| w.id)
+    }
+
+    fn close_dialogs_of(&mut self, id: u32) {
+        while let Some(d) = self.modal_of(id) {
+            if let Some(i) = self.pos(d) {
+                self.wins.remove(i);
+            }
+            self.forget(d);
+            self.dmg_all();
+        }
     }
 
     /// Llama a la app de la ventana `id` y aplica lo que pida.
@@ -452,18 +618,40 @@ impl Desktop {
         let mut cx = Ctx::new(sys, &mut self.theme, self.now_ms);
         f(&mut *self.wins[i].app, &mut cx);
         let (redraw, close, themed) = (cx.redraw, cx.close, cx.theme_changed);
+        let (dialog, open) = (cx.dialog.take(), cx.open.take());
         if themed {
             self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
             for w in self.wins.iter_mut() {
                 w.dirty = true;
             }
             self.dmg_all();
+            save_config(sys, &self.theme);
         }
         if redraw {
             self.wins[i].dirty = true;
         }
         if close {
             self.close(id);
+        } else if let Some(req) = dialog {
+            self.open_dialog(Some(id), req, sys);
+        }
+        if let Some(p) = open {
+            self.open_path(&p, sys);
+        }
+    }
+
+    /// Abre una ruta: carpeta (o Papelera) en el Explorador, archivo en un Bloc de notas nuevo.
+    fn open_path(&mut self, path: &str, sys: &mut dyn Platform) {
+        if path == files::TRASH || sys.files().stat(path).is_ok_and(|e| e.dir) {
+            let id = match self.wins.iter().rev().find(|w| w.kind == AppKind::Files && w.dlg.is_none()) {
+                Some(w) => w.id,
+                None => self.launch_id(AppKind::Files, sys),
+            };
+            self.raise(id);
+            self.with_app(id, sys, |a, cx| a.open_path(path, cx));
+        } else {
+            let id = self.launch_id(AppKind::Notepad, sys);
+            self.with_app(id, sys, |a, cx| a.open_path(path, cx));
         }
     }
 
@@ -472,29 +660,124 @@ impl Desktop {
         let Some(i) = self.pos(id) else { return };
         let c = self.wins[i].content_rect();
         let ev = f(self.mx - c.x, self.my - c.y);
-        self.with_app(id, sys, |a, cx| a.mouse(ev, cx));
+        if self.wins[i].dlg.is_some() {
+            self.dlg_event(id, sys, |d, s| d.mouse(ev, s));
+        } else {
+            self.with_app(id, sys, |a, cx| a.mouse(ev, cx));
+        }
     }
 
+    /// Pasa un evento al diálogo de la ventana `id`; si termina, entrega la respuesta.
+    fn dlg_event(&mut self, id: u32, sys: &mut dyn Platform, f: impl FnOnce(&mut Dialog, &mut dyn Platform) -> Option<DialogResult>) {
+        let Some(i) = self.pos(id) else { return };
+        let Some(d) = self.wins[i].dlg.as_mut() else { return };
+        let res = f(d, sys);
+        if d.take_dirty() {
+            self.wins[i].dirty = true;
+        }
+        if let Some(r) = res {
+            self.finish_dialog(id, r, sys);
+        }
+    }
+
+    /// Cierra el diálogo y entrega su respuesta a la ventana dueña o al sistema.
+    fn finish_dialog(&mut self, id: u32, res: DialogResult, sys: &mut dyn Platform) {
+        let owner = self.pos(id).and_then(|i| self.wins[i].owner);
+        self.close(id);
+        match owner {
+            Some(o) => self.with_app(o, sys, |a, cx| a.dialog_result(res, cx)),
+            None => self.system_result(res, sys),
+        }
+    }
+
+    /// Respuestas a los diálogos del sistema.
+    fn system_result(&mut self, res: DialogResult, sys: &mut dyn Platform) {
+        match res {
+            DialogResult::Answer { tag: TAG_FORMAT, answer } => {
+                if answer == Answer::Yes {
+                    let now = sys.now();
+                    match sys.files().format_pending(now) {
+                        Ok(()) => save_config(sys, &self.theme),
+                        Err(e) => {
+                            let text = format!("No se ha podido preparar el disco: {}", e.message());
+                            let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Disco nuevo"), text, buttons: Buttons::Ok };
+                            self.open_dialog(None, req, sys);
+                            return;
+                        }
+                    }
+                } else {
+                    // Solo el Sí formatea: cualquier otra respuesta descarta el disco.
+                    sys.files().decline_format();
+                }
+                self.show_notice(sys);
+            }
+            DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            _ => {}
+        }
+    }
+
+    fn show_notice(&mut self, sys: &mut dyn Platform) {
+        if let Some(text) = sys.files().notice() {
+            let req = DialogRequest::Message { tag: u32::MAX, title: String::from("Almacenamiento"), text: String::from(text), buttons: Buttons::Ok };
+            self.open_dialog(None, req, sys);
+        }
+    }
+
+    /// Primer tick: pregunta por el disco nuevo (si lo hay) y, después, avisa de que no se guarda.
+    fn boot_flow(&mut self, sys: &mut dyn Platform) {
+        if sys.files().pending_format() {
+            let text = "Se ha encontrado un disco sin formato. ¿Quieres prepararlo para NightFury? Si dices que no, los archivos se guardarán solo en la memoria y se perderán al apagar.";
+            let req = DialogRequest::Message { tag: TAG_FORMAT, title: String::from("Disco nuevo"), text: String::from(text), buttons: Buttons::YesNo };
+            self.open_dialog(None, req, sys);
+        } else {
+            self.show_notice(sys);
+        }
+    }
+
+    /// El usuario quiere cerrar la ventana `id` (aspa o Alt+F4).
+    fn request_close(&mut self, id: u32, sys: &mut dyn Platform) {
+        let Some(i) = self.pos(id) else { return };
+        if self.wins[i].dlg.is_some() {
+            self.dlg_event(id, sys, |d, _| Some(d.cancel()));
+            return;
+        }
+        let mut ok = false;
+        self.with_app(id, sys, |a, cx| ok = a.request_close(cx));
+        if ok {
+            self.close(id);
+        }
+    }
+
+    /// Trae `id` al frente; si tiene un diálogo, este queda encima.
     fn raise(&mut self, id: u32) {
         if let Some(i) = self.pos(id) {
             let mut w = self.wins.remove(i);
             w.min = false;
             self.wins.push(w);
+            if let Some(j) = self.modal_of(id).and_then(|d| self.pos(d)) {
+                let mut d = self.wins.remove(j);
+                d.min = false;
+                self.wins.push(d);
+            }
             self.dmg_all();
         }
     }
 
     fn minimize(&mut self, id: u32) {
-        if let Some(i) = self.pos(id) {
-            let mut w = self.wins.remove(i);
-            w.min = true;
-            self.wins.insert(0, w);
-            self.forget(id);
-            self.dmg_all();
+        let ids = [self.modal_of(id), Some(id)];
+        for id in ids.into_iter().flatten() {
+            if let Some(i) = self.pos(id) {
+                let mut w = self.wins.remove(i);
+                w.min = true;
+                self.wins.insert(0, w);
+                self.forget(id);
+            }
         }
+        self.dmg_all();
     }
 
     fn close(&mut self, id: u32) {
+        self.close_dialogs_of(id);
         if let Some(i) = self.pos(id) {
             self.wins.remove(i);
             self.forget(id);
@@ -627,8 +910,48 @@ impl Desktop {
         let s = self.shut_rect();
         Rect::new(s.x, s.y + 40 * i as i32, s.w, 40)
     }
+    /// Iconos en columnas, de arriba abajo; pasan a la columna siguiente si no caben.
     fn icon_cell(&self, i: usize) -> Rect {
-        Rect::new(6, 6 + 84 * i as i32, 84, 84)
+        let rows = ((self.h - BAR_H - 6) / 84).max(1) as usize;
+        Rect::new(6 + 84 * (i / rows) as i32, 6 + 84 * (i % rows) as i32, 84, 84)
+    }
+
+    /// Refresca los iconos del escritorio si ha cambiado algo en los archivos.
+    fn refresh_icons(&mut self, sys: &mut dyn Platform) {
+        let g = sys.files().generation();
+        if g == self.files_gen {
+            return;
+        }
+        self.files_gen = g;
+        let new = build_icons(sys);
+        let same = new.len() == self.icons.len()
+            && new.iter().zip(&self.icons).all(|(a, b)| a.name == b.name && a.icon == b.icon);
+        if same {
+            return;
+        }
+        for i in 0..self.icons.len().max(new.len()) {
+            self.dmg(self.icon_cell(i));
+        }
+        self.icons = new;
+        if self.sel.is_some_and(|s| s >= self.icons.len()) {
+            self.sel = None;
+        }
+    }
+
+    /// Abre el icono `i` del escritorio.
+    fn activate_icon(&mut self, i: usize, sys: &mut dyn Platform) {
+        match self.icons.get(i).map(|d| &d.act) {
+            Some(Act::App(k)) => {
+                let k = *k;
+                self.launch(k, sys);
+            }
+            Some(Act::Path(p)) => {
+                let p = p.clone();
+                self.set_start(false);
+                self.open_path(&p, sys);
+            }
+            None => {}
+        }
     }
 
     // ---------------------------------------------------------------- puntero y entrada
@@ -673,12 +996,12 @@ impl Desktop {
                 return Self::hit_win(w, x, y);
             }
         }
-        (0..APPS.len()).find(|&i| self.icon_cell(i).contains(x, y)).map_or(Hit::None, Hit::Icon)
+        (0..self.icons.len()).find(|&i| self.icon_cell(i).contains(x, y)).map_or(Hit::None, Hit::Icon)
     }
 
     fn hit_win(w: &Window, x: i32, y: i32) -> Hit {
         let r = w.rect;
-        if !w.max {
+        if !w.max && w.dlg.is_none() {
             let (l, rt, b) = (x < r.x + 6, x >= r.right() - 6, y >= r.bottom() - 6);
             let t = y < r.y + 3 || ((l || rt) && y < r.y + 6);
             let e = l as u8 | (rt as u8) << 1 | (t as u8) << 2 | (b as u8) << 3;
@@ -687,7 +1010,8 @@ impl Desktop {
             }
         }
         if w.title_rect().contains(x, y) {
-            for k in 0..3 {
+            // Un diálogo solo tiene el botón de cerrar.
+            for k in (if w.dlg.is_some() { 2 } else { 0 })..3 {
                 if w.cap(k).contains(x, y) {
                     return Hit::Cap(w.id, k as u8);
                 }
@@ -793,7 +1117,7 @@ impl Desktop {
                 }
                 self.dmg(self.icon_cell(i));
                 if self.double(hit) {
-                    self.launch(APPS[i].0, sys);
+                    self.activate_icon(i, sys);
                 }
             }
             Hit::None => {
@@ -803,11 +1127,20 @@ impl Desktop {
             }
             Hit::Cap(id, k) => {
                 self.raise(id);
-                self.drag = Drag::Cap(id, k);
+                // Con un diálogo abierto la ventana está bloqueada: solo se enfoca el diálogo.
+                if self.modal_of(id).is_none() {
+                    self.drag = Drag::Cap(id, k);
+                }
             }
             Hit::Title(id) => {
                 self.raise(id);
-                if self.double(hit) {
+                let dialog = self.pos(id).is_some_and(|i| self.wins[i].dlg.is_some());
+                if dialog {
+                    if let Some(i) = self.pos(id) {
+                        let r = self.wins[i].rect;
+                        self.drag = Drag::Move { id, ox: self.mx - r.x, oy: self.my - r.y };
+                    }
+                } else if self.double(hit) {
                     self.toggle_max(id);
                 } else if let Some(i) = self.pos(id) {
                     if !self.wins[i].max {
@@ -818,14 +1151,16 @@ impl Desktop {
             }
             Hit::Edge(id, edge) => {
                 self.raise(id);
-                if let Some(i) = self.pos(id) {
+                if let Some(i) = self.pos(id).filter(|_| self.modal_of(id).is_none()) {
                     self.drag = Drag::Resize { id, edge, start: self.wins[i].rect, px: self.mx, py: self.my };
                 }
             }
             Hit::Content(id) => {
                 self.raise(id);
-                self.drag = Drag::Content(id);
-                self.send(id, sys, |x, y| MouseEv::Down { x, y });
+                if self.modal_of(id).is_none() {
+                    self.drag = Drag::Content(id);
+                    self.send(id, sys, |x, y| MouseEv::Down { x, y });
+                }
             }
             Hit::Bar | Hit::MenuBg => {}
         }
@@ -839,7 +1174,7 @@ impl Desktop {
                     match k {
                         0 => self.minimize(id),
                         1 => self.toggle_max(id),
-                        _ => self.close(id),
+                        _ => self.request_close(id, sys),
                     }
                 }
             }
@@ -871,11 +1206,15 @@ impl Desktop {
             }
         } else if k.key == Key::F(4) && k.alt {
             if let Some(id) = self.active_id() {
-                self.close(id);
+                self.request_close(id, sys);
             }
         } else if !self.start_open {
             if let Some(id) = self.active_id() {
-                self.with_app(id, sys, |a, cx| a.key(&k, cx));
+                if self.pos(id).is_some_and(|i| self.wins[i].dlg.is_some()) {
+                    self.dlg_event(id, sys, |d, s| d.key(&k, s));
+                } else {
+                    self.with_app(id, sys, |a, cx| a.key(&k, cx));
+                }
             }
         }
         self.after(sys);
@@ -883,7 +1222,12 @@ impl Desktop {
 
     fn tick(&mut self, ms: u64, sys: &mut dyn Platform) {
         self.now_ms = ms;
-        let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min).map(|w| w.id).collect();
+        if !self.booted {
+            self.booted = true;
+            self.boot_flow(sys);
+        }
+        self.refresh_icons(sys);
+        let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
         for id in ids {
             self.with_app(id, sys, |a, cx| a.tick(cx));
         }
@@ -944,7 +1288,7 @@ impl Desktop {
     }
 
     fn paint_icons(&self, s: &mut Surface) {
-        for (i, (_, name, icon)) in APPS.iter().enumerate() {
+        for (i, DIcon { name, icon, .. }) in self.icons.iter().enumerate() {
             let c = self.icon_cell(i);
             if !c.intersects(s.clip()) {
                 continue;
@@ -954,9 +1298,10 @@ impl Desktop {
                 s.frame(c, lighten(self.theme.accent, 70));
             }
             icons::draw(s, *icon, c.x + 22, c.y + 8, 40, 0xFFFFFF);
+            let name = dialogs::fit(name, 8, c.w - 6);
             let t = Rect::new(c.x, c.y + 52, c.w, font::line_h(8));
-            text_in(s, Rect::new(t.x + 1, t.y + 1, t.w, t.h), name, 8, 0x000000, Align::Center);
-            text_in(s, t, name, 8, 0xFFFFFF, Align::Center);
+            text_in(s, Rect::new(t.x + 1, t.y + 1, t.w, t.h), &name, 8, 0x000000, Align::Center);
+            text_in(s, t, &name, 8, 0xFFFFFF, Align::Center);
         }
     }
 
@@ -975,7 +1320,7 @@ impl Desktop {
             icons::draw(s, icon, tb.x + 8, tb.y + 7, 16, 0x444444);
         }
         text_in(s, Rect::new(tb.x + 32, tb.y, tb.w - 32 - 138, TITLE_H), &w.title, 9, ink, Align::Left);
-        for k in 0..3 {
+        for k in (if w.dlg.is_some() { 2 } else { 0 })..3 {
             self.paint_cap(s, w, k, active);
         }
         let c = w.content_rect();
@@ -1090,8 +1435,14 @@ impl Desktop {
             let bg = if self.hot == Hit::Tile(i) { lighten(self.theme.accent, 45) } else { self.theme.accent };
             s.fill_rect(r, bg);
             icons::draw(s, *icon, r.x + 34, r.y + 16, 32, 0xFFFFFF);
+            // Los nombres largos pasan a dos líneas ("Explorador de archivos").
             let lh = font::line_h(8);
-            text_in(s, Rect::new(r.x + 8, r.bottom() - 6 - lh, r.w - 12, lh), name, 8, 0xFFFFFF, Align::Left);
+            let mut lines = dialogs::wrap(name, 8, r.w - 14);
+            lines.truncate(2);
+            let top = r.bottom() - 6 - lh * lines.len() as i32;
+            for (j, l) in lines.iter().enumerate() {
+                text_in(s, Rect::new(r.x + 8, top + j as i32 * lh, r.w - 12, lh), l, 8, 0xFFFFFF, Align::Left);
+            }
         }
     }
 
@@ -1120,7 +1471,9 @@ mod tests {
 
     fn setup(w: i32, h: i32) -> (Desktop, TestPlatform) {
         let mut sys = TestPlatform { size: (w as u32, h as u32), ..Default::default() };
-        let d = Desktop::new(w, h, &mut sys);
+        let mut d = Desktop::new(w, h, &mut sys);
+        // Sin el flujo de arranque del disco: los avisos del sistema se prueban aparte.
+        d.booted = true;
         (d, sys)
     }
 
@@ -1528,5 +1881,396 @@ mod cursor_tests {
         d.left_button(false, &mut sys);
         d.mouse_to(600, 700, &mut sys);
         assert_eq!(d.cur, 0);
+    }
+}
+
+#[cfg(test)]
+mod modal_tests {
+    use super::*;
+    use crate::block::RamDisk;
+    use crate::dialogs::Buttons;
+    use crate::files::Files;
+    use crate::platform::TestPlatform;
+    use crate::theme::ACCENTS;
+    use alloc::rc::Rc;
+    use core::cell::{Cell, RefCell};
+
+    /// App de pruebas: Enter pide `req`, 'o' pide abrir `open`, y si `dirty` no se deja cerrar.
+    struct Probe {
+        req: Option<DialogRequest>,
+        open: Option<String>,
+        results: Rc<RefCell<Vec<DialogResult>>>,
+        downs: Rc<Cell<u32>>,
+        dirty: bool,
+    }
+
+    type Log = (Rc<RefCell<Vec<DialogResult>>>, Rc<Cell<u32>>);
+
+    fn probe(req: Option<DialogRequest>, dirty: bool) -> (Box<Probe>, Log) {
+        let log: Log = (Rc::new(RefCell::new(Vec::new())), Rc::new(Cell::new(0)));
+        let p = Probe { req, open: None, results: log.0.clone(), downs: log.1.clone(), dirty };
+        (Box::new(p), log)
+    }
+
+    impl App for Probe {
+        fn kind(&self) -> AppKind {
+            AppKind::Notepad
+        }
+        fn title(&self) -> String {
+            String::from("Probe")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {
+            let b = s.bounds();
+            s.fill_rect(b, 0xEEEEEE);
+        }
+        fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
+            match ev.key {
+                Key::Enter => cx.dialog = self.req.clone(),
+                Key::Char('o') => cx.open = self.open.clone(),
+                _ => {}
+            }
+        }
+        fn mouse(&mut self, ev: MouseEv, _cx: &mut Ctx) {
+            if matches!(ev, MouseEv::Down { .. }) {
+                self.downs.set(self.downs.get() + 1);
+            }
+        }
+        fn tick(&mut self, _cx: &mut Ctx) {}
+        fn dialog_result(&mut self, r: DialogResult, cx: &mut Ctx) {
+            if let DialogResult::Answer { tag: 9, answer } = r {
+                if answer == Answer::Yes {
+                    cx.close = true;
+                }
+            }
+            self.results.borrow_mut().push(r);
+        }
+        fn request_close(&mut self, cx: &mut Ctx) -> bool {
+            if self.dirty {
+                cx.dialog = Some(DialogRequest::Message {
+                    tag: 9,
+                    title: String::from("Cerrar"),
+                    text: String::from("¿Cerrar sin guardar?"),
+                    buttons: Buttons::YesNo,
+                });
+                return false;
+            }
+            true
+        }
+    }
+
+    fn setup() -> (Desktop, TestPlatform) {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.booted = true;
+        (d, sys)
+    }
+
+    fn msg(tag: u32, buttons: Buttons) -> DialogRequest {
+        DialogRequest::Message { tag, title: String::from("T"), text: String::from("Hola"), buttons }
+    }
+
+    fn key(d: &mut Desktop, sys: &mut TestPlatform, key: Key, ch: Option<char>, alt: bool) {
+        d.event(Event::Key(KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt }), sys);
+    }
+
+    fn click_at(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+        d.left_button(true, sys);
+        d.left_button(false, sys);
+    }
+
+    fn kinds(d: &Desktop) -> Vec<AppKind> {
+        d.wins.iter().filter(|w| w.dlg.is_none()).map(|w| w.kind).collect()
+    }
+
+    fn center(r: Rect) -> (i32, i32) {
+        (r.x + r.w / 2, r.y + r.h / 2)
+    }
+
+    #[test]
+    fn modal_blocks_owner_and_returns_result() {
+        let (mut d, mut sys) = setup();
+        let (p, (results, downs)) = probe(Some(msg(4, Buttons::YesNo)), false);
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!((d.dialog_count(), d.window_count()), (1, 2));
+        // El diálogo queda encima de su dueña y es la ventana activa.
+        assert!(d.wins[1].dlg.is_some() && d.wins[1].owner == Some(d.wins[0].id));
+        // Un clic sobre la dueña no le llega: enfoca el diálogo.
+        let c = d.wins[0].content_rect();
+        click_at(&mut d, &mut sys, (c.x + 30, c.y + 30));
+        assert_eq!(downs.get(), 0);
+        assert!(d.wins.last().unwrap().dlg.is_some());
+        // Tampoco las teclas: van al diálogo (Enter = Sí).
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!(d.dialog_count(), 0);
+        assert_eq!(*results.borrow(), [DialogResult::Answer { tag: 4, answer: Answer::Yes }]);
+        // Sin diálogo, la dueña vuelve a recibir clics.
+        click_at(&mut d, &mut sys, (c.x + 30, c.y + 30));
+        assert_eq!(downs.get(), 1);
+    }
+
+    #[test]
+    fn closing_owner_closes_its_dialog_and_taskbar_ignores_dialogs() {
+        let (mut d, mut sys) = setup();
+        let (p, _) = probe(Some(msg(1, Buttons::Ok)), false);
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!(d.task_ids().len(), 1);
+        let id = d.wins[0].id;
+        d.close(id);
+        assert_eq!((d.window_count(), d.dialog_count()), (0, 0));
+        // Minimizar la dueña minimiza también el diálogo; restaurar los trae a los dos.
+        let (p, _) = probe(Some(msg(1, Buttons::Ok)), false);
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        let id = d.wins.iter().find(|w| w.dlg.is_none()).unwrap().id;
+        d.minimize(id);
+        assert!(d.wins.iter().all(|w| w.min));
+        d.raise(id);
+        assert!(d.wins.iter().all(|w| !w.min) && d.wins.last().unwrap().dlg.is_some());
+    }
+
+    #[test]
+    fn request_close_false_keeps_window() {
+        let (mut d, mut sys) = setup();
+        let (p, (results, _)) = probe(None, true);
+        d.launch_app(p, &mut sys);
+        // Alt+F4: la app pide confirmación y no se cierra.
+        key(&mut d, &mut sys, Key::F(4), None, true);
+        assert_eq!((kinds(&d).len(), d.dialog_count()), (1, 1));
+        // No (Escape): sigue abierta y sin diálogo.
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        assert_eq!((kinds(&d).len(), d.dialog_count()), (1, 0));
+        assert_eq!(*results.borrow(), [DialogResult::Answer { tag: 9, answer: Answer::No }]);
+        // El aspa hace lo mismo; con Sí la app pone `cx.close`.
+        let p = center(d.wins[0].cap(2));
+        click_at(&mut d, &mut sys, p);
+        assert_eq!(d.dialog_count(), 1);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!(d.window_count(), 0);
+        // Sin cambios pendientes se cierra directamente.
+        let (p, _) = probe(None, false);
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::F(4), None, true);
+        assert_eq!(d.window_count(), 0);
+    }
+
+    #[test]
+    fn system_dialog_without_owner() {
+        let (mut d, mut sys) = setup();
+        d.request_dialog(msg(77, Buttons::OkCancel), &mut sys);
+        assert_eq!((d.dialog_count(), d.window_count()), (1, 1));
+        assert!(d.wins[0].owner.is_none() && d.task_ids().is_empty());
+        let r = d.wins[0].rect;
+        assert!(r.x > 0 && r.y > 0 && r.right() < 1280);
+        // El aspa del diálogo lo cierra; los botones de minimizar/maximizar no existen.
+        assert_eq!(d.hit(r.right() - 20, r.y + 10), Hit::Cap(d.wins[0].id, 2));
+        assert!(matches!(d.hit(r.right() - 100, r.y + 10), Hit::Title(_)));
+        let p = center(d.wins[0].cap(2));
+        click_at(&mut d, &mut sys, p);
+        assert_eq!(d.window_count(), 0);
+    }
+
+    fn disk_platform() -> TestPlatform {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files = Files::probe(Some(Box::new(RamDisk::new(256))), now);
+        sys
+    }
+
+    #[test]
+    fn new_disk_yes_formats_and_saves_config() {
+        let mut sys = disk_platform();
+        assert!(sys.files.pending_format());
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        assert_eq!(d.dialog_count(), 1);
+        assert!(sys.files.pending_format(), "no se formatea sin respuesta");
+        d.event(Event::Tick(20), &mut sys);
+        assert_eq!(d.dialog_count(), 1, "el flujo solo ocurre una vez");
+        key(&mut d, &mut sys, Key::Enter, None, false); // Sí
+        assert!(!sys.files.pending_format() && sys.files.persistent());
+        assert_eq!(d.dialog_count(), 0, "formateado: no hay aviso de memoria");
+        assert!(sys.files.read(files::CONFIG_FILE).is_ok());
+    }
+
+    #[test]
+    fn new_disk_no_never_formats_and_then_notifies() {
+        let mut sys = disk_platform();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        key(&mut d, &mut sys, Key::Escape, None, false); // No
+        assert!(!sys.files.pending_format() && !sys.files.persistent());
+        // Aviso de almacenamiento, una sola vez.
+        assert_eq!(d.dialog_count(), 1);
+        assert_eq!(d.wins[0].dlg.as_ref().unwrap().title(), "Almacenamiento");
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        assert_eq!(d.dialog_count(), 0);
+        d.event(Event::Tick(30), &mut sys);
+        assert_eq!(d.dialog_count(), 0);
+        // Con el aspa tampoco formatea.
+        let mut sys = disk_platform();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        let p = center(d.wins[0].cap(2));
+        click_at(&mut d, &mut sys, p);
+        assert!(!sys.files.persistent() && !sys.files.pending_format());
+    }
+
+    #[test]
+    fn notice_without_disk_shown_once() {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        assert_eq!(d.dialog_count(), 1);
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        d.event(Event::Tick(20), &mut sys);
+        assert_eq!(d.dialog_count(), 0);
+    }
+
+    #[test]
+    fn config_is_loaded_validated_and_saved() {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files.write(files::CONFIG_FILE, b"fondo=2\nenfasis=D13B3B\n", now).unwrap();
+        let d = Desktop::new(1280, 800, &mut sys);
+        assert_eq!((d.theme.wallpaper, d.theme.accent), (2, 0xD13B3B));
+        // Valores no válidos se ignoran.
+        sys.files.write(files::CONFIG_FILE, b"fondo=9\nenfasis=zz\nbasura\n", now).unwrap();
+        let d = Desktop::new(1280, 800, &mut sys);
+        assert_eq!(d.theme, Theme::default());
+        // Guardado al cambiar el tema desde una app.
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.launch(AppKind::Settings, &mut sys);
+        let id = d.wins[0].id;
+        d.with_app(id, &mut sys, |_, cx| {
+            cx.theme.accent = ACCENTS[3];
+            cx.theme.wallpaper = 1;
+            cx.theme_changed = true;
+        });
+        assert_eq!(sys.files.read(files::CONFIG_FILE).unwrap(), b"fondo=1\nenfasis=6B8E23\n");
+        let d2 = Desktop::new(1280, 800, &mut sys);
+        assert_eq!((d2.theme.wallpaper, d2.theme.accent), (1, ACCENTS[3]));
+    }
+
+    #[test]
+    fn desktop_folder_items_become_icons() {
+        let mut sys = TestPlatform { size: (1280, 400), ..Default::default() };
+        let now = sys.now();
+        sys.files.mkdir("C:\\Escritorio\\Carpeta", now).unwrap();
+        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
+        sys.files.write("C:\\Escritorio\\datos.bin", b"1", now).unwrap();
+        let mut d = Desktop::new(1280, 400, &mut sys);
+        d.booted = true;
+        let names: Vec<&str> = d.icons.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names[..6], ["Bloc de notas", "Calculadora", "Configuración", "Explorador de archivos", "Terminal", "Papelera"]);
+        assert_eq!(names[6..], ["Carpeta", "datos.bin", "nota.txt"]);
+        assert_eq!([d.icons[5].icon, d.icons[6].icon, d.icons[7].icon, d.icons[8].icon], [Icon::Trash, Icon::Folder, Icon::FileBlank, Icon::FileText]);
+        // Columnas: con 400 px de alto caben 4 por columna.
+        assert_eq!((d.icon_cell(3).x, d.icon_cell(4).x, d.icon_cell(4).y), (6, 90, 6));
+        // Se refrescan al cambiar los archivos.
+        sys.files.write("C:\\Escritorio\\z.txt", b"z", now).unwrap();
+        d.event(Event::Tick(10), &mut sys);
+        assert_eq!(d.icons.len(), 10);
+        sys.files.delete("C:\\Escritorio\\z.txt").unwrap();
+        d.event(Event::Tick(20), &mut sys);
+        assert_eq!(d.icons.len(), 9);
+        // Doble clic: carpeta y Papelera abren el Explorador; el archivo, el Bloc de notas.
+        let dbl = |d: &mut Desktop, sys: &mut TestPlatform, i: usize, t: u64| {
+            d.event(Event::Tick(t), sys);
+            let p = center(d.icon_cell(i));
+            click_at(d, sys, p);
+            click_at(d, sys, p);
+        };
+        dbl(&mut d, &mut sys, 8, 1000);
+        assert_eq!(kinds(&d), [AppKind::Notepad]);
+        // Las ventanas ya tapan los iconos: se activan directamente.
+        d.activate_icon(6, &mut sys);
+        assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files]);
+        d.activate_icon(5, &mut sys);
+        assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files], "se reutiliza el Explorador");
+    }
+
+    #[test]
+    fn cx_open_routes_folders_and_files() {
+        let (mut d, mut sys) = setup();
+        let (mut p, _) = probe(None, false);
+        p.open = Some(String::from("C:\\Documentos"));
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Char('o'), Some('o'), false);
+        assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files]);
+        let now = sys.now();
+        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
+        let (mut p, _) = probe(None, false);
+        p.open = Some(String::from("C:\\Documentos\\a.txt"));
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Char('o'), Some('o'), false);
+        assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files, AppKind::Notepad, AppKind::Notepad]);
+        let (mut p, _) = probe(None, false);
+        p.open = Some(String::from(files::TRASH));
+        d.launch_app(p, &mut sys);
+        key(&mut d, &mut sys, Key::Char('o'), Some('o'), false);
+        assert_eq!(kinds(&d).iter().filter(|k| **k == AppKind::Files).count(), 1);
+    }
+
+    #[test]
+    fn start_menu_tiles_fit_their_names() {
+        let (d, _) = setup();
+        for (i, (_, name, _)) in APPS.iter().enumerate() {
+            let r = d.tile_rect(i);
+            let lines = dialogs::wrap(name, 8, r.w - 14);
+            assert!(lines.len() <= 2, "{name}");
+            assert!(lines.iter().all(|l| font::width(l, 8, false) <= r.w - 12), "{name}");
+            let top = r.bottom() - 6 - font::line_h(8) * lines.len() as i32;
+            assert!(top >= r.y + 16 + 32, "{name} pisa el icono");
+        }
+    }
+
+    #[test]
+    fn incremental_equals_full_with_dialogs() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
+        d.render(&mut sys);
+        let check = |d: &mut Desktop, sys: &mut TestPlatform, what: &str| {
+            d.render(sys);
+            let inc = d.back().px.clone();
+            d.invalidate();
+            d.render(sys);
+            assert!(inc == d.back().px, "incremental distinto del completo: {what}");
+        };
+        let req = DialogRequest::Save { tag: 2, title: String::from("Guardar como"), dir: String::from("C:\\Documentos"), name: String::from("x") };
+        let (p, _) = probe(Some(req), false);
+        d.launch_app(p, &mut sys);
+        check(&mut d, &mut sys, "dueña");
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        check(&mut d, &mut sys, "diálogo");
+        key(&mut d, &mut sys, Key::Char('q'), Some('q'), false);
+        check(&mut d, &mut sys, "texto");
+        key(&mut d, &mut sys, Key::Tab, None, false);
+        key(&mut d, &mut sys, Key::Down, None, false);
+        check(&mut d, &mut sys, "lista");
+        // Arrastre del diálogo por su barra de título.
+        let t = d.wins[1].title_rect();
+        d.mouse_to(t.x + 100, t.y + 10, &mut sys);
+        d.left_button(true, &mut sys);
+        for i in 1..=10 {
+            d.mouse_to(t.x + 100 + i * 12, t.y + 10 + i * 7, &mut sys);
+            d.render(&mut sys);
+        }
+        d.left_button(false, &mut sys);
+        check(&mut d, &mut sys, "arrastre");
+        // Reemplazo, y cierre.
+        key(&mut d, &mut sys, Key::Enter, None, false);
+        check(&mut d, &mut sys, "reemplazar");
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        check(&mut d, &mut sys, "cerrado");
+        assert_eq!(d.dialog_count(), 0);
     }
 }
