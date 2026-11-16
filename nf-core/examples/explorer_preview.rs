@@ -2,7 +2,7 @@
 //! `cargo run -p nf-core --example explorer_preview -- carpeta`
 //! Guarda BMP de una carpeta con contenido, de la Papelera y del tamaño mínimo.
 use nf_core::apps::{self, AppKind, Ctx, MouseEv};
-use nf_core::files;
+use nf_core::files::{self, join, Std};
 use nf_core::platform::{Platform, TestPlatform};
 use nf_core::surface::Surface;
 use nf_core::theme::Theme;
@@ -17,19 +17,20 @@ fn main() {
     let mut sys = TestPlatform { ms: 1000, size: (1280, 800), ..Default::default() };
     let now = sys.now();
     let f = &mut sys.files;
-    f.mkdir("C:\\Documentos\\Trabajo", now).unwrap();
-    f.mkdir("C:\\Documentos\\Fotos de viaje", now).unwrap();
-    f.write("C:\\Documentos\\nota.txt", &[b'x'; 1500], now).unwrap();
-    f.write("C:\\Documentos\\Lista de la compra con un nombre bastante largo.txt", b"leche", now).unwrap();
-    f.write("C:\\Documentos\\datos.bin", &vec![7u8; 3 << 20], now).unwrap();
-    f.write("C:\\Documentos\\vacio", b"", now).unwrap();
-    f.write("C:\\Imágenes\\viejo.txt", b"a", now).unwrap();
-    f.trash("C:\\Imágenes\\viejo.txt", now).unwrap();
-    f.write("C:\\Documentos\\borrador.txt", b"hola", now).unwrap();
-    f.trash("C:\\Documentos\\borrador.txt", now).unwrap();
+    let (docs, escritorio, imagenes) = (f.std_dir(Std::Documents), f.std_dir(Std::Desktop), f.std_dir(Std::Pictures));
+    f.mkdir(&join(&docs, "Trabajo"), now).unwrap();
+    f.mkdir(&join(&docs, "Fotos de viaje"), now).unwrap();
+    f.write(&join(&docs, "nota.txt"), &[b'x'; 1500], now).unwrap();
+    f.write(&join(&docs, "Lista de la compra con un nombre bastante largo.txt"), b"leche", now).unwrap();
+    f.write(&join(&docs, "datos.bin"), &vec![7u8; 3 << 20], now).unwrap();
+    f.write(&join(&docs, "vacio"), b"", now).unwrap();
+    f.write(&join(&imagenes, "viejo.txt"), b"a", now).unwrap();
+    f.trash(&join(&imagenes, "viejo.txt"), now).unwrap();
+    f.write(&join(&docs, "borrador.txt"), b"hola", now).unwrap();
+    f.trash(&join(&docs, "borrador.txt"), now).unwrap();
     let mut theme = Theme::default();
     let mut app = apps::create(AppKind::Files);
-    app.open_path("C:\\Documentos", &mut Ctx::new(&mut sys, &mut theme, 0));
+    app.open_path(&docs, &mut Ctx::new(&mut sys, &mut theme, 0));
     for (nombre, (w, h)) in [("def", apps::default_size(AppKind::Files)), ("min", app.min_size())] {
         let mut s = Surface::new(w, h, 0);
         app.draw(&mut s, &theme, &mut sys, true);
@@ -43,9 +44,9 @@ fn main() {
     }
     // Carpeta con muchas filas: barra de desplazamiento.
     for i in 0..30 {
-        sys.files.mkdir(&format!("C:\\Escritorio\\Carpeta {i:02}"), now).unwrap();
+        sys.files.mkdir(&join(&escritorio, &format!("Carpeta {i:02}")), now).unwrap();
     }
-    app.open_path("C:\\Escritorio", &mut Ctx::new(&mut sys, &mut theme, 0));
+    app.open_path(&escritorio, &mut Ctx::new(&mut sys, &mut theme, 0));
     let (w, h) = apps::default_size(AppKind::Files);
     let mut s = Surface::new(w, h, 0);
     app.draw(&mut s, &theme, &mut sys, true);
@@ -55,7 +56,7 @@ fn main() {
     let mut ms = 0; // cada clic en un instante distinto para que no cuente como doble clic
     for (nombre, id) in [("iconos", 22), ("lista", 21)] {
         app.menu_result(2, id, &mut Ctx::new(&mut sys, &mut theme, 0));
-        for (carpeta, sufijo) in [(files::DOCUMENTS_DIR, "carpeta"), (files::DESKTOP_DIR, "barra")] {
+        for (carpeta, sufijo) in [(&docs, "carpeta"), (&escritorio, "barra")] {
             app.open_path(carpeta, &mut Ctx::new(&mut sys, &mut theme, 0));
             let mut s = Surface::new(w, h, 0);
             app.draw(&mut s, &theme, &mut sys, true); // las zonas activas se calculan al dibujar
@@ -64,5 +65,13 @@ fn main() {
             app.draw(&mut s, &theme, &mut sys, true);
             guarda(&dir, &format!("{nombre}_{sufijo}"), &s);
         }
+    }
+    // Raíz y carpeta de la cuenta: entradas de Usuarios y las seis carpetas estándar con su icono.
+    app.menu_result(2, 20, &mut Ctx::new(&mut sys, &mut theme, 0)); // Detalles
+    for (nombre, ruta) in [("raiz", String::from("C:\\")), ("cuenta", sys.files.home())] {
+        app.open_path(&ruta, &mut Ctx::new(&mut sys, &mut theme, 0));
+        let mut s = Surface::new(w, h, 0);
+        app.draw(&mut s, &theme, &mut sys, true);
+        guarda(&dir, &format!("ruta_{nombre}"), &s);
     }
 }
