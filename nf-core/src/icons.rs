@@ -118,9 +118,52 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
                 s.fill_circle(dx, dy, (1.45 * k).max(1.2), c, 255);
             }
         }
-        // Provisional hasta que se dibujen los iconos de archivos.
-        Icon::Folder | Icon::FileText | Icon::FileBlank | Icon::Trash | Icon::Drive => {
-            s.frame(Rect::new(x + size / 8, y + size / 8, size * 3 / 4, size * 3 / 4), fg);
+        Icon::Folder => {
+            // Pestaña y cuerpo trasero ámbar, frente más oscuro.
+            let (d, l) = (rgb(0xE0, 0x9F, 0x1E), rgb(0xF6, 0xC8, 0x4C));
+            cell(s, o, k, (1.0, 2.5, 6.5, 5.0), d);
+            cell(s, o, k, (1.0, 4.0, 15.0, 13.0), l);
+            cell(s, o, k, (1.0, 6.5, 15.0, 13.5), d);
+        }
+        Icon::FileText | Icon::FileBlank => {
+            let (borde, plie) = (rgb(0x8A, 0x90, 0x99), rgb(0xD3, 0xD7, 0xDC));
+            // Hoja con la esquina superior derecha doblada (pliegue triangular escalonado).
+            cell(s, o, k, (3.0, 1.0, 9.0, 15.0), borde);
+            cell(s, o, k, (9.0, 5.0, 13.0, 15.0), borde);
+            cell(s, o, k, (4.0, 2.0, 9.0, 14.0), 0xFFFFFF);
+            cell(s, o, k, (9.0, 6.0, 12.0, 14.0), 0xFFFFFF);
+            cell(s, o, k, (9.0, 1.0, 10.0, 6.0), borde);
+            cell(s, o, k, (9.0, 5.0, 13.0, 6.0), borde);
+            cell(s, o, k, (10.0, 2.0, 12.0, 5.0), plie);
+            if icon == Icon::FileText {
+                for (i, yy) in [7.0f32, 9.0, 11.0].iter().enumerate() {
+                    let x1 = if i == 2 { 8.0 } else { 11.0 };
+                    cell(s, o, k, (5.0, *yy, x1, yy + 1.0), rgb(0xA8, 0xAD, 0xB3));
+                }
+            }
+        }
+        Icon::Trash => {
+            // Tapa y asa.
+            cell(s, o, k, (2.5, 3.5, 13.5, 4.8), fg);
+            cell(s, o, k, (6.0, 1.5, 10.0, 2.5), fg);
+            cell(s, o, k, (6.0, 1.5, 7.0, 3.5), fg);
+            cell(s, o, k, (9.0, 1.5, 10.0, 3.5), fg);
+            // Cubo recto (trazos a píxel, nítido a 16 px) con dos rayas.
+            cell(s, o, k, (3.8, 5.0, 5.0, 15.0), fg);
+            cell(s, o, k, (11.0, 5.0, 12.2, 15.0), fg);
+            cell(s, o, k, (3.8, 14.0, 12.2, 15.0), fg);
+            cell(s, o, k, (6.6, 7.0, 7.6, 12.5), fg);
+            cell(s, o, k, (8.4, 7.0, 9.4, 12.5), fg);
+        }
+        Icon::Drive => {
+            let (c, d) = (rgb(0xB9, 0xBE, 0xC5), rgb(0x7E, 0x84, 0x8C));
+            cell(s, o, k, (1.0, 5.0, 15.0, 12.0), d);
+            cell(s, o, k, (1.0, 5.0, 15.0, 10.5), c);
+            cell(s, o, k, (1.0, 5.0, 15.0, 6.0), rgb(0xD8, 0xDB, 0xE0));
+            cell(s, o, k, (3.0, 7.5, 9.0, 8.8), rgb(0x3A, 0x3D, 0x42));
+            let (lx, ly) = p(12.4, 8.2);
+            s.fill_circle(lx, ly, (0.9 * k).max(0.9), rgb(0x2F, 0xC2, 0x5B), 255);
+            cell(s, o, k, (3.0, 11.0, 6.0, 11.5), rgb(0x5E, 0x63, 0x6A));
         }
     }
     s.set_clip(old);
@@ -130,8 +173,21 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 8] =
-        [Icon::Notepad, Icon::Calc, Icon::Terminal, Icon::Settings, Icon::Power, Icon::Logo, Icon::Info, Icon::Palette];
+    const ALL: [Icon; 13] = [
+        Icon::Notepad,
+        Icon::Calc,
+        Icon::Terminal,
+        Icon::Settings,
+        Icon::Power,
+        Icon::Logo,
+        Icon::Info,
+        Icon::Palette,
+        Icon::Folder,
+        Icon::FileText,
+        Icon::FileBlank,
+        Icon::Trash,
+        Icon::Drive,
+    ];
     const SENT: u32 = 0x123456;
 
     #[test]

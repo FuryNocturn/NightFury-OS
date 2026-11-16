@@ -6,13 +6,26 @@ use nf_core::surface::Surface;
 use nf_core::theme::{render_wallpaper, ACCENTS};
 use std::time::Instant;
 
-const ICONS: [Icon; 8] =
-    [Icon::Notepad, Icon::Calc, Icon::Terminal, Icon::Settings, Icon::Power, Icon::Logo, Icon::Info, Icon::Palette];
+const ICONS: [Icon; 13] = [
+    Icon::Notepad,
+    Icon::Calc,
+    Icon::Terminal,
+    Icon::Settings,
+    Icon::Power,
+    Icon::Logo,
+    Icon::Info,
+    Icon::Palette,
+    Icon::Folder,
+    Icon::FileText,
+    Icon::FileBlank,
+    Icon::Trash,
+    Icon::Drive,
+];
 
 fn main() {
     let out = std::env::args().nth(1).expect("falta la ruta de salida .bmp");
     let accent = ACCENTS[0];
-    let mut img = Surface::new(1760, 1260, 0x404040);
+    let mut img = Surface::new(2800, 1260, 0x404040);
 
     // Fondos a 640x400 y miniaturas de 128x72.
     for id in 0..4u8 {
@@ -33,8 +46,8 @@ fn main() {
     // Iconos sobre tres fondos: (color de fondo, fg).
     let fondos = [(0xFFFFFF, 0x202020), (0x1F1F1F, 0xFFFFFF), (accent, 0xFFFFFF)];
     for (b, &(bg, fg)) in fondos.iter().enumerate() {
-        let (x0, y0) = (10 + b as i32 * 585, 930);
-        img.fill_rect(Rect::new(x0, y0, 575, 320), bg);
+        let (x0, y0) = (10 + b as i32 * 930, 930);
+        img.fill_rect(Rect::new(x0, y0, 920, 320), bg);
         for (i, &ic) in ICONS.iter().enumerate() {
             let x = x0 + 8 + i as i32 * 70;
             let mut y = y0 + 8;

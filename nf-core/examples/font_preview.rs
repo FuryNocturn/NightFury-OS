@@ -11,7 +11,7 @@ fn bloque(s: &mut Surface, y0: i32, fondo: u32, tinta: u32) -> i32 {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
         "abcdefghijklmnopqrstuvwxyz",
         "0123456789  . , : ; ! ¡ ? ¿ - _ + = * / \\ | ( ) [ ] { } < > ' \" ` ´ ^ ~ ¨",
-        "# $ % & @ º ª · ¬ € ç Ç × ÷ − ± ² √ ← → ° … ✓",
+        "# $ % & @ º ª · ¬ € ç Ç × ÷ − ± ² √ ← → ↑ ↓ › ‹ ° … ✓",
         "áéíóú ÁÉÍÓÚ àèìòù ÀÈÌÒÙ äëïöü ÄËÏÖÜ âêîôû ÂÊÎÔÛ ñ Ñ",
         "El veloz murciélago hindú comía feliz cardillo y kiwi. ¿Qué tal? ¡Ñandú! 0123456789",
         "Bloc de notas",
