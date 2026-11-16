@@ -25,6 +25,28 @@ pub enum Icon {
     Trash,
     /// Unidad de disco.
     Drive,
+    Copiar,
+    Pegar,
+    Cortar,
+    MoverA,
+    CopiarA,
+    Eliminar,
+    CambiarNombre,
+    CarpetaNueva,
+    DocumentoNuevo,
+    Propiedades,
+    Abrir,
+    SeleccionarTodo,
+    SeleccionarNada,
+    InvertirSeleccion,
+    VistaIconosGrandes,
+    VistaIconosMedianos,
+    VistaIconosPequenos,
+    VistaLista,
+    VistaDetalles,
+    Ordenar,
+    VentanaNueva,
+    Cerrar,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -32,6 +54,27 @@ fn cell(s: &mut Surface, o: (i32, i32), k: f32, r: (f32, f32, f32, f32), c: u32)
     let (x0, y0) = (iround(r.0 * k), iround(r.1 * k));
     let (x1, y1) = (iround(r.2 * k).max(x0 + 1), iround(r.3 * k).max(y0 + 1));
     s.fill_rect(Rect::new(o.0 + x0, o.1 + y0, x1 - x0, y1 - y0), c);
+}
+
+const AZUL: u32 = 0x2F7BE0;
+const CLARO: u32 = 0xBFD6F2;
+const GRIS: u32 = 0x8A9099;
+const OSCURO: u32 = 0x44484D;
+const ROJO: u32 = 0xD94141;
+const VERDE: u32 = 0x3CB371;
+
+/// Hoja rectangular: borde de 1 unidad de rejilla y relleno.
+fn sheet(s: &mut Surface, o: (i32, i32), k: f32, r: (f32, f32, f32, f32), borde: u32, fill: u32) {
+    cell(s, o, k, r, borde);
+    cell(s, o, k, (r.0 + 1.0, r.1 + 1.0, r.2 - 1.0, r.3 - 1.0), fill);
+}
+
+/// Disco de color con un "+" blanco (nuevo / copiar), centrado en `c`.
+fn insignia(s: &mut Surface, c: (f32, f32), k: f32, col: u32) {
+    s.fill_circle(c.0, c.1, 3.4 * k, col, 255);
+    let t = (1.3 * k).max(1.3);
+    s.stroke(&[(c.0 - 1.8 * k, c.1), (c.0 + 1.8 * k, c.1)], t, 0xFFFFFF);
+    s.stroke(&[(c.0, c.1 - 1.8 * k), (c.0, c.1 + 1.8 * k)], t, 0xFFFFFF);
 }
 
 /// Dibuja `icon` en el cuadrado de lado `size` con esquina en (x, y).
@@ -165,6 +208,139 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             s.fill_circle(lx, ly, (0.9 * k).max(0.9), rgb(0x2F, 0xC2, 0x5B), 255);
             cell(s, o, k, (3.0, 11.0, 6.0, 11.5), rgb(0x5E, 0x63, 0x6A));
         }
+        Icon::Copiar => {
+            sheet(s, o, k, (2.0, 1.0, 10.0, 11.0), GRIS, 0xFFFFFF);
+            sheet(s, o, k, (6.0, 5.0, 14.0, 15.0), AZUL, 0xFFFFFF);
+            cell(s, o, k, (8.0, 8.0, 12.0, 9.0), CLARO);
+            cell(s, o, k, (8.0, 10.5, 12.0, 11.5), CLARO);
+        }
+        Icon::Pegar => {
+            cell(s, o, k, (2.0, 3.0, 14.0, 15.0), rgb(0xC0, 0x8A, 0x4A));
+            sheet(s, o, k, (4.0, 5.0, 12.0, 14.0), GRIS, 0xFFFFFF);
+            cell(s, o, k, (5.0, 1.5, 11.0, 4.5), OSCURO);
+            cell(s, o, k, (6.0, 8.0, 10.0, 9.0), CLARO);
+            cell(s, o, k, (6.0, 10.5, 10.0, 11.5), CLARO);
+        }
+        Icon::Cortar => {
+            let t = tw(1.3);
+            s.stroke(&[p(4.5, 1.5), p(10.5, 10.5)], t, OSCURO);
+            s.stroke(&[p(11.5, 1.5), p(5.5, 10.5)], t, OSCURO);
+            for u in [4.5f32, 11.5] {
+                let (cx, cy) = p(u, 12.5);
+                s.arc(cx, cy, 2.0 * k, 0.0, 360.0, tw(1.3), ROJO);
+            }
+        }
+        Icon::MoverA | Icon::CopiarA => {
+            let (d, l) = (rgb(0xE0, 0x9F, 0x1E), rgb(0xF6, 0xC8, 0x4C));
+            cell(s, o, k, (1.0, 2.0, 6.0, 4.0), d);
+            cell(s, o, k, (1.0, 3.0, 12.0, 11.0), l);
+            cell(s, o, k, (1.0, 5.0, 12.0, 11.0), d);
+            if icon == Icon::MoverA {
+                s.stroke(&[p(6.0, 13.5), p(14.0, 13.5)], tw(1.5), AZUL);
+                s.stroke(&[p(11.5, 11.0), p(14.5, 13.5), p(11.5, 16.0)], tw(1.5), AZUL);
+            } else {
+                insignia(s, p(12.0, 11.5), k, VERDE);
+            }
+        }
+        Icon::Eliminar => {
+            let t = tw(2.2);
+            s.stroke(&[p(3.5, 3.5), p(12.5, 12.5)], t, ROJO);
+            s.stroke(&[p(12.5, 3.5), p(3.5, 12.5)], t, ROJO);
+        }
+        Icon::CambiarNombre => {
+            cell(s, o, k, (1.0, 4.0, 15.0, 12.0), GRIS);
+            cell(s, o, k, (2.0, 5.0, 14.0, 11.0), 0xFFFFFF);
+            cell(s, o, k, (3.0, 7.5, 7.0, 8.5), CLARO);
+            s.stroke(&[p(9.5, 2.0), p(9.5, 14.0)], tw(1.2), AZUL);
+            s.stroke(&[p(8.0, 2.0), p(11.0, 2.0)], tw(1.2), AZUL);
+            s.stroke(&[p(8.0, 14.0), p(11.0, 14.0)], tw(1.2), AZUL);
+        }
+        Icon::CarpetaNueva => {
+            draw(s, Icon::Folder, x, y + iround(1.5 * k), size, fg);
+            insignia(s, p(12.0, 4.0), k, VERDE);
+        }
+        Icon::DocumentoNuevo => {
+            draw(s, Icon::FileBlank, x, y, size, fg);
+            insignia(s, p(12.0, 12.0), k, VERDE);
+        }
+        Icon::Propiedades => {
+            sheet(s, o, k, (3.0, 1.0, 13.0, 15.0), GRIS, 0xFFFFFF);
+            cell(s, o, k, (5.0, 4.0, 11.0, 5.0), CLARO);
+            cell(s, o, k, (5.0, 6.5, 9.0, 7.5), CLARO);
+            s.stroke(&[p(5.5, 11.0), p(7.5, 13.0), p(11.5, 8.5)], tw(1.5), VERDE);
+        }
+        Icon::Abrir => {
+            sheet(s, o, k, (2.0, 3.0, 11.0, 15.0), GRIS, 0xFFFFFF);
+            cell(s, o, k, (4.0, 6.0, 8.0, 7.0), CLARO);
+            s.stroke(&[p(7.0, 10.0), p(14.0, 3.0)], tw(1.6), AZUL);
+            s.stroke(&[p(9.5, 2.5), p(14.5, 2.5), p(14.5, 7.5)], tw(1.6), AZUL);
+        }
+        Icon::SeleccionarTodo => {
+            sheet(s, o, k, (2.0, 2.0, 14.0, 14.0), AZUL, CLARO);
+            s.stroke(&[p(4.8, 8.2), p(7.2, 10.8), p(11.5, 5.2)], tw(1.6), AZUL);
+        }
+        Icon::SeleccionarNada => {
+            // Marco discontinuo: borde gris con huecos en el centro de cada lado.
+            sheet(s, o, k, (2.0, 2.0, 14.0, 14.0), GRIS, 0xFFFFFF);
+            cell(s, o, k, (6.0, 2.0, 10.0, 3.0), 0xFFFFFF);
+            cell(s, o, k, (6.0, 13.0, 10.0, 14.0), 0xFFFFFF);
+            cell(s, o, k, (2.0, 6.0, 3.0, 10.0), 0xFFFFFF);
+            cell(s, o, k, (13.0, 6.0, 14.0, 10.0), 0xFFFFFF);
+        }
+        Icon::InvertirSeleccion => {
+            sheet(s, o, k, (2.0, 2.0, 14.0, 14.0), AZUL, 0xFFFFFF);
+            cell(s, o, k, (3.0, 3.0, 8.0, 13.0), AZUL);
+        }
+        Icon::VistaIconosGrandes | Icon::VistaIconosMedianos | Icon::VistaIconosPequenos => {
+            // n x n cuadrados con hueco dentro de 1..15.
+            let n = match icon {
+                Icon::VistaIconosGrandes => 2,
+                Icon::VistaIconosMedianos => 3,
+                _ => 4,
+            };
+            let gap = 1.6 - 0.1 * n as f32;
+            let lado = (14.0 - gap * (n - 1) as f32) / n as f32;
+            for j in 0..n {
+                for i in 0..n {
+                    let (u, v) = (1.0 + i as f32 * (lado + gap), 1.0 + j as f32 * (lado + gap));
+                    cell(s, o, k, (u, v, u + lado, v + lado), AZUL);
+                }
+            }
+        }
+        Icon::VistaLista => {
+            for v in [2.5f32, 6.5, 10.5] {
+                cell(s, o, k, (1.5, v, 4.5, v + 3.0), AZUL);
+                cell(s, o, k, (6.0, v + 1.0, 14.5, v + 2.0), GRIS);
+            }
+        }
+        Icon::VistaDetalles => {
+            cell(s, o, k, (1.0, 2.0, 15.0, 5.0), AZUL);
+            for v in [6.5f32, 9.0, 11.5, 14.0] {
+                cell(s, o, k, (1.0, v, 5.0, v + 1.0), GRIS);
+                cell(s, o, k, (6.5, v, 15.0, v + 1.0), CLARO);
+            }
+        }
+        Icon::Ordenar => {
+            cell(s, o, k, (1.5, 3.0, 5.0, 4.5), GRIS);
+            cell(s, o, k, (1.5, 7.0, 8.0, 8.5), GRIS);
+            cell(s, o, k, (1.5, 11.0, 10.0, 12.5), GRIS);
+            s.stroke(&[p(13.0, 2.5), p(13.0, 13.0)], tw(1.4), AZUL);
+            s.stroke(&[p(10.8, 10.8), p(13.0, 13.2), p(15.2, 10.8)], tw(1.4), AZUL);
+        }
+        Icon::VentanaNueva => {
+            cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
+            cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
+            cell(s, o, k, (2.0, 3.0, 14.0, 5.0), AZUL);
+            insignia(s, p(11.5, 11.0), k, VERDE);
+        }
+        Icon::Cerrar => {
+            cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
+            cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
+            cell(s, o, k, (2.0, 3.0, 14.0, 5.0), AZUL);
+            let t = tw(1.7);
+            s.stroke(&[p(5.5, 6.5), p(10.5, 11.5)], t, ROJO);
+            s.stroke(&[p(10.5, 6.5), p(5.5, 11.5)], t, ROJO);
+        }
     }
     s.set_clip(old);
 }
@@ -173,7 +349,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 13] = [
+    const ALL: [Icon; 35] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -187,6 +363,28 @@ mod tests {
         Icon::FileBlank,
         Icon::Trash,
         Icon::Drive,
+        Icon::Copiar,
+        Icon::Pegar,
+        Icon::Cortar,
+        Icon::MoverA,
+        Icon::CopiarA,
+        Icon::Eliminar,
+        Icon::CambiarNombre,
+        Icon::CarpetaNueva,
+        Icon::DocumentoNuevo,
+        Icon::Propiedades,
+        Icon::Abrir,
+        Icon::SeleccionarTodo,
+        Icon::SeleccionarNada,
+        Icon::InvertirSeleccion,
+        Icon::VistaIconosGrandes,
+        Icon::VistaIconosMedianos,
+        Icon::VistaIconosPequenos,
+        Icon::VistaLista,
+        Icon::VistaDetalles,
+        Icon::Ordenar,
+        Icon::VentanaNueva,
+        Icon::Cerrar,
     ];
     const SENT: u32 = 0x123456;
 
