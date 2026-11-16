@@ -24,6 +24,22 @@ pub unsafe fn inb(port: u16) -> u8 {
     v
 }
 
+/// # Safety
+/// Escribir en un puerto de E/S puede tener cualquier efecto sobre el hardware.
+#[inline]
+pub unsafe fn outl(port: u16, v: u32) {
+    asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack, preserves_flags));
+}
+
+/// # Safety
+/// Leer un puerto de E/S puede tener efectos secundarios en el hardware.
+#[inline]
+pub unsafe fn inl(port: u16) -> u32 {
+    let v: u32;
+    asm!("in eax, dx", in("dx") port, out("eax") v, options(nomem, nostack, preserves_flags));
+    v
+}
+
 // ---------- Rutinas de entrada ----------
 
 /// Rutina de una IRQ: guarda los registros y el estado SSE, llama al manejador y vuelve.

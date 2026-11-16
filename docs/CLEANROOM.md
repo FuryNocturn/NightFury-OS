@@ -23,6 +23,7 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `kernel/src/arch.rs` | GDT, IDT, PIC, PIT, puertos | Intel SDM vol. 3; hojas de datos 8259 y 8254 |
 | `kernel/src/ps2.rs` | Teclado y ratón | Interfaz del controlador 8042 y protocolo PS/2 |
 | `kernel/src/rtc.rs` | Fecha y hora | Registros del MC146818 |
+| `kernel/src/pci.rs`, `ahci.rs` | Configuración PCI y disco SATA (AHCI) por sondeo | PCI Local Bus Specification (acceso por 0xCF8/0xCFC); Serial ATA AHCI 1.3.1; ATA/ATAPI Command Set (IDENTIFY, READ/WRITE DMA EXT, FLUSH CACHE EXT) |
 | `nf-core/src/input.rs` | Códigos de tecla y distribución ES | Tabla pública "scan code set 1"; distribución de teclado española |
 | `nf-core/src/glyphs.rs` | Tipografía | Diseño propio, trazo a trazo |
 | `nf-core/src/icons.rs`, `theme.rs` | Iconos, logo, fondos | Diseño propio, generado por código |
