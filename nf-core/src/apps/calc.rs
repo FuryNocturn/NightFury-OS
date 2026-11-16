@@ -541,7 +541,7 @@ mod tests {
     fn con_ctx(f: impl FnOnce(&mut Ctx)) {
         let mut sys = TestPlatform::default();
         let mut th = Theme::default();
-        let mut cx = Ctx { sys: &mut sys, theme: &mut th, now_ms: 0, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
         f(&mut cx);
     }
 

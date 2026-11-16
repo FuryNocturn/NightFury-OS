@@ -250,7 +250,7 @@ mod tests {
             s
         }
         fn ev(&mut self, ev: MouseEv) {
-            let mut cx = Ctx { sys: &mut self.sys, theme: &mut self.theme, now_ms: 0, redraw: false, close: false, theme_changed: false };
+            let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
             self.app.mouse(ev, &mut cx);
             self.redraw |= cx.redraw;
             self.changed |= cx.theme_changed;
@@ -305,13 +305,13 @@ mod tests {
     fn tick_solo_en_acerca_de() {
         let mut b = Banco::new();
         b.dibuja(780, 520);
-        let mut cx = Ctx { sys: &mut b.sys, theme: &mut b.theme, now_ms: 5000, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 5000);
         b.app.tick(&mut cx);
         assert!(!cx.redraw);
         drop(cx);
         b.clic(50, 56 + 40 + 5);
         b.dibuja(780, 520);
-        let mut cx = Ctx { sys: &mut b.sys, theme: &mut b.theme, now_ms: 6000, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 6000);
         b.app.tick(&mut cx);
         assert!(cx.redraw);
         cx.redraw = false;

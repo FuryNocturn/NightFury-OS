@@ -20,6 +20,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering::*};
 use fb::Fb;
 use nf_core::desktop::Desktop;
+use nf_core::files::Files;
 use nf_core::geom::Rect;
 use nf_core::heap::Heap;
 use nf_core::icons::{self, Icon};
@@ -60,6 +61,7 @@ static ASIGNADOR: Asignador = Asignador;
 
 struct Plat {
     info: boot::BootInfo,
+    files: Files,
 }
 
 fn cpu_name() -> String {
@@ -124,6 +126,9 @@ impl Platform for Plat {
     fn shutdown(&mut self) {
         self.reset(uefi::RESET_SHUTDOWN);
     }
+    fn files(&mut self) -> &mut Files {
+        &mut self.files
+    }
 }
 
 // ---------- Núcleo ----------
@@ -145,7 +150,7 @@ extern "C" fn kmain() -> ! {
     pantalla_de_arranque(&fb);
     ps2::init();
 
-    let mut plat = Plat { info };
+    let mut plat = Plat { info, files: Files::default() };
     let (w, h) = (info.width as i32, info.height as i32);
     let mut desk = Desktop::new(w, h, &mut plat);
 

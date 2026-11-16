@@ -3,7 +3,11 @@
 extern crate alloc;
 
 pub mod apps;
+pub mod block;
 pub mod bmp;
+pub mod dialogs;
+pub mod files;
+pub mod fs;
 pub mod desktop;
 pub mod font;
 pub mod geom;

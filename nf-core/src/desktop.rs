@@ -449,7 +449,7 @@ impl Desktop {
     /// Llama a la app de la ventana `id` y aplica lo que pida.
     fn with_app(&mut self, id: u32, sys: &mut dyn Platform, f: impl FnOnce(&mut dyn App, &mut Ctx)) {
         let Some(i) = self.pos(id) else { return };
-        let mut cx = Ctx { sys, theme: &mut self.theme, now_ms: self.now_ms, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(sys, &mut self.theme, self.now_ms);
         f(&mut *self.wins[i].app, &mut cx);
         let (redraw, close, themed) = (cx.redraw, cx.close, cx.theme_changed);
         if themed {
@@ -1165,7 +1165,7 @@ mod tests {
         assert!(!d.start_is_open());
         assert_eq!(kinds(&d), [AppKind::Calc]);
         click!(d, sys, center(d.start_rect()));
-        click!(d, sys, center(d.tile_rect(3)));
+        click!(d, sys, center(d.tile_rect(4)));
         assert_eq!(kinds(&d), [AppKind::Calc, AppKind::Terminal]);
         assert!(!d.start_is_open());
     }

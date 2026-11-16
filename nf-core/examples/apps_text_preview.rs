@@ -40,7 +40,7 @@ fn main() {
     let mut nota = apps::create(AppKind::Notepad);
     let mut term = apps::create(AppKind::Terminal);
     {
-        let mut cx = Ctx { sys: &mut sys, theme: &mut th, now_ms: 0, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
         escribe(
             &mut *nota,
             "Canción de otoño\nEl veloz murciélago hindú comía feliz cardillo y kiwi.\n¿Qué tal, ñandú? ¡Ñu, niño, año, pingüino!\n\tCon tabulador y acentos: áéíóú ÁÉÍÓÚ ü\nUna línea muy larga para comprobar el desplazamiento horizontal del cursor, que debe seguir visible sin cortarse.",
@@ -54,7 +54,7 @@ fn main() {
     let (w, h) = apps::default_size(AppKind::Notepad);
     guarda(&dir, "notepad_desplazado", &mut *nota, w, h, &mut sys);
     {
-        let mut cx = Ctx { sys: &mut sys, theme: &mut th, now_ms: 0, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
         for _ in 0..4 {
             nota.key(&tecla(Key::Up, None), &mut cx);
         }

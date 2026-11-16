@@ -26,7 +26,7 @@ impl Banco {
     }
 
     fn ratón(&mut self, ev: MouseEv) {
-        let mut cx = Ctx { sys: &mut self.sys, theme: &mut self.theme, now_ms: 0, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
         self.app.mouse(ev, &mut cx);
     }
 
@@ -36,7 +36,7 @@ impl Banco {
     }
 
     fn tecla(&mut self, c: char) {
-        let mut cx = Ctx { sys: &mut self.sys, theme: &mut self.theme, now_ms: 0, redraw: false, close: false, theme_changed: false };
+        let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
         let key = if c == '\n' { Key::Enter } else { Key::Char(c) };
         let ch = if c == '\n' { None } else { Some(c) };
         self.app.key(&KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt: false }, &mut cx);

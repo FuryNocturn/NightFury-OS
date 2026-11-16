@@ -1,5 +1,6 @@
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
+use crate::files::Files;
 use alloc::string::String;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -29,6 +30,8 @@ pub trait Platform {
     fn screen(&self) -> (u32, u32);
     fn reboot(&mut self);
     fn shutdown(&mut self);
+    /// Archivos del sistema (unidad C:).
+    fn files(&mut self) -> &mut Files;
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
@@ -38,6 +41,8 @@ pub struct TestPlatform {
     pub rebooted: bool,
     pub halted: bool,
     pub size: (u32, u32),
+    /// Unidad C: en memoria.
+    pub files: Files,
 }
 
 impl Platform for TestPlatform {
@@ -61,5 +66,8 @@ impl Platform for TestPlatform {
     }
     fn shutdown(&mut self) {
         self.halted = true;
+    }
+    fn files(&mut self) -> &mut Files {
+        &mut self.files
     }
 }

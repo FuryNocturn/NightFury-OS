@@ -15,6 +15,16 @@ pub enum Icon {
     Logo,
     Info,
     Palette,
+    /// Carpeta.
+    Folder,
+    /// Archivo de texto.
+    FileText,
+    /// Archivo de tipo desconocido.
+    FileBlank,
+    /// Papelera.
+    Trash,
+    /// Unidad de disco.
+    Drive,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -107,6 +117,10 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
                 let (dx, dy) = p(u, v);
                 s.fill_circle(dx, dy, (1.45 * k).max(1.2), c, 255);
             }
+        }
+        // Provisional hasta que se dibujen los iconos de archivos.
+        Icon::Folder | Icon::FileText | Icon::FileBlank | Icon::Trash | Icon::Drive => {
+            s.frame(Rect::new(x + size / 8, y + size / 8, size * 3 / 4, size * 3 / 4), fg);
         }
     }
     s.set_clip(old);
