@@ -1,6 +1,8 @@
 //! Bloc de notas: editor de texto plano de varias líneas, sin ajuste de línea ni selección.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 use super::{App, AppKind, Ctx, MouseEv};
+use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
+use crate::files::{self, DOCUMENTS_DIR};
 use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::input::{Key, KeyEvent};
@@ -17,6 +19,28 @@ const SIZE: u32 = 10;
 const MARGIN: i32 = 6;
 const STATUS_H: i32 = 22;
 const BLINK_MS: u64 = 530;
+const MENU_H: i32 = 24;
+const ITEM_H: i32 = 26;
+const DROP_W: i32 = 230;
+const MAX_FILE: usize = 1 << 20;
+const TAG_OPEN: u32 = 1;
+const TAG_SAVE: u32 = 2;
+const TAG_ASK: u32 = 3;
+const TAG_MSG: u32 = 4;
+const TITLE: &str = "Bloc de notas";
+
+/// Entradas del menú Archivo: (texto, atajo).
+const ITEMS: [(&str, &str); 5] =
+    [("Nuevo", "Ctrl+N"), ("Abrir…", "Ctrl+O"), ("Guardar", "Ctrl+S"), ("Guardar como…", "Ctrl+Mayús+S"), ("Salir", "")];
+
+/// Acción que espera a que se resuelva "¿guardar los cambios?".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pending {
+    Ninguna,
+    Nuevo,
+    Abrir,
+    Cerrar,
+}
 
 /// Texto y cursor, sin nada de dibujo.
 struct Editor {
@@ -129,10 +153,53 @@ pub struct Notepad {
     /// Instante desde el que cuenta el parpadeo.
     t0: u64,
     shown: bool,
+    path: Option<String>,
+    modified: bool,
+    pending: Pending,
+    menu_open: bool,
+    hover: Option<usize>,
+}
+
+fn blank() -> Notepad {
+    Notepad {
+        ed: Editor::new(),
+        top: 0,
+        scroll_x: 0,
+        vis: 10,
+        w: 0,
+        h: 0,
+        focused: false,
+        t0: 0,
+        shown: true,
+        path: None,
+        modified: false,
+        pending: Pending::Ninguna,
+        menu_open: false,
+        hover: None,
+    }
 }
 
 pub fn new() -> Box<dyn App> {
-    Box::new(Notepad { ed: Editor::new(), top: 0, scroll_x: 0, vis: 10, w: 0, h: 0, focused: false, t0: 0, shown: true })
+    Box::new(blank())
+}
+
+/// Texto del archivo -> líneas (acepta `\r\n` y `\n`; tabuladores a 4 espacios).
+fn parse(text: &str) -> Vec<Vec<char>> {
+    text.split('\n')
+        .map(|l| {
+            let l = l.strip_suffix('\r').unwrap_or(l);
+            l.chars().flat_map(|c| if c == '\t' { vec![' '; 4] } else { vec![c] }).collect()
+        })
+        .collect()
+}
+
+fn message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message {
+        tag: TAG_MSG,
+        title: String::from(TITLE),
+        text: String::from(text),
+        buttons: Buttons::Ok,
+    });
 }
 
 fn line_text(l: &[char]) -> String {
@@ -142,6 +209,158 @@ fn line_text(l: &[char]) -> String {
 impl Notepad {
     fn lh() -> i32 {
         font::line_h(SIZE)
+    }
+
+    fn doc_name(&self) -> &str {
+        self.path.as_deref().map_or("Sin título", files::file_name)
+    }
+
+    fn doc_dir(&self) -> String {
+        self.path.as_deref().and_then(files::parent).unwrap_or_else(|| String::from(DOCUMENTS_DIR))
+    }
+
+    /// Ejecuta una acción ya autorizada.
+    fn run(&mut self, a: Pending, cx: &mut Ctx) {
+        match a {
+            Pending::Ninguna => {}
+            Pending::Nuevo => {
+                self.ed = Editor::new();
+                self.top = 0;
+                self.scroll_x = 0;
+                self.path = None;
+                self.modified = false;
+            }
+            Pending::Abrir => {
+                cx.dialog = Some(DialogRequest::Open { tag: TAG_OPEN, title: String::from("Abrir"), dir: self.doc_dir() });
+            }
+            Pending::Cerrar => cx.close = true,
+        }
+        cx.redraw = true;
+    }
+
+    /// Pide confirmación si hay cambios sin guardar; si no, ejecuta la acción.
+    fn guard(&mut self, a: Pending, cx: &mut Ctx) {
+        if !self.modified {
+            return self.run(a, cx);
+        }
+        self.pending = a;
+        cx.dialog = Some(DialogRequest::Message {
+            tag: TAG_ASK,
+            title: String::from(TITLE),
+            text: format!("¿Quieres guardar los cambios de {}?", self.doc_name()),
+            buttons: Buttons::YesNoCancel,
+        });
+    }
+
+    fn save_as(&mut self, cx: &mut Ctx) {
+        let name = self.path.as_deref().map_or("Sin título.txt", files::file_name);
+        cx.dialog = Some(DialogRequest::Save {
+            tag: TAG_SAVE,
+            title: String::from("Guardar como"),
+            dir: self.doc_dir(),
+            name: String::from(name),
+        });
+    }
+
+    fn save(&mut self, cx: &mut Ctx) {
+        match self.path.clone() {
+            Some(p) => self.write_to(&p, cx),
+            None => self.save_as(cx),
+        }
+    }
+
+    /// Escribe el documento en `path`; si sale bien sigue con la acción pendiente.
+    fn write_to(&mut self, path: &str, cx: &mut Ctx) {
+        let mut text = String::new();
+        for (i, l) in self.ed.lines.iter().enumerate() {
+            if i > 0 {
+                text.push_str("\r\n");
+            }
+            text.extend(l.iter());
+        }
+        let now = cx.sys.now();
+        match cx.sys.files().write(path, text.as_bytes(), now) {
+            Ok(()) => {
+                self.path = Some(String::from(path));
+                self.modified = false;
+                let a = core::mem::replace(&mut self.pending, Pending::Ninguna);
+                self.run(a, cx);
+            }
+            Err(e) => {
+                self.pending = Pending::Ninguna;
+                message(cx, e.message());
+            }
+        }
+        cx.redraw = true;
+    }
+
+    fn load(&mut self, path: &str, cx: &mut Ctx) {
+        let data = match cx.sys.files().read(path) {
+            Ok(d) => d,
+            Err(e) => return message(cx, e.message()),
+        };
+        if data.len() > MAX_FILE {
+            return message(cx, "El archivo es demasiado grande para el Bloc de notas (máximo 1 MiB).");
+        }
+        let Ok(text) = core::str::from_utf8(&data) else {
+            return message(cx, "Este archivo no es un archivo de texto.");
+        };
+        self.ed = Editor::new();
+        self.ed.lines = parse(text);
+        self.top = 0;
+        self.scroll_x = 0;
+        self.path = Some(String::from(path));
+        self.modified = false;
+        cx.redraw = true;
+    }
+
+    fn menu_action(&mut self, i: usize, cx: &mut Ctx) {
+        self.menu_open = false;
+        match i {
+            0 => self.guard(Pending::Nuevo, cx),
+            1 => self.guard(Pending::Abrir, cx),
+            2 => self.save(cx),
+            3 => self.save_as(cx),
+            _ => self.guard(Pending::Cerrar, cx),
+        }
+        cx.redraw = true;
+    }
+
+    fn button_w() -> i32 {
+        font::width("Archivo", SIZE, false) + 20
+    }
+
+    /// Entrada del desplegable bajo el punto (x, y), si hay.
+    fn item_at(x: i32, y: i32) -> Option<usize> {
+        let r = Rect::new(4, MENU_H, DROP_W, ITEMS.len() as i32 * ITEM_H + 4);
+        if x < r.x || x >= r.x + r.w || y < r.y + 2 || y >= r.y + r.h - 2 {
+            return None;
+        }
+        Some(((y - r.y - 2) / ITEM_H) as usize)
+    }
+
+    fn draw_menu(&self, s: &mut Surface) {
+        s.fill_rect(Rect::new(0, 0, s.w, MENU_H), 0xF0F0F0);
+        s.fill_rect(Rect::new(0, MENU_H - 1, s.w, 1), 0xD7D7D7);
+        let b = Rect::new(4, 2, Self::button_w(), MENU_H - 4);
+        if self.menu_open {
+            s.fill_rect(b, 0xCCE4F7);
+        }
+        font::draw_in(s, b, "Archivo", SIZE, false, 0x000000, Align::Center);
+        if !self.menu_open {
+            return;
+        }
+        let r = Rect::new(4, MENU_H, DROP_W, ITEMS.len() as i32 * ITEM_H + 4);
+        s.fill_rect(r, 0x808080);
+        s.fill_rect(Rect::new(r.x + 1, r.y + 1, r.w - 2, r.h - 2), 0xFAFAFA);
+        for (i, (name, key)) in ITEMS.iter().enumerate() {
+            let row = Rect::new(r.x + 2, r.y + 2 + i as i32 * ITEM_H, r.w - 4, ITEM_H);
+            if self.hover == Some(i) {
+                s.fill_rect(row, 0xCCE4F7);
+            }
+            font::draw_in(s, Rect::new(row.x + 10, row.y, row.w - 20, row.h), name, SIZE, false, 0x000000, Align::Left);
+            font::draw_in(s, Rect::new(row.x + 10, row.y, row.w - 20, row.h), key, 9, false, 0x606060, Align::Right);
+        }
     }
 
     fn touch(&mut self, cx: &mut Ctx) {
@@ -181,7 +400,7 @@ impl App for Notepad {
         AppKind::Notepad
     }
     fn title(&self) -> String {
-        String::from("Sin título: Bloc de notas")
+        format!("{}{}: {}", if self.modified { "*" } else { "" }, self.doc_name(), TITLE)
     }
     fn min_size(&self) -> (i32, i32) {
         (240, 140)
@@ -191,37 +410,60 @@ impl App for Notepad {
         self.w = s.w;
         self.h = s.h;
         self.focused = focused;
-        let text_h = (s.h - STATUS_H).max(0);
+        let text_h = (s.h - STATUS_H - MENU_H).max(0);
         self.follow_cursor(s.w, text_h);
         let lh = Self::lh();
         s.fill_rect(s.bounds(), 0xFFFFFF);
 
-        s.set_clip(Rect::new(0, 0, s.w, text_h));
+        s.set_clip(Rect::new(0, MENU_H, s.w, text_h));
         let last = (self.top + self.vis + 1).min(self.ed.lines.len());
         for row in self.top..last {
-            let y = (row - self.top) as i32 * lh;
+            let y = MENU_H + (row - self.top) as i32 * lh;
             let t = line_text(&self.ed.lines[row]);
             font::draw(s, MARGIN - self.scroll_x, y, &t, SIZE, false, 0x000000);
         }
         if focused && self.shown {
             let x = MARGIN - self.scroll_x + self.x_of(self.ed.row, self.ed.col);
-            let y = (self.ed.row - self.top) as i32 * lh;
+            let y = MENU_H + (self.ed.row - self.top) as i32 * lh;
             s.fill_rect(Rect::new(x, y + 1, 1, lh - 2), 0x000000);
         }
         s.reset_clip();
 
         // Barra de estado.
-        let bar = Rect::new(0, text_h, s.w, s.h - text_h);
+        let by = text_h + MENU_H;
+        let bar = Rect::new(0, by, s.w, s.h - by);
         s.fill_rect(bar, 0xF0F0F0);
-        s.fill_rect(Rect::new(0, text_h, s.w, 1), 0xD7D7D7);
+        s.fill_rect(Rect::new(0, by, s.w, 1), 0xD7D7D7);
         let left = format!("{} caracteres", self.ed.char_count());
         let right = format!("Ln {}, Col {}", self.ed.row + 1, self.ed.col + 1);
-        font::draw_in(s, Rect::new(MARGIN, text_h, s.w - 2 * MARGIN, STATUS_H), &left, 9, false, 0x404040, Align::Left);
-        font::draw_in(s, Rect::new(MARGIN, text_h, s.w - 2 * MARGIN, STATUS_H), &right, 9, false, 0x404040, Align::Right);
+        font::draw_in(s, Rect::new(MARGIN, by, s.w - 2 * MARGIN, STATUS_H), &left, 9, false, 0x404040, Align::Left);
+        font::draw_in(s, Rect::new(MARGIN, by, s.w - 2 * MARGIN, STATUS_H), &right, 9, false, 0x404040, Align::Right);
+        self.draw_menu(s);
     }
 
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
         let page = self.vis.max(1) as i32;
+        if ev.key == Key::Escape && self.menu_open {
+            self.menu_open = false;
+            cx.redraw = true;
+            return;
+        }
+        if ev.ctrl {
+            if let Key::Char(c) = ev.key {
+                match c.to_ascii_lowercase() {
+                    'n' => self.guard(Pending::Nuevo, cx),
+                    'o' => self.guard(Pending::Abrir, cx),
+                    's' if ev.shift => self.save_as(cx),
+                    's' => self.save(cx),
+                    _ => return,
+                }
+                self.menu_open = false;
+                cx.redraw = true;
+                return;
+            }
+        }
+        let editing = matches!(ev.key, Key::Enter | Key::Backspace | Key::Delete | Key::Tab)
+            || matches!(ev.ch, Some(c) if !ev.ctrl && !c.is_control());
         match ev.key {
             Key::Enter => self.ed.newline(),
             Key::Backspace => self.ed.backspace(),
@@ -240,14 +482,51 @@ impl App for Notepad {
                 _ => return,
             },
         }
+        self.modified |= editing;
+        self.menu_open = false;
         self.touch(cx);
     }
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+        match ev {
+            MouseEv::Move { x, y } if self.menu_open => {
+                let h = Self::item_at(x, y);
+                if h != self.hover {
+                    self.hover = h;
+                    cx.redraw = true;
+                }
+                return;
+            }
+            MouseEv::Leave if self.menu_open => {
+                self.hover = None;
+                cx.redraw = true;
+                return;
+            }
+            MouseEv::Down { x, y } => {
+                if y < MENU_H && x >= 4 && x < 4 + Self::button_w() {
+                    self.menu_open = !self.menu_open;
+                    self.hover = None;
+                    cx.redraw = true;
+                    return;
+                }
+                if self.menu_open {
+                    match Self::item_at(x, y) {
+                        Some(i) => self.menu_action(i, cx),
+                        None => {
+                            self.menu_open = false;
+                            cx.redraw = true;
+                        }
+                    }
+                    return;
+                }
+            }
+            _ => {}
+        }
         let MouseEv::Down { x, y } = ev else { return };
-        if y >= self.h - STATUS_H {
+        if y < MENU_H || y >= self.h - STATUS_H {
             return;
         }
+        let y = y - MENU_H;
         let row = (self.top as i32 + y.max(0) / Self::lh()) as usize;
         let row = row.min(self.ed.lines.len() - 1);
         // Carácter más cercano: el borde se parte por la mitad de cada glifo.
@@ -263,6 +542,35 @@ impl App for Notepad {
         }
         self.ed.set_pos(row, col);
         self.touch(cx);
+    }
+
+    fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
+        match result {
+            DialogResult::Answer { tag: TAG_ASK, answer } => match answer {
+                Answer::Yes => self.save(cx),
+                Answer::No => {
+                    let a = core::mem::replace(&mut self.pending, Pending::Ninguna);
+                    self.run(a, cx);
+                }
+                _ => self.pending = Pending::Ninguna,
+            },
+            DialogResult::Path { tag: TAG_OPEN, path: Some(p) } => self.load(&p, cx),
+            DialogResult::Path { tag: TAG_SAVE, path: Some(p) } => self.write_to(&p, cx),
+            DialogResult::Path { tag: TAG_SAVE, path: None } => self.pending = Pending::Ninguna,
+            _ => {}
+        }
+    }
+
+    fn open_path(&mut self, path: &str, cx: &mut Ctx) {
+        self.load(path, cx);
+    }
+
+    fn request_close(&mut self, cx: &mut Ctx) -> bool {
+        if !self.modified {
+            return true;
+        }
+        self.guard(Pending::Cerrar, cx);
+        false
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
@@ -370,7 +678,7 @@ mod tests {
     #[test]
     fn teclas_y_tab() {
         con_cx(|cx| {
-            let mut np = Notepad { ed: Editor::new(), top: 0, scroll_x: 0, vis: 10, w: 100, h: 100, focused: true, t0: 0, shown: true };
+            let mut np = Notepad { w: 100, h: 100, focused: true, ..blank() };
             np.key(&ev(Key::Tab, None), cx);
             np.key(&ev(Key::Char('a'), Some('a')), cx);
             np.key(&ev(Key::Enter, Some('\n')), cx);
@@ -383,17 +691,17 @@ mod tests {
     #[test]
     fn clic_coloca_el_cursor() {
         con_cx(|cx| {
-            let mut np = Notepad { ed: Editor::new(), top: 0, scroll_x: 0, vis: 10, w: 300, h: 200, focused: true, t0: 0, shown: true };
+            let mut np = Notepad { w: 300, h: 200, focused: true, ..blank() };
             escribe(&mut np.ed, "hola\nmundo");
             let lh = Notepad::lh();
             let x3 = MARGIN + font::width("mun", SIZE, false);
-            np.mouse(MouseEv::Down { x: x3 + 1, y: lh + 2 }, cx);
+            np.mouse(MouseEv::Down { x: x3 + 1, y: MENU_H + lh + 2 }, cx);
             assert_eq!((np.ed.row, np.ed.col), (1, 3));
-            np.mouse(MouseEv::Down { x: 0, y: 2 }, cx);
+            np.mouse(MouseEv::Down { x: 0, y: MENU_H + 2 }, cx);
             assert_eq!((np.ed.row, np.ed.col), (0, 0));
             np.mouse(MouseEv::Down { x: 290, y: 190 }, cx); // barra de estado: se ignora
             assert_eq!((np.ed.row, np.ed.col), (0, 0));
-            np.mouse(MouseEv::Down { x: 290, y: 150 }, cx); // más allá del texto
+            np.mouse(MouseEv::Down { x: 290, y: MENU_H + 150 }, cx); // más allá del texto
             assert_eq!((np.ed.row, np.ed.col), (1, 5));
         });
     }
@@ -412,7 +720,7 @@ mod tests {
     #[test]
     fn el_cursor_siempre_visible() {
         let mut sys = TestPlatform::default();
-        let mut np = Notepad { ed: Editor::new(), top: 0, scroll_x: 0, vis: 10, w: 0, h: 0, focused: true, t0: 0, shown: true };
+        let mut np = Notepad { focused: true, ..blank() };
         for i in 0..40 {
             escribe(&mut np.ed, &format!("línea {} {}\n", i, "x".repeat(80)));
         }
@@ -430,7 +738,7 @@ mod tests {
     #[test]
     fn parpadeo_solo_pide_redibujar_si_cambia() {
         con_cx(|cx| {
-            let mut np = Notepad { ed: Editor::new(), top: 0, scroll_x: 0, vis: 10, w: 100, h: 100, focused: true, t0: 0, shown: true };
+            let mut np = Notepad { w: 100, h: 100, focused: true, ..blank() };
             cx.now_ms = 100;
             np.tick(cx);
             assert!(!cx.redraw);
