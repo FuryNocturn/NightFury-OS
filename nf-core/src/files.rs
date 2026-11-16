@@ -24,6 +24,8 @@ pub const DOCUMENTS_DIR: &str = "C:\\Documentos";
 pub const PICTURES_DIR: &str = "C:\\Imágenes";
 /// Archivo de configuración del sistema (texto, líneas `clave=valor`).
 pub const CONFIG_FILE: &str = "C:\\Sistema\\config.txt";
+/// Preferencias del Explorador: `vista=`, `orden=`, `desc=`, `extensiones=`.
+pub const EXPLORER_PREFS: &str = "C:\\Sistema\\explorador.txt";
 
 /// Almacén interno de la Papelera (relativo a la raíz) y su índice.
 const STORE: &str = "$Papelera";
@@ -212,8 +214,8 @@ pub struct Files {
     pending: Option<Box<dyn BlockDev>>,
     notice: Option<&'static str>,
     generation: u64,
-    clip: Option<(String, bool)>,
-    undo: Option<(Undo, &'static str)>,
+    clip: Option<(Vec<String>, bool)>,
+    undo: Option<(Vec<Undo>, &'static str)>,
 }
 
 impl Default for Files {
@@ -574,48 +576,98 @@ impl Files {
 
     // ---- Portapapeles y deshacer (compartidos por el Explorador y el escritorio) ----
 
-    /// Ruta en el portapapeles de archivos y si es "cortar".
+    /// Primera ruta del portapapeles de archivos y si es "cortar".
     pub fn clip(&self) -> Option<(&str, bool)> {
-        self.clip.as_ref().map(|(p, cut)| (p.as_str(), *cut))
+        self.clip.as_ref().and_then(|(p, cut)| p.first().map(|p| (p.as_str(), *cut)))
+    }
+
+    /// Todas las rutas del portapapeles (vacío si no hay nada) y si es "cortar".
+    pub fn clip_paths(&self) -> (&[String], bool) {
+        match &self.clip {
+            Some((p, cut)) => (p.as_slice(), *cut),
+            None => (&[], false),
+        }
     }
 
     pub fn set_clip(&mut self, path: &str, cut: bool) {
-        self.clip = Some((String::from(path), cut));
+        self.clip = Some((vec![String::from(path)], cut));
     }
 
-    /// Pega el portapapeles en `dir` (con otro nombre libre si ya existe). Devuelve la ruta nueva.
-    /// Cortar y pegar en la misma carpeta no hace nada. Tras pegar un "cortar" se vacía.
+    /// Como `set_clip` con varias rutas. Con una lista vacía, vacía el portapapeles.
+    pub fn set_clip_many(&mut self, paths: &[String], cut: bool) {
+        self.clip = if paths.is_empty() { None } else { Some((paths.to_vec(), cut)) };
+    }
+
+    /// Pega el portapapeles en `dir` (con otro nombre libre si ya existe). Devuelve la primera ruta
+    /// nueva. Cortar y pegar en la misma carpeta no hace nada. Tras pegar un "cortar" se vacía.
     pub fn paste(&mut self, dir: &str, now: DateTime) -> Result<String, FsError> {
+        self.paste_all(dir, now)?.into_iter().next().ok_or(FsError::NotFound)
+    }
+
+    /// Como `paste`, pero devuelve todas las rutas resultantes. Se deshace como un solo lote.
+    pub fn paste_all(&mut self, dir: &str, now: DateTime) -> Result<Vec<String>, FsError> {
         let (src, cut) = self.clip.clone().ok_or(FsError::NotFound)?;
         if cut {
             self.clip = None;
-            if parent(&src).is_some_and(|p| lower(&p) == lower(dir)) {
-                return Ok(src);
+        }
+        self.transfer(&src, dir, cut, now)
+    }
+
+    /// Mueve (`mv`) o copia `paths` a la carpeta `dir`, con nombre libre si ya existe; se deshace
+    /// como un solo lote ("Mover" o "Copiar"). Mover a la carpeta donde ya está no hace nada.
+    /// Si algo falla se para ahí: lo ya hecho se queda y se puede deshacer.
+    pub fn transfer(&mut self, paths: &[String], dir: &str, mv: bool, now: DateTime) -> Result<Vec<String>, FsError> {
+        let mut out = Vec::new();
+        let mut done = Vec::new();
+        let mut err = None;
+        for src in paths {
+            if mv && parent(src).is_some_and(|p| lower(&p) == lower(dir)) {
+                out.push(src.clone());
+                continue;
             }
+            let dest = join(dir, &self.free_name(dir, file_name(src)));
+            let r = if mv { self.rename(src, &dest) } else { self.copy(src, &dest, now) };
+            if let Err(e) = r {
+                err = Some(e);
+                break;
+            }
+            done.push(if mv { Undo::Move { from: src.clone(), to: dest.clone() } } else { Undo::Created(dest.clone()) });
+            out.push(dest);
         }
-        let dest = join(dir, &self.free_name(dir, file_name(&src)));
-        if cut {
-            self.rename(&src, &dest)?;
-            self.undo = Some((Undo::Move { from: src, to: dest.clone() }, "Mover"));
-        } else {
-            self.copy(&src, &dest, now)?;
-            self.undo = Some((Undo::Created(dest.clone()), "Copiar"));
+        if !done.is_empty() {
+            self.undo = Some((done, if mv { "Mover" } else { "Copiar" }));
         }
-        Ok(dest)
+        err.map_or(Ok(out), Err)
     }
 
     /// Como `rename`, pero se puede deshacer ("Cambiar nombre").
     pub fn user_rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
         self.rename(from, to)?;
-        self.undo = Some((Undo::Move { from: String::from(from), to: String::from(to) }, "Cambiar nombre"));
+        self.undo = Some((vec![Undo::Move { from: String::from(from), to: String::from(to) }], "Cambiar nombre"));
         Ok(())
     }
 
     /// Como `trash`, pero se puede deshacer ("Eliminar").
     pub fn user_trash(&mut self, path: &str, now: DateTime) -> Result<(), FsError> {
-        self.trash(path, now)?;
-        self.undo = Some((Undo::Trashed(String::from(path)), "Eliminar"));
-        Ok(())
+        self.user_trash_many(&[String::from(path)], now)
+    }
+
+    /// Envía varias rutas a la Papelera; se deshace como un solo lote ("Eliminar").
+    /// Si algo falla se para ahí: lo ya hecho se queda y se puede deshacer.
+    pub fn user_trash_many(&mut self, paths: &[String], now: DateTime) -> Result<(), FsError> {
+        let mut done = Vec::new();
+        let mut err = None;
+        for p in paths {
+            if let Err(e) = self.trash(p, now) {
+                err = Some(e);
+                break;
+            }
+            done.push(Undo::Trashed(p.clone()));
+        }
+        if !done.is_empty() {
+            self.undo = Some((done, "Eliminar"));
+        }
+        err.map_or(Ok(()), Err)
     }
 
     /// Crea una carpeta (`dir == true`) o un archivo vacío; se puede deshacer ("Nuevo").
@@ -627,7 +679,7 @@ impl Files {
         } else {
             self.write(path, &[], now)?;
         }
-        self.undo = Some((Undo::Created(String::from(path)), "Nuevo"));
+        self.undo = Some((vec![Undo::Created(String::from(path))], "Nuevo"));
         Ok(())
     }
 
@@ -637,18 +689,50 @@ impl Files {
         self.undo.as_ref().map(|u| u.1)
     }
 
-    /// Deshace la última operación (un solo nivel). Lo creado o copiado va a la Papelera.
+    /// Deshace la última operación (un solo nivel, el lote entero). Lo creado o copiado va a la
+    /// Papelera. Si un paso falla sigue con los demás y devuelve el primer error.
     pub fn undo(&mut self, now: DateTime) -> Result<(), FsError> {
-        let (u, _) = self.undo.take().ok_or(FsError::NotFound)?;
-        match u {
-            Undo::Move { from, to } => self.rename(&to, &from),
-            Undo::Created(p) => self.trash(&p, now),
-            Undo::Trashed(orig) => {
-                // trash_list da lo más reciente primero.
-                let item = self.trash_list()?.into_iter().find(|t| lower(&t.original) == lower(&orig)).ok_or(FsError::NotFound)?;
-                self.restore(&item.id).map(|_| ())
+        let (steps, _) = self.undo.take().ok_or(FsError::NotFound)?;
+        let mut res = Ok(());
+        for u in steps.into_iter().rev() {
+            let r = match u {
+                Undo::Move { from, to } => self.rename(&to, &from),
+                Undo::Created(p) => self.trash(&p, now),
+                Undo::Trashed(orig) => {
+                    // trash_list da lo más reciente primero.
+                    match self.trash_list()?.into_iter().find(|t| lower(&t.original) == lower(&orig)) {
+                        Some(item) => self.restore(&item.id).map(|_| ()),
+                        None => Err(FsError::NotFound),
+                    }
+                }
+            };
+            if res.is_ok() {
+                res = r;
             }
         }
+        res
+    }
+
+    // ---- Extensiones de nombre de archivo (Explorador y escritorio) ----
+
+    /// `false` si el usuario ocultó las extensiones (`extensiones=no` en `EXPLORER_PREFS`).
+    pub fn show_ext(&mut self) -> bool {
+        match self.read(EXPLORER_PREFS) {
+            Ok(d) => !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"),
+            Err(_) => true,
+        }
+    }
+}
+
+/// Nombre que se muestra: sin la extensión si `show_ext` es `false` (solo archivos; un nombre
+/// que empieza por punto o no tiene punto se deja igual).
+pub fn display_name(name: &str, is_dir: bool, show_ext: bool) -> &str {
+    if show_ext || is_dir {
+        return name;
+    }
+    match name.rfind('.') {
+        Some(i) if i > 0 => &name[..i],
+        _ => name,
     }
 }
 
@@ -668,6 +752,54 @@ mod tests {
     use crate::block::{DiskError, BLOCK};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn lotes_y_extensiones() {
+        let mut f = Files::default();
+        let n = DateTime::default();
+        let doc = |x: &str| format!("C:\\Documentos\\{x}");
+        for x in ["a.txt", "b.txt", "c.txt"] {
+            f.write(&doc(x), b"x", n).unwrap();
+        }
+        let all = vec![doc("a.txt"), doc("b.txt"), doc("c.txt")];
+        // Eliminar varios y deshacer el lote entero.
+        f.user_trash_many(&all, n).unwrap();
+        assert!(all.iter().all(|p| !f.exists(p)));
+        f.undo(n).unwrap();
+        assert!(all.iter().all(|p| f.exists(p)) && f.undo_label().is_none());
+        // Copiar varios con el portapapeles.
+        f.set_clip_many(&all, false);
+        assert_eq!(f.clip_paths().0.len(), 3);
+        assert_eq!(f.clip(), Some((all[0].as_str(), false)));
+        let out = f.paste_all("C:\\Escritorio", n).unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(f.undo_label(), Some("Copiar"));
+        f.undo(n).unwrap();
+        assert!(out.iter().all(|p| !f.exists(p)));
+        // Mover varios y deshacer.
+        let out = f.transfer(&all, "C:\\Escritorio", true, n).unwrap();
+        assert!(all.iter().all(|p| !f.exists(p)) && out.iter().all(|p| f.exists(p)));
+        assert_eq!(f.undo_label(), Some("Mover"));
+        f.undo(n).unwrap();
+        assert!(all.iter().all(|p| f.exists(p)));
+        // Si uno falla, lo anterior queda hecho y se puede deshacer.
+        let bad = vec![doc("a.txt"), doc("no.txt"), doc("b.txt")];
+        assert!(f.user_trash_many(&bad, n).is_err());
+        assert!(!f.exists(&doc("a.txt")) && f.exists(&doc("b.txt")));
+        f.undo(n).unwrap();
+        assert!(f.exists(&doc("a.txt")));
+        f.set_clip_many(&[], true);
+        assert!(f.clip().is_none());
+        // Extensiones.
+        assert!(f.show_ext());
+        f.write(EXPLORER_PREFS, b"vista=lista\nextensiones=no\n", n).unwrap();
+        assert!(!f.show_ext());
+        assert_eq!(display_name("nota.txt", false, false), "nota");
+        assert_eq!(display_name("nota.txt", false, true), "nota.txt");
+        assert_eq!(display_name("v1.2", true, false), "v1.2");
+        assert_eq!(display_name(".oculto", false, false), ".oculto");
+        assert_eq!(display_name("sin", false, false), "sin");
+    }
 
     #[test]
     fn portapapeles_y_deshacer() {
