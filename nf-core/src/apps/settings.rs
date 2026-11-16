@@ -122,11 +122,19 @@ impl Settings {
         let mb = |b: u64| b / (1 << 20);
         let up = sys.uptime_ms() / 60_000;
         let (sw, sh) = sys.screen();
+        let (total, free) = sys.files().space();
+        let disk = format!(
+            "{} libres de {}{}",
+            super::terminal::units(free),
+            super::terminal::units(total),
+            if sys.files().persistent() { "" } else { " (en memoria)" }
+        );
         let rows = [
             ("Procesador", sys.cpu()),
             ("Memoria instalada", format!("{} MB", mb(mem.total))),
             ("Memoria del sistema", format!("{} / {} MB", mb(mem.heap_used), mb(mem.heap_total))),
             ("Pantalla", format!("{} x {}", sw, sh)),
+            ("Disco C:", disk),
             ("Tipo de sistema", String::from("64 bits, arranque UEFI")),
             ("Tiempo encendido", format!("{} h {} min", up / 60, up % 60)),
         ];
