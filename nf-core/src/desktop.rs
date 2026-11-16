@@ -1647,7 +1647,11 @@ impl Desktop {
         };
         if target != self.chover {
             if let Some(old) = self.chover {
-                self.with_app(old, sys, |a, cx| a.mouse(MouseEv::Leave, cx));
+                if self.pos(old).is_some_and(|i| self.wins[i].dlg.is_some()) {
+                    self.dlg_event(old, sys, |d, s| d.mouse(MouseEv::Leave, s));
+                } else {
+                    self.with_app(old, sys, |a, cx| a.mouse(MouseEv::Leave, cx));
+                }
             }
             self.chover = target;
         }
@@ -1815,6 +1819,14 @@ impl Desktop {
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
         for id in ids {
             self.with_app(id, sys, |a, cx| a.tick(cx));
+        }
+        // Los diálogos repiten la flecha o la pista de su barra mientras se mantiene pulsada.
+        let dlgs: Vec<u32> = self.wins.iter().filter(|w| w.dlg.is_some()).map(|w| w.id).collect();
+        for id in dlgs {
+            self.dlg_event(id, sys, |d, s| {
+                d.tick(s);
+                None
+            });
         }
         if ms >= self.next_clock {
             self.next_clock = ms + 250;

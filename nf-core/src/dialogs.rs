@@ -10,6 +10,7 @@ use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
 use crate::platform::Platform;
+use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::Theme;
 use alloc::format;
@@ -49,6 +50,9 @@ pub enum DialogRequest {
     /// Elegir dónde guardar. `name` es el nombre propuesto. Si el archivo ya existe, el propio
     /// diálogo pregunta si se reemplaza antes de responder.
     Save { tag: u32, title: String, dir: String, name: String },
+    /// Elegir una carpeta. `dir` es la carpeta inicial. Solo lista carpetas (sin la Papelera ni
+    /// `C:\Sistema`); "Nueva carpeta" crea una en la carpeta actual.
+    Folder { tag: u32, title: String, dir: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -57,7 +61,7 @@ pub enum DialogResult {
     Answer { tag: u32, answer: Answer },
     /// Respuesta a `Input`; `None` si se canceló.
     Text { tag: u32, value: Option<String> },
-    /// Respuesta a `Open` y `Save`: ruta absoluta; `None` si se canceló.
+    /// Respuesta a `Open`, `Save` y `Folder`: ruta absoluta; `None` si se canceló.
     Path { tag: u32, path: Option<String> },
 }
 
@@ -72,6 +76,16 @@ const INK: u32 = 0x1A1A1A;
 const MUTED: u32 = 0x6B6B6B;
 const RED: u32 = 0xC62828;
 const DOUBLE_MS: u64 = 450;
+/// Anchos de los botones "Seleccionar carpeta" y "Nueva carpeta".
+const PICK_W: i32 = 150;
+const NEW_W: i32 = 120;
+
+const SYSTEM: &str = "Sistema";
+
+/// ¿Es `C:\Sistema` o algo dentro?
+fn is_system(path: &str) -> bool {
+    path.get(3..).and_then(|r| r.split('\\').next()).is_some_and(|f| f.eq_ignore_ascii_case(SYSTEM))
+}
 
 /// Dibuja con el recorte limitado a `r`.
 fn text_in(s: &mut Surface, r: Rect, text: &str, color: u32, align: Align) {
@@ -206,6 +220,7 @@ enum Mode {
     Input,
     Open,
     Save,
+    Folder,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -237,6 +252,7 @@ pub struct Dialog {
     /// Ruta existente pendiente de "¿Reemplazar?" (solo Guardar).
     confirm: Option<String>,
     press: Option<Tgt>,
+    sb: ScrollBar,
     last_click: (usize, u64),
     dirty: bool,
 }
@@ -260,6 +276,7 @@ impl Dialog {
             error: None,
             confirm: None,
             press: None,
+            sb: ScrollBar::new(false),
             last_click: (usize::MAX, 0),
             dirty: true,
         };
@@ -291,6 +308,9 @@ impl Dialog {
             }
             DialogRequest::Save { tag, title, dir, name } => {
                 d.file(tag, title, Mode::Save, &dir, &name, sys);
+            }
+            DialogRequest::Folder { tag, title, dir } => {
+                d.file(tag, title, Mode::Folder, &dir, "", sys);
             }
         }
         d
@@ -327,7 +347,7 @@ impl Dialog {
     // ---------------------------------------------------------------- geometría
 
     fn is_file(&self) -> bool {
-        matches!(self.mode, Mode::Open | Mode::Save)
+        matches!(self.mode, Mode::Open | Mode::Save | Mode::Folder)
     }
     fn labels(&self) -> Vec<&'static str> {
         match self.mode {
@@ -335,6 +355,7 @@ impl Dialog {
             _ if self.confirm.is_some() => vec!["Sí", "No"],
             Mode::Save => vec!["Guardar", "Cancelar"],
             Mode::Open => vec!["Abrir", "Cancelar"],
+            Mode::Folder => vec!["Seleccionar carpeta", "Cancelar", "Nueva carpeta"],
             Mode::Input => vec!["Aceptar", "Cancelar"],
         }
     }
@@ -342,12 +363,20 @@ impl Dialog {
     fn nbefore(&self) -> usize {
         match self.mode {
             Mode::Message => 0,
-            Mode::Input => 1,
+            Mode::Input | Mode::Folder => 1,
             _ if self.confirm.is_some() => 0,
             _ => 2,
         }
     }
     fn btn_rect(&self, i: usize, n: usize) -> Rect {
+        if self.mode == Mode::Folder {
+            let y = self.h - 16 - BTN_H;
+            return match i {
+                0 => Rect::new(self.w - 16 - BTN_W - 8 - PICK_W, y, PICK_W, BTN_H),
+                1 => Rect::new(self.w - 16 - BTN_W, y, BTN_W, BTN_H),
+                _ => Rect::new(12, y, NEW_W, BTN_H),
+            };
+        }
         let k = (n - i) as i32;
         Rect::new(self.w - 16 - k * BTN_W - (k - 1) * 8, self.h - 16 - BTN_H, BTN_W, BTN_H)
     }
@@ -358,6 +387,9 @@ impl Dialog {
         self.h - 16 - BTN_H - 36
     }
     fn list_rect(&self) -> Rect {
+        if self.mode == Mode::Folder {
+            return Rect::new(12, 52, self.w - 24, self.h - 16 - BTN_H - 32 - 52);
+        }
         Rect::new(12, 52, self.w - 24, self.name_y() - 28 - 52)
     }
     fn field_rect(&self) -> Rect {
@@ -368,6 +400,27 @@ impl Dialog {
     }
     fn rows(&self) -> usize {
         (self.list_rect().h / ROW_H).max(1) as usize
+    }
+    /// La lista no cabe y lleva barra de desplazamiento.
+    fn need_sb(&self) -> bool {
+        self.entries.len() > self.rows()
+    }
+    fn sb_metrics(&self) -> Metrics {
+        let l = self.list_rect();
+        Metrics { rect: Rect::new(l.right() - 1 - SB_W, l.y + 1, SB_W, l.h - 2), total: self.entries.len() as i32, page: self.rows() as i32, pos: self.scroll as i32, line: 1 }
+    }
+    fn has_sb(&self) -> bool {
+        self.is_file() && self.confirm.is_none()
+    }
+
+    /// Reloj del diálogo (unas 100 veces por segundo): repite la flecha o la pista mantenida.
+    pub fn tick(&mut self, sys: &mut dyn Platform) {
+        if self.has_sb() {
+            if let Some(p) = self.sb.tick(&self.sb_metrics(), sys.uptime_ms()) {
+                self.scroll = p as usize;
+                self.dirty = true;
+            }
+        }
     }
 
     // ---------------------------------------------------------------- dibujo
@@ -428,14 +481,15 @@ impl Dialog {
         let list = self.list_rect();
         s.frame(list, if self.focus == 0 { theme.accent } else { 0x8A8A8A });
         if self.entries.is_empty() {
-            text_in(s, Rect::new(list.x + 8, list.y, list.w - 16, ROW_H), "(carpeta vacía)", MUTED, Align::Left);
+            text_in(s, Rect::new(list.x + 8, list.y, list.w - 16, ROW_H), if self.mode == Mode::Folder { "(sin subcarpetas)" } else { "(carpeta vacía)" }, MUTED, Align::Left);
         }
+        let sbw = if self.need_sb() { SB_W } else { 0 };
         let old = s.clip();
         s.set_clip(old.intersect(list.inflate(-1)));
         for k in 0..self.rows() {
             let i = self.scroll + k;
             let Some(e) = self.entries.get(i) else { break };
-            let r = Rect::new(list.x + 1, list.y + 1 + k as i32 * ROW_H, list.w - 2, ROW_H);
+            let r = Rect::new(list.x + 1, list.y + 1 + k as i32 * ROW_H, list.w - 2 - sbw, ROW_H);
             let on = self.sel == Some(i);
             if on {
                 s.fill_rect(r, if self.focus == 0 { theme.accent } else { 0xD9D9D9 });
@@ -452,6 +506,15 @@ impl Dialog {
             text_in(s, Rect::new(r.x + 30, r.y, r.w - 36, r.h), &e.name, ink, Align::Left);
         }
         s.set_clip(old);
+        if sbw > 0 {
+            self.sb.draw(s, &self.sb_metrics(), theme);
+        }
+        if self.mode == Mode::Folder {
+            if let Some(e) = &self.error {
+                text_in(s, Rect::new(12, list.bottom() + 6, self.w - 24, 20), e, RED, Align::Left);
+            }
+            return;
+        }
         if let Some(e) = &self.error {
             text_in(s, Rect::new(12, self.name_y() - 24, self.w - 24, 20), e, RED, Align::Left);
         }
@@ -491,9 +554,17 @@ impl Dialog {
 
     /// Lista `dir` y pasa a ella; `false` (con el error anotado) si no se puede.
     fn go(&mut self, dir: &str, sys: &mut dyn Platform) -> bool {
+        let target = files::resolve("C:\\", dir).unwrap_or_else(|_| String::from("C:\\"));
+        if self.mode == Mode::Folder && is_system(&target) {
+            self.error = Some(String::from("Esa carpeta es del sistema."));
+            return false;
+        }
         match sys.files().list(dir) {
-            Ok(v) => {
-                self.dir = files::resolve("C:\\", dir).unwrap_or_else(|_| String::from("C:\\"));
+            Ok(mut v) => {
+                if self.mode == Mode::Folder {
+                    v.retain(|e| e.dir && !(target.len() == 3 && e.name.eq_ignore_ascii_case(SYSTEM)));
+                }
+                self.dir = target;
                 self.entries = v;
                 self.sel = None;
                 self.scroll = 0;
@@ -534,6 +605,13 @@ impl Dialog {
     /// Acepta el nombre del campo en Abrir/Guardar.
     fn accept(&mut self, sys: &mut dyn Platform) -> Option<DialogResult> {
         let tag = self.tag;
+        if self.mode == Mode::Folder {
+            let path = match self.sel.and_then(|i| self.entries.get(i)) {
+                Some(e) => files::join(&self.dir, &e.name),
+                None => self.dir.clone(),
+            };
+            return Some(DialogResult::Path { tag, path: Some(path) });
+        }
         let name = String::from(self.field.text.trim());
         if self.mode == Mode::Open {
             if name.is_empty() {
@@ -580,6 +658,23 @@ impl Dialog {
         None
     }
 
+    /// Crea "Nueva carpeta" (o con número) en la carpeta actual y la deja seleccionada.
+    fn new_folder(&mut self, sys: &mut dyn Platform) {
+        let name = sys.files().free_name(&self.dir, "Nueva carpeta");
+        let path = files::join(&self.dir, &name);
+        let now = sys.now();
+        if let Err(e) = sys.files().user_create(&path, true, now) {
+            self.error = Some(String::from(e.message()));
+            return;
+        }
+        let dir = self.dir.clone();
+        if self.go(&dir, sys) {
+            if let Some(i) = self.entries.iter().position(|e| e.name == name) {
+                self.select(i);
+            }
+        }
+    }
+
     /// Pulsa el botón `i` (según `labels`).
     fn press(&mut self, i: usize, sys: &mut dyn Platform) -> Option<DialogResult> {
         let tag = self.tag;
@@ -592,6 +687,11 @@ impl Dialog {
                 }
                 self.confirm = None;
                 self.focus = 1;
+                None
+            }
+            Mode::Folder if i == 2 => {
+                self.new_folder(sys);
+                self.focus = 0;
                 None
             }
             _ if i == 0 => self.accept(sys),
@@ -663,6 +763,20 @@ impl Dialog {
 
     /// `ev` en coordenadas del contenido del diálogo.
     pub fn mouse(&mut self, ev: MouseEv, sys: &mut dyn Platform) -> Option<DialogResult> {
+        if self.has_sb() {
+            let e = self.sb.mouse(ev, &self.sb_metrics(), sys.uptime_ms());
+            if let Some(p) = e.pos {
+                self.scroll = p as usize;
+            }
+            self.dirty |= e.redraw;
+            if e.captured {
+                if matches!(ev, MouseEv::Down { .. }) {
+                    self.press = None;
+                    self.focus = 0;
+                }
+                return None;
+            }
+        }
         match ev {
             MouseEv::Down { x, y } => {
                 self.press = None;
@@ -679,7 +793,7 @@ impl Dialog {
                     return None;
                 }
                 let f = self.field_rect();
-                if self.mode == Mode::Input || self.is_file() {
+                if self.mode != Mode::Message && self.mode != Mode::Folder {
                     if f.contains(x, y) {
                         self.focus = if self.mode == Mode::Input { 0 } else { 1 };
                         self.field.click(x - f.x - 6, f.w - 12);
@@ -954,5 +1068,156 @@ mod tests {
         let mut s = Surface::new(d.size().0, d.size().1, 0);
         d.draw(&mut s, &Theme::default());
         assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
+    }
+
+    #[test]
+    fn barra_en_la_lista_solo_si_hace_falta() {
+        let mut sys = TestPlatform::default();
+        let now = sys.now();
+        let open = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\Documentos".into() }, sys);
+        let mut d = open(&mut sys);
+        assert!(!d.need_sb());
+        let (w, h) = d.size();
+        let mut s = Surface::new(w, h, 0);
+        d.draw(&mut s, &Theme::default());
+        let m = d.sb_metrics();
+        let probe = (m.rect.y + 40) as usize * w as usize + (m.rect.x + 8) as usize;
+        assert_eq!(s.px[probe], 0xFFFFFF);
+        for i in 0..30 {
+            sys.files.write(&format!("C:\\Documentos\\f{i:02}.txt"), b"x", now).unwrap();
+        }
+        let mut d = open(&mut sys);
+        assert!(d.need_sb());
+        d.draw(&mut s, &Theme::default());
+        assert_ne!(s.px[probe], 0xFFFFFF);
+        let m = d.sb_metrics();
+        let bx = m.rect.x + 5;
+        let rows = d.rows();
+        let max = d.entries.len() - rows;
+        // Flecha de abajo, flecha de arriba, pista y arrastre.
+        let (by, ey) = (m.rect.bottom() - 3, m.rect.y + 3);
+        d.mouse(MouseEv::Down { x: bx, y: by }, &mut sys);
+        d.mouse(MouseEv::Up { x: bx, y: by }, &mut sys);
+        assert_eq!(d.scroll, 1);
+        d.mouse(MouseEv::Down { x: bx, y: ey }, &mut sys);
+        d.mouse(MouseEv::Up { x: bx, y: ey }, &mut sys);
+        assert_eq!(d.scroll, 0);
+        let py = m.rect.bottom() - 30;
+        d.mouse(MouseEv::Down { x: bx, y: py }, &mut sys);
+        d.mouse(MouseEv::Up { x: bx, y: py }, &mut sys);
+        assert_eq!(d.scroll, rows);
+        let (ts, _) = d.sb.thumb(&d.sb_metrics());
+        d.mouse(MouseEv::Down { x: bx, y: m.rect.y + ts + 2 }, &mut sys);
+        d.mouse(MouseEv::Move { x: 1, y: 9000 }, &mut sys);
+        assert_eq!(d.scroll, max);
+        d.mouse(MouseEv::Move { x: 1, y: -9000 }, &mut sys);
+        assert_eq!(d.scroll, 0);
+        d.mouse(MouseEv::Up { x: 1, y: 1 }, &mut sys);
+        assert!(!d.sb.active());
+        // Un clic en la barra no selecciona nada; la rueda sigue funcionando.
+        assert!(d.sel.is_none());
+        d.mouse(MouseEv::Wheel { x: 50, y: 50, dz: 1 }, &mut sys);
+        assert_eq!(d.scroll, 3);
+    }
+
+    fn folder(dir: &str, sys: &mut TestPlatform) -> Dialog {
+        Dialog::new(DialogRequest::Folder { tag: 5, title: "Mover a".into(), dir: dir.into() }, sys)
+    }
+    fn names(d: &Dialog) -> Vec<&str> {
+        d.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn carpeta_navega_y_solo_lista_carpetas() {
+        let mut sys = TestPlatform::default();
+        let now = sys.now();
+        sys.files.mkdir("C:\\Documentos\\sub", now).unwrap();
+        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
+        let mut d = folder("C:\\Documentos", &mut sys);
+        assert_eq!(names(&d), ["sub"]);
+        // Enter con la carpeta resaltada entra; Retroceso sube.
+        press(&mut d, &mut sys, Key::Down);
+        assert!(press(&mut d, &mut sys, Key::Enter).is_none());
+        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        press(&mut d, &mut sys, Key::Backspace);
+        assert_eq!(d.dir, "C:\\Documentos");
+        // Doble clic entra y el botón de subir vuelve.
+        let l = d.list_rect();
+        let p = (l.x + 40, l.y + 5);
+        for _ in 0..2 {
+            d.mouse(MouseEv::Down { x: p.0, y: p.1 }, &mut sys);
+            d.mouse(MouseEv::Up { x: p.0, y: p.1 }, &mut sys);
+        }
+        assert_eq!(d.dir, "C:\\Documentos\\sub");
+        let u = d.up_rect();
+        d.mouse(MouseEv::Down { x: u.x + 3, y: u.y + 3 }, &mut sys);
+        d.mouse(MouseEv::Up { x: u.x + 3, y: u.y + 3 }, &mut sys);
+        assert_eq!(d.dir, "C:\\Documentos");
+        let mut s = Surface::new(d.size().0, d.size().1, 0);
+        d.draw(&mut s, &Theme::default());
+    }
+
+    #[test]
+    fn carpeta_elige_la_actual_o_la_resaltada_y_cancela() {
+        let mut sys = TestPlatform::default();
+        let now = sys.now();
+        sys.files.mkdir("C:\\Documentos\\sub", now).unwrap();
+        // Sin selección: la carpeta actual.
+        let mut d = folder("C:\\Documentos", &mut sys);
+        press(&mut d, &mut sys, Key::Tab);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos")));
+        let mut d = folder("C:\\Documentos", &mut sys);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos")));
+        // Con una resaltada: esa.
+        let mut d = folder("C:\\Documentos", &mut sys);
+        press(&mut d, &mut sys, Key::Down);
+        let r = d.btn_rect(0, 3);
+        d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
+        assert_eq!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys), path(Some("C:\\Documentos\\sub")));
+        // Cancelar con el botón y con Esc.
+        let mut d = folder("C:\\Documentos", &mut sys);
+        let r = d.btn_rect(1, 3);
+        d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
+        assert_eq!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys), path(None));
+        let mut d = folder("C:\\Documentos", &mut sys);
+        assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
+        assert_eq!(Some(d.cancel()), path(None));
+    }
+
+    #[test]
+    fn carpeta_nueva_con_nombre_libre_y_seleccionada() {
+        let mut sys = TestPlatform::default();
+        let mut d = folder("C:\\Documentos", &mut sys);
+        let r = d.btn_rect(2, 3);
+        for esperado in ["Nueva carpeta", "Nueva carpeta (2)"] {
+            d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, &mut sys);
+            assert!(d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, &mut sys).is_none());
+            assert!(sys.files.stat(&format!("C:\\Documentos\\{esperado}")).unwrap().dir);
+            assert_eq!(d.sel.map(|i| d.entries[i].name.as_str()), Some(esperado));
+        }
+        // Elegir ahora devuelve la recién creada.
+        d.focus = 1;
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), path(Some("C:\\Documentos\\Nueva carpeta (2)")));
+        // Con teclado: Tab hasta "Nueva carpeta".
+        let mut d = folder("C:\\Imágenes", &mut sys);
+        for _ in 0..3 {
+            press(&mut d, &mut sys, Key::Tab);
+        }
+        press(&mut d, &mut sys, Key::Enter);
+        assert!(sys.files.stat("C:\\Imágenes\\Nueva carpeta").is_ok());
+    }
+
+    #[test]
+    fn carpeta_oculta_sistema_y_papelera() {
+        let mut sys = TestPlatform::default();
+        let d = folder("C:\\", &mut sys);
+        let n = names(&d);
+        assert!(n.contains(&"Documentos") && !n.contains(&"Sistema") && !n.iter().any(|x| x.starts_with('$')));
+        // Pedir C:\Sistema o la Papelera cae en la raíz.
+        let d = folder("C:\\Sistema", &mut sys);
+        assert_eq!(d.dir, "C:\\");
+        let d = folder(crate::files::TRASH, &mut sys);
+        assert_eq!(d.dir, "C:\\");
+        assert!(d.entries.iter().all(|e| e.dir));
     }
 }
