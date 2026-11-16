@@ -1444,7 +1444,7 @@ mod tests {
     fn lotes_y_extensiones() {
         let mut f = Files::default();
         let n = DateTime::default();
-        let doc = |x: &str| format!("C:\\Documentos\\{x}");
+        let doc = |x: &str| format!("C:\\Usuarios\\Usuario\\Documentos\\{x}");
         for x in ["a.txt", "b.txt", "c.txt"] {
             f.write(&doc(x), b"x", n).unwrap();
         }
@@ -1458,13 +1458,13 @@ mod tests {
         f.set_clip_many(&all, false);
         assert_eq!(f.clip_paths().0.len(), 3);
         assert_eq!(f.clip(), Some((all[0].as_str(), false)));
-        let out = f.paste_all("C:\\Escritorio", n).unwrap();
+        let out = f.paste_all("C:\\Usuarios\\Usuario\\Escritorio", n).unwrap();
         assert_eq!(out.len(), 3);
         assert_eq!(f.undo_label(), Some("Copiar"));
         f.undo(n).unwrap();
         assert!(out.iter().all(|p| !f.exists(p)));
         // Mover varios y deshacer.
-        let out = f.transfer(&all, "C:\\Escritorio", true, n).unwrap();
+        let out = f.transfer(&all, "C:\\Usuarios\\Usuario\\Escritorio", true, n).unwrap();
         assert!(all.iter().all(|p| !f.exists(p)) && out.iter().all(|p| f.exists(p)));
         assert_eq!(f.undo_label(), Some("Mover"));
         f.undo(n).unwrap();
@@ -1492,39 +1492,39 @@ mod tests {
     fn portapapeles_y_deshacer() {
         let mut f = Files::default();
         let n = DateTime::default();
-        f.write("C:\\Documentos\\a.txt", b"hola", n).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"hola", n).unwrap();
         assert_eq!(f.undo_label(), None);
         // Copiar y pegar en la misma carpeta: nombre libre; deshacer lo manda a la Papelera.
-        f.set_clip("C:\\Documentos\\a.txt", false);
-        let p = f.paste("C:\\Documentos", n).unwrap();
-        assert_eq!(p, "C:\\Documentos\\a (2).txt");
+        f.set_clip("C:\\Usuarios\\Usuario\\Documentos\\a.txt", false);
+        let p = f.paste("C:\\Usuarios\\Usuario\\Documentos", n).unwrap();
+        assert_eq!(p, "C:\\Usuarios\\Usuario\\Documentos\\a (2).txt");
         assert_eq!(f.undo_label(), Some("Copiar"));
         f.undo(n).unwrap();
         assert!(!f.exists(&p) && f.undo_label().is_none());
         // Cortar y pegar en otra carpeta; deshacer lo devuelve.
-        f.set_clip("C:\\Documentos\\a.txt", true);
-        let p = f.paste("C:\\Escritorio", n).unwrap();
-        assert!(f.exists(&p) && !f.exists("C:\\Documentos\\a.txt") && f.clip().is_none());
+        f.set_clip("C:\\Usuarios\\Usuario\\Documentos\\a.txt", true);
+        let p = f.paste("C:\\Usuarios\\Usuario\\Escritorio", n).unwrap();
+        assert!(f.exists(&p) && !f.exists("C:\\Usuarios\\Usuario\\Documentos\\a.txt") && f.clip().is_none());
         assert_eq!(f.undo_label(), Some("Mover"));
         f.undo(n).unwrap();
-        assert!(f.exists("C:\\Documentos\\a.txt"));
+        assert!(f.exists("C:\\Usuarios\\Usuario\\Documentos\\a.txt"));
         // Cortar y pegar en la misma carpeta no hace nada.
-        f.set_clip("C:\\Documentos\\a.txt", true);
-        assert_eq!(f.paste("C:\\documentos", n).unwrap(), "C:\\Documentos\\a.txt");
+        f.set_clip("C:\\Usuarios\\Usuario\\Documentos\\a.txt", true);
+        assert_eq!(f.paste("c:\\usuarios\\usuario\\documentos", n).unwrap(), "C:\\Usuarios\\Usuario\\Documentos\\a.txt");
         assert!(f.undo_label().is_none());
         // Cambiar nombre, eliminar y crear.
-        f.user_rename("C:\\Documentos\\a.txt", "C:\\Documentos\\b.txt").unwrap();
+        f.user_rename("C:\\Usuarios\\Usuario\\Documentos\\a.txt", "C:\\Usuarios\\Usuario\\Documentos\\b.txt").unwrap();
         f.undo(n).unwrap();
-        assert!(f.exists("C:\\Documentos\\a.txt"));
-        f.user_trash("C:\\Documentos\\a.txt", n).unwrap();
+        assert!(f.exists("C:\\Usuarios\\Usuario\\Documentos\\a.txt"));
+        f.user_trash("C:\\Usuarios\\Usuario\\Documentos\\a.txt", n).unwrap();
         assert_eq!(f.undo_label(), Some("Eliminar"));
         f.undo(n).unwrap();
-        assert_eq!(f.read("C:\\Documentos\\a.txt").unwrap(), b"hola");
-        f.user_create("C:\\Documentos\\n.txt", false, n).unwrap();
-        assert_eq!(f.user_create("C:\\Documentos\\n.txt", false, n), Err(FsError::Exists));
-        f.user_create("C:\\Documentos\\c", true, n).unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt").unwrap(), b"hola");
+        f.user_create("C:\\Usuarios\\Usuario\\Documentos\\n.txt", false, n).unwrap();
+        assert_eq!(f.user_create("C:\\Usuarios\\Usuario\\Documentos\\n.txt", false, n), Err(FsError::Exists));
+        f.user_create("C:\\Usuarios\\Usuario\\Documentos\\c", true, n).unwrap();
         f.undo(n).unwrap();
-        assert!(!f.exists("C:\\Documentos\\c") && f.exists("C:\\Documentos\\n.txt"));
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\c") && f.exists("C:\\Usuarios\\Usuario\\Documentos\\n.txt"));
         assert_eq!(f.undo(n), Err(FsError::NotFound));
     }
 
@@ -1560,6 +1560,21 @@ mod tests {
         }
     }
 
+    impl Files {
+        /// Existe `rel` (ruta relativa a la raíz) en el disco, sin pasar por los permisos.
+        fn exists_raw(&mut self, rel: &str) -> bool {
+            self.fs.stat(rel).is_ok()
+        }
+    }
+
+    /// Crea la cuenta `name` si no hay ninguna, y abre su sesión (como administradora).
+    fn enter(f: &mut Files, name: &str) {
+        if f.accounts().is_empty() {
+            f.create_account(name, None, true, [7; 16], d(1)).unwrap();
+        }
+        f.login(name, "").unwrap();
+    }
+
     fn names(f: &mut Files, dir: &str) -> Vec<String> {
         f.list(dir).unwrap().into_iter().map(|e| e.name).collect()
     }
@@ -1576,7 +1591,7 @@ mod tests {
         assert_eq!(file_name("C:\\"), "");
         assert_eq!(file_name("C:\\a"), "a");
         assert_eq!(file_name("C:\\a\\b.txt"), "b.txt");
-        assert_eq!(file_name("C:\\Imágenes\\ñ"), "ñ");
+        assert_eq!(file_name("C:\\Usuarios\\Usuario\\Imágenes\\ñ"), "ñ");
     }
 
     #[test]
@@ -1635,8 +1650,11 @@ mod tests {
         assert!(!f.persistent());
         assert!(!f.pending_format());
         assert!(f.notice().is_some());
-        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Sistema"]);
-        for p in [DOCUMENTS_DIR, DESKTOP_DIR, PICTURES_DIR, "C:\\Sistema", "c:/documentos", "C:\\imágenes"] {
+        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        for s in Std::ALL {
+            assert!(f.stat(&f.std_dir(s)).unwrap().dir);
+        }
+        for p in ["C:\\Usuarios", "C:\\Usuarios\\Usuario\\.config", "C:\\Sistema\\temp", "C:\\Sistema\\logs", "C:\\Sistema", "c:/usuarios/usuario/documentos", "c:/usuarios/usuario/imágenes"] {
             assert!(f.stat(p).unwrap().dir, "{p}");
         }
         assert!(f.exists("C:\\"));
@@ -1653,30 +1671,30 @@ mod tests {
             assert_eq!(f.delete(p), Err(FsError::BadPath));
             assert_eq!(f.trash(p, d(1)), Err(FsError::BadPath));
             assert_eq!(f.rename(p, "C:\\z"), Err(FsError::BadPath));
-            assert_eq!(f.rename("C:\\Documentos", p), Err(FsError::BadPath));
-            assert_eq!(f.copy("C:\\Documentos", p, d(1)), Err(FsError::BadPath));
+            assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos", p), Err(FsError::BadPath));
+            assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos", p, d(1)), Err(FsError::BadPath));
             assert_eq!(f.copy(p, "C:\\z", d(1)), Err(FsError::BadPath));
             assert!(!f.exists(p));
         }
-        assert_eq!(f.write("C:\\Documentos\\..\\$Papelera\\x", b"1", d(1)), Err(FsError::BadPath));
+        assert_eq!(f.write("C:\\Usuarios\\Usuario\\Documentos\\..\\..\\..\\$Papelera\\x", b"1", d(1)), Err(FsError::BadPath));
     }
 
     #[test]
     fn list_order_and_basic_io() {
         let mut f = Files::default();
-        f.write("C:\\Documentos\\b.txt", b"b", d(1)).unwrap();
-        f.write("C:\\Documentos\\A.txt", b"aaa", d(2)).unwrap();
-        f.write("C:\\Documentos\\ñu.txt", b"n", d(3)).unwrap();
-        f.write("C:\\Documentos\\zeta", b"z", d(3)).unwrap();
-        f.mkdir("C:\\Documentos\\Zona", d(4)).unwrap();
-        f.mkdir("C:\\Documentos\\carpeta", d(4)).unwrap();
-        assert_eq!(names(&mut f, "C:\\Documentos"), ["carpeta", "Zona", "A.txt", "b.txt", "zeta", "ñu.txt"]);
-        let e = f.stat("c:/documentos/a.TXT").unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\b.txt", b"b", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\A.txt", b"aaa", d(2)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\ñu.txt", b"n", d(3)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\zeta", b"z", d(3)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\Zona", d(4)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\carpeta", d(4)).unwrap();
+        assert_eq!(names(&mut f, "C:\\Usuarios\\Usuario\\Documentos"), ["carpeta", "Zona", "A.txt", "b.txt", "zeta", "ñu.txt"]);
+        let e = f.stat("c:/usuarios/usuario/documentos/a.TXT").unwrap();
         assert_eq!((e.name.as_str(), e.size, e.modified, e.dir), ("A.txt", 3, d(2), false));
-        assert_eq!(f.read("C:\\Documentos\\A.txt").unwrap(), b"aaa");
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\A.txt").unwrap(), b"aaa");
         assert_eq!(f.write("C:\\", b"x", d(1)), Err(FsError::IsDir));
         assert_eq!(f.mkdir("C:\\", d(1)), Err(FsError::Exists));
-        assert_eq!(f.mkdir("C:\\Documentos", d(1)), Err(FsError::Exists));
+        assert_eq!(f.mkdir("C:\\Usuarios\\Usuario\\Documentos", d(1)), Err(FsError::Exists));
         assert_eq!(f.read("C:\\nada"), Err(FsError::NotFound));
         assert_eq!(f.read("D:\\x"), Err(FsError::BadPath));
         assert_eq!(f.write("C:\\a*", b"x", d(1)), Err(FsError::BadName));
@@ -1685,93 +1703,93 @@ mod tests {
     #[test]
     fn copy_and_delete_are_recursive() {
         let mut f = Files::default();
-        f.mkdir("C:\\Documentos\\p", d(1)).unwrap();
-        f.mkdir("C:\\Documentos\\p\\q", d(1)).unwrap();
-        f.mkdir("C:\\Documentos\\p\\vacia", d(1)).unwrap();
-        f.write("C:\\Documentos\\p\\a.txt", b"A", d(1)).unwrap();
-        f.write("C:\\Documentos\\p\\q\\b.bin", &vec![7u8; 10_000], d(1)).unwrap();
-        f.copy("C:\\Documentos\\p", "C:\\Escritorio\\copia", d(5)).unwrap();
-        assert_eq!(f.read("C:\\Escritorio\\copia\\q\\b.bin").unwrap(), vec![7u8; 10_000]);
-        assert_eq!(f.read("C:\\Escritorio\\copia\\a.txt").unwrap(), b"A");
-        assert!(f.stat("C:\\Escritorio\\copia\\vacia").unwrap().dir);
-        assert!(f.exists("C:\\Documentos\\p\\a.txt"));
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\p", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\p\\q", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\p\\vacia", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\p\\a.txt", b"A", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\p\\q\\b.bin", &vec![7u8; 10_000], d(1)).unwrap();
+        f.copy("C:\\Usuarios\\Usuario\\Documentos\\p", "C:\\Usuarios\\Usuario\\Escritorio\\copia", d(5)).unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Escritorio\\copia\\q\\b.bin").unwrap(), vec![7u8; 10_000]);
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Escritorio\\copia\\a.txt").unwrap(), b"A");
+        assert!(f.stat("C:\\Usuarios\\Usuario\\Escritorio\\copia\\vacia").unwrap().dir);
+        assert!(f.exists("C:\\Usuarios\\Usuario\\Documentos\\p\\a.txt"));
         // archivo suelto
-        f.copy("C:\\Documentos\\p\\a.txt", "C:\\Documentos\\a2.txt", d(5)).unwrap();
-        assert_eq!(f.read("C:\\Documentos\\a2.txt").unwrap(), b"A");
+        f.copy("C:\\Usuarios\\Usuario\\Documentos\\p\\a.txt", "C:\\Usuarios\\Usuario\\Documentos\\a2.txt", d(5)).unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a2.txt").unwrap(), b"A");
         // errores
-        assert_eq!(f.copy("C:\\Documentos\\p", "C:\\Escritorio\\copia", d(5)), Err(FsError::Exists));
-        assert_eq!(f.copy("C:\\Documentos\\p", "C:\\Documentos\\p\\q\\dentro", d(5)), Err(FsError::Invalid));
-        assert_eq!(f.copy("C:\\Documentos\\p", "C:\\DOCUMENTOS\\P\\dentro", d(5)), Err(FsError::Invalid));
-        assert!(!f.exists("C:\\Documentos\\p\\q\\dentro"));
-        assert_eq!(f.copy("C:\\", "C:\\Escritorio\\todo", d(5)), Err(FsError::Invalid));
+        assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\p", "C:\\Usuarios\\Usuario\\Escritorio\\copia", d(5)), Err(FsError::Exists));
+        assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\p", "C:\\Usuarios\\Usuario\\Documentos\\p\\q\\dentro", d(5)), Err(FsError::Invalid));
+        assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\p", "C:\\USUARIOS\\USUARIO\\DOCUMENTOS\\P\\dentro", d(5)), Err(FsError::Invalid));
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\p\\q\\dentro"));
+        assert_eq!(f.copy("C:\\", "C:\\Usuarios\\Usuario\\Escritorio\\todo", d(5)), Err(FsError::Invalid));
         assert_eq!(f.copy("C:\\nada", "C:\\x", d(5)), Err(FsError::NotFound));
-        assert_eq!(f.copy("C:\\Documentos\\a2.txt", "C:\\nada\\x", d(5)), Err(FsError::NotFound));
+        assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\a2.txt", "C:\\nada\\x", d(5)), Err(FsError::NotFound));
         assert!(!f.exists("C:\\nada"));
         // un nombre parecido no cuenta como "dentro"
-        f.copy("C:\\Documentos\\p", "C:\\Documentos\\p2", d(5)).unwrap();
+        f.copy("C:\\Usuarios\\Usuario\\Documentos\\p", "C:\\Usuarios\\Usuario\\Documentos\\p2", d(5)).unwrap();
         // borrado
         let (_, free) = f.space();
-        f.delete("C:\\Escritorio\\copia").unwrap();
-        assert!(!f.exists("C:\\Escritorio\\copia"));
+        f.delete("C:\\Usuarios\\Usuario\\Escritorio\\copia").unwrap();
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Escritorio\\copia"));
         assert!(f.space().1 > free);
-        assert_eq!(f.delete("C:\\Escritorio\\copia"), Err(FsError::NotFound));
-        f.delete("C:\\Documentos\\a2.txt").unwrap();
-        assert!(f.exists("C:\\Documentos\\p2\\q\\b.bin"));
+        assert_eq!(f.delete("C:\\Usuarios\\Usuario\\Escritorio\\copia"), Err(FsError::NotFound));
+        f.delete("C:\\Usuarios\\Usuario\\Documentos\\a2.txt").unwrap();
+        assert!(f.exists("C:\\Usuarios\\Usuario\\Documentos\\p2\\q\\b.bin"));
     }
 
     #[test]
     fn copy_that_runs_out_of_space_leaves_nothing() {
         let mut f = Files::default();
-        f.write("C:\\Documentos\\grande", &vec![1u8; 2_500_000], d(1)).unwrap();
-        f.mkdir("C:\\Documentos\\c", d(1)).unwrap();
-        f.write("C:\\Documentos\\c\\g", &vec![2u8; 1_200_000], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande", &vec![1u8; 2_500_000], d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\c\\g", &vec![2u8; 1_200_000], d(1)).unwrap();
         let (_, free) = f.space();
-        assert_eq!(f.copy("C:\\Documentos\\c", "C:\\Escritorio\\c", d(2)), Err(FsError::NoSpace));
-        assert!(!f.exists("C:\\Escritorio\\c"));
+        assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\c", "C:\\Usuarios\\Usuario\\Escritorio\\c", d(2)), Err(FsError::NoSpace));
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Escritorio\\c"));
         assert_eq!(f.space().1, free);
     }
 
     #[test]
     fn free_name_cases() {
         let mut f = Files::default();
-        let dir = "C:\\Documentos";
+        let dir = "C:\\Usuarios\\Usuario\\Documentos";
         assert_eq!(f.free_name(dir, "nota.txt"), "nota.txt");
-        f.write("C:\\Documentos\\nota.txt", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\nota.txt", b"1", d(1)).unwrap();
         assert_eq!(f.free_name(dir, "nota.txt"), "nota (2).txt");
         assert_eq!(f.free_name(dir, "NOTA.TXT"), "NOTA (2).TXT");
-        f.write("C:\\Documentos\\nota (2).txt", b"1", d(1)).unwrap();
-        f.write("C:\\Documentos\\nota (3).txt", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\nota (2).txt", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\nota (3).txt", b"1", d(1)).unwrap();
         assert_eq!(f.free_name(dir, "nota.txt"), "nota (4).txt");
-        f.mkdir("C:\\Documentos\\carpeta", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\carpeta", d(1)).unwrap();
         assert_eq!(f.free_name(dir, "carpeta"), "carpeta (2)");
-        f.mkdir("C:\\Documentos\\carpeta (2)", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\carpeta (2)", d(1)).unwrap();
         assert_eq!(f.free_name(dir, "carpeta"), "carpeta (3)");
-        f.write("C:\\Documentos\\.oculto", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\.oculto", b"1", d(1)).unwrap();
         assert_eq!(f.free_name(dir, ".oculto"), ".oculto (2)");
-        f.write("C:\\Documentos\\a.tar.gz", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.tar.gz", b"1", d(1)).unwrap();
         assert_eq!(f.free_name(dir, "a.tar.gz"), "a.tar (2).gz");
-        assert_eq!(f.free_name("C:\\Documentos\\nada", "x"), "x");
+        assert_eq!(f.free_name("C:\\Usuarios\\Usuario\\Documentos\\nada", "x"), "x");
         assert_eq!(f.free_name("D:\\", "x"), "x");
     }
 
     #[test]
     fn rename_and_protected_folders() {
         let mut f = Files::default();
-        f.write("C:\\Documentos\\a.txt", b"1", d(1)).unwrap();
-        f.rename("C:\\Documentos\\a.txt", "C:\\Escritorio\\b.txt").unwrap();
-        assert_eq!(f.read("C:\\Escritorio\\b.txt").unwrap(), b"1");
-        assert_eq!(f.rename("C:\\Documentos\\a.txt", "C:\\x"), Err(FsError::NotFound));
-        f.write("C:\\Documentos\\c.txt", b"2", d(1)).unwrap();
-        assert_eq!(f.rename("C:\\Documentos\\c.txt", "C:\\Escritorio\\B.TXT"), Err(FsError::Exists));
-        assert_eq!(f.rename("C:\\Documentos", "C:\\Documentos\\x"), Err(FsError::Invalid));
-        f.rename("c:/escritorio/b.txt", "C:\\Escritorio\\B.txt").unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"1", d(1)).unwrap();
+        f.rename("C:\\Usuarios\\Usuario\\Documentos\\a.txt", "C:\\Usuarios\\Usuario\\Escritorio\\b.txt").unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Escritorio\\b.txt").unwrap(), b"1");
+        assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos\\a.txt", "C:\\x"), Err(FsError::NotFound));
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\c.txt", b"2", d(1)).unwrap();
+        assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos\\c.txt", "C:\\Usuarios\\Usuario\\Escritorio\\B.TXT"), Err(FsError::Exists));
+        assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos", "C:\\Usuarios\\Usuario\\Documentos\\x"), Err(FsError::Invalid));
+        f.rename("c:/usuarios/usuario/escritorio/b.txt", "C:\\Usuarios\\Usuario\\Escritorio\\B.txt").unwrap();
         // raíz y Sistema
-        for p in ["C:\\", "C:\\Sistema", "c:\\sistema", "C:\\Documentos\\..\\Sistema"] {
+        for p in ["C:\\", "C:\\Sistema", "c:\\sistema", "C:\\Usuarios\\Usuario\\..\\..\\Sistema"] {
             assert_eq!(f.delete(p), Err(FsError::Invalid), "{p}");
             assert_eq!(f.rename(p, "C:\\otro"), Err(FsError::Invalid), "{p}");
             assert_eq!(f.trash(p, d(1)), Err(FsError::Invalid), "{p}");
         }
-        assert_eq!(f.rename("C:\\Documentos", "C:\\"), Err(FsError::Exists));
+        assert_eq!(f.rename("C:\\Usuarios\\Usuario\\Documentos", "C:\\"), Err(FsError::Invalid));
         assert!(f.exists("C:\\Sistema"));
         // dentro de Sistema sí se puede trabajar
         f.write(CONFIG_FILE, b"fondo=1\n", d(1)).unwrap();
@@ -1783,7 +1801,7 @@ mod tests {
         let mut f = Files::default();
         let g0 = f.generation();
         let _ = f.list("C:\\");
-        let _ = f.stat("C:\\Documentos");
+        let _ = f.stat("C:\\Usuarios\\Usuario\\Documentos");
         let _ = f.read("C:\\nada");
         let _ = f.trash_list();
         assert_eq!(f.generation(), g0);
@@ -1792,24 +1810,24 @@ mod tests {
             assert!(f.generation() > last);
             last = f.generation();
         };
-        f.write("C:\\Documentos\\a", b"1", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a", b"1", d(1)).unwrap();
         step(&mut f);
-        f.mkdir("C:\\Documentos\\m", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\m", d(1)).unwrap();
         step(&mut f);
-        f.rename("C:\\Documentos\\a", "C:\\Documentos\\b").unwrap();
+        f.rename("C:\\Usuarios\\Usuario\\Documentos\\a", "C:\\Usuarios\\Usuario\\Documentos\\b").unwrap();
         step(&mut f);
-        f.copy("C:\\Documentos\\b", "C:\\Documentos\\c", d(1)).unwrap();
+        f.copy("C:\\Usuarios\\Usuario\\Documentos\\b", "C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
         step(&mut f);
-        f.trash("C:\\Documentos\\c", d(1)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
         step(&mut f);
         let id = f.trash_list().unwrap()[0].id.clone();
         f.restore(&id).unwrap();
         step(&mut f);
-        f.trash("C:\\Documentos\\c", d(1)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
         step(&mut f);
         f.empty_trash().unwrap();
         step(&mut f);
-        f.delete("C:\\Documentos\\b").unwrap();
+        f.delete("C:\\Usuarios\\Usuario\\Documentos\\b").unwrap();
         step(&mut f);
     }
 
@@ -1817,20 +1835,20 @@ mod tests {
     fn trash_full_cycle() {
         let mut f = Files::default();
         assert!(f.trash_list().unwrap().is_empty());
-        f.write("C:\\Documentos\\nota.txt", b"hola", d(1)).unwrap();
-        f.mkdir("C:\\Documentos\\carp", d(1)).unwrap();
-        f.write("C:\\Documentos\\carp\\x.bin", &vec![9u8; 5000], d(1)).unwrap();
-        f.trash("C:\\Documentos\\nota.txt", d(10)).unwrap();
-        f.trash("C:\\Documentos\\carp", d(11)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\nota.txt", b"hola", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\carp", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\carp\\x.bin", &vec![9u8; 5000], d(1)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\nota.txt", d(10)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\carp", d(11)).unwrap();
         // desaparecen del sitio y de la raíz no aparece el almacén
-        assert!(!f.exists("C:\\Documentos\\nota.txt"));
-        assert!(!f.exists("C:\\Documentos\\carp"));
-        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Sistema"]);
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\nota.txt"));
+        assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\carp"));
+        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
         let items = f.trash_list().unwrap();
         assert_eq!(items.len(), 2);
         // lo más reciente primero
         assert_eq!(items[0].name, "carp");
-        assert_eq!(items[0].original, "C:\\Documentos\\carp");
+        assert_eq!(items[0].original, "C:\\Usuarios\\Usuario\\Documentos\\carp");
         assert!(items[0].dir);
         assert_eq!(items[0].deleted, d(11));
         assert_eq!(items[1].name, "nota.txt");
@@ -1838,7 +1856,7 @@ mod tests {
         assert_ne!(items[0].id, items[1].id);
         // restaurar
         let p = f.restore(&items[1].id).unwrap();
-        assert_eq!(p, "C:\\Documentos\\nota.txt");
+        assert_eq!(p, "C:\\Usuarios\\Usuario\\Documentos\\nota.txt");
         assert_eq!(f.read(&p).unwrap(), b"hola");
         assert_eq!(f.trash_list().unwrap().len(), 1);
         assert_eq!(f.restore(&items[1].id), Err(FsError::NotFound));
@@ -1847,27 +1865,27 @@ mod tests {
         f.trash(&p, d(12)).unwrap();
         f.write(&p, b"nueva", d(13)).unwrap();
         let id = f.trash_list().unwrap()[0].id.clone();
-        assert_eq!(f.restore(&id).unwrap(), "C:\\Documentos\\nota (2).txt");
-        assert_eq!(f.read("C:\\Documentos\\nota (2).txt").unwrap(), b"hola");
+        assert_eq!(f.restore(&id).unwrap(), "C:\\Usuarios\\Usuario\\Documentos\\nota (2).txt");
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\nota (2).txt").unwrap(), b"hola");
         assert_eq!(f.read(&p).unwrap(), b"nueva");
         // la carpeta original ya no existe: se recrea
-        f.mkdir("C:\\Escritorio\\a", d(1)).unwrap();
-        f.mkdir("C:\\Escritorio\\a\\b", d(1)).unwrap();
-        f.write("C:\\Escritorio\\a\\b\\f.txt", b"f", d(1)).unwrap();
-        f.trash("C:\\Escritorio\\a\\b\\f.txt", d(14)).unwrap();
-        f.delete("C:\\Escritorio\\a").unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Escritorio\\a", d(1)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Escritorio\\a\\b", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Escritorio\\a\\b\\f.txt", b"f", d(1)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Escritorio\\a\\b\\f.txt", d(14)).unwrap();
+        f.delete("C:\\Usuarios\\Usuario\\Escritorio\\a").unwrap();
         let id = f.trash_list().unwrap()[0].id.clone();
-        assert_eq!(f.restore(&id).unwrap(), "C:\\Escritorio\\a\\b\\f.txt");
-        assert_eq!(f.read("C:\\Escritorio\\a\\b\\f.txt").unwrap(), b"f");
+        assert_eq!(f.restore(&id).unwrap(), "C:\\Usuarios\\Usuario\\Escritorio\\a\\b\\f.txt");
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Escritorio\\a\\b\\f.txt").unwrap(), b"f");
         // la carpeta con contenido se restaura entera
         let id = f.trash_list().unwrap()[0].id.clone();
         assert_eq!(f.trash_list().unwrap()[0].name, "carp");
-        assert_eq!(f.restore(&id).unwrap(), "C:\\Documentos\\carp");
-        assert_eq!(f.read("C:\\Documentos\\carp\\x.bin").unwrap(), vec![9u8; 5000]);
+        assert_eq!(f.restore(&id).unwrap(), "C:\\Usuarios\\Usuario\\Documentos\\carp");
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\carp\\x.bin").unwrap(), vec![9u8; 5000]);
         assert!(f.trash_list().unwrap().is_empty());
         // vaciar
-        f.trash("C:\\Documentos\\carp", d(15)).unwrap();
-        f.trash("C:\\Documentos\\nota (2).txt", d(15)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\carp", d(15)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\nota (2).txt", d(15)).unwrap();
         assert_eq!(f.trash_list().unwrap().len(), 2);
         let (_, free) = f.space();
         f.empty_trash().unwrap();
@@ -1875,10 +1893,10 @@ mod tests {
         assert!(f.space().1 > free);
         f.empty_trash().unwrap();
         // se sigue pudiendo usar
-        f.trash("C:\\Documentos\\nota.txt", d(16)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\nota.txt", d(16)).unwrap();
         assert_eq!(f.trash_list().unwrap().len(), 1);
-        assert_eq!(f.trash("C:\\Documentos\\nota.txt", d(16)), Err(FsError::NotFound));
-        assert_eq!(f.trash("C:\\Documentos\\ya-no-esta", d(16)), Err(FsError::NotFound));
+        assert_eq!(f.trash("C:\\Usuarios\\Usuario\\Documentos\\nota.txt", d(16)), Err(FsError::NotFound));
+        assert_eq!(f.trash("C:\\Usuarios\\Usuario\\Documentos\\ya-no-esta", d(16)), Err(FsError::NotFound));
     }
 
     #[test]
@@ -1886,22 +1904,24 @@ mod tests {
         let disk = Disk::new(1024);
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
         f.format_pending(d(1)).unwrap();
-        f.write("C:\\Documentos\\a.txt", b"A", d(2)).unwrap();
-        f.trash("C:\\Documentos\\a.txt", d(3)).unwrap();
+        enter(&mut f, DEFAULT_USER);
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"A", d(2)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\a.txt", d(3)).unwrap();
         drop(f);
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(4));
         assert!(f.persistent());
+        enter(&mut f, DEFAULT_USER);
         let items = f.trash_list().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].deleted, d(3));
         // una línea de índice sin elemento (corte entre los dos pasos) se ignora
-        f.fs.write(INDEX, b"00000007|2026-11-3-1-2-3|C:\\Documentos\\fantasma\n", d(5)).unwrap();
+        f.fs.write("Usuarios\\Usuario\\.papelera\\indice", b"00000007|2026-11-3-1-2-3|C:\\Usuarios\\Usuario\\Documentos\\fantasma\n", d(5)).unwrap();
         assert!(f.trash_list().unwrap().is_empty());
-        f.write("C:\\Documentos\\b.txt", b"B", d(5)).unwrap();
-        f.trash("C:\\Documentos\\b.txt", d(6)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\b.txt", b"B", d(5)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\b.txt", d(6)).unwrap();
         let items = f.trash_list().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(f.restore(&items[0].id).unwrap(), "C:\\Documentos\\b.txt");
+        assert_eq!(f.restore(&items[0].id).unwrap(), "C:\\Usuarios\\Usuario\\Documentos\\b.txt");
     }
 
     #[test]
@@ -1909,7 +1929,7 @@ mod tests {
         let mut f = Files::probe(None, d(1));
         assert!(!f.persistent() && !f.pending_format());
         assert!(f.notice().is_some());
-        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Sistema"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
         assert_eq!(f.format_pending(d(1)), Err(FsError::Invalid));
     }
 
@@ -1926,12 +1946,14 @@ mod tests {
         assert_eq!(f.notice(), None);
         assert_eq!(f.read("C:\\Mio\\x.txt").unwrap(), b"x");
         // asegura las carpetas iniciales
-        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Mio", "Sistema"]);
-        f.write("C:\\Documentos\\n.txt", b"dato", d(3)).unwrap();
+        assert_eq!(names(&mut f, "C:\\"), ["Mio", "Sistema", "Usuarios"]);
+        enter(&mut f, DEFAULT_USER);
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\n.txt", b"dato", d(3)).unwrap();
         drop(f);
         let mut f = Files::probe(Some(Box::new(disk)), d(4));
-        assert_eq!(f.read("C:\\Documentos\\n.txt").unwrap(), b"dato");
-        assert_eq!(f.stat("C:\\Documentos\\n.txt").unwrap().modified, d(3));
+        enter(&mut f, DEFAULT_USER);
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\n.txt").unwrap(), b"dato");
+        assert_eq!(f.stat("C:\\Usuarios\\Usuario\\Documentos\\n.txt").unwrap().modified, d(3));
     }
 
     #[test]
@@ -1941,13 +1963,13 @@ mod tests {
         assert!(!f.persistent());
         assert!(f.pending_format());
         let notice_new = f.notice().unwrap();
-        f.write("C:\\Documentos\\a.txt", b"mem", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"mem", d(1)).unwrap();
         f.decline_format();
         assert!(!f.pending_format());
         assert!(!f.persistent());
         assert!(f.notice().is_some());
         assert_eq!(f.format_pending(d(2)), Err(FsError::Invalid));
-        assert_eq!(f.read("C:\\Documentos\\a.txt").unwrap(), b"mem");
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt").unwrap(), b"mem");
         // el disco no se ha tocado
         assert!(disk.0.borrow().iter().all(|&b| b == 0));
         assert_ne!(notice_new, "");
@@ -1962,7 +1984,7 @@ mod tests {
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
         assert!(!f.persistent() && !f.pending_format());
         assert!(f.notice().is_some());
-        f.write("C:\\Documentos\\a.txt", b"mem", d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"mem", d(1)).unwrap();
         assert_eq!(f.format_pending(d(1)), Err(FsError::Invalid));
         assert_eq!(*disk.0.borrow(), before);
         // contenido en medio del disco, pero cabeceras en blanco: sigue contando como en blanco
@@ -1984,7 +2006,7 @@ mod tests {
         assert!(!f.pending_format());
         assert!(f.notice().is_some());
         assert_eq!(f.format_pending(d(2)), Err(FsError::Invalid));
-        f.write("C:\\Documentos\\a", b"1", d(2)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a", b"1", d(2)).unwrap();
         assert_eq!(*disk.0.borrow(), before, "no se debe escribir nada en un disco dañado");
     }
 
@@ -2018,47 +2040,54 @@ mod tests {
         let disk = Disk::new(2048);
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
         assert!(f.pending_format());
-        f.write("C:\\Documentos\\a.txt", b"uno", d(2)).unwrap();
-        f.mkdir("C:\\Documentos\\sub", d(3)).unwrap();
-        f.write("C:\\Documentos\\sub\\b.bin", &vec![5u8; 70_000], d(4)).unwrap();
-        f.write("C:\\Escritorio\\ñ.txt", b"n", d(5)).unwrap();
-        f.write("C:\\Sistema\\config.txt", b"fondo=2\n", d(6)).unwrap();
-        f.write("C:\\Documentos\\borrado.txt", b"papelera", d(7)).unwrap();
-        f.trash("C:\\Documentos\\borrado.txt", d(8)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"uno", d(2)).unwrap();
+        f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\sub", d(3)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\sub\\b.bin", &vec![5u8; 70_000], d(4)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Escritorio\\ñ.txt", b"n", d(5)).unwrap();
+        let cfg = f.config_file();
+        f.write(&cfg, b"fondo=2\n", d(6)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\borrado.txt", b"papelera", d(7)).unwrap();
+        f.trash("C:\\Usuarios\\Usuario\\Documentos\\borrado.txt", d(8)).unwrap();
         let g = f.generation();
         f.format_pending(d(9)).unwrap();
         assert!(f.generation() > g);
-        assert!(f.persistent());
-        assert!(!f.pending_format());
-        assert_eq!(f.notice(), None);
-        assert_eq!(f.read("C:\\Documentos\\a.txt").unwrap(), b"uno");
-        assert_eq!(f.read("C:\\Documentos\\sub\\b.bin").unwrap(), vec![5u8; 70_000]);
-        assert_eq!(f.read("C:\\Escritorio\\ñ.txt").unwrap(), b"n");
-        assert_eq!(f.read(CONFIG_FILE).unwrap(), b"fondo=2\n");
-        assert_eq!(f.stat("C:\\Documentos\\a.txt").unwrap().modified, d(2));
-        assert_eq!(f.stat("C:\\Documentos\\sub").unwrap().modified, d(3));
+        assert!(f.persistent() && !f.pending_format() && f.notice().is_none());
+        // Sin sesión: asistente pendiente y nada de lo de la memoria al alcance.
+        assert!(f.user().is_none() && f.needs_setup());
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\a.txt"), Err(FsError::Invalid));
+        // La primera cuenta (con otro nombre) adopta la carpeta de la memoria.
+        f.create_account("Ana", None, false, [1; 16], d(10)).unwrap();
+        assert!(!f.exists_raw("Usuarios\\Usuario"), "la carpeta de la memoria ya no está");
+        assert!(!f.exists_raw("Sistema\\config\\migracion"));
+        f.login("Ana", "").unwrap();
+        let ana = "C:\\Usuarios\\Ana";
+        assert_eq!(f.read(&format!("{ana}\\Documentos\\a.txt")).unwrap(), b"uno");
+        assert_eq!(f.read(&format!("{ana}\\Documentos\\sub\\b.bin")).unwrap(), vec![5u8; 70_000]);
+        assert_eq!(f.read(&format!("{ana}\\Escritorio\\ñ.txt")).unwrap(), b"n");
+        assert_eq!(f.read(&f.config_file()).unwrap(), b"fondo=2\n");
+        assert_eq!(f.stat(&format!("{ana}\\Documentos\\a.txt")).unwrap().modified, d(2));
+        assert_eq!(f.stat(&format!("{ana}\\Documentos\\sub")).unwrap().modified, d(3));
         let items = f.trash_list().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].original, "C:\\Documentos\\borrado.txt");
+        assert_eq!(items[0].original, format!("{ana}\\Documentos\\borrado.txt"));
         assert_eq!(items[0].deleted, d(8));
-        assert_eq!(f.restore(&items[0].id).unwrap(), "C:\\Documentos\\borrado.txt");
+        assert_eq!(f.restore(&items[0].id).unwrap(), format!("{ana}\\Documentos\\borrado.txt"));
         // y está de verdad en el disco
         drop(f);
-        let mut f = Files::probe(Some(Box::new(disk)), d(10));
-        assert!(f.persistent());
-        assert_eq!(f.read("C:\\Documentos\\sub\\b.bin").unwrap().len(), 70_000);
-        assert_eq!(f.read("C:\\Documentos\\borrado.txt").unwrap(), b"papelera");
-        assert_eq!(f.read(CONFIG_FILE).unwrap(), b"fondo=2\n");
+        let mut f = Files::probe(Some(Box::new(disk)), d(11));
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.read(&format!("{ana}\\Documentos\\sub\\b.bin")).unwrap().len(), 70_000);
+        assert_eq!(f.read(&format!("{ana}\\Documentos\\borrado.txt")).unwrap(), b"papelera");
     }
 
     #[test]
     fn format_pending_on_tiny_disk_fails_and_keeps_memory_drive() {
         let mut f = Files::probe(Some(Box::new(Disk::new(100))), d(1));
         assert!(f.pending_format());
-        f.write("C:\\Documentos\\gran.bin", &vec![1u8; 2_000_000], d(2)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\gran.bin", &vec![1u8; 2_000_000], d(2)).unwrap();
         assert_eq!(f.format_pending(d(3)), Err(FsError::NoSpace));
         assert!(!f.persistent());
-        assert_eq!(f.read("C:\\Documentos\\gran.bin").unwrap().len(), 2_000_000);
+        assert_eq!(f.read("C:\\Usuarios\\Usuario\\Documentos\\gran.bin").unwrap().len(), 2_000_000);
         let mut f = Files::probe(Some(Box::new(Disk::new(100))), d(1));
         f.write("C:\\a.txt", b"1", d(1)).unwrap();
         f.format_pending(d(2)).unwrap();
