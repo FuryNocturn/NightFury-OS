@@ -1,7 +1,7 @@
 //! nfdisk: lee y escribe imágenes de disco NFFS (el `disco.img` de QEMU) desde Windows.
 //! Solo escribe en archivos regulares; nunca en dispositivos ni unidades.
 use nf_core::block::{BlockDev, DiskError, BLOCK};
-use nf_core::files::Files;
+use nf_core::files::{is_protected, Files};
 use nf_core::fs::{Entry, FsError, Nffs};
 use nf_core::platform::DateTime;
 use std::fs::{File, OpenOptions};
@@ -22,7 +22,9 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
   nfdisk ayuda\n\
-Rutas de la imagen: C:\\Documentos\\nota.txt, \\Documentos\\nota.txt o Documentos/nota.txt.";
+Rutas de la imagen: C:\\Usuarios\\Ana\\Documentos\\nota.txt, \\Usuarios\\Ana\\Documentos\\nota.txt o Usuarios/Ana/Documentos/nota.txt.\n\
+Estructura: Usuarios\\<nombre>\\{Escritorio,Documentos,Descargas,Imágenes,Música,Vídeos,.config,.papelera} y Sistema\\{config,temp,lib,drivers,logs}.\n\
+nfdisk trabaja directamente sobre el volumen, sin cuentas ni permisos (como administrador): no crea cuentas ni migra discos antiguos; eso lo hace NightFury al arrancar.";
 
 type R<T> = Result<T, String>;
 
@@ -281,8 +283,8 @@ fn run(args: &[String]) -> R<()> {
         "borrar" => {
             need(2)?;
             let p = rel_item(pos[1])?;
-            if p.eq_ignore_ascii_case("Sistema") {
-                return Err("La carpeta Sistema no se puede borrar.".into());
+            if is_protected(&p) {
+                return Err(format!("«{p}» es una carpeta del sistema o de una cuenta y no se puede borrar."));
             }
             mount(pos[0], true)?.remove(&p).map_err(fs_err)?;
             println!("Borrado.");
@@ -347,27 +349,34 @@ mod tests {
         go(&["info", &img.0]).unwrap();
         go(&["comprobar", &img.0]).unwrap();
         let mut fs = mount(&img.0, false).unwrap();
-        for c in ["Documentos", "Imágenes", "Escritorio", "Sistema"] {
+        for c in ["Usuarios", "Sistema\\config", "Sistema\\temp", "Sistema\\lib", "Sistema\\drivers", "Sistema\\logs"] {
             assert!(fs.stat(c).unwrap().dir, "{c}");
         }
+        assert!(fs.list("Usuarios").unwrap().is_empty(), "sin cuentas: las crea el sistema");
+        assert!(fs.stat("Documentos").is_err());
         drop(fs);
-        go(&["carpeta", &img.0, "C:\\Documentos\\sub"]).unwrap();
-        go(&["meter", &img.0, &src.0, "Documentos/sub/a.bin"]).unwrap();
-        assert!(go(&["meter", &img.0, &src.0, "\\Documentos\\sub\\a.bin"]).is_err());
-        go(&["meter", &img.0, &src.0, "C:\\Documentos\\sub\\a.bin", "--reemplazar"]).unwrap();
-        go(&["listar", &img.0, "C:\\Documentos", "-r"]).unwrap();
-        go(&["sacar", &img.0, "C:\\Documentos\\sub\\a.bin", &out.0]).unwrap();
+        go(&["carpeta", &img.0, "C:\\Usuarios\\Ana"]).unwrap();
+        go(&["carpeta", &img.0, "C:\\Usuarios\\Ana\\Documentos"]).unwrap();
+        go(&["carpeta", &img.0, "C:\\Usuarios\\Ana\\Documentos\\sub"]).unwrap();
+        go(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/sub/a.bin"]).unwrap();
+        assert!(go(&["meter", &img.0, &src.0, "\\Usuarios\\Ana\\Documentos\\sub\\a.bin"]).is_err());
+        go(&["meter", &img.0, &src.0, "C:\\Usuarios\\Ana\\Documentos\\sub\\a.bin", "--reemplazar"]).unwrap();
+        go(&["listar", &img.0, "C:\\Usuarios\\Ana", "-r"]).unwrap();
+        go(&["sacar", &img.0, "C:\\Usuarios\\Ana\\Documentos\\sub\\a.bin", &out.0]).unwrap();
         assert_eq!(std::fs::read(&out.0).unwrap(), datos);
-        assert!(go(&["sacar", &img.0, "Documentos/sub/a.bin", &out.0]).is_err());
-        go(&["sacar", &img.0, "Documentos/sub/a.bin", &out.0, "--reemplazar"]).unwrap();
+        assert!(go(&["sacar", &img.0, "Usuarios/Ana/Documentos/sub/a.bin", &out.0]).is_err());
+        go(&["sacar", &img.0, "Usuarios/Ana/Documentos/sub/a.bin", &out.0, "--reemplazar"]).unwrap();
         std::fs::write(&src.0, "hola").unwrap();
-        go(&["meter", &img.0, &src.0, "Documentos/sub/t.txt"]).unwrap();
-        go(&["ver", &img.0, "Documentos/sub/t.txt"]).unwrap();
-        go(&["borrar", &img.0, "Documentos/sub/t.txt"]).unwrap();
-        assert!(go(&["borrar", &img.0, "Documentos/sub"]).is_err());
-        go(&["borrar", &img.0, "Documentos/sub/a.bin"]).unwrap();
-        go(&["borrar", &img.0, "Documentos/sub"]).unwrap();
-        assert!(go(&["borrar", &img.0, "Sistema"]).is_err());
+        go(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/sub/t.txt"]).unwrap();
+        go(&["ver", &img.0, "Usuarios/Ana/Documentos/sub/t.txt"]).unwrap();
+        go(&["borrar", &img.0, "Usuarios/Ana/Documentos/sub/t.txt"]).unwrap();
+        assert!(go(&["borrar", &img.0, "Usuarios/Ana/Documentos/sub"]).is_err());
+        go(&["borrar", &img.0, "Usuarios/Ana/Documentos/sub/a.bin"]).unwrap();
+        go(&["borrar", &img.0, "Usuarios/Ana/Documentos/sub"]).unwrap();
+        // Carpetas del sistema y de las cuentas: no se borran.
+        for p in ["Usuarios\\Ana\\Documentos", "Usuarios\\Ana", "Usuarios", "Sistema", "Sistema\\logs", "Usuarios\\Ana\\.config"] {
+            assert!(go(&["borrar", &img.0, p]).is_err(), "{p}");
+        }
         assert!(go(&["borrar", &img.0, "C:\\"]).is_err());
         assert!(go(&["meter", &img.0, &src.0, "$Papelera\\x"]).is_err());
         go(&["comprobar", &img.0]).unwrap();
@@ -378,12 +387,12 @@ mod tests {
         let img = Tmp::new("img");
         go(&["crear", &img.0, "1"]).unwrap();
         assert!(go(&["formatear", &img.0]).is_err());
-        go(&["carpeta", &img.0, "Documentos\\x"]).unwrap();
+        go(&["carpeta", &img.0, "Usuarios\\x"]).unwrap();
         assert!(go(&["formatear", &img.0]).is_err());
         go(&["formatear", &img.0, "--forzar"]).unwrap();
         let mut fs = mount(&img.0, false).unwrap();
-        assert!(fs.stat("Documentos\\x").is_err());
-        assert!(fs.stat("Sistema").is_ok());
+        assert!(fs.stat("Usuarios\\x").is_err());
+        assert!(fs.stat("Sistema\\logs").is_ok());
         drop(fs);
         let en_blanco = Tmp::new("img");
         std::fs::write(&en_blanco.0, vec![0u8; 1 << 20]).unwrap();

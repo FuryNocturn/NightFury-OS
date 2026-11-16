@@ -33,18 +33,25 @@ escribir a la vez y dañarla.
 Compilar: `cargo build -p nfdisk --release` → `target\release\nfdisk.exe`.
 
 ```powershell
-nfdisk crear disco.img 64                       # imagen nueva de 64 MiB, formateada y con sus carpetas
+nfdisk crear disco.img 64                       # imagen nueva de 64 MiB, formateada y con la estructura base
 nfdisk info disco.img                           # tamaño, libre y usado
-nfdisk meter disco.img foto.bmp C:\Imágenes\foto.bmp
-nfdisk carpeta disco.img C:\Documentos\Trabajo
-nfdisk listar disco.img C:\Documentos -r
-nfdisk ver disco.img C:\Documentos\nota.txt
-nfdisk sacar disco.img C:\Documentos\nota.txt nota.txt
-nfdisk borrar disco.img C:\Documentos\nota.txt
+nfdisk listar disco.img C:\Usuarios -r          # carpetas de usuario (incluidas las ocultas .config y .papelera)
+nfdisk meter disco.img foto.bmp C:\Usuarios\Ana\Imágenes\foto.bmp
+nfdisk carpeta disco.img C:\Usuarios\Ana\Documentos\Trabajo
+nfdisk ver disco.img C:\Usuarios\Ana\Documentos\nota.txt
+nfdisk sacar disco.img C:\Usuarios\Ana\Documentos\nota.txt nota.txt
+nfdisk borrar disco.img C:\Usuarios\Ana\Documentos\nota.txt
 nfdisk comprobar disco.img                      # revisa la coherencia del volumen
 ```
-- Las rutas de la imagen se aceptan como `C:\Documentos\a.txt`, `\Documentos\a.txt` o `Documentos/a.txt`.
+- Estructura: `Usuarios\<nombre>\{Escritorio, Documentos, Descargas, Imágenes, Música, Vídeos, .config, .papelera}` y
+  `Sistema\{config, temp, lib, drivers, logs}`. Una imagen nueva no tiene cuentas: NightFury las crea en el primer
+  arranque (asistente), y entonces crea la carpeta de cada una.
+- `nfdisk` trabaja directamente sobre el volumen NFFS, sin sesión: es como un administrador sin restricciones de usuario
+  (puede entrar en la carpeta de cualquier cuenta y en `Sistema`). No crea cuentas ni migra discos con la estructura
+  antigua (eso lo hace NightFury al arrancar con ese disco). Sí se niega a borrar `Usuarios`, `Sistema`, sus subcarpetas,
+  la carpeta de cada cuenta ni sus carpetas estándar, `.config` y `.papelera`.
+- Las rutas de la imagen se aceptan como `C:\Usuarios\Ana\a.txt`, `\Usuarios\Ana\a.txt` o `Usuarios/Ana/a.txt`.
 - `meter` y `sacar` no sustituyen un archivo existente salvo con `--reemplazar`.
 - `formatear disco.img` solo funciona con una imagen en blanco; con datos exige `--forzar` (borra todo).
-- Solo trabaja con archivos normales: rechaza `\.\PhysicalDrive0`, `\?\...`, `D:\` y similares.
+- Solo trabaja con archivos normales: rechaza `\\.\PhysicalDrive0`, `\\?\...`, `D:\` y similares.
 - Una imagen creada con `nfdisk crear` arranca en NightFury sin preguntar por formato.
