@@ -1,11 +1,21 @@
-//! Configuración: personalización (fondo y color de énfasis) y datos del sistema.
+//! Configuración: personalización (fondo y color de énfasis), cuentas y datos del sistema.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
+//!
+//! Cuentas: las operaciones con varios pasos (poner o cambiar la clave, añadir, renombrar y
+//! eliminar una cuenta) encadenan diálogos; lo que se va recogiendo vive en `Job`. Las claves
+//! solo pasan por `Secret`, que las borra de la memoria al soltarlas, y nunca van a un título,
+//! al registro ni a un archivo.
 use super::{App, AppKind, Ctx, MouseEv};
+use crate::accounts::{salt_from, AccountError, MIN_PASSWORD};
+use crate::crypto::{ct_eq, wipe};
+use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
+use crate::fs::same;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::KeyEvent;
 use crate::platform::Platform;
+use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::{render_wallpaper, Theme, ACCENTS, WALLPAPERS};
 use alloc::boxed::Box;
@@ -17,13 +27,81 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 2] = [("Personalización", Icon::Palette), ("Acerca de", Icon::Info)];
+const SECTIONS: [(&str, Icon); 3] = [("Personalización", Icon::Palette), ("Cuentas", Icon::Logo), ("Acerca de", Icon::Info)];
+const PAGE_ACCOUNTS: usize = 1;
+const PAGE_ABOUT: usize = 2;
+const BTN_H: i32 = 26;
+/// Paso de la rueda y de las flechas de la barra, en píxeles.
+const STEP: i32 = 24;
+
+const TITLE: &str = "Cuentas";
+const T_MSG: u32 = 1;
+const T_PW_OLD: u32 = 10;
+const T_PW_NEW: u32 = 11;
+const T_PW_REP: u32 = 12;
+const T_ADD_NAME: u32 = 20;
+const T_ADD_PW: u32 = 21;
+const T_ADD_REP: u32 = 22;
+const T_ADD_ADMIN: u32 = 23;
+const T_REN: u32 = 30;
+const T_DEL_FILES: u32 = 40;
+const T_DEL_NAME: u32 = 41;
+const NO_MATCH: &str = "Las claves no coinciden.";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Act {
+    SetPwd,
+    ChangePwd,
+    RemovePwd,
+    Add,
+    /// Índice en `Settings::others`.
+    Rename(usize),
+    Admin(usize),
+    Delete(usize),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hit {
     Nav(usize),
     Wall(u8),
     Accent(usize),
+    Act(Act),
+}
+
+/// Texto secreto (claves) que se borra de la memoria al soltarlo.
+#[derive(Default)]
+struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        // SAFETY: se escriben ceros, que son UTF-8 válido.
+        wipe(unsafe { self.0.as_bytes_mut() });
+    }
+}
+
+impl Secret {
+    fn same(&self, other: &Secret) -> bool {
+        ct_eq(self.0.as_bytes(), other.0.as_bytes())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Op {
+    SetPwd,
+    ChangePwd,
+    RemovePwd,
+    Add,
+    Rename,
+    Delete,
+}
+
+/// Operación de cuentas en marcha entre un diálogo y el siguiente.
+struct Job {
+    op: Op,
+    /// Cuenta sobre la que se actúa (o la que se crea).
+    name: String,
+    old: Secret,
+    new: Secret,
 }
 
 struct Settings {
@@ -36,10 +114,38 @@ struct Settings {
     hits: Vec<(Rect, Hit)>,
     /// Segundo (de `now_ms`) de la última vez que se redibujó "Acerca de".
     last_sec: u64,
+    /// Página de cuentas: desplazamiento, alto del contenido y tamaño dibujado, barra, y las
+    /// demás cuentas (nombre, administrador) tal como se vieron al dibujar.
+    scroll: i32,
+    content_h: i32,
+    size: (i32, i32),
+    sb: ScrollBar,
+    others: Vec<(String, bool)>,
+    job: Option<Job>,
+    /// Botón de la página Cuentas bajo el puntero.
+    hover_hit: Option<Act>,
 }
 
 pub fn new() -> Box<dyn App> {
-    Box::new(Settings { page: 0, thumbs: Vec::new(), thumb_accent: 0, hover: None, hits: Vec::new(), last_sec: 0 })
+    Box::new(init())
+}
+
+fn init() -> Settings {
+    Settings {
+        page: 0,
+        thumbs: Vec::new(),
+        thumb_accent: 0,
+        hover: None,
+        hits: Vec::new(),
+        last_sec: 0,
+        scroll: 0,
+        content_h: 0,
+        size: (0, 0),
+        sb: ScrollBar::new(false),
+        others: Vec::new(),
+        job: None,
+        hover_hit: None,
+    }
 }
 
 fn nav_rect(i: usize) -> Rect {
@@ -149,6 +255,274 @@ impl Settings {
     }
 }
 
+fn message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_MSG, title: String::from(TITLE), text: String::from(text), buttons: Buttons::Ok });
+}
+
+fn password(cx: &mut Ctx, tag: u32, label: &str) {
+    cx.dialog = Some(DialogRequest::Password { tag, title: String::from(TITLE), label: String::from(label) });
+}
+
+fn input(cx: &mut Ctx, tag: u32, label: &str, value: &str) {
+    cx.dialog = Some(DialogRequest::Input { tag, title: String::from(TITLE), label: String::from(label), value: String::from(value) });
+}
+
+fn salt(cx: &mut Ctx) -> [u8; 16] {
+    let (a, b) = (cx.sys.entropy(), cx.sys.entropy());
+    salt_from(a, b)
+}
+
+// ---- Página Cuentas: dibujo ----
+impl Settings {
+    /// Botón en la posición del cursor `at`; salta de línea si no cabe. Devuelve su ancho.
+    fn button(&mut self, s: &mut Surface, at: &mut (i32, i32), x0: i32, right: i32, label: &str, act: Act, theme: &Theme) {
+        let w = font::width(label, 9, false) + 24;
+        if at.0 > x0 && at.0 + w > right {
+            *at = (x0, at.1 + BTN_H + 6);
+        }
+        let r = Rect::new(at.0, at.1, w, BTN_H);
+        let hot = self.hover_hit == Some(act);
+        s.fill_rect(r, if hot { 0xD8D8D8 } else { 0xE6E6E6 });
+        s.frame(r, if hot { theme.accent } else { 0xA0A0A0 });
+        font::draw_in(s, r, label, 9, false, TEXT, Align::Center);
+        self.hits.push((r, Hit::Act(act)));
+        at.0 += w + 8;
+    }
+
+    fn accounts_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, TITLE, 18, false, TEXT);
+        y += font::line_h(18) + if compact { 6 } else { 12 };
+        self.others.clear();
+        if !sys.files().persistent() {
+            font::draw(s, x0, y, "Sin disco no hay cuentas que guardar.", 9, false, GRAY);
+            self.content_h = y + self.scroll + font::line_h(9) + 16;
+            return;
+        }
+        let me = String::from(sys.files().user().unwrap_or(""));
+        let admin = sys.files().is_admin();
+        let has_pwd = sys.files().has_password();
+        let list = sys.files().accounts();
+        font::draw(s, x0, y, "Mi cuenta", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        for (label, value) in [("Nombre", me.clone()), ("Tipo", String::from(if admin { "Administrador" } else { "Usuario" })), ("Clave", String::from(if has_pwd { "Puesta" } else { "Sin clave" }))] {
+            font::draw_in(s, Rect::new(x0, y, 90, 22), label, 9, false, GRAY, Align::Left);
+            font::draw_in(s, Rect::new(x0 + 90, y, (right - x0 - 90).max(0), 22), &value, 9, false, TEXT, Align::Left);
+            y += 22;
+        }
+        y += 6;
+        let mut at = (x0, y);
+        if has_pwd {
+            self.button(s, &mut at, x0, right, "Cambiar clave", Act::ChangePwd, theme);
+            self.button(s, &mut at, x0, right, "Quitar clave", Act::RemovePwd, theme);
+        } else {
+            self.button(s, &mut at, x0, right, "Poner clave", Act::SetPwd, theme);
+        }
+        y = at.1 + BTN_H + if compact { 12 } else { 20 };
+        if admin {
+            font::draw(s, x0, y, "Otras cuentas", 11, true, TEXT);
+            y += font::line_h(11) + 8;
+            self.others = list.iter().filter(|a| !same(&a.name, &me)).map(|a| (a.name.clone(), a.admin)).collect();
+            if self.others.is_empty() {
+                font::draw(s, x0, y, "No hay más cuentas.", 9, false, GRAY);
+                y += 24;
+            }
+            for i in 0..self.others.len() {
+                let (name, is_admin) = self.others[i].clone();
+                let end = font::draw(s, x0, y, &name, 9, true, TEXT);
+                font::draw(s, end + 10, y, if is_admin { "Administrador" } else { "Usuario" }, 9, false, GRAY);
+                y += font::line_h(9) + 4;
+                let mut at = (x0, y);
+                self.button(s, &mut at, x0, right, "Cambiar nombre", Act::Rename(i), theme);
+                self.button(s, &mut at, x0, right, if is_admin { "Hacer usuario normal" } else { "Hacer administrador" }, Act::Admin(i), theme);
+                self.button(s, &mut at, x0, right, "Eliminar", Act::Delete(i), theme);
+                y = at.1 + BTN_H + 12;
+            }
+            let mut at = (x0, y + 4);
+            self.button(s, &mut at, x0, right, "Añadir cuenta", Act::Add, theme);
+            y = at.1 + BTN_H;
+        }
+        self.content_h = y + self.scroll + 16;
+    }
+
+    fn metrics(&self) -> Metrics {
+        Metrics { rect: Rect::new(self.size.0 - SB_W, 0, SB_W, self.size.1), total: self.content_h, page: self.size.1, pos: self.scroll, line: STEP }
+    }
+
+    fn max_scroll(&self) -> i32 {
+        (self.content_h - self.size.1).max(0)
+    }
+}
+
+// ---- Página Cuentas: operaciones ----
+impl Settings {
+    fn start(&mut self, act: Act, cx: &mut Ctx) {
+        let other = |i: usize| self.others.get(i).cloned();
+        let (op, name) = match act {
+            Act::SetPwd => (Op::SetPwd, String::new()),
+            Act::ChangePwd => (Op::ChangePwd, String::new()),
+            Act::RemovePwd => (Op::RemovePwd, String::new()),
+            Act::Add => (Op::Add, String::new()),
+            Act::Rename(i) => match other(i) {
+                Some((n, _)) => (Op::Rename, n),
+                None => return,
+            },
+            Act::Delete(i) => match other(i) {
+                Some((n, _)) => (Op::Delete, n),
+                None => return,
+            },
+            Act::Admin(i) => {
+                let Some((n, is_admin)) = other(i) else { return };
+                let now = cx.sys.now();
+                if let Err(e) = cx.sys.files().set_admin(&n, !is_admin, now) {
+                    message(cx, e.text());
+                }
+                cx.redraw = true;
+                return;
+            }
+        };
+        match act {
+            Act::SetPwd => password(cx, T_PW_NEW, "Clave nueva (mínimo 6 caracteres):"),
+            Act::ChangePwd | Act::RemovePwd => password(cx, T_PW_OLD, "Clave actual:"),
+            Act::Add => input(cx, T_ADD_NAME, "Nombre de la cuenta nueva:", ""),
+            Act::Rename(_) => input(cx, T_REN, "Nombre nuevo:", &name),
+            _ => {
+                cx.dialog = Some(DialogRequest::Message {
+                    tag: T_DEL_FILES,
+                    title: String::from(TITLE),
+                    text: format!("¿Eliminar también sus archivos?\nSí: se borran para siempre.\nNo: se conserva la carpeta de «{name}»."),
+                    buttons: Buttons::YesNoCancel,
+                })
+            }
+        }
+        self.job = Some(Job { op, name, old: Secret::default(), new: Secret::default() });
+    }
+
+    /// Termina la operación de clave con la clave nueva ya repetida (`None` = quitarla).
+    fn finish_password(&mut self, job: Job, new: Option<&str>, cx: &mut Ctx) {
+        let (now, salt) = (cx.sys.now(), salt(cx));
+        match cx.sys.files().set_password(&job.old.0, new, salt, now) {
+            Ok(()) => message(
+                cx,
+                match job.op {
+                    Op::SetPwd => "Se ha puesto la clave.",
+                    Op::ChangePwd => "Se ha cambiado la clave.",
+                    _ => "Se ha quitado la clave.",
+                },
+            ),
+            Err(e) => message(cx, e.text()),
+        }
+    }
+
+    fn step_text(&mut self, tag: u32, value: Option<Secret>, cx: &mut Ctx) {
+        let Some(mut job) = self.job.take() else { return };
+        let Some(v) = value else { return };
+        match tag {
+            T_PW_OLD => {
+                if !cx.sys.files().verify_password(&v.0) {
+                    return message(cx, AccountError::WrongPassword.text());
+                }
+                if job.op == Op::RemovePwd {
+                    job.old = v;
+                    return self.finish_password(job, None, cx);
+                }
+                job.old = v;
+                password(cx, T_PW_NEW, "Clave nueva (mínimo 6 caracteres):");
+            }
+            T_PW_NEW | T_ADD_PW => {
+                // Al crear una cuenta, la clave vacía significa "sin clave".
+                if tag == T_ADD_PW && v.0.is_empty() {
+                    job.new = v;
+                    return self.ask_admin(job, cx);
+                }
+                if v.0.chars().count() < MIN_PASSWORD {
+                    return message(cx, AccountError::WeakPassword.text());
+                }
+                job.new = v;
+                password(cx, if tag == T_PW_NEW { T_PW_REP } else { T_ADD_REP }, "Repite la clave:");
+            }
+            T_PW_REP | T_ADD_REP => {
+                if !job.new.same(&v) {
+                    return message(cx, NO_MATCH);
+                }
+                if tag == T_ADD_REP {
+                    return self.ask_admin(job, cx);
+                }
+                let new = Secret(core::mem::take(&mut job.new.0));
+                return self.finish_password(job, Some(&new.0), cx);
+            }
+            T_ADD_NAME => {
+                if !crate::accounts::valid_user_name(&v.0) {
+                    return message(cx, AccountError::BadName.text());
+                }
+                if cx.sys.files().accounts().iter().any(|a| same(&a.name, &v.0)) {
+                    return message(cx, AccountError::Exists.text());
+                }
+                job.name = v.0.clone();
+                password(cx, T_ADD_PW, "Clave (vacía = sin clave):");
+            }
+            T_REN => {
+                let now = cx.sys.now();
+                if let Err(e) = cx.sys.files().rename_account(&job.name, &v.0, now) {
+                    message(cx, e.text());
+                }
+                return;
+            }
+            T_DEL_NAME => {
+                if v.0 != job.name {
+                    return message(cx, "El nombre no coincide. No se ha eliminado nada.");
+                }
+                return self.delete(&job.name, false, cx);
+            }
+            _ => return,
+        }
+        self.job = Some(job);
+    }
+
+    fn ask_admin(&mut self, job: Job, cx: &mut Ctx) {
+        cx.dialog = Some(DialogRequest::Message {
+            tag: T_ADD_ADMIN,
+            title: String::from(TITLE),
+            text: format!("¿Será «{}» administrador?\nSí: administrador. No: usuario normal.", job.name),
+            buttons: Buttons::YesNoCancel,
+        });
+        self.job = Some(job);
+    }
+
+    fn delete(&mut self, name: &str, keep: bool, cx: &mut Ctx) {
+        let now = cx.sys.now();
+        match cx.sys.files().delete_account(name, keep, now) {
+            Ok(()) => message(cx, if keep { "Cuenta eliminada. Su carpeta se ha conservado." } else { "Cuenta eliminada junto con sus archivos." }),
+            Err(e) => message(cx, e.text()),
+        }
+    }
+
+    fn step_answer(&mut self, tag: u32, answer: Answer, cx: &mut Ctx) {
+        let Some(job) = self.job.take() else { return };
+        if answer == Answer::Cancel {
+            return;
+        }
+        match tag {
+            T_ADD_ADMIN => {
+                let (now, salt) = (cx.sys.now(), salt(cx));
+                let pw = Some(job.new.0.as_str()).filter(|p| !p.is_empty());
+                if let Err(e) = cx.sys.files().create_account(&job.name, pw, answer == Answer::Yes, salt, now) {
+                    message(cx, e.text());
+                }
+            }
+            T_DEL_FILES if answer == Answer::No => self.delete(&job.name, true, cx),
+            T_DEL_FILES => {
+                input(cx, T_DEL_NAME, &format!("Para confirmar, escribe el nombre ({}):", job.name), "");
+                self.job = Some(job);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl App for Settings {
     fn kind(&self) -> AppKind {
         AppKind::Settings
@@ -170,37 +544,73 @@ impl App for Settings {
             self.thumb_accent = theme.accent;
         }
         let b = s.bounds();
-        s.fill_rect(b, 0xFFFFFF);
-        self.hits.clear();
-        self.panel(s, theme);
-        // Lo de la derecha no se sale de su zona.
-        s.set_clip(Rect::new(PANEL_W, 0, (s.w - PANEL_W).max(0), s.h));
-        if self.page == 0 {
-            self.personalization(s, theme);
-        } else {
-            self.about(s, theme, sys);
+        self.size = (s.w, s.h);
+        // Si el contenido de Cuentas ha encogido, se redibuja ya con el desplazamiento corregido.
+        for _ in 0..2 {
+            s.fill_rect(b, 0xFFFFFF);
+            self.hits.clear();
+            self.panel(s, theme);
+            // Lo de la derecha no se sale de su zona.
+            s.set_clip(Rect::new(PANEL_W, 0, (s.w - PANEL_W).max(0), s.h));
+            match self.page {
+                0 => self.personalization(s, theme),
+                PAGE_ACCOUNTS => self.accounts_page(s, theme, sys),
+                _ => self.about(s, theme, sys),
+            }
+            s.reset_clip();
+            if self.page != PAGE_ACCOUNTS || self.scroll <= self.max_scroll() {
+                break;
+            }
+            self.scroll = self.max_scroll();
         }
-        s.reset_clip();
+        if self.page == PAGE_ACCOUNTS && self.metrics().needed() {
+            s.set_clip(Rect::new(PANEL_W, 0, (s.w - PANEL_W).max(0), s.h));
+            self.sb.draw(s, &self.metrics(), theme);
+            s.reset_clip();
+        }
     }
 
     fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         let at = |s: &Self, x: i32, y: i32| s.hits.iter().find(|(r, _)| r.contains(x, y)).map(|h| h.1);
+        if self.page == PAGE_ACCOUNTS {
+            if let MouseEv::Wheel { dz, .. } = ev {
+                let to = (self.scroll + dz * STEP * 2).clamp(0, self.max_scroll());
+                if to != self.scroll {
+                    self.scroll = to;
+                    cx.redraw = true;
+                }
+                return;
+            }
+            let m = self.metrics();
+            if m.needed() {
+                let e = self.sb.mouse(ev, &m, cx.now_ms);
+                if let Some(p) = e.pos {
+                    self.scroll = p;
+                }
+                cx.redraw |= e.redraw;
+                if e.captured {
+                    return;
+                }
+            }
+        }
         match ev {
             MouseEv::RightDown { .. } | MouseEv::Wheel { .. } => {}
             MouseEv::Move { x, y } => {
-                let h = match at(self, x, y) {
-                    Some(Hit::Nav(i)) => Some(i),
-                    _ => None,
+                let (h, b) = match at(self, x, y) {
+                    Some(Hit::Nav(i)) => (Some(i), None),
+                    Some(Hit::Act(a)) => (None, Some(a)),
+                    _ => (None, None),
                 };
-                if h != self.hover {
+                if h != self.hover || b != self.hover_hit {
                     self.hover = h;
+                    self.hover_hit = b;
                     cx.redraw = true;
                 }
             }
             MouseEv::Leave => {
-                if self.hover.take().is_some() {
+                if self.hover.take().is_some() | self.hover_hit.take().is_some() {
                     cx.redraw = true;
                 }
             }
@@ -209,8 +619,10 @@ impl App for Settings {
                 Some(Hit::Nav(i)) if i != self.page => {
                     self.page = i;
                     self.hits.clear();
+                    self.scroll = 0;
                     cx.redraw = true;
                 }
+                Some(Hit::Act(a)) => self.start(a, cx),
                 Some(Hit::Wall(i)) if cx.theme.wallpaper != i => {
                     cx.theme.wallpaper = i;
                     cx.theme_changed = true;
@@ -226,10 +638,26 @@ impl App for Settings {
         }
     }
 
+    fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
+        cx.redraw = true;
+        match result {
+            DialogResult::Text { tag, value } => self.step_text(tag, value.map(Secret), cx),
+            DialogResult::Answer { tag, answer } => self.step_answer(tag, answer, cx),
+            DialogResult::Path { .. } => {}
+        }
+    }
+
     fn tick(&mut self, cx: &mut Ctx) {
+        if self.page == PAGE_ACCOUNTS {
+            let m = self.metrics();
+            if let Some(p) = self.sb.tick(&m, cx.now_ms) {
+                self.scroll = p;
+                cx.redraw = true;
+            }
+        }
         // "Tiempo encendido" y memoria cambian solos: redibuja una vez por segundo.
         let sec = cx.now_ms / 1000;
-        if self.page == 1 && sec != self.last_sec {
+        if self.page == PAGE_ABOUT && sec != self.last_sec {
             self.last_sec = sec;
             cx.redraw = true;
         }
@@ -242,16 +670,18 @@ mod tests {
     use crate::platform::TestPlatform;
 
     struct Banco {
-        app: Box<dyn App>,
+        app: Settings,
         sys: TestPlatform,
         theme: Theme,
         redraw: bool,
         changed: bool,
+        /// Último diálogo pedido por la app (se queda hasta que se coge con `take`).
+        dialog: Option<DialogRequest>,
     }
 
     impl Banco {
         fn new() -> Self {
-            Banco { app: new(), sys: TestPlatform { size: (1280, 800), ..Default::default() }, theme: Theme::default(), redraw: false, changed: false }
+            Banco { app: init(), sys: TestPlatform { size: (1280, 800), ..Default::default() }, theme: Theme::default(), redraw: false, changed: false, dialog: None }
         }
         fn dibuja(&mut self, w: i32, h: i32) -> Surface {
             let mut s = Surface::new(w, h, 0);
@@ -263,6 +693,71 @@ mod tests {
             self.app.mouse(ev, &mut cx);
             self.redraw |= cx.redraw;
             self.changed |= cx.theme_changed;
+            if cx.dialog.is_some() {
+                self.dialog = cx.dialog.take();
+            }
+        }
+        /// Contesta al diálogo pendiente.
+        fn responde(&mut self, r: DialogResult) {
+            self.dialog = None;
+            let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
+            self.app.dialog_result(r, &mut cx);
+            self.dialog = cx.dialog.take();
+        }
+        fn texto(&mut self, tag: u32, v: &str) {
+            self.responde(DialogResult::Text { tag, value: Some(String::from(v)) });
+        }
+        fn respuesta(&mut self, tag: u32, answer: Answer) {
+            self.responde(DialogResult::Answer { tag, answer });
+        }
+        /// Pulsa el botón `act` de la página de cuentas (tras dibujarla).
+        fn pulsa(&mut self, act: Act) {
+            self.dibuja(780, 520);
+            let r = self.app.hits.iter().find(|h| h.1 == Hit::Act(act)).unwrap_or_else(|| panic!("no hay botón {act:?}")).0;
+            self.clic(r.x + r.w / 2, r.y + r.h / 2);
+        }
+        /// Como `pulsa` pero sin volver a dibujar: la pantalla se ha quedado con lo que se vio antes.
+        fn pulsa_viejo(&mut self, act: Act) {
+            let r = self.app.hits.iter().find(|h| h.1 == Hit::Act(act)).unwrap_or_else(|| panic!("no hay botón {act:?}")).0;
+            self.clic(r.x + r.w / 2, r.y + r.h / 2);
+        }
+        fn hay(&mut self, act: Act) -> bool {
+            self.dibuja(780, 520);
+            self.app.hits.iter().any(|h| h.1 == Hit::Act(act))
+        }
+        fn pagina(&mut self, i: usize) {
+            self.dibuja(780, 520);
+            self.clic(50, 56 + 40 * i as i32 + 5);
+        }
+        fn mensaje(&mut self) -> String {
+            match self.dialog.take() {
+                Some(DialogRequest::Message { text, tag: T_MSG, .. }) => text,
+                otro => panic!("se esperaba un mensaje y hay {otro:?}"),
+            }
+        }
+        /// Posición de la cuenta `name` en la lista de "Otras cuentas".
+        fn fila(&mut self, name: &str) -> usize {
+            self.dibuja(780, 520);
+            self.app.others.iter().position(|o| o.0 == name).unwrap_or_else(|| panic!("no está {name}"))
+        }
+        fn files(&mut self) -> &mut crate::files::Files {
+            self.sys.files()
+        }
+        /// Disco persistente con la administradora Ana y el usuario normal Luis; la sesión es de `quien`,
+        /// con la página de cuentas abierta.
+        fn con_disco(quien: &str) -> Self {
+            let n = crate::platform::DateTime::default();
+            let mut f = crate::files::Files::probe(Some(Box::new(crate::block::RamDisk::new(2048))), n);
+            f.format_pending(n).unwrap();
+            f.create_account("Ana", None, true, [1; 16], n).unwrap();
+            f.login("Ana", "").unwrap();
+            f.create_account("Luis", None, false, [2; 16], n).unwrap();
+            f.login(quien, "").unwrap();
+            let mut b = Banco::new();
+            b.sys.files = f;
+            b.pagina(PAGE_ACCOUNTS);
+            b.dibuja(780, 520);
+            b
         }
         fn clic(&mut self, x: i32, y: i32) {
             self.redraw = false;
@@ -298,9 +793,9 @@ mod tests {
     fn cambio_de_seccion() {
         let mut b = Banco::new();
         b.dibuja(780, 520);
-        b.ev(MouseEv::Move { x: 50, y: 56 + 40 + 5 });
+        b.ev(MouseEv::Move { x: 50, y: 56 + 80 + 5 });
         assert!(b.redraw);
-        b.clic(50, 56 + 40 + 5);
+        b.clic(50, 56 + 80 + 5);
         assert!(b.redraw && !b.changed);
         let s = b.dibuja(780, 520);
         // En "Acerca de" ya no hay muestras de color en la zona de contenido.
@@ -318,7 +813,7 @@ mod tests {
         b.app.tick(&mut cx);
         assert!(!cx.redraw);
         drop(cx);
-        b.clic(50, 56 + 40 + 5);
+        b.clic(50, 56 + 80 + 5);
         b.dibuja(780, 520);
         let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 6000);
         b.app.tick(&mut cx);
@@ -331,7 +826,7 @@ mod tests {
     #[test]
     fn tamanos_extremos() {
         let mut b = Banco::new();
-        for pagina in 0..2 {
+        for pagina in 0..3 {
             b.clic(50, 56 + 40 * pagina + 5);
             for (w, h) in [(520, 360), (780, 520), (1, 1), (0, 0), (221, 400), (600, 1)] {
                 b.dibuja(w, h);
@@ -341,5 +836,291 @@ mod tests {
         // Color sólido se regenera con el nuevo énfasis sin pánico.
         b.theme.accent = ACCENTS[3];
         b.dibuja(520, 360);
+    }
+
+    fn pw_dialog(b: &Banco, tag: u32) {
+        assert!(matches!(&b.dialog, Some(DialogRequest::Password { tag: t, .. }) if *t == tag), "{:?}", b.dialog);
+    }
+
+    #[test]
+    fn poner_cambiar_y_quitar_la_clave() {
+        let mut b = Banco::con_disco("Ana");
+        assert!(b.hay(Act::SetPwd) && !b.hay(Act::ChangePwd) && !b.hay(Act::RemovePwd));
+        // Poner.
+        b.pulsa(Act::SetPwd);
+        pw_dialog(&b, T_PW_NEW);
+        b.texto(T_PW_NEW, "secreta1");
+        pw_dialog(&b, T_PW_REP);
+        b.texto(T_PW_REP, "secreta1");
+        assert_eq!(b.mensaje(), "Se ha puesto la clave.");
+        assert!(b.files().has_password() && b.files().verify_password("secreta1"));
+        assert!(b.app.job.is_none(), "las claves se sueltan al terminar");
+        // Cambiar: la clave actual mala corta el proceso.
+        assert!(b.hay(Act::ChangePwd) && b.hay(Act::RemovePwd) && !b.hay(Act::SetPwd));
+        b.pulsa(Act::ChangePwd);
+        pw_dialog(&b, T_PW_OLD);
+        b.texto(T_PW_OLD, "mala-clave");
+        assert_eq!(b.mensaje(), AccountError::WrongPassword.text());
+        assert!(b.app.job.is_none() && b.files().verify_password("secreta1"));
+        b.pulsa(Act::ChangePwd);
+        b.texto(T_PW_OLD, "secreta1");
+        pw_dialog(&b, T_PW_NEW);
+        b.texto(T_PW_NEW, "otra-clave");
+        pw_dialog(&b, T_PW_REP);
+        b.texto(T_PW_REP, "otra-clave");
+        assert_eq!(b.mensaje(), "Se ha cambiado la clave.");
+        assert!(b.files().verify_password("otra-clave") && !b.files().verify_password("secreta1"));
+        // Quitar.
+        b.pulsa(Act::RemovePwd);
+        b.texto(T_PW_OLD, "otra-clave");
+        assert_eq!(b.mensaje(), "Se ha quitado la clave.");
+        assert!(!b.files().has_password() && b.files().verify_password(""));
+        assert!(b.hay(Act::SetPwd));
+    }
+
+    #[test]
+    fn claves_que_no_coinciden_cortas_o_canceladas_no_cambian_nada() {
+        let mut b = Banco::con_disco("Ana");
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "secreta1");
+        b.texto(T_PW_REP, "secreta2");
+        assert_eq!(b.mensaje(), "Las claves no coinciden.");
+        assert!(!b.files().has_password() && b.app.job.is_none());
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "corta");
+        assert_eq!(b.mensaje(), AccountError::WeakPassword.text());
+        assert!(!b.files().has_password() && b.app.job.is_none());
+        // Cancelar en cualquier paso.
+        b.pulsa(Act::SetPwd);
+        b.responde(DialogResult::Text { tag: T_PW_NEW, value: None });
+        assert!(b.dialog.is_none() && b.app.job.is_none());
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "secreta1");
+        b.responde(DialogResult::Text { tag: T_PW_REP, value: None });
+        assert!(b.dialog.is_none() && b.app.job.is_none() && !b.files().has_password());
+        // Con clave puesta, cancelar la actual tampoco cambia nada.
+        let n = crate::platform::DateTime::default();
+        b.files().set_password("", Some("secreta1"), [3; 16], n).unwrap();
+        b.pulsa(Act::RemovePwd);
+        b.responde(DialogResult::Text { tag: T_PW_OLD, value: None });
+        assert!(b.dialog.is_none() && b.files().has_password());
+    }
+
+    #[test]
+    fn anadir_cuenta_con_y_sin_clave_y_con_errores() {
+        let mut b = Banco::con_disco("Ana");
+        // Sin clave y administradora.
+        b.pulsa(Act::Add);
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { tag: T_ADD_NAME, .. })));
+        b.texto(T_ADD_NAME, "Marta");
+        pw_dialog(&b, T_ADD_PW);
+        b.texto(T_ADD_PW, "");
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_ADD_ADMIN, buttons: Buttons::YesNoCancel, .. })));
+        b.respuesta(T_ADD_ADMIN, Answer::Yes);
+        assert!(b.dialog.is_none());
+        let marta = b.files().accounts().into_iter().find(|a| a.name == "Marta").unwrap();
+        assert!(marta.admin && !marta.has_password());
+        assert!(b.files().exists("C:\\Usuarios\\Marta\\Documentos"));
+        // Con clave y usuaria normal.
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "Pepe");
+        b.texto(T_ADD_PW, "clavepepe");
+        pw_dialog(&b, T_ADD_REP);
+        b.texto(T_ADD_REP, "clavepepe");
+        b.respuesta(T_ADD_ADMIN, Answer::No);
+        let pepe = b.files().accounts().into_iter().find(|a| a.name == "Pepe").unwrap();
+        assert!(!pepe.admin && pepe.has_password() && pepe.verify("clavepepe") && !pepe.verify(""));
+        // Errores: nombre mal, repetido (sin distinguir mayúsculas), claves distintas, corta y cancelar al final.
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "a|b");
+        assert_eq!(b.mensaje(), AccountError::BadName.text());
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "luis");
+        assert_eq!(b.mensaje(), AccountError::Exists.text());
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "Nora");
+        b.texto(T_ADD_PW, "clavenora");
+        b.texto(T_ADD_REP, "otraclave");
+        assert_eq!(b.mensaje(), "Las claves no coinciden.");
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "Nora");
+        b.texto(T_ADD_PW, "corta");
+        assert_eq!(b.mensaje(), AccountError::WeakPassword.text());
+        b.pulsa(Act::Add);
+        b.texto(T_ADD_NAME, "Nora");
+        b.texto(T_ADD_PW, "");
+        b.respuesta(T_ADD_ADMIN, Answer::Cancel);
+        assert!(b.dialog.is_none() && !b.files().accounts().iter().any(|a| a.name == "Nora"));
+        assert_eq!(b.files().accounts().len(), 4);
+        // La lista dibujada incluye las nuevas.
+        b.dibuja(780, 520);
+        assert_eq!(b.app.others.iter().map(|o| o.0.as_str()).collect::<Vec<_>>(), ["Luis", "Marta", "Pepe"]);
+    }
+
+    #[test]
+    fn renombrar_y_cambiar_el_tipo_de_otra_cuenta() {
+        let mut b = Banco::con_disco("Ana");
+        let luis = b.fila("Luis");
+        b.files().write("C:\\Usuarios\\Luis\\Documentos\\a.txt", b"x", crate::platform::DateTime::default()).unwrap();
+        b.pulsa(Act::Rename(luis));
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { tag: T_REN, value, .. }) if value == "Luis"));
+        b.texto(T_REN, "Luisa");
+        assert!(b.dialog.is_none());
+        assert!(b.files().accounts().iter().any(|a| a.name == "Luisa") && b.files().exists("C:\\Usuarios\\Luisa\\Documentos\\a.txt"));
+        assert!(!b.files().exists("C:\\Usuarios\\Luis"));
+        // Errores: nombre repetido y nombre malo.
+        let luisa = b.fila("Luisa");
+        b.pulsa(Act::Rename(luisa));
+        b.texto(T_REN, "ana");
+        assert_eq!(b.mensaje(), AccountError::Exists.text());
+        b.pulsa(Act::Rename(luisa));
+        b.texto(T_REN, "x|y");
+        assert_eq!(b.mensaje(), AccountError::BadName.text());
+        // Hacer administradora y volver a usuaria normal.
+        b.pulsa(Act::Admin(luisa));
+        assert!(b.dialog.is_none() && b.files().accounts().iter().find(|a| a.name == "Luisa").unwrap().admin);
+        b.dibuja(780, 520);
+        assert!(b.app.others[luisa].1);
+        b.pulsa(Act::Admin(luisa));
+        assert!(!b.files().accounts().iter().find(|a| a.name == "Luisa").unwrap().admin);
+    }
+
+    #[test]
+    fn eliminar_conservando_o_con_archivos_y_confirmando_el_nombre() {
+        let mut b = Banco::con_disco("Ana");
+        let n = crate::platform::DateTime::default();
+        for c in ["Marta", "Pepe"] {
+            b.files().create_account(c, None, false, [5; 16], n).unwrap();
+            b.files().write(&format!("C:\\Usuarios\\{c}\\Documentos\\a.txt"), b"x", n).unwrap();
+        }
+        // Conservar la carpeta: No.
+        let luis = b.fila("Luis");
+        b.files().write("C:\\Usuarios\\Luis\\Documentos\\a.txt", b"x", n).unwrap();
+        b.pulsa(Act::Delete(luis));
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_DEL_FILES, buttons: Buttons::YesNoCancel, .. })));
+        b.respuesta(T_DEL_FILES, Answer::No);
+        assert!(b.mensaje().contains("conservado"));
+        assert!(!b.files().accounts().iter().any(|a| a.name == "Luis") && b.files().exists("C:\\Usuarios\\Luis\\Documentos\\a.txt"));
+        // Cancelar: no se toca nada.
+        let marta = b.fila("Marta");
+        b.pulsa(Act::Delete(marta));
+        b.respuesta(T_DEL_FILES, Answer::Cancel);
+        assert!(b.dialog.is_none() && b.app.job.is_none() && b.files().accounts().iter().any(|a| a.name == "Marta"));
+        // Con archivos: pide el nombre; mal escrito (otra capitalización o vacío) no elimina.
+        b.pulsa(Act::Delete(marta));
+        b.respuesta(T_DEL_FILES, Answer::Yes);
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { tag: T_DEL_NAME, .. })));
+        b.texto(T_DEL_NAME, "marta");
+        assert!(b.mensaje().contains("No se ha eliminado nada"));
+        assert!(b.files().accounts().iter().any(|a| a.name == "Marta") && b.files().exists("C:\\Usuarios\\Marta\\Documentos\\a.txt"));
+        b.pulsa(Act::Delete(marta));
+        b.respuesta(T_DEL_FILES, Answer::Yes);
+        b.texto(T_DEL_NAME, "");
+        assert!(b.mensaje().contains("No se ha eliminado nada") && b.files().accounts().iter().any(|a| a.name == "Marta"));
+        // Cancelar el nombre tampoco.
+        b.pulsa(Act::Delete(marta));
+        b.respuesta(T_DEL_FILES, Answer::Yes);
+        b.responde(DialogResult::Text { tag: T_DEL_NAME, value: None });
+        assert!(b.dialog.is_none() && b.files().accounts().iter().any(|a| a.name == "Marta"));
+        // Bien escrito: se elimina con sus archivos.
+        b.pulsa(Act::Delete(marta));
+        b.respuesta(T_DEL_FILES, Answer::Yes);
+        b.texto(T_DEL_NAME, "Marta");
+        assert!(b.mensaje().contains("sus archivos"));
+        assert!(!b.files().accounts().iter().any(|a| a.name == "Marta") && !b.files().exists("C:\\Usuarios\\Marta"));
+        assert!(b.files().exists("C:\\Usuarios\\Pepe\\Documentos\\a.txt") && b.app.job.is_none());
+    }
+
+    #[test]
+    fn errores_de_cuentas_se_muestran() {
+        // Tres administradoras y una usuaria; la lista se dibuja con una sesión y luego cambia
+        // la situación (la pantalla puede ir por detrás del disco).
+        let mut b = Banco::con_disco("Ana");
+        let n = crate::platform::DateTime::default();
+        b.files().set_admin("Luis", true, n).unwrap();
+        let luis = b.fila("Luis");
+        // Sesión de Luis, único administrador: no puede quitarse el tipo ni eliminarse a sí mismo.
+        b.files().login("Luis", "").unwrap();
+        b.files().set_admin("Ana", false, n).unwrap();
+        b.pulsa_viejo(Act::Admin(luis));
+        assert_eq!(b.mensaje(), AccountError::LastAdmin.text());
+        b.pulsa_viejo(Act::Delete(luis));
+        b.respuesta(T_DEL_FILES, Answer::No);
+        assert_eq!(b.mensaje(), AccountError::InUse.text());
+        // Un usuario normal que aún tiene la pantalla de administrador.
+        let mut b = Banco::con_disco("Ana");
+        let luis = b.fila("Luis");
+        b.files().login("Luis", "").unwrap();
+        b.pulsa_viejo(Act::Admin(luis));
+        assert_eq!(b.mensaje(), AccountError::NotAdmin.text());
+        b.pulsa_viejo(Act::Rename(luis));
+        b.texto(T_REN, "Otro");
+        assert_eq!(b.mensaje(), AccountError::NotAdmin.text());
+        b.pulsa_viejo(Act::Delete(luis));
+        b.respuesta(T_DEL_FILES, Answer::No);
+        assert_eq!(b.mensaje(), AccountError::NotAdmin.text());
+    }
+
+    #[test]
+    fn un_usuario_normal_solo_ve_su_cuenta() {
+        let mut b = Banco::con_disco("Luis");
+        assert!(b.hay(Act::SetPwd) && !b.hay(Act::Add));
+        assert!(b.app.others.is_empty() && !b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(Act::Rename(_) | Act::Admin(_) | Act::Delete(_)))));
+        // Su clave sí la puede cambiar.
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "clave-luis");
+        b.texto(T_PW_REP, "clave-luis");
+        assert_eq!(b.mensaje(), "Se ha puesto la clave.");
+        assert!(b.files().verify_password("clave-luis"));
+        // Sin sesión de administrador, las cuentas de los demás siguen intactas.
+        assert_eq!(b.files().accounts().len(), 2);
+    }
+
+    #[test]
+    fn sin_disco_se_avisa_y_no_hay_acciones() {
+        let mut b = Banco::new();
+        b.pagina(PAGE_ACCOUNTS);
+        let s = b.dibuja(780, 520);
+        assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
+        assert!(s.px.iter().any(|&p| p != 0xFFFFFF));
+        assert!(!b.sys.files().persistent());
+        // Un clic donde estaría un botón no hace nada.
+        b.clic(PANEL_W + 40, 200);
+        assert!(b.dialog.is_none());
+    }
+
+    #[test]
+    fn la_lista_larga_se_desplaza_y_se_dibuja_en_cualquier_tamano() {
+        let mut b = Banco::con_disco("Ana");
+        let n = crate::platform::DateTime::default();
+        for i in 0..14 {
+            b.files().create_account(&format!("Cuenta{i:02}"), None, false, [6; 16], n).unwrap();
+        }
+        b.dibuja(780, 520);
+        assert!(b.app.metrics().needed());
+        let max = b.app.max_scroll();
+        b.ev(MouseEv::Wheel { x: 400, y: 300, dz: 1 });
+        assert!(b.app.scroll > 0 && b.redraw);
+        b.ev(MouseEv::Wheel { x: 400, y: 300, dz: 1000 });
+        assert_eq!(b.app.scroll, max);
+        b.dibuja(780, 520);
+        // El último botón (Añadir cuenta) está a la vista y se puede pulsar.
+        b.pulsa(Act::Add);
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { tag: T_ADD_NAME, .. })));
+        // Si la ventana crece, el desplazamiento se corrige solo.
+        b.dialog = None;
+        b.dibuja(780, 1400);
+        assert_eq!(b.app.scroll, 0);
+        for (w, h) in [(520, 360), (1, 1), (0, 0), (221, 400), (600, 1), (780, 520)] {
+            b.dibuja(w, h);
+        }
+        // La barra arrastra el contenido.
+        b.dibuja(780, 520);
+        let m = b.app.metrics();
+        let (ts, _) = b.app.sb.thumb(&m);
+        b.ev(MouseEv::Down { x: m.rect.x + 5, y: m.rect.y + ts + 2 });
+        b.ev(MouseEv::Move { x: m.rect.x + 5, y: 9000 });
+        b.ev(MouseEv::Up { x: m.rect.x + 5, y: 9000 });
+        assert_eq!(b.app.scroll, b.app.max_scroll());
     }
 }

@@ -2,8 +2,10 @@
 //! `cargo run --release -p nf-core --example apps_ui_preview -- carpeta`
 //! Guarda BMP de varias situaciones (tamaño por defecto y mínimo).
 use nf_core::apps::{self, App, AppKind, Ctx, MouseEv};
+use nf_core::block::RamDisk;
+use nf_core::files::Files;
 use nf_core::input::{Key, KeyEvent};
-use nf_core::platform::TestPlatform;
+use nf_core::platform::{DateTime, TestPlatform};
 use nf_core::surface::Surface;
 use nf_core::theme::{Theme, ACCENTS};
 
@@ -99,9 +101,9 @@ fn main() {
         guarda(&dir, &format!("conf_{nombre}_personalizacion"), &b.dibuja(w, h));
         // Pasa el ratón sobre "Acerca de" y entra.
         b.dibuja(w, h);
-        b.ratón(MouseEv::Move { x: 60, y: 56 + 40 + 10 });
+        b.ratón(MouseEv::Move { x: 60, y: 56 + 80 + 10 });
         guarda(&dir, &format!("conf_{nombre}_hover"), &b.dibuja(w, h));
-        b.clic(60, 56 + 40 + 10);
+        b.clic(60, 56 + 80 + 10);
         guarda(&dir, &format!("conf_{nombre}_acerca"), &b.dibuja(w, h));
         // Vuelve, elige otro fondo y otro color: se busca el color en la imagen para pulsar encima.
         b.clic(60, 56 + 10);
@@ -118,4 +120,34 @@ fn main() {
         guarda(&dir, &format!("conf_{nombre}_eleccion"), &b.dibuja(w, h));
         eprintln!("{nombre}: fondo {} acento {:06X}", b.theme.wallpaper, b.theme.accent);
     }
+
+    // Cuentas: sin disco (aviso), como administradora con dos cuentas más y como usuario normal.
+    for (nombre, (w, h)) in [("def", apps::default_size(AppKind::Settings)), ("min", (520, 360))] {
+        let mut b = Banco::new(AppKind::Settings);
+        b.dibuja(w, h);
+        b.clic(60, 56 + 40 + 10);
+        guarda(&dir, &format!("conf_{nombre}_cuentas_sin_disco"), &b.dibuja(w, h));
+        for quien in ["Ana", "Luis"] {
+            let mut b = Banco::new(AppKind::Settings);
+            b.sys.files = con_cuentas(quien);
+            b.dibuja(w, h);
+            b.clic(60, 56 + 40 + 10);
+            guarda(&dir, &format!("conf_{nombre}_cuentas_{}", quien.to_lowercase()), &b.dibuja(w, h));
+        }
+    }
+}
+
+/// Disco en memoria con la administradora Ana y el usuario normal Luis (más la normal Marta);
+/// la sesión es la de `quien`.
+fn con_cuentas(quien: &str) -> Files {
+    let n = DateTime::default();
+    let mut f = Files::probe(Some(Box::new(RamDisk::new(2048))), n);
+    f.format_pending(n).unwrap();
+    f.create_account("Ana", Some("secreta1"), true, [1; 16], n).unwrap();
+    f.login("Ana", "secreta1").unwrap();
+    f.create_account("Luis", None, false, [2; 16], n).unwrap();
+    f.create_account("Marta", Some("clavemarta"), true, [3; 16], n).unwrap();
+    f.logout();
+    f.login(quien, if quien == "Ana" { "secreta1" } else { "" }).unwrap();
+    f
 }

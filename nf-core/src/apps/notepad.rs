@@ -2,7 +2,7 @@
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
-use crate::files::{self, DOCUMENTS_DIR};
+use crate::files::{self, Std};
 use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::input::{Key, KeyEvent};
@@ -221,8 +221,8 @@ impl Notepad {
         self.path.as_deref().map_or("Sin título", files::file_name)
     }
 
-    fn doc_dir(&self) -> String {
-        self.path.as_deref().and_then(files::parent).unwrap_or_else(|| String::from(DOCUMENTS_DIR))
+    fn doc_dir(&self, cx: &mut Ctx) -> String {
+        self.path.as_deref().and_then(files::parent).unwrap_or_else(|| cx.sys.files().std_dir(Std::Documents))
     }
 
     /// Ejecuta una acción ya autorizada.
@@ -238,7 +238,7 @@ impl Notepad {
                 self.modified = false;
             }
             Pending::Abrir => {
-                cx.dialog = Some(DialogRequest::Open { tag: TAG_OPEN, title: String::from("Abrir"), dir: self.doc_dir() });
+                cx.dialog = Some(DialogRequest::Open { tag: TAG_OPEN, title: String::from("Abrir"), dir: self.doc_dir(cx) });
             }
             Pending::Cerrar => cx.close = true,
         }
@@ -264,7 +264,7 @@ impl Notepad {
         cx.dialog = Some(DialogRequest::Save {
             tag: TAG_SAVE,
             title: String::from("Guardar como"),
-            dir: self.doc_dir(),
+            dir: self.doc_dir(cx),
             name: String::from(name),
         });
     }
@@ -900,7 +900,13 @@ mod tests {
         DialogResult::Path { tag: TAG_SAVE, path: Some(String::from(p)) }
     }
 
-    const DOC: &str = "C:\\Documentos\\a.txt";
+    fn docs() -> String {
+        files::join(&files::join(files::USERS_DIR, files::DEFAULT_USER), Std::Documents.name())
+    }
+
+    fn doc() -> String {
+        files::join(&docs(), "a.txt")
+    }
 
     #[test]
     fn guardar_nuevo_escribe_crlf_y_actualiza_titulo() {
@@ -914,20 +920,20 @@ mod tests {
         assert_eq!(np.title(), "*Sin título: Bloc de notas");
         np.key(&ctrl('s', false), &mut cx);
         let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!("sin Guardar como") };
-        assert_eq!((dir.as_str(), name.as_str()), (DOCUMENTS_DIR, "Sin título.txt"));
-        np.dialog_result(ruta(DOC), &mut cx);
-        assert_eq!(cx.sys.files().read(DOC).unwrap(), "uno\r\ndos ñx".as_bytes());
+        assert_eq!((dir.as_str(), name.as_str()), (docs().as_str(), "Sin título.txt"));
+        np.dialog_result(ruta(&doc()), &mut cx);
+        assert_eq!(cx.sys.files().read(&doc()).unwrap(), "uno\r\ndos ñx".as_bytes());
         assert!(!np.modified);
         assert_eq!(np.title(), "a.txt: Bloc de notas");
         // Con ruta, Ctrl+S escribe sin diálogo.
         np.key(&ev(Key::Char('y'), Some('y')), &mut cx);
         np.key(&ctrl('s', false), &mut cx);
         assert!(cx.dialog.is_none() && !np.modified);
-        assert_eq!(cx.sys.files().read(DOC).unwrap(), "uno\r\ndos ñxy".as_bytes());
+        assert_eq!(cx.sys.files().read(&doc()).unwrap(), "uno\r\ndos ñxy".as_bytes());
         // Guardar como propone el nombre actual en su carpeta.
         np.key(&ctrl('s', true), &mut cx);
         let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!() };
-        assert_eq!((dir.as_str(), name.as_str()), (DOCUMENTS_DIR, "a.txt"));
+        assert_eq!((dir.as_str(), name.as_str()), (docs().as_str(), "a.txt"));
     }
 
     #[test]
@@ -936,12 +942,12 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(DOC, "a\tb\nc\r\nd".as_bytes(), now).unwrap();
+        cx.sys.files().write(&doc(), "a\tb\nc\r\nd".as_bytes(), now).unwrap();
         let mut np = blank();
         np.key(&ctrl('o', false), &mut cx);
         let Some(DialogRequest::Open { dir, .. }) = cx.dialog.take() else { panic!() };
-        assert_eq!(dir, DOCUMENTS_DIR);
-        np.dialog_result(DialogResult::Path { tag: TAG_OPEN, path: Some(String::from(DOC)) }, &mut cx);
+        assert_eq!(dir, docs());
+        np.dialog_result(DialogResult::Path { tag: TAG_OPEN, path: Some(doc()) }, &mut cx);
         assert_eq!(texto(&np.ed), "a    b\nc\nd");
         assert!(!np.modified && np.title() == "a.txt: Bloc de notas");
     }
@@ -952,13 +958,13 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(DOC, &[0xFF, 0xFE, 0x41], now).unwrap();
-        cx.sys.files().write("C:\\Documentos\\g.txt", &vec![b'a'; MAX_FILE + 1], now).unwrap();
+        cx.sys.files().write(&doc(), &[0xFF, 0xFE, 0x41], now).unwrap();
+        cx.sys.files().write(&files::join(&docs(), "g.txt"),&vec![b'a'; MAX_FILE + 1], now).unwrap();
         let mut np = blank();
         escribe(&mut np.ed, "previo");
-        np.open_path(DOC, &mut cx);
+        np.open_path(&doc(), &mut cx);
         assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { text, .. }) if text.contains("no es un archivo de texto")));
-        np.open_path("C:\\Documentos\\g.txt", &mut cx);
+        np.open_path(&files::join(&docs(), "g.txt"), &mut cx);
         assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { text, .. }) if text.contains("1 MiB")));
         assert_eq!(texto(&np.ed), "previo");
         assert!(np.path.is_none());
@@ -970,9 +976,9 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(DOC, b"hola", now).unwrap();
+        cx.sys.files().write(&doc(), b"hola", now).unwrap();
         let mut np = new();
-        np.open_path(DOC, &mut cx);
+        np.open_path(&doc(), &mut cx);
         assert_eq!(np.title(), "a.txt: Bloc de notas");
         assert!(cx.dialog.is_none());
     }
@@ -1003,7 +1009,7 @@ mod tests {
         cx.dialog = None;
         np.dialog_result(resp(TAG_ASK, Answer::Yes), &mut cx);
         assert!(matches!(cx.dialog.take(), Some(DialogRequest::Save { .. })) && !cx.close);
-        np.dialog_result(ruta(DOC), &mut cx);
+        np.dialog_result(ruta(&doc()), &mut cx);
         assert!(cx.close && !np.modified);
     }
 

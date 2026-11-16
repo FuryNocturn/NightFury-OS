@@ -3,6 +3,7 @@
 use nf_core::apps::{App, AppKind, Ctx, MouseEv};
 use nf_core::desktop::Desktop;
 use nf_core::dialogs::{Buttons, DialogRequest};
+use nf_core::files::{self, Std};
 use nf_core::geom::Rect;
 use nf_core::input::{Event, Key, KeyEvent};
 use nf_core::menu::{MenuItem, MenuRequest};
@@ -101,9 +102,10 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut sys = TestPlatform { size: (W as u32, H as u32), ..Default::default() };
     let now = sys.now();
-    sys.files.mkdir("C:\\Escritorio\\Proyectos", now).unwrap();
-    sys.files.write("C:\\Escritorio\\notas.txt", b"hola", now).unwrap();
-    sys.files.write("C:\\Escritorio\\datos.bin", b"1234", now).unwrap();
+    let desk = sys.files.std_dir(Std::Desktop);
+    sys.files.mkdir(&files::join(&desk, "Proyectos"), now).unwrap();
+    sys.files.write(&files::join(&desk, "notas.txt"), b"hola", now).unwrap();
+    sys.files.write(&files::join(&desk, "datos.bin"), b"1234", now).unwrap();
     let d = Desktop::new(W, H, &mut sys);
     let mut s = Shots { dir, d, sys };
 
@@ -203,10 +205,10 @@ fn main() {
 
     // 7. Diálogo "Guardar como" con archivos y una carpeta, y un mensaje de pregunta.
     let now = s.sys.now();
-    s.sys.files.mkdir("C:\\Documentos\\Proyectos", now).unwrap();
-    s.sys.files.write("C:\\Documentos\\nota.txt", b"hola", now).unwrap();
-    s.sys.files.write("C:\\Documentos\\datos.bin", b"1234", now).unwrap();
-    let dir = String::from("C:\\Documentos");
+    let dir = s.sys.files.std_dir(Std::Documents);
+    s.sys.files.mkdir(&files::join(&dir, "Proyectos"), now).unwrap();
+    s.sys.files.write(&files::join(&dir, "nota.txt"), b"hola", now).unwrap();
+    s.sys.files.write(&files::join(&dir, "datos.bin"), b"1234", now).unwrap();
     s.d.request_dialog(DialogRequest::Save { tag: 1, title: "Guardar como".into(), dir, name: "nota".into() }, &mut s.sys);
     s.mv(640, 400);
     s.key(Key::Tab);
