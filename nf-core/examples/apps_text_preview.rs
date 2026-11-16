@@ -1,7 +1,7 @@
 //! Vista previa del Bloc de notas y el Terminal:
 //! `cargo run --release -p nf-core --example apps_text_preview -- carpeta`
 //! Escribe un BMP por app y tamaño (por defecto y mínimo) en la carpeta indicada.
-use nf_core::apps::{self, App, AppKind, Ctx};
+use nf_core::apps::{self, App, AppKind, Ctx, MouseEv};
 use nf_core::bmp;
 use nf_core::input::{Key, KeyEvent};
 use nf_core::platform::TestPlatform;
@@ -67,4 +67,12 @@ fn main() {
         let (mw, mh) = app.min_size();
         guarda(&dir, &format!("{}_pequeno", nombre), app, mw, mh, &mut sys);
     }
+    // Bloc de notas con el menú Archivo desplegado y una entrada resaltada.
+    {
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        nota.mouse(MouseEv::Down { x: 10, y: 5 }, &mut cx);
+        nota.mouse(MouseEv::Move { x: 40, y: 24 + 2 + 26 + 5 }, &mut cx);
+    }
+    let (w, h) = apps::default_size(AppKind::Notepad);
+    guarda(&dir, "notepad_menu", &mut *nota, w, h, &mut sys);
 }
