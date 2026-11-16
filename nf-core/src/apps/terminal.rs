@@ -2,7 +2,7 @@
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::font;
 use crate::geom::Rect;
-use crate::files::{file_name, join, parent, resolve, valid_name};
+use crate::files::{file_name, in_system, join, parent, resolve, valid_name};
 use crate::fs::FsError;
 use crate::input::{Key, KeyEvent};
 use crate::platform::Platform;
@@ -22,6 +22,7 @@ const MAX_LINES: usize = 500;
 const BLINK_MS: u64 = 530;
 const BG: u32 = 0x0C0C0C;
 const FG: u32 = 0xCCCCCC;
+const CONFIRM: &str = "Vas a modificar una carpeta del sistema. Escribe si para continuar:";
 
 /// Efecto de una orden sobre la ventana.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,6 +205,10 @@ fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> 
             })(),
             _ => uso("escribir archivo texto"),
         },
+        "quien" => Ok(match f.user() {
+            Some(u) => vec![format!("Usuario: {}", u), format!("Tipo: {}", if f.is_admin() { "administrador" } else { "usuario normal" })],
+            None => vec![String::from("No hay ninguna sesión abierta.")],
+        }),
         "disco" => {
             let (total, free) = f.space();
             Ok(vec![
@@ -222,6 +227,25 @@ fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> 
 fn mb(bytes: u64) -> String {
     let d = bytes * 10 / (1 << 20);
     format!("{},{} MB", d / 10, d % 10)
+}
+
+/// ¿Modifica la orden algo dentro de `C:\Sistema`? Solo se pregunta a un administrador (a los
+/// demás `Files` les deniega el acceso sin más). Mira el origen y el destino.
+fn modifies_system(line: &str, sys: &mut dyn Platform, cwd: &str) -> bool {
+    if !sys.files().is_admin() {
+        return false;
+    }
+    let line = line.trim();
+    let (cmd, args) = line.split_once(' ').map_or((line, ""), |(c, a)| (c, a.trim()));
+    let a = tokens(args);
+    let paths: Vec<String> = match lower(cmd).as_str() {
+        "carpeta" | "renombrar" => a.into_iter().take(1).collect(),
+        "copiar" | "mover" => a.into_iter().take(2).collect(),
+        "borrar" => a.into_iter().filter(|t| !t.eq_ignore_ascii_case("/todo")).take(1).collect(),
+        "escribir" => first_token(args).map(|t| t.0).into_iter().collect(),
+        _ => Vec::new(),
+    };
+    paths.iter().any(|p| resolve(cwd, p).is_ok_and(|p| in_system(&p)))
 }
 
 /// Intérprete de órdenes: devuelve las líneas de salida y la acción pedida.
@@ -261,6 +285,8 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
             "  borrar [/todo] ruta: Borra para siempre (/todo: carpeta con contenido)",
             "  escribir archivo texto: Crea o reemplaza un archivo con ese texto",
             "  disco: Tamaño, espacio libre y tipo del disco C:",
+            "  quien: Muestra el usuario de la sesión y si es administrador",
+            "Modificar algo dentro de C:\\Sistema pide confirmación: escribe si para continuar.",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -335,8 +361,10 @@ fn wrap(text: &str, max_w: i32) -> Vec<String> {
 
 pub struct Terminal {
     out: Vec<String>,
-    /// Carpeta actual.
+    /// Carpeta actual (vacía hasta el primer uso: entonces pasa a ser la del usuario).
     cwd: String,
+    /// Orden de `C:Sistema` esperando que se escriba `si`.
+    pending: Option<String>,
     input: String,
     history: Vec<String>,
     /// Posición en `history` al recorrerlo con las flechas; `history.len()` = línea nueva.
@@ -362,7 +390,8 @@ impl Terminal {
     fn new() -> Self {
         let mut t = Terminal {
             out: Vec::new(),
-            cwd: String::from("C:\\"),
+            cwd: String::new(),
+            pending: None,
             input: String::new(),
             history: Vec::new(),
             hist_pos: 0,
@@ -400,14 +429,40 @@ impl Terminal {
         }
     }
 
+    /// La carpeta de partida es la del usuario de la sesión.
+    fn ready(&mut self, sys: &mut dyn Platform) {
+        if self.cwd.is_empty() {
+            self.cwd = sys.files().home();
+        }
+    }
+
     fn submit(&mut self, sys: &mut dyn Platform) -> Action {
+        self.ready(sys);
         let line = core::mem::take(&mut self.input);
         self.push(format!("{}{}", prompt(&self.cwd), line));
         let cmd = line.trim();
+        // Respuesta a "¿Seguro?": solo `si` sigue adelante; cualquier otra cosa cancela.
+        if let Some(orden) = self.pending.take() {
+            self.hist_pos = self.history.len();
+            if !(cmd.eq_ignore_ascii_case("si") || cmd.eq_ignore_ascii_case("sí")) {
+                self.push(String::from("Cancelado."));
+                return Action::Nothing;
+            }
+            let (lines, act) = run(&orden, sys, &mut self.cwd);
+            for l in lines {
+                self.push(l);
+            }
+            return act;
+        }
         if !cmd.is_empty() && self.history.last().map(String::as_str) != Some(cmd) {
             self.history.push(cmd.to_string());
         }
         self.hist_pos = self.history.len();
+        if modifies_system(&line, sys, &self.cwd) {
+            self.pending = Some(line);
+            self.push(String::from(CONFIRM));
+            return Action::Nothing;
+        }
         let (lines, act) = run(&line, sys, &mut self.cwd);
         if act == Action::Clear {
             self.out.clear();
@@ -438,7 +493,8 @@ impl App for Terminal {
         }
     }
 
-    fn draw(&mut self, s: &mut Surface, theme: &Theme, _sys: &mut dyn Platform, focused: bool) {
+    fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, focused: bool) {
+        self.ready(sys);
         self.focused = focused;
         s.fill_rect(s.bounds(), BG);
         let lh = font::line_h(SIZE);
@@ -503,6 +559,7 @@ impl App for Terminal {
             Key::Escape => {
                 self.scroll = 0;
                 self.input.clear();
+                self.pending = None;
                 self.hist_pos = self.history.len();
             }
             Key::Up => {
@@ -569,10 +626,35 @@ impl App for Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::TestPlatform;
+    use crate::block::RamDisk;
+    use crate::files::{Files, DEFAULT_USER, USERS_DIR};
+    use crate::platform::{DateTime, TestPlatform};
+
+    /// Carpeta del usuario de la sesión por defecto de las pruebas.
+    fn home() -> String {
+        join(USERS_DIR, DEFAULT_USER)
+    }
+    fn h(rel: &str) -> String {
+        join(&home(), rel)
+    }
 
     fn ejecuta(l: &str) -> (Vec<String>, Action) {
-        run(l, &mut TestPlatform { ms: 3_723_000, size: (1024, 768), ..Default::default() }, &mut String::from("C:\\"))
+        run(l, &mut TestPlatform { ms: 3_723_000, size: (1024, 768), ..Default::default() }, &mut home())
+    }
+
+    /// Plataforma con disco: administradora Ana y usuario normal Luis, con la sesión de `quien`.
+    fn con_disco(quien: &str) -> TestPlatform {
+        let n = DateTime::default();
+        let mut f = Files::probe(Some(Box::new(RamDisk::new(2048))), n);
+        f.format_pending(n).unwrap();
+        f.create_account("Ana", None, true, [1; 16], n).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], n).unwrap();
+        f.write(&join(&join(&join(USERS_DIR, "Ana"), "Documentos"), "secreto.txt"), b"x", n).unwrap();
+        f.login(quien, "").unwrap();
+        let mut p = TestPlatform::default();
+        p.files = f;
+        p
     }
 
     fn ev(key: Key, ch: Option<char>) -> KeyEvent {
@@ -611,31 +693,31 @@ mod tests {
     /// Ejecuta varias órdenes seguidas con la misma plataforma y carpeta actual.
     fn sesion(ordenes: &[&str]) -> (Vec<Vec<String>>, String, TestPlatform) {
         let mut p = TestPlatform::default();
-        let mut cwd = String::from("C:\\");
+        let mut cwd = p.files().home();
         let out = ordenes.iter().map(|o| run(o, &mut p, &mut cwd).0).collect();
         (out, cwd, p)
     }
 
     #[test]
     fn ir_cambia_carpeta_y_prompt() {
-        let (o, cwd, _) = sesion(&["ir", "ir Documentos", "cd", "ir ..", "ir C:\\Escritorio", "ir ../Imágenes", "ir nada"]);
-        assert_eq!(o[0], ["C:\\"]);
+        let (o, cwd, _) = sesion(&["ir", "ir Documentos", "cd", "ir ..", "ir Escritorio", "ir ../Imágenes", "ir nada"]);
+        assert_eq!(o[0], [home()]);
         assert!(o[1].is_empty());
-        assert_eq!(o[2], ["C:\\Documentos"]);
+        assert_eq!(o[2], [h("Documentos")]);
         assert_eq!(o[6], [FsError::NotFound.message()]);
-        assert_eq!(cwd, "C:\\Imágenes");
-        assert_eq!(prompt(&cwd), "C:\\Imágenes> ");
+        assert_eq!(cwd, h("Imágenes"));
+        assert_eq!(prompt(&cwd), format!("{}> ", h("Imágenes")));
         let (o, cwd, _) = sesion(&["escribir a.txt hola", "ir a.txt", "ir a b"]);
         assert_eq!(o[1], [FsError::NotDir.message()]);
         assert_eq!(o[2], ["Uso: ir [ruta]"]);
-        assert_eq!(cwd, "C:\\");
+        assert_eq!(cwd, home());
         // el indicador del Terminal sigue la carpeta
         con_cx(|cx| {
             let mut t = Terminal::new();
             escribe(&mut t, "ir Documentos", cx);
-            assert_eq!(t.cwd, "C:\\Documentos");
+            assert_eq!(t.cwd, h("Documentos"));
             escribe(&mut t, "eco x", cx);
-            assert_eq!(t.out[t.out.len() - 2], "C:\\Documentos> eco x");
+            assert_eq!(t.out[t.out.len() - 2], format!("{}> eco x", h("Documentos")));
         });
     }
 
@@ -643,16 +725,16 @@ mod tests {
     fn open_path_cambia_la_carpeta_solo_si_existe() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        sys.files().write("C:\\a.txt", b"x", now).unwrap();
+        sys.files().write(&h("a.txt"), b"x", now).unwrap();
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let mut t = Terminal::new();
-        t.open_path("C:\\Documentos", &mut cx);
-        assert_eq!(t.cwd, "C:\\Documentos");
-        assert_eq!(prompt(&t.cwd), "C:\\Documentos> ");
-        t.open_path("C:\\nada", &mut cx);
-        t.open_path("C:\\a.txt", &mut cx);
-        assert_eq!(t.cwd, "C:\\Documentos");
+        t.open_path(&h("Documentos"), &mut cx);
+        assert_eq!(t.cwd, h("Documentos"));
+        assert_eq!(prompt(&t.cwd), format!("{}> ", h("Documentos")));
+        t.open_path(&h("nada"), &mut cx);
+        t.open_path(&h("a.txt"), &mut cx);
+        assert_eq!(t.cwd, h("Documentos"));
     }
 
     #[test]
@@ -673,16 +755,16 @@ mod tests {
             "carpeta Documentos\\sub",
             "escribir Documentos\\a.txt hola",
             "lista Documentos",
-            "dir \"C:\\\"",
+            "dir \"C:\\Usuarios\"",
             "lista a b",
             "lista nada",
         ]);
         let l = &o[2];
-        assert_eq!(l[0], "Carpeta C:\\Documentos");
+        assert_eq!(l[0], format!("Carpeta {}", h("Documentos")));
         assert!(l[1].starts_with("15/11/2026 21:37") && l[1].contains("<CARPETA>") && l[1].ends_with("sub"));
         assert!(l[2].contains(" 6  a.txt"), "{:?}", l[2]);
         assert!(l[3].starts_with("Archivos: 1, carpetas: 1, 6 bytes. Libre: "), "{:?}", l[3]);
-        assert_eq!(o[3].len(), 4 + 2);
+        assert_eq!(o[3].len(), 1 + 1 + 1); // cabecera, la carpeta de la cuenta y el resumen
         assert_eq!(o[4], ["Uso: lista [ruta]"]);
         assert_eq!(o[5], [FsError::NotFound.message()]);
         let d = ejecuta("disco").0;
@@ -702,7 +784,7 @@ mod tests {
             "escribir x",
         ]);
         assert!(o[0].is_empty());
-        assert_eq!(p.files().read("C:\\mi nota.txt").unwrap(), "Hola  mundo ñ\r\n".as_bytes());
+        assert_eq!(p.files().read(&h("mi nota.txt")).unwrap(), "Hola  mundo ñ\r\n".as_bytes());
         assert_eq!(o[1], ["Hola  mundo ñ"]);
         assert_eq!(o[2], ["Uso: ver archivo"]);
         assert_eq!(o[3], [FsError::NotFound.message()]);
@@ -710,11 +792,11 @@ mod tests {
         assert_eq!(o[5], ["Uso: escribir archivo texto"]);
         // no UTF-8 y recorte
         let now = p.now();
-        p.files().write("C:\\bin", &[0xff, 0xfe, 0], now).unwrap();
-        let mut cwd = String::from("C:\\");
+        p.files().write(&h("bin"), &[0xff, 0xfe, 0], now).unwrap();
+        let mut cwd = home();
         assert_eq!(run("ver bin", &mut p, &mut cwd).0, ["No es un archivo de texto (UTF-8)."]);
         let largo = "linea\n".repeat(500);
-        p.files().write("C:\\largo", largo.as_bytes(), now).unwrap();
+        p.files().write(&h("largo"), largo.as_bytes(), now).unwrap();
         let v = run("ver largo", &mut p, &mut cwd).0;
         assert_eq!(v.len(), VER_LINES + 1);
         assert!(v[VER_LINES].starts_with("..."));
@@ -740,10 +822,10 @@ mod tests {
             "mover nada x",
         ]);
         assert!(o[..4].iter().all(Vec::is_empty));
-        assert_eq!(p.files().read("C:\\Mi carpeta\\a.txt").unwrap(), b"uno\r\n");
+        assert_eq!(p.files().read(&join(&h("Mi carpeta"), "a.txt")).unwrap(), b"uno\r\n");
         assert_eq!(o[4], [FsError::Exists.message()]);
-        assert!(!p.files().exists("C:\\b.txt"));
-        assert_eq!(p.files().read("C:\\Escritorio\\c.txt").unwrap(), b"uno\r\n");
+        assert!(!p.files().exists(&h("b.txt")));
+        assert_eq!(p.files().read(&join(&h("Escritorio"), "c.txt")).unwrap(), b"uno\r\n");
         assert_eq!(o[7], [FsError::BadName.message()]);
         assert_eq!(o[8].len(), 1);
         assert_eq!(o[9], ["Uso: copiar origen destino"]);
@@ -763,26 +845,122 @@ mod tests {
             "borrar Documentos\\suelto.txt",
             "borrar Documentos\\p",
             "ir Documentos\\p",
-            "borrar /TODO C:\\Documentos\\p",
+            "borrar /TODO .",
             "carpeta vacia",
             "borrar vacia",
             "borrar",
             "borrar /todo",
             "borrar nada",
-            "borrar C:\\Sistema",
+            "borrar /todo C:\\Sistema",
         ]);
         assert!(o[3].is_empty());
         assert_eq!(o[4].len(), 2);
         assert_eq!(o[4][0], FsError::NotEmpty.message());
         assert!(o[4][1].contains("borrar /todo"));
         assert!(o[6].is_empty());
-        assert!(!p.files().exists("C:\\Documentos\\p"));
-        assert_eq!(cwd, "C:\\Documentos");
-        assert!(o[8].is_empty() && !p.files().exists("C:\\Documentos\\vacia"));
+        assert!(!p.files().exists(&join(&h("Documentos"), "p")));
+        assert_eq!(cwd, h("Documentos"));
+        assert!(o[8].is_empty() && !p.files().exists(&join(&h("Documentos"), "vacia")));
         assert_eq!(o[9], ["Uso: borrar [/todo] ruta"]);
         assert_eq!(o[10], ["Uso: borrar [/todo] ruta"]);
         assert_eq!(o[11], [FsError::NotFound.message()]);
         assert_eq!(o[12], [FsError::Invalid.message()]);
+    }
+
+    #[test]
+    fn arranca_en_la_carpeta_del_usuario_y_el_indicador_la_muestra() {
+        let mut sys = con_disco("Luis");
+        let mut t = Terminal::new();
+        let mut s = Surface::new(320, 160, 0);
+        t.draw(&mut s, &Theme::default(), &mut sys, true);
+        assert_eq!(t.cwd, join(USERS_DIR, "Luis"));
+        assert_eq!(prompt(&t.cwd), "C:\\Usuarios\\Luis> ");
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        escribe(&mut t, "ir Documentos", &mut cx);
+        assert_eq!(t.out[t.out.len() - 1], "C:\\Usuarios\\Luis> ir Documentos");
+        assert_eq!(prompt(&t.cwd), "C:\\Usuarios\\Luis\\Documentos> ");
+        // Aunque la primera cosa sea una tecla: la carpeta se fija al ejecutar.
+        let mut t = Terminal::new();
+        escribe(&mut t, "ir", &mut cx);
+        assert_eq!(t.out.last().unwrap(), "C:\\Usuarios\\Luis");
+    }
+
+    #[test]
+    fn quien_muestra_usuario_y_tipo() {
+        let mut p = con_disco("Ana");
+        assert_eq!(run("quien", &mut p, &mut home()).0, ["Usuario: Ana", "Tipo: administrador"]);
+        let mut p = con_disco("Luis");
+        assert_eq!(run("QUIEN", &mut p, &mut home()).0, ["Usuario: Luis", "Tipo: usuario normal"]);
+        p.files.logout();
+        assert_eq!(run("quien", &mut p, &mut home()).0, ["No hay ninguna sesión abierta."]);
+        assert!(ejecuta("ayuda").0.iter().any(|l| l.trim_start().starts_with("quien")));
+    }
+
+    /// Escribe órdenes en un terminal ya abierto y devuelve lo que salió tras la última.
+    fn teclea(t: &mut Terminal, cx: &mut Ctx, orden: &str) -> Vec<String> {
+        let n = t.out.len();
+        escribe(t, orden, cx);
+        t.out[n + 1..].to_vec()
+    }
+
+    #[test]
+    fn en_sistema_pide_si_y_solo_si_continua() {
+        let mut sys = con_disco("Ana");
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut t = Terminal::new();
+        let conf = String::from(CONFIRM);
+        // Con "si" se ejecuta.
+        assert_eq!(teclea(&mut t, &mut cx, "carpeta C:\\Sistema\\temp\\prueba"), [conf.clone()]);
+        assert!(!cx.sys.files().exists("C:\\Sistema\\temp\\prueba"));
+        assert!(teclea(&mut t, &mut cx, "si").is_empty());
+        assert!(cx.sys.files().exists("C:\\Sistema\\temp\\prueba"));
+        // Con otra cosa se cancela y esa otra cosa no se ejecuta como orden.
+        assert_eq!(teclea(&mut t, &mut cx, "escribir C:\\Sistema\\temp\\n.txt hola"), [conf.clone()]);
+        assert_eq!(teclea(&mut t, &mut cx, "eco hola"), ["Cancelado."]);
+        assert!(!cx.sys.files().exists("C:\\Sistema\\temp\\n.txt"));
+        // Tras cancelar, el siguiente comando va normal.
+        assert_eq!(teclea(&mut t, &mut cx, "eco x"), ["x"]);
+        // Origen o destino dentro de Sistema, y renombrar y borrar.
+        let docs = join(&t.cwd, "Documentos");
+        cx.sys.files().write(&join(&docs, "a.txt"), b"x", DateTime::default()).unwrap();
+        for orden in ["copiar Documentos\\a.txt C:\\Sistema\\temp", "copiar C:\\Sistema\\config\\cuentas Documentos\\c.txt", "mover Documentos\\a.txt C:\\Sistema\\temp", "borrar /todo C:\\Sistema\\temp\\prueba", "renombrar C:\\Sistema\\temp\\prueba otra"] {
+            assert_eq!(teclea(&mut t, &mut cx, orden), [conf.clone()], "{orden}");
+            assert_eq!(teclea(&mut t, &mut cx, "no"), ["Cancelado."]);
+        }
+        assert!(cx.sys.files().exists("C:\\Sistema\\temp\\prueba") && cx.sys.files().exists(&join(&docs, "a.txt")));
+        // Escape también cancela.
+        teclea(&mut t, &mut cx, "borrar C:\\Sistema\\temp\\prueba");
+        t.key(&ev(Key::Escape, None), &mut cx);
+        assert_eq!(teclea(&mut t, &mut cx, "si"), ["'si' no es una orden conocida. Escribe 'ayuda'."]);
+        // Fuera de Sistema no pregunta.
+        assert!(teclea(&mut t, &mut cx, "borrar Documentos\\a.txt").is_empty());
+        // Preguntar ni ejecuta ni registra la orden dos veces en el historial.
+        assert_eq!(t.history.iter().filter(|h| h.starts_with("borrar C:\\Sistema")).count(), 1);
+    }
+
+    #[test]
+    fn un_usuario_normal_recibe_el_mensaje_sin_confirmacion() {
+        let mut sys = con_disco("Luis");
+        let mut th = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut th, 0);
+        let mut t = Terminal::new();
+        let denied = [FsError::Denied.message()];
+        // Escribir en Sistema y entrar o escribir en la carpeta de otro usuario.
+        assert_eq!(teclea(&mut t, &mut cx, "carpeta C:\\Sistema\\temp\\x"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "escribir C:\\Sistema\\temp\\x.txt hola"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "ir C:\\Usuarios\\Ana"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "ver C:\\Usuarios\\Ana\\Documentos\\secreto.txt"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "lista C:\\Usuarios\\Ana\\Documentos"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "copiar Documentos C:\\Usuarios\\Ana\\Documentos"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "borrar C:\\Usuarios\\Ana\\Documentos\\secreto.txt"), denied);
+        assert!(teclea(&mut t, &mut cx, "escribir Documentos\\mio.txt hola").is_empty());
+        assert_eq!(teclea(&mut t, &mut cx, "mover Documentos\\mio.txt C:\\Usuarios\\Ana\\Documentos"), denied);
+        assert_eq!(teclea(&mut t, &mut cx, "renombrar C:\\Usuarios\\Ana\\Documentos\\secreto.txt otro.txt"), denied);
+        assert_eq!(t.cwd, "C:\\Usuarios\\Luis");
+        // Sus propias cosas, con normalidad.
+        assert!(teclea(&mut t, &mut cx, "mover Documentos\\mio.txt Escritorio").is_empty());
     }
 
     #[test]
@@ -844,7 +1022,7 @@ mod tests {
             let n = t.out.len();
             t.key(&ev(Key::Enter, Some('\n')), cx);
             assert_eq!(t.out.len(), n + 1);
-            assert_eq!(t.out[n], prompt("C:\\"));
+            assert_eq!(t.out[n], prompt(&home()));
         });
     }
 
