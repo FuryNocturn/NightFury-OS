@@ -11,6 +11,8 @@ use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
 use crate::menu::{MenuItem, MenuRequest};
 use crate::platform::{DateTime, Platform};
+use crate::ribbon::{Group, Ribbon, RibbonAct, RibbonItem, Tab};
+use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::{blend, Surface};
 use crate::theme::Theme;
 use alloc::boxed::Box;
@@ -20,18 +22,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+/// Alto de la cinta (`Ribbon::height`, lo comprueba una prueba).
+const RIB_H: i32 = 116;
 const NAV_H: i32 = 34;
-const CMD_H: i32 = 32;
 const HEAD_H: i32 = 22;
 const ROW_H: i32 = 22;
 const STATUS_H: i32 = 22;
 const PANEL_W: i32 = 140;
-const SB_W: i32 = 10;
 const COL_W: [i32; 3] = [152, 152, 76];
-/// Iconos grandes: celda de la rejilla y tamaño del icono.
-const CELL_W: i32 = 84;
-const CELL_H: i32 = 76;
-const BIG: i32 = 48;
 /// Lista: ancho de cada columna.
 const LCOL_W: i32 = 190;
 /// Filas que mueve la rueda por muesca en Detalles (en Iconos, una fila de la rejilla; en Lista, una columna).
@@ -48,17 +46,21 @@ const PLACES: [(&str, &str, Icon); 5] = [
     ("Disco local (C:)", "C:\\", Icon::Drive),
     ("Papelera", files::TRASH, Icon::Trash),
 ];
-/// Dónde se recuerdan la vista y el orden.
-const PREFS: &str = "C:\\Sistema\\explorador.txt";
+//// Dónde se recuerdan la vista, el orden y las extensiones.
+const PREFS: &str = files::EXPLORER_PREFS;
 const TAG_NEW: u32 = 1;
 const TAG_RENAME: u32 = 2;
 const TAG_EMPTY: u32 = 3;
 const TAG_ERROR: u32 = 4;
 const TAG_PROPS: u32 = 5;
 const TAG_NEWDOC: u32 = 6;
-/// Menús: sobre un elemento / sobre la zona vacía.
+const TAG_MOVETO: u32 = 7;
+const TAG_COPYTO: u32 = 8;
+/// Menús: sobre un elemento / sobre la zona vacía / de la cinta (Archivo y Ordenar por).
 const TAG_MENU_ITEM: u32 = 1;
 const TAG_MENU_BG: u32 = 2;
+const TAG_MENU_FILE: u32 = 3;
+const TAG_MENU_SORT: u32 = 4;
 const M_OPEN: u32 = 1;
 const M_OPEN_NEW: u32 = 2;
 const M_NOTEPAD: u32 = 3;
@@ -77,21 +79,77 @@ const M_NEW_DOC: u32 = 15;
 const M_VIEW_DETAILS: u32 = 20;
 const M_VIEW_LIST: u32 = 21;
 const M_VIEW_ICONS: u32 = 22;
+const M_VIEW_MEDIUM: u32 = 23;
+const M_VIEW_SMALL: u32 = 24;
 const M_SORT_NAME: u32 = 30;
 const M_SORT_DATE: u32 = 31;
 const M_SORT_TYPE: u32 = 32;
 const M_SORT_SIZE: u32 = 33;
 const M_ASC: u32 = 34;
 const M_DESC: u32 = 35;
+const M_FILE_NEWWIN: u32 = 40;
+const M_FILE_TERM: u32 = 41;
+const M_FILE_CLOSE: u32 = 42;
+/// Botones de la cinta.
+const R_COPY: u32 = 1;
+const R_PASTE: u32 = 2;
+const R_CUT: u32 = 3;
+const R_MOVE: u32 = 4;
+const R_COPYTO: u32 = 5;
+const R_DEL: u32 = 6;
+const R_REN: u32 = 7;
+const R_NEWF: u32 = 8;
+const R_NEWD: u32 = 9;
+const R_PROPS: u32 = 10;
+const R_OPEN: u32 = 11;
+const R_SELALL: u32 = 12;
+const R_SELNONE: u32 = 13;
+const R_INVERT: u32 = 14;
+const R_RESTORE: u32 = 15;
+const R_EMPTY: u32 = 16;
+const R_V_LARGE: u32 = 20;
+const R_V_MEDIUM: u32 = 21;
+const R_V_SMALL: u32 = 22;
+const R_V_LIST: u32 = 23;
+const R_V_DETAILS: u32 = 24;
+const R_SORT: u32 = 25;
+const R_EXT: u32 = 26;
+/// Botón de cinta -> orden, para los que se activan o desactivan según el contexto.
+const RIB_CMDS: [(u32, Cmd); 16] = [
+    (R_COPY, Cmd::Copy),
+    (R_PASTE, Cmd::Paste),
+    (R_CUT, Cmd::Cut),
+    (R_MOVE, Cmd::MoveTo),
+    (R_COPYTO, Cmd::CopyTo),
+    (R_DEL, Cmd::Delete),
+    (R_REN, Cmd::Rename),
+    (R_NEWF, Cmd::NewFolder),
+    (R_NEWD, Cmd::NewDoc),
+    (R_PROPS, Cmd::Props),
+    (R_OPEN, Cmd::Open),
+    (R_SELALL, Cmd::SelAll),
+    (R_SELNONE, Cmd::SelNone),
+    (R_INVERT, Cmd::Invert),
+    (R_RESTORE, Cmd::Restore),
+    (R_EMPTY, Cmd::EmptyTrash),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Cmd {
     NewFolder,
+    NewDoc,
     Rename,
     Copy,
     Cut,
     Paste,
     Delete,
+    MoveTo,
+    CopyTo,
+    Open,
+    Props,
+    SelAll,
+    SelNone,
+    Invert,
     Restore,
     EmptyTrash,
 }
@@ -101,6 +159,20 @@ enum View {
     Details,
     List,
     Icons,
+    Medium,
+    Small,
+}
+
+impl View {
+    /// Rejillas con desplazamiento vertical: (ancho de celda, alto de celda, icono, nombre a la derecha).
+    fn grid(self) -> Option<(i32, i32, i32, bool)> {
+        match self {
+            View::Icons => Some((84, 76, 48, false)),
+            View::Medium => Some((80, 68, 40, false)),
+            View::Small => Some((176, 22, 16, true)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -116,7 +188,6 @@ enum Hit {
     Back,
     Up,
     Crumb(String),
-    Cmd(Cmd),
     Place(usize),
     Head(Sort),
 }
@@ -137,7 +208,12 @@ struct Explorer {
     cwd: String,
     back: Vec<String>,
     rows: Vec<Row>,
+    /// Elemento con el foco (el último tocado); si hay selección, está en `marked`.
     sel: Option<usize>,
+    /// Extremo fijo de la selección por rango (Mayús).
+    anchor: usize,
+    /// Todos los seleccionados, ordenados.
+    marked: Vec<usize>,
     /// Primera línea visible: fila (Detalles), fila de la rejilla (Iconos) o columna (Lista).
     top: usize,
     gen: u64,
@@ -146,21 +222,79 @@ struct Explorer {
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
     last_click: Option<(usize, u64)>,
-    /// Desplazamiento del puntero dentro del pulgar de la barra mientras se arrastra.
-    drag: Option<i32>,
-    /// Nombre a seleccionar en la próxima recarga.
-    want: Option<String>,
+    sb_v: ScrollBar,
+    sb_h: ScrollBar,
+    rib: Ribbon,
+    /// La cinta está montada para la Papelera.
+    rib_trash: bool,
+    /// Nombres a seleccionar en la próxima recarga.
+    want: Vec<String>,
     rename_from: String,
+    /// Extensión que se conserva al cambiar nombre con las extensiones ocultas (con el punto).
+    rename_ext: String,
+    /// Rutas de Mover a / Copiar a mientras está abierto el selector de carpeta.
+    pending: Vec<String>,
     view: View,
     sort: Sort,
     desc: bool,
+    show_ext: bool,
     prefs_loaded: bool,
     /// Hay algo en el portapapeles (se actualiza al dibujar y al ejecutar órdenes).
     has_clip: bool,
+    /// Estado de Ctrl y Mayús para el ratón. shortcut: `MouseEv` no lleva modificadores y el
+    /// escritorio aún no los envía; nadie los activa hasta que lo haga (ver informe, `set_mods`).
+    ctrl: bool,
+    shift: bool,
 }
 
 pub fn new() -> Box<dyn App> {
     Box::new(make())
+}
+
+fn item(id: u32, t: &'static str, i: Icon) -> RibbonItem {
+    RibbonItem::new(id, t, i)
+}
+
+/// La cinta del Explorador. En la Papelera, Inicio lleva además el grupo "Papelera".
+fn build_ribbon(trash: bool) -> Ribbon {
+    let mut inicio = vec![
+        Group { title: "Portapapeles", items: vec![item(R_COPY, "Copiar", Icon::Copiar).large(), item(R_PASTE, "Pegar", Icon::Pegar).large(), item(R_CUT, "Cortar", Icon::Cortar)] },
+        Group {
+            title: "Organizar",
+            items: vec![item(R_MOVE, "Mover a", Icon::MoverA), item(R_COPYTO, "Copiar a", Icon::CopiarA), item(R_DEL, "Eliminar", Icon::Eliminar), item(R_REN, "Cambiar nombre", Icon::CambiarNombre)],
+        },
+        Group { title: "Nuevo", items: vec![item(R_NEWF, "Nueva carpeta", Icon::CarpetaNueva).large(), item(R_NEWD, "Documento de texto", Icon::DocumentoNuevo)] },
+        Group { title: "Abrir", items: vec![item(R_PROPS, "Propiedades", Icon::Propiedades).large(), item(R_OPEN, "Abrir", Icon::Abrir)] },
+        Group {
+            title: "Seleccionar",
+            items: vec![
+                item(R_SELALL, "Seleccionar todo", Icon::SeleccionarTodo),
+                item(R_SELNONE, "No seleccionar nada", Icon::SeleccionarNada),
+                item(R_INVERT, "Invertir selección", Icon::InvertirSeleccion),
+            ],
+        },
+    ];
+    if trash {
+        inicio.insert(
+            0,
+            Group { title: "Papelera", items: vec![item(R_RESTORE, "Restaurar", Icon::Abrir).large(), item(R_EMPTY, "Vaciar Papelera", Icon::Trash).large()] },
+        );
+    }
+    let vista = vec![
+        Group {
+            title: "Diseño",
+            items: vec![
+                item(R_V_LARGE, "Iconos grandes", Icon::VistaIconosGrandes),
+                item(R_V_MEDIUM, "Iconos medianos", Icon::VistaIconosMedianos),
+                item(R_V_SMALL, "Iconos pequeños", Icon::VistaIconosPequenos),
+                item(R_V_LIST, "Lista", Icon::VistaLista),
+                item(R_V_DETAILS, "Detalles", Icon::VistaDetalles),
+            ],
+        },
+        Group { title: "Vista actual", items: vec![item(R_SORT, "Ordenar por", Icon::Ordenar).large().dropdown()] },
+        Group { title: "Mostrar u ocultar", items: vec![item(R_EXT, "Extensiones de nombre de archivo", Icon::FileBlank).checkbox()] },
+    ];
+    Ribbon::new(Some("Archivo"), vec![Tab { title: "Inicio", groups: inicio }, Tab { title: "Vista", groups: vista }])
 }
 
 fn make() -> Explorer {
@@ -169,21 +303,31 @@ fn make() -> Explorer {
         back: Vec::new(),
         rows: Vec::new(),
         sel: None,
+        anchor: 0,
+        marked: Vec::new(),
         top: 0,
         gen: u64::MAX,
-        w: 760,
-        h: 480,
+        w: 1000,
+        h: 520,
         hits: Vec::new(),
         hover: None,
         last_click: None,
-        drag: None,
-        want: None,
+        sb_v: ScrollBar::new(false),
+        sb_h: ScrollBar::new(true),
+        rib: build_ribbon(false),
+        rib_trash: false,
+        want: Vec::new(),
         rename_from: String::new(),
+        rename_ext: String::new(),
+        pending: Vec::new(),
         view: View::Details,
         sort: Sort::Name,
         desc: false,
+        show_ext: true,
         prefs_loaded: false,
         has_clip: false,
+        ctrl: false,
+        shift: false,
     }
 }
 
@@ -269,7 +413,73 @@ impl Explorer {
         self.sel.and_then(|i| self.rows.get(i))
     }
 
-    // ---- recordar vista y orden ----
+    /// El único seleccionado (con 0 o varios, `None`).
+    fn single(&self) -> Option<&Row> {
+        match self.marked.as_slice() {
+            [i] => self.rows.get(*i),
+            _ => None,
+        }
+    }
+
+    /// Rutas de todos los seleccionados.
+    fn paths(&self) -> Vec<String> {
+        self.marked.iter().filter_map(|&i| self.rows.get(i)).map(|r| join(&self.cwd, &r.name)).collect()
+    }
+
+    // ---- selección ----
+
+    fn is_sel(&self, i: usize) -> bool {
+        self.marked.binary_search(&i).is_ok()
+    }
+
+    fn set_one(&mut self, i: usize) {
+        self.sel = Some(i);
+        self.anchor = i;
+        self.marked = vec![i];
+    }
+
+    fn clear_sel(&mut self) {
+        self.sel = None;
+        self.marked.clear();
+    }
+
+    /// Ctrl+clic: añade o quita `i`.
+    fn toggle(&mut self, i: usize) {
+        match self.marked.binary_search(&i) {
+            Ok(p) => {
+                self.marked.remove(p);
+                self.sel = self.marked.last().copied();
+            }
+            Err(p) => {
+                self.marked.insert(p, i);
+                self.sel = Some(i);
+            }
+        }
+        self.anchor = i;
+    }
+
+    /// Mayús+clic: del ancla a `i`.
+    fn range_to(&mut self, i: usize) {
+        let a = self.anchor.min(self.rows.len().saturating_sub(1));
+        self.marked = (a.min(i)..=a.max(i)).collect();
+        self.sel = Some(i);
+    }
+
+    fn select_all(&mut self) {
+        let n = self.rows.len();
+        self.marked = (0..n).collect();
+        self.sel = n.checked_sub(1);
+        self.anchor = 0;
+    }
+
+    fn invert(&mut self) {
+        let old = core::mem::take(&mut self.marked);
+        self.marked = (0..self.rows.len()).filter(|i| old.binary_search(i).is_err()).collect();
+        self.sel = self.marked.last().copied();
+        self.anchor = self.sel.unwrap_or(0);
+    }
+
+    // ---- recordar vista, orden y extensiones ----
 
     fn load_prefs(&mut self, f: &mut Files) {
         self.prefs_loaded = true;
@@ -280,6 +490,8 @@ impl Explorer {
                 Some(("vista", "detalles")) => self.view = View::Details,
                 Some(("vista", "lista")) => self.view = View::List,
                 Some(("vista", "iconos")) => self.view = View::Icons,
+                Some(("vista", "iconos-medianos")) => self.view = View::Medium,
+                Some(("vista", "iconos-pequenos")) => self.view = View::Small,
                 Some(("orden", "nombre")) => self.sort = Sort::Name,
                 Some(("orden", "fecha")) => self.sort = Sort::Date,
                 Some(("orden", "tipo")) => self.sort = Sort::Type,
@@ -291,11 +503,31 @@ impl Explorer {
         }
     }
 
+    /// Escribe esas claves y conserva las demás líneas del archivo.
+    fn write_prefs(sys: &mut dyn Platform, new: &[(&str, String)]) {
+        let old = sys.files().read(PREFS).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        let mut out = String::new();
+        for (k, v) in new {
+            out += &format!("{k}={v}\n");
+        }
+        for l in old.lines().filter(|l| !l.trim().is_empty()) {
+            let key = l.split('=').next().unwrap_or("").trim();
+            if !new.iter().any(|(k, _)| *k == key) {
+                out += l;
+                out.push('\n');
+            }
+        }
+        let now = sys.now();
+        let _ = sys.files().write(PREFS, out.as_bytes(), now);
+    }
+
     fn save_prefs(&self, sys: &mut dyn Platform) {
         let v = match self.view {
             View::Details => "detalles",
             View::List => "lista",
             View::Icons => "iconos",
+            View::Medium => "iconos-medianos",
+            View::Small => "iconos-pequenos",
         };
         let o = match self.sort {
             Sort::Name => "nombre",
@@ -303,9 +535,7 @@ impl Explorer {
             Sort::Type => "tipo",
             Sort::Size => "tamano",
         };
-        let text = format!("vista={v}\norden={o}\ndesc={}\n", self.desc as u8);
-        let now = sys.now();
-        let _ = sys.files().write(PREFS, text.as_bytes(), now);
+        Self::write_prefs(sys, &[("vista", v.into()), ("orden", o.into()), ("desc", format!("{}", self.desc as u8))]);
     }
 
     /// Tras cambiar vista u orden: se guarda, se reordena y se redibuja.
@@ -314,7 +544,7 @@ impl Explorer {
         self.save_prefs(cx.sys);
         self.reload(cx.sys);
         if let Some(i) = self.sel {
-            self.select(i);
+            self.reveal(i);
         }
         cx.redraw = true;
     }
@@ -336,80 +566,79 @@ impl Explorer {
 
     // ---- geometría (depende de la vista) ----
 
+    fn body_y(&self) -> i32 {
+        RIB_H + NAV_H
+    }
+
     fn top_y(&self) -> i32 {
-        NAV_H + CMD_H + if self.view == View::Details { HEAD_H } else { 0 }
-    }
-
-    fn avail_h(&self) -> i32 {
-        (self.h - STATUS_H - self.top_y() - if self.view == View::List { SB_W } else { 0 }).max(1)
-    }
-
-    fn avail_w(&self) -> i32 {
-        self.w - PANEL_W - if self.view == View::Icons { SB_W } else { 0 }
-    }
-
-    /// Elementos por línea: 1 (Detalles), columnas de la rejilla (Iconos) o filas por columna (Lista).
-    fn per_line(&self) -> usize {
-        match self.view {
-            View::Details => 1,
-            View::Icons => (self.avail_w() / CELL_W).max(1) as usize,
-            View::List => (self.avail_h() / ROW_H).max(1) as usize,
-        }
-    }
-
-    fn lines(&self) -> usize {
-        self.rows.len().div_ceil(self.per_line())
-    }
-
-    /// Líneas que caben a la vez.
-    fn page(&self) -> usize {
-        match self.view {
-            View::Details => (self.avail_h() / ROW_H).max(1) as usize,
-            View::Icons => (self.avail_h() / CELL_H).max(1) as usize,
-            View::List => (self.avail_w() / LCOL_W).max(1) as usize,
-        }
-    }
-
-    fn max_top(&self) -> usize {
-        self.lines().saturating_sub(self.page())
-    }
-
-    fn need_sb(&self) -> bool {
-        self.lines() > self.page()
+        self.body_y() + if self.view == View::Details { HEAD_H } else { 0 }
     }
 
     fn horiz(&self) -> bool {
         self.view == View::List
     }
 
+    /// (elementos por línea, líneas que caben, líneas totales) con o sin barra de desplazamiento.
+    fn compute(&self, sb: bool) -> (usize, usize, usize) {
+        let n = self.rows.len();
+        let free_h = self.h - STATUS_H - self.top_y();
+        let free_w = self.w - PANEL_W;
+        let (pl, page) = match (self.view, self.view.grid()) {
+            (View::Details, _) => (1, (free_h / ROW_H).max(1) as usize),
+            (View::List, _) => (((free_h - if sb { SB_W } else { 0 }) / ROW_H).max(1) as usize, (free_w / LCOL_W).max(1) as usize),
+            (_, Some((cw, ch, _, _))) => (((free_w - if sb { SB_W } else { 0 }) / cw).max(1) as usize, (free_h / ch).max(1) as usize),
+            _ => (1, 1),
+        };
+        (pl, page, n.div_ceil(pl))
+    }
+
+    fn need_sb(&self) -> bool {
+        let (_, page, lines) = self.compute(false);
+        lines > page
+    }
+
+    fn dims(&self) -> (usize, usize, usize) {
+        self.compute(self.need_sb())
+    }
+
+    /// Elementos por línea: 1 (Detalles), columnas de la rejilla o filas por columna (Lista).
+    fn per_line(&self) -> usize {
+        self.dims().0
+    }
+
+    /// Líneas que caben a la vez.
+    fn page(&self) -> usize {
+        self.dims().1
+    }
+
+    #[cfg(test)]
+    fn lines(&self) -> usize {
+        self.dims().2
+    }
+
+    fn max_top(&self) -> usize {
+        let (_, page, lines) = self.dims();
+        lines.saturating_sub(page)
+    }
+
     /// Zona donde se dibujan los elementos (sin barra de desplazamiento).
     fn area(&self) -> Rect {
-        let vs = match self.view {
-            View::Details if self.need_sb() => SB_W,
-            View::Icons => SB_W,
-            _ => 0,
-        };
-        Rect::new(PANEL_W, self.top_y(), self.w - PANEL_W - vs, self.avail_h())
+        let sb = if self.need_sb() { SB_W } else { 0 };
+        let (vs, hs) = if self.horiz() { (0, sb) } else { (sb, 0) };
+        Rect::new(PANEL_W, self.top_y(), self.w - PANEL_W - vs, (self.h - STATUS_H - self.top_y() - hs).max(1))
     }
 
     fn track(&self) -> Rect {
-        let y = self.top_y();
         if self.horiz() {
             Rect::new(PANEL_W, self.h - STATUS_H - SB_W, self.w - PANEL_W, SB_W)
         } else {
-            Rect::new(self.w - SB_W, y, SB_W, (self.h - STATUS_H - y).max(1))
+            Rect::new(self.w - SB_W, self.top_y(), SB_W, (self.h - STATUS_H - self.top_y()).max(1))
         }
     }
 
-    /// Pulgar de la barra: (inicio, largo) a lo largo de la pista.
-    fn thumb(&self) -> (i32, i32) {
-        let t = self.track();
-        let (start, tl) = if self.horiz() { (t.x, t.w) } else { (t.y, t.h) };
-        let n = self.lines() as i32;
-        let len = (tl * self.page() as i32 / n.max(1)).clamp(20.min(tl), tl);
-        let max = self.max_top() as i32;
-        let pos = if max == 0 { 0 } else { (tl - len) * self.top as i32 / max };
-        (start + pos, len)
+    fn metrics(&self) -> Metrics {
+        let (_, page, lines) = self.dims();
+        Metrics { rect: self.track(), total: lines as i32, page: page as i32, pos: self.top as i32, line: 1 }
     }
 
     fn col_x(&self) -> [i32; 4] {
@@ -425,10 +654,10 @@ impl Explorer {
         let a = self.area();
         let pl = self.per_line();
         let (line, slot) = ((i / pl) as i32 - self.top as i32, (i % pl) as i32);
-        match self.view {
-            View::Details => Rect::new(a.x, a.y + line * ROW_H, a.w, ROW_H),
-            View::Icons => Rect::new(a.x + slot * CELL_W, a.y + line * CELL_H, CELL_W, CELL_H),
-            View::List => Rect::new(a.x + line * LCOL_W, a.y + slot * ROW_H, LCOL_W, ROW_H),
+        match (self.view, self.view.grid()) {
+            (_, Some((cw, ch, _, _))) => Rect::new(a.x + slot * cw, a.y + line * ch, cw, ch),
+            (View::List, _) => Rect::new(a.x + line * LCOL_W, a.y + slot * ROW_H, LCOL_W, ROW_H),
+            _ => Rect::new(a.x, a.y + line * ROW_H, a.w, ROW_H),
         }
     }
 
@@ -438,13 +667,13 @@ impl Explorer {
             return None;
         }
         let (dx, dy) = (x - a.x, y - a.y);
-        let (line, slot) = match self.view {
-            View::Details => (dy / ROW_H, 0),
-            View::Icons => (dy / CELL_H, dx / CELL_W),
-            View::List => (dx / LCOL_W, dy / ROW_H),
+        let (line, slot) = match (self.view, self.view.grid()) {
+            (_, Some((cw, ch, _, _))) => (dy / ch, dx / cw),
+            (View::List, _) => (dx / LCOL_W, dy / ROW_H),
+            _ => (dy / ROW_H, 0),
         };
-        let pl = self.per_line();
-        if line as usize >= self.page() || slot as usize >= pl {
+        let (pl, page, _) = self.dims();
+        if line as usize >= page || slot as usize >= pl {
             return None;
         }
         let i = (self.top + line as usize) * pl + slot as usize;
@@ -461,9 +690,16 @@ impl Explorer {
         if !self.prefs_loaded {
             self.load_prefs(sys.files());
         }
-        let keep = self.want.take().or_else(|| self.sel_row().map(|r| r.name.clone()));
+        let (keep, cur) = if self.want.is_empty() {
+            (self.marked.iter().filter_map(|&i| self.rows.get(i)).map(|r| r.name.clone()).collect::<Vec<_>>(), self.sel_row().map(|r| r.name.clone()))
+        } else {
+            let w = core::mem::take(&mut self.want);
+            let c = w.last().cloned();
+            (w, c)
+        };
         let f = sys.files();
         self.gen = f.generation();
+        self.show_ext = f.show_ext();
         self.rows.clear();
         if self.trash() {
             for t in f.trash_list().unwrap_or_default() {
@@ -495,7 +731,9 @@ impl Explorer {
             }
         }
         self.sort_rows();
-        self.sel = keep.and_then(|k| self.rows.iter().position(|r| r.name == k));
+        self.marked = (0..self.rows.len()).filter(|&i| keep.contains(&self.rows[i].name)).collect();
+        self.sel = cur.and_then(|c| self.marked.iter().copied().find(|&i| self.rows[i].name == c)).or(self.marked.last().copied());
+        self.anchor = self.sel.unwrap_or(0);
         self.top = self.top.min(self.max_top());
     }
 
@@ -528,7 +766,7 @@ impl Explorer {
         }
         self.cwd = String::from(path);
         self.top = 0;
-        self.sel = None;
+        self.clear_sel();
         self.reload(cx.sys);
         cx.redraw = true;
     }
@@ -551,7 +789,7 @@ impl Explorer {
         if self.trash() {
             return;
         }
-        if let Some(r) = self.sel_row() {
+        if let Some(r) = self.single() {
             let path = join(&self.cwd, &r.name);
             if r.dir {
                 self.go(&path, true, cx);
@@ -562,14 +800,18 @@ impl Explorer {
     }
 
     fn enabled(&self, c: Cmd) -> bool {
-        let sel = self.sel.is_some();
+        let n = self.marked.len();
         let trash = self.trash();
         match c {
-            Cmd::NewFolder => !trash,
-            Cmd::Rename | Cmd::Copy | Cmd::Cut | Cmd::Delete => sel && !trash,
-            Cmd::Restore => sel,
+            Cmd::NewFolder | Cmd::NewDoc => !trash,
+            Cmd::Rename | Cmd::Open => n == 1 && !trash,
+            Cmd::Copy | Cmd::Cut | Cmd::Delete | Cmd::MoveTo | Cmd::CopyTo => n >= 1 && !trash,
+            Cmd::Restore => n >= 1 && trash,
             Cmd::Paste => self.has_clip && !trash,
-            Cmd::EmptyTrash => !self.rows.is_empty(),
+            Cmd::EmptyTrash => trash && !self.rows.is_empty(),
+            Cmd::Props => true,
+            Cmd::SelAll | Cmd::Invert => !self.rows.is_empty(),
+            Cmd::SelNone => n > 0,
         }
     }
 
@@ -579,7 +821,7 @@ impl Explorer {
             return;
         }
         let now = cx.sys.now();
-        let path = self.sel_row().map(|r| join(&self.cwd, &r.name)).unwrap_or_default();
+        let paths = self.paths();
         match c {
             Cmd::NewFolder => {
                 let name = cx.sys.files().free_name(&self.cwd, "Nueva carpeta");
@@ -590,28 +832,52 @@ impl Explorer {
                     value: name,
                 });
             }
+            Cmd::NewDoc => self.new_doc(cx),
             Cmd::Rename => {
-                let name = String::from(file_name(&path));
-                self.rename_from = path;
+                let Some(r) = self.single() else { return };
+                let shown = files::display_name(&r.name, r.dir, self.show_ext);
+                let (value, ext) = (String::from(shown), String::from(&r.name[shown.len()..]));
+                self.rename_from = paths[0].clone();
+                self.rename_ext = ext;
                 cx.dialog = Some(DialogRequest::Input {
                     tag: TAG_RENAME,
                     title: String::from("Cambiar nombre"),
                     label: String::from("Nuevo nombre:"),
-                    value: name,
+                    value,
                 });
             }
-            Cmd::Copy | Cmd::Cut => cx.sys.files().set_clip(&path, c == Cmd::Cut),
+            Cmd::Copy | Cmd::Cut => cx.sys.files().set_clip_many(&paths, c == Cmd::Cut),
             Cmd::Paste => {
                 let dir = self.cwd.clone();
                 self.paste_into(&dir, cx);
             }
             Cmd::Delete => {
-                let r = cx.sys.files().user_trash(&path, now);
+                let r = cx.sys.files().user_trash_many(&paths, now);
                 self.done(r, cx);
             }
+            Cmd::MoveTo | Cmd::CopyTo => {
+                let mv = c == Cmd::MoveTo;
+                self.pending = paths;
+                cx.dialog = Some(DialogRequest::Folder {
+                    tag: if mv { TAG_MOVETO } else { TAG_COPYTO },
+                    title: String::from(if mv { "Mover a" } else { "Copiar a" }),
+                    dir: self.cwd.clone(),
+                });
+            }
+            Cmd::Open => self.open_sel(cx),
+            Cmd::Props => self.props(!self.marked.is_empty(), cx),
+            Cmd::SelAll => self.select_all(),
+            Cmd::SelNone => self.clear_sel(),
+            Cmd::Invert => self.invert(),
             Cmd::Restore => {
-                let id = self.sel_row().map(|r| r.id.clone()).unwrap_or_default();
-                let r = cx.sys.files().restore(&id).map(|_| ());
+                let ids: Vec<String> = self.marked.iter().filter_map(|&i| self.rows.get(i)).map(|r| r.id.clone()).collect();
+                let mut r = Ok(());
+                for id in ids {
+                    if let Err(e) = cx.sys.files().restore(&id) {
+                        r = Err(e);
+                        break;
+                    }
+                }
                 self.done(r, cx);
             }
             Cmd::EmptyTrash => {
@@ -628,9 +894,9 @@ impl Explorer {
 
     fn paste_into(&mut self, dir: &str, cx: &mut Ctx) {
         let now = cx.sys.now();
-        let r = cx.sys.files().paste(dir, now);
-        if let (Ok(p), true) = (&r, same(dir, &self.cwd)) {
-            self.want = Some(String::from(file_name(p)));
+        let r = cx.sys.files().paste_all(dir, now);
+        if let (Ok(v), true) = (&r, same(dir, &self.cwd)) {
+            self.want = v.iter().map(|p| String::from(file_name(p))).collect();
         }
         self.done(r.map(|_| ()), cx);
     }
@@ -657,13 +923,10 @@ impl Explorer {
         });
     }
 
-    fn select(&mut self, i: usize) {
-        if self.rows.is_empty() {
-            return;
-        }
-        let i = i.min(self.rows.len() - 1);
-        self.sel = Some(i);
-        let (line, page) = (i / self.per_line(), self.page());
+    /// Desplaza lo justo para que se vea el elemento `i`.
+    fn reveal(&mut self, i: usize) {
+        let (pl, page, _) = self.dims();
+        let line = i / pl;
         if line < self.top {
             self.top = line;
         } else if line >= self.top + page {
@@ -671,8 +934,22 @@ impl Explorer {
         }
     }
 
+    /// Lleva el foco a `i`: selección simple o, con `extend`, rango desde el ancla.
+    fn go_to(&mut self, i: usize, extend: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let i = i.min(self.rows.len() - 1);
+        self.reveal(i);
+        if extend && self.sel.is_some() {
+            self.range_to(i);
+        } else {
+            self.set_one(i);
+        }
+    }
+
     /// Mueve la selección `d` elementos (sin selección: primero o último).
-    fn step(&mut self, d: i32) {
+    fn step(&mut self, d: i32, extend: bool) {
         let n = self.rows.len() as i32;
         if n == 0 {
             return;
@@ -682,37 +959,105 @@ impl Explorer {
             None => n - 1,
             Some(c) => (c as i32 + d).clamp(0, n - 1),
         };
-        self.select(i as usize);
+        self.go_to(i as usize, extend);
+    }
+
+    // ---- cinta ----
+
+    /// Pone al día los botones desactivados y marcados según el contexto.
+    fn sync_ribbon(&mut self) {
+        if self.trash() != self.rib_trash {
+            self.rib_trash = self.trash();
+            let a = self.rib.active();
+            self.rib = build_ribbon(self.rib_trash);
+            self.rib.set_active(a);
+        }
+        for (id, c) in RIB_CMDS {
+            let off = !self.enabled(c);
+            self.rib.set_disabled(id, off);
+        }
+        for (id, v) in [(R_V_LARGE, View::Icons), (R_V_MEDIUM, View::Medium), (R_V_SMALL, View::Small), (R_V_LIST, View::List), (R_V_DETAILS, View::Details)] {
+            self.rib.set_checked(id, self.view == v);
+        }
+        self.rib.set_checked(R_EXT, self.show_ext);
+    }
+
+    fn rib_pick(&mut self, id: u32, cx: &mut Ctx) {
+        if let Some(&(_, c)) = RIB_CMDS.iter().find(|(i, _)| *i == id) {
+            self.run(c, cx);
+            return;
+        }
+        match id {
+            R_V_LARGE | R_V_MEDIUM | R_V_SMALL | R_V_LIST | R_V_DETAILS => {
+                self.view = match id {
+                    R_V_LARGE => View::Icons,
+                    R_V_MEDIUM => View::Medium,
+                    R_V_SMALL => View::Small,
+                    R_V_LIST => View::List,
+                    _ => View::Details,
+                };
+                self.prefs_changed(cx);
+            }
+            R_SORT => {
+                if let Some(r) = self.rib.item_rect(R_SORT, self.w) {
+                    cx.menu = Some(MenuRequest { tag: TAG_MENU_SORT, x: r.x, y: r.bottom(), items: self.sort_items() });
+                }
+            }
+            R_EXT => {
+                let v = if self.show_ext { "no" } else { "si" };
+                Self::write_prefs(cx.sys, &[("extensiones", v.into())]);
+                self.reload(cx.sys);
+            }
+            _ => {}
+        }
+        cx.redraw = true;
+    }
+
+    fn file_menu(&self, cx: &mut Ctx) {
+        let r = self.rib.file_rect();
+        let n = MenuItem::new;
+        cx.menu = Some(MenuRequest {
+            tag: TAG_MENU_FILE,
+            x: r.x,
+            y: r.bottom(),
+            items: vec![
+                n(M_FILE_NEWWIN, "Abrir ventana nueva"),
+                n(M_FILE_TERM, "Abrir Terminal aquí").disabled(self.trash()),
+                MenuItem::sep(),
+                n(M_FILE_CLOSE, "Cerrar"),
+            ],
+        });
     }
 
     // ---- menús ----
 
-    fn sort_menu(&self) -> MenuItem {
+    fn sort_items(&self) -> Vec<MenuItem> {
         let k = |s: Sort, id: u32, t: &str| MenuItem::new(id, t).checked(self.sort == s);
-        MenuItem::submenu(
-            "Ordenar por",
-            vec![
-                k(Sort::Name, M_SORT_NAME, "Nombre"),
-                k(Sort::Date, M_SORT_DATE, "Fecha de modificación"),
-                k(Sort::Type, M_SORT_TYPE, "Tipo"),
-                k(Sort::Size, M_SORT_SIZE, "Tamaño"),
-                MenuItem::sep(),
-                MenuItem::new(M_ASC, "Ascendente").checked(!self.desc),
-                MenuItem::new(M_DESC, "Descendente").checked(self.desc),
-            ],
-        )
+        vec![
+            k(Sort::Name, M_SORT_NAME, "Nombre"),
+            k(Sort::Date, M_SORT_DATE, "Fecha de modificación"),
+            k(Sort::Type, M_SORT_TYPE, "Tipo"),
+            k(Sort::Size, M_SORT_SIZE, "Tamaño"),
+            MenuItem::sep(),
+            MenuItem::new(M_ASC, "Ascendente").checked(!self.desc),
+            MenuItem::new(M_DESC, "Descendente").checked(self.desc),
+        ]
     }
 
-    fn item_menu(&self, dir: bool, has_clip: bool) -> Vec<MenuItem> {
+    fn sort_menu(&self) -> MenuItem {
+        MenuItem::submenu("Ordenar por", self.sort_items())
+    }
+
+    fn item_menu(&self, dir: bool, has_clip: bool, multi: bool) -> Vec<MenuItem> {
         let n = MenuItem::new;
         if self.trash() {
             return vec![n(M_RESTORE, "Restaurar"), MenuItem::sep(), n(M_PROPS, "Propiedades")];
         }
-        let mut v = vec![n(M_OPEN, "Abrir").bold()];
+        let mut v = vec![n(M_OPEN, "Abrir").bold().disabled(multi)];
         if dir {
             v.push(n(M_OPEN_NEW, "Abrir en ventana nueva"));
         } else {
-            v.push(MenuItem::submenu("Abrir con", vec![n(M_NOTEPAD, "Bloc de notas")]));
+            v.push(MenuItem::submenu("Abrir con", vec![n(M_NOTEPAD, "Bloc de notas")]).disabled(multi));
         }
         v.push(MenuItem::sep());
         v.push(n(M_CUT, "Cortar"));
@@ -723,7 +1068,7 @@ impl Explorer {
         v.extend([
             MenuItem::sep(),
             n(M_DELETE, "Eliminar"),
-            n(M_RENAME, "Cambiar nombre"),
+            n(M_RENAME, "Cambiar nombre").disabled(multi),
             MenuItem::sep(),
             n(M_PROPS, "Propiedades"),
         ]);
@@ -749,6 +1094,8 @@ impl Explorer {
                 "Ver",
                 vec![
                     n(M_VIEW_ICONS, "Iconos grandes").checked(self.view == View::Icons),
+                    n(M_VIEW_MEDIUM, "Iconos medianos").checked(self.view == View::Medium),
+                    n(M_VIEW_SMALL, "Iconos pequeños").checked(self.view == View::Small),
                     n(M_VIEW_LIST, "Lista").checked(self.view == View::List),
                     n(M_VIEW_DETAILS, "Detalles").checked(self.view == View::Details),
                 ],
@@ -765,9 +1112,16 @@ impl Explorer {
         ]
     }
 
-    /// Cuadro "Propiedades" del elemento seleccionado (`item`) o de la carpeta actual.
+    /// Cuadro "Propiedades" de la selección (`item`) o de la carpeta actual.
     fn props(&self, item: bool, cx: &mut Ctx) {
-        let (title, text) = if let (true, Some(r)) = (item, self.sel_row()) {
+        let (title, text) = if item && self.marked.len() > 1 {
+            let rows: Vec<&Row> = self.marked.iter().filter_map(|&i| self.rows.get(i)).collect();
+            let dirs = rows.iter().filter(|r| r.dir).count();
+            let total: u64 = rows.iter().filter(|r| !r.dir).map(|r| r.size).sum();
+            let mut t = format!("Elementos: {}\nArchivos: {}\nCarpetas: {dirs}\n", rows.len(), rows.len() - dirs);
+            t += &format!("Tamaño total de los archivos: {}", size_text(total));
+            (format!("{} elementos", rows.len()), t)
+        } else if let (true, Some(r)) = (item, self.sel_row()) {
             let ty = kind_of(&r.name, r.dir);
             let mut t = format!("Nombre: {}\nTipo: {ty}\n", r.name);
             if self.trash() {
@@ -866,11 +1220,13 @@ impl Explorer {
     }
 
     fn nav_bar(&mut self, s: &mut Surface) {
-        s.fill_rect(Rect::new(0, 0, self.w, NAV_H), 0xFFFFFF);
+        let y0 = RIB_H;
+        s.fill_rect(Rect::new(0, y0, self.w, NAV_H), 0xFFFFFF);
+        s.fill_rect(Rect::new(0, y0 + NAV_H - 1, self.w, 1), LINE);
         let can_back = !self.back.is_empty();
         let can_up = !self.trash() && parent(&self.cwd).is_some();
         for (i, (hit, ok)) in [(Hit::Back, can_back), (Hit::Up, can_up)].into_iter().enumerate() {
-            let r = Rect::new(6 + i as i32 * 30, 5, 26, 24);
+            let r = Rect::new(6 + i as i32 * 30, y0 + 5, 26, 24);
             let c = if ok { TEXT } else { DISABLED };
             if ok {
                 if self.hover == Some(hit.clone()) {
@@ -887,7 +1243,7 @@ impl Explorer {
                 s.stroke(&[(cx - 3.0, cy - 3.0), (cx, cy - 6.0), (cx + 3.0, cy - 3.0)], 1.5, c);
             }
         }
-        let bar = Rect::new(70, 5, self.w - 76, 24);
+        let bar = Rect::new(70, y0 + 5, self.w - 76, 24);
         s.fill_rect(bar, 0xFFFFFF);
         s.frame(bar, 0xC8C8C8);
         let old = s.clip();
@@ -896,40 +1252,8 @@ impl Explorer {
         s.set_clip(old);
     }
 
-    fn cmd_bar(&mut self, s: &mut Surface) {
-        let y = NAV_H;
-        s.fill_rect(Rect::new(0, y, self.w, CMD_H), 0xFFFFFF);
-        s.fill_rect(Rect::new(0, y + CMD_H - 1, self.w, 1), LINE);
-        let cmds: &[(Cmd, &str)] = if self.trash() {
-            &[(Cmd::Restore, "Restaurar"), (Cmd::EmptyTrash, "Vaciar Papelera")]
-        } else {
-            &[
-                (Cmd::NewFolder, "Nueva carpeta"),
-                (Cmd::Rename, "Cambiar nombre"),
-                (Cmd::Copy, "Copiar"),
-                (Cmd::Cut, "Cortar"),
-                (Cmd::Paste, "Pegar"),
-                (Cmd::Delete, "Eliminar"),
-            ]
-        };
-        let mut x = 6;
-        for &(c, name) in cmds {
-            let w = font::width(name, 9, false) + 20;
-            let r = Rect::new(x, y + 4, w, CMD_H - 9);
-            let ok = self.enabled(c);
-            if ok {
-                if self.hover == Some(Hit::Cmd(c)) {
-                    s.fill_rect(r, 0xE5F1FB);
-                }
-                self.hits.push((r, Hit::Cmd(c)));
-            }
-            font::draw_in(s, r, name, 9, false, if ok { TEXT } else { DISABLED }, Align::Center);
-            x += w + 2;
-        }
-    }
-
     fn panel(&mut self, s: &mut Surface, theme: &Theme) {
-        let y0 = NAV_H + CMD_H;
+        let y0 = self.body_y();
         s.fill_rect(Rect::new(0, y0, PANEL_W, self.h - y0 - STATUS_H), 0xF7F7F7);
         s.fill_rect(Rect::new(PANEL_W - 1, y0, 1, self.h - y0 - STATUS_H), LINE);
         for (i, (name, path, icon)) in PLACES.iter().enumerate() {
@@ -948,7 +1272,7 @@ impl Explorer {
 
     /// Cabecera de columnas de Detalles; cada título es un botón de orden.
     fn heads(&mut self, s: &mut Surface, end: i32) {
-        let y0 = NAV_H + CMD_H;
+        let y0 = self.body_y();
         let cx = self.col_x();
         let heads: [&str; 4] = if self.trash() {
             ["Nombre", "Ubicación original", "Fecha de eliminación", "Tamaño"]
@@ -985,14 +1309,14 @@ impl Explorer {
 
     fn list(&mut self, s: &mut Surface, theme: &Theme) {
         let trash = self.trash();
-        let y0 = NAV_H + CMD_H;
+        let y0 = self.body_y();
         let a = self.area();
         s.fill_rect(Rect::new(PANEL_W, y0, self.w - PANEL_W, self.h - y0 - STATUS_H), 0xFFFFFF);
         if self.view == View::Details {
             self.heads(s, a.right());
         }
         let cx = self.col_x();
-        let (pl, page) = (self.per_line(), self.page());
+        let (pl, page, _) = self.dims();
         let old = s.clip();
         s.set_clip(old.intersect(a));
         for (n, row) in self.rows.iter().enumerate().skip(self.top * pl).take(page * pl) {
@@ -1005,14 +1329,36 @@ impl Explorer {
                 Icon::FileBlank
             };
             let hl = blend(0xFFFFFF, theme.accent, 55);
-            match self.view {
-                View::Details => {
-                    if self.sel == Some(n) {
+            let on = self.is_sel(n);
+            let name = files::display_name(&row.name, row.dir, self.show_ext);
+            match (self.view, self.view.grid()) {
+                (_, Some((_, _, ic, right))) => {
+                    if on {
+                        s.fill_rect(Rect::new(r.x + 2, r.y + 1, r.w - 4, r.h - 2), hl);
+                    }
+                    if right {
+                        icons::draw(s, icon, r.x + 4, r.y + (r.h - ic) / 2, ic, 0x444444);
+                        clipped(s, Rect::new(r.x + ic + 10, r.y, r.w - ic - 14, r.h), name, TEXT, Align::Left);
+                    } else {
+                        icons::draw(s, icon, r.x + (r.w - ic) / 2, r.y + 5, ic, 0x444444);
+                        let name = dialogs::fit(name, 9, r.w - 10);
+                        clipped(s, Rect::new(r.x + 3, r.y + ic + 8, r.w - 6, 18), &name, TEXT, Align::Center);
+                    }
+                }
+                (View::List, _) => {
+                    if on {
+                        s.fill_rect(Rect::new(r.x, r.y, r.w - 4, r.h), hl);
+                    }
+                    icons::draw(s, icon, r.x + 4, r.y + 3, 16, 0x444444);
+                    clipped(s, Rect::new(r.x + 26, r.y, r.w - 34, r.h), name, TEXT, Align::Left);
+                }
+                _ => {
+                    if on {
                         s.fill_rect(r, hl);
                     }
                     let y = r.y;
                     icons::draw(s, icon, PANEL_W + 6, y + 3, 16, 0x444444);
-                    clipped(s, Rect::new(PANEL_W + 28, y, cx[1] - PANEL_W - 32, ROW_H), &row.name, TEXT, Align::Left);
+                    clipped(s, Rect::new(PANEL_W + 28, y, cx[1] - PANEL_W - 32, ROW_H), name, TEXT, Align::Left);
                     let (c1, c2) = if trash {
                         (row.loc.clone(), fmt_date(row.date))
                     } else {
@@ -1025,31 +1371,16 @@ impl Explorer {
                         clipped(s, sz, &fmt_size(row.size), GRAY, Align::Right);
                     }
                 }
-                View::List => {
-                    if self.sel == Some(n) {
-                        s.fill_rect(Rect::new(r.x, r.y, r.w - 4, r.h), hl);
-                    }
-                    icons::draw(s, icon, r.x + 4, r.y + 3, 16, 0x444444);
-                    clipped(s, Rect::new(r.x + 26, r.y, r.w - 34, r.h), &row.name, TEXT, Align::Left);
-                }
-                View::Icons => {
-                    if self.sel == Some(n) {
-                        s.fill_rect(Rect::new(r.x + 2, r.y + 2, r.w - 4, r.h - 4), hl);
-                    }
-                    icons::draw(s, icon, r.x + (r.w - BIG) / 2, r.y + 5, BIG, 0x444444);
-                    let name = dialogs::fit(&row.name, 9, r.w - 10);
-                    clipped(s, Rect::new(r.x + 3, r.y + BIG + 8, r.w - 6, 18), &name, TEXT, Align::Center);
-                }
             }
         }
         s.set_clip(old);
-        if self.need_sb() {
-            let t = self.track();
-            s.fill_rect(t, 0xF0F0F0);
-            let (ts, len) = self.thumb();
-            let c = if self.drag.is_some() { 0x7A7A7A } else { 0xB4B4B4 };
-            let thumb = if self.horiz() { Rect::new(ts, t.y + 2, len, t.h - 4) } else { Rect::new(t.x + 2, ts, t.w - 4, len) };
-            s.fill_rect(thumb, c);
+        let m = self.metrics();
+        if m.needed() {
+            if self.horiz() {
+                self.sb_h.draw(s, &m, theme);
+            } else {
+                self.sb_v.draw(s, &m, theme);
+            }
         }
         if self.rows.is_empty() {
             let t = if trash { "La Papelera está vacía." } else { "Esta carpeta está vacía." };
@@ -1061,8 +1392,11 @@ impl Explorer {
         let y = self.h - STATUS_H;
         s.fill_rect(Rect::new(0, y, self.w, STATUS_H), 0xF7F7F7);
         s.fill_rect(Rect::new(0, y, self.w, 1), LINE);
-        let t = count_text(self.rows.len());
-        font::draw_in(s, Rect::new(10, y, 200, STATUS_H), &t, 9, false, GRAY, Align::Left);
+        let mut t = count_text(self.rows.len());
+        if self.marked.len() > 1 {
+            t += &format!("     {} elementos seleccionados", self.marked.len());
+        }
+        font::draw_in(s, Rect::new(10, y, 320, STATUS_H), &t, 9, false, GRAY, Align::Left);
         let (total, free) = sys.files().space();
         let t = format!("{} libres de {}", fmt_size(free), fmt_size(total));
         font::draw_in(s, Rect::new(self.w - 310, y, 300, STATUS_H), &t, 9, false, GRAY, Align::Right);
@@ -1084,7 +1418,7 @@ impl App for Explorer {
         }
     }
     fn min_size(&self) -> (i32, i32) {
-        (680, 320)
+        (760, 400)
     }
 
     fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, _focused: bool) {
@@ -1096,22 +1430,29 @@ impl App for Explorer {
         self.has_clip = sys.files().clip().is_some();
         self.top = self.top.min(self.max_top());
         self.hits.clear();
+        self.sync_ribbon();
         let b = s.bounds();
         s.fill_rect(b, 0xFFFFFF);
         self.list(s, theme);
         self.panel(s, theme);
-        self.cmd_bar(s);
         self.nav_bar(s);
+        self.rib.draw(s, self.w, theme);
         self.status(s, sys);
     }
 
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
+        // El escritorio avisa con `Key::Other` de cada cambio de Ctrl y Mayús (también al soltar).
+        if ev.key == Key::Other {
+            (self.ctrl, self.shift) = (ev.ctrl, ev.shift);
+            return;
+        }
         if ev.ctrl {
             match ev.key {
                 Key::Char('c') => self.run(Cmd::Copy, cx),
                 Key::Char('x') => self.run(Cmd::Cut, cx),
                 Key::Char('v') => self.run(Cmd::Paste, cx),
                 Key::Char('z') => self.undo(cx),
+                Key::Char('a') => self.run(Cmd::SelAll, cx),
                 _ => {}
             }
             return;
@@ -1121,18 +1462,19 @@ impl App for Explorer {
         // Desplazamientos de la selección según la vista: (arriba, abajo, izquierda, derecha, página).
         let (up, down, left, right, pg) = match self.view {
             View::Details => (-1, 1, 0, 0, page),
-            View::Icons => (-pl, pl, -1, 1, pl * page),
             View::List => (-1, 1, -pl, pl, pl * page),
+            _ => (-pl, pl, -1, 1, pl * page),
         };
+        let x = ev.shift;
         match ev.key {
-            Key::Up => self.step(up),
-            Key::Down => self.step(down),
-            Key::Left if left != 0 => self.step(left),
-            Key::Right if right != 0 => self.step(right),
-            Key::PageUp => self.step(-pg),
-            Key::PageDown => self.step(pg),
-            Key::Home => self.select(0),
-            Key::End => self.select(usize::MAX),
+            Key::Up => self.step(up, x),
+            Key::Down => self.step(down, x),
+            Key::Left if left != 0 => self.step(left, x),
+            Key::Right if right != 0 => self.step(right, x),
+            Key::PageUp => self.step(-pg, x),
+            Key::PageDown => self.step(pg, x),
+            Key::Home => self.go_to(0, x),
+            Key::End => self.go_to(usize::MAX, x),
             Key::Enter => self.open_sel(cx),
             Key::Backspace => self.up(cx),
             Key::F(2) if !trash => self.run(Cmd::Rename, cx),
@@ -1144,15 +1486,50 @@ impl App for Explorer {
     }
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+        // La cinta recibe los movimientos y las soltadas siempre, y las pulsaciones sobre ella.
+        let on_rib = matches!(ev, MouseEv::Down { y, .. } if y < RIB_H);
+        if on_rib || matches!(ev, MouseEv::Up { .. } | MouseEv::Move { .. } | MouseEv::Leave) {
+            match self.rib.mouse(ev, self.w) {
+                RibbonAct::None => {}
+                RibbonAct::Redraw => cx.redraw = true,
+                RibbonAct::Pick(id) => self.rib_pick(id, cx),
+                RibbonAct::File => {
+                    self.file_menu(cx);
+                    cx.redraw = true;
+                }
+            }
+            if on_rib {
+                return;
+            }
+        }
+        // La barra de desplazamiento, antes que los elementos.
+        if !matches!(ev, MouseEv::Wheel { .. } | MouseEv::RightDown { .. }) {
+            let m = self.metrics();
+            let e = if self.horiz() { self.sb_h.mouse(ev, &m, cx.now_ms) } else { self.sb_v.mouse(ev, &m, cx.now_ms) };
+            if let Some(p) = e.pos {
+                self.top = (p.max(0) as usize).min(self.max_top());
+            }
+            if e.redraw {
+                cx.redraw = true;
+            }
+            if e.captured {
+                return;
+            }
+        }
         match ev {
             MouseEv::RightDown { x, y } => {
                 let has_clip = cx.sys.files().clip().is_some();
                 let (tag, items) = if let Some(i) = self.item_at(x, y) {
-                    self.sel = Some(i);
+                    if self.is_sel(i) {
+                        self.sel = Some(i);
+                    } else {
+                        self.set_one(i);
+                    }
                     self.last_click = None;
-                    (TAG_MENU_ITEM, self.item_menu(self.rows[i].dir, has_clip))
+                    let multi = self.marked.len() > 1;
+                    (TAG_MENU_ITEM, self.item_menu(self.rows[i].dir && !multi, has_clip, multi))
                 } else if self.area().contains(x, y) {
-                    self.sel = None;
+                    self.clear_sel();
                     (TAG_MENU_BG, self.bg_menu(has_clip, cx.sys.files().undo_label()))
                 } else {
                     return;
@@ -1161,7 +1538,7 @@ impl App for Explorer {
                 cx.redraw = true;
             }
             MouseEv::Wheel { x, y, dz } => {
-                if x >= PANEL_W && y >= NAV_H + CMD_H && y < self.h - STATUS_H {
+                if x >= PANEL_W && y >= self.body_y() && y < self.h - STATUS_H {
                     let step = if self.view == View::Details { WHEEL_ROWS } else { 1 };
                     let t = (self.top as i32 + dz * step).clamp(0, self.max_top() as i32) as usize;
                     if t != self.top {
@@ -1170,30 +1547,16 @@ impl App for Explorer {
                     }
                 }
             }
+            MouseEv::Up { .. } => {}
             MouseEv::Leave => {
                 if self.hover.take().is_some() {
                     cx.redraw = true;
                 }
             }
             MouseEv::Move { x, y } => {
-                if let Some(off) = self.drag {
-                    let t = self.track();
-                    let (start, tl, p) = if self.horiz() { (t.x, t.w, x) } else { (t.y, t.h, y) };
-                    let (_, len) = self.thumb();
-                    let span = (tl - len).max(1);
-                    let p = (p - off - start).clamp(0, span);
-                    self.top = (p as usize * self.max_top() + span as usize / 2) / span as usize;
-                    cx.redraw = true;
-                    return;
-                }
                 let h = self.hit_at(x, y);
                 if h != self.hover {
                     self.hover = h;
-                    cx.redraw = true;
-                }
-            }
-            MouseEv::Up { .. } => {
-                if self.drag.take().is_some() {
                     cx.redraw = true;
                 }
             }
@@ -1204,7 +1567,6 @@ impl App for Explorer {
                         Hit::Back => self.go_back(cx),
                         Hit::Up => self.up(cx),
                         Hit::Crumb(p) => self.go(&p, true, cx),
-                        Hit::Cmd(c) => self.run(c, cx),
                         Hit::Place(i) => self.go(PLACES[i].1, true, cx),
                         Hit::Head(so) => {
                             if self.sort == so {
@@ -1217,20 +1579,17 @@ impl App for Explorer {
                     }
                     return;
                 }
-                if self.need_sb() && self.track().contains(x, y) {
-                    let (ts, len) = self.thumb();
-                    let p = if self.horiz() { x } else { y };
-                    if p >= ts && p < ts + len {
-                        self.drag = Some(p - ts);
-                    } else {
-                        let v = self.page();
-                        self.top = if p < ts { self.top.saturating_sub(v) } else { (self.top + v).min(self.max_top()) };
-                    }
-                    return;
-                }
                 match self.item_at(x, y) {
+                    Some(i) if self.shift => {
+                        self.range_to(i);
+                        self.last_click = None;
+                    }
+                    Some(i) if self.ctrl => {
+                        self.toggle(i);
+                        self.last_click = None;
+                    }
                     Some(i) => {
-                        self.sel = Some(i);
+                        self.set_one(i);
                         if self.last_click.is_some_and(|(j, t)| j == i && cx.now_ms.saturating_sub(t) < DOUBLE_MS) {
                             self.last_click = None;
                             self.open_sel(cx);
@@ -1239,8 +1598,8 @@ impl App for Explorer {
                         }
                     }
                     None => {
-                        if self.area().contains(x, y) {
-                            self.sel = None;
+                        if self.area().contains(x, y) && !self.ctrl && !self.shift {
+                            self.clear_sel();
                         }
                     }
                 }
@@ -1253,6 +1612,12 @@ impl App for Explorer {
             self.reload(cx.sys);
             cx.redraw = true;
         }
+        let m = self.metrics();
+        let p = if self.horiz() { self.sb_h.tick(&m, cx.now_ms) } else { self.sb_v.tick(&m, cx.now_ms) };
+        if let Some(p) = p {
+            self.top = (p.max(0) as usize).min(self.max_top());
+            cx.redraw = true;
+        }
     }
 
     fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
@@ -1260,7 +1625,7 @@ impl App for Explorer {
         match result {
             DialogResult::Text { tag: TAG_NEW, value: Some(v) } => {
                 let r = if valid_name(&v) {
-                    self.want = Some(v.clone());
+                    self.want = vec![v.clone()];
                     cx.sys.files().user_create(&join(&self.cwd, &v), true, now)
                 } else {
                     Err(FsError::BadName)
@@ -1272,7 +1637,7 @@ impl App for Explorer {
                     v.push_str(".txt");
                 }
                 let r = if valid_name(&v) {
-                    self.want = Some(v.clone());
+                    self.want = vec![v.clone()];
                     cx.sys.files().user_create(&join(&self.cwd, &v), false, now)
                 } else {
                     Err(FsError::BadName)
@@ -1281,17 +1646,33 @@ impl App for Explorer {
             }
             DialogResult::Text { tag: TAG_RENAME, value: Some(v) } => {
                 let from = core::mem::take(&mut self.rename_from);
-                let r = if file_name(&from) == v {
+                let ext = core::mem::take(&mut self.rename_ext);
+                let empty = v.trim().is_empty();
+                // Con las extensiones ocultas se escribe solo el nombre; la extensión se conserva.
+                let v = v + &ext;
+                let r = if !empty && file_name(&from) == v {
                     Ok(())
-                } else if !valid_name(&v) {
+                } else if empty || !valid_name(&v) {
                     Err(FsError::BadName)
                 } else {
                     let to = join(&parent(&from).unwrap_or_default(), &v);
-                    self.want = Some(v);
+                    self.want = vec![v];
                     cx.sys.files().user_rename(&from, &to)
                 };
                 self.done(r, cx);
             }
+            DialogResult::Path { tag, path: Some(dir) } if tag == TAG_MOVETO || tag == TAG_COPYTO => {
+                let paths = core::mem::take(&mut self.pending);
+                let mv = tag == TAG_MOVETO;
+                let r = cx.sys.files().transfer(&paths, &dir, mv, now);
+                let r = r.map(|v| {
+                    if same(&dir, &self.cwd) {
+                        self.want = v.iter().map(|p| String::from(file_name(p))).collect();
+                    }
+                });
+                self.done(r, cx);
+            }
+            DialogResult::Path { path: None, .. } => self.pending.clear(),
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
                 let r = cx.sys.files().empty_trash();
                 self.done(r, cx);
@@ -1302,8 +1683,8 @@ impl App for Explorer {
 
     fn menu_result(&mut self, tag: u32, id: u32, cx: &mut Ctx) {
         let item = tag == TAG_MENU_ITEM;
-        let path = self.sel_row().map(|r| join(&self.cwd, &r.name));
-        let dir = self.sel_row().is_some_and(|r| r.dir);
+        let path = self.single().map(|r| join(&self.cwd, &r.name));
+        let dir = self.single().is_some_and(|r| r.dir);
         match id {
             M_OPEN => self.open_sel(cx),
             M_OPEN_NEW if dir => cx.open_new = path,
@@ -1330,10 +1711,15 @@ impl App for Explorer {
             M_UNDO => self.undo(cx),
             M_NEW_FOLDER => self.run(Cmd::NewFolder, cx),
             M_NEW_DOC => self.new_doc(cx),
-            M_VIEW_DETAILS | M_VIEW_LIST | M_VIEW_ICONS => {
+            M_FILE_NEWWIN => cx.open_new = Some(self.cwd.clone()),
+            M_FILE_TERM if !self.trash() => cx.open_terminal = Some(self.cwd.clone()),
+            M_FILE_CLOSE => cx.close = true,
+            M_VIEW_DETAILS | M_VIEW_LIST | M_VIEW_ICONS | M_VIEW_MEDIUM | M_VIEW_SMALL => {
                 self.view = match id {
                     M_VIEW_DETAILS => View::Details,
                     M_VIEW_LIST => View::List,
+                    M_VIEW_MEDIUM => View::Medium,
+                    M_VIEW_SMALL => View::Small,
                     _ => View::Icons,
                 };
                 self.prefs_changed(cx);
@@ -1387,7 +1773,7 @@ mod tests {
             t
         }
         fn draw(&mut self) -> Surface {
-            let mut s = Surface::new(760, 480, 0);
+            let mut s = Surface::new(1000, 520, 0);
             self.e.draw(&mut s, &self.th, &mut self.sys, true);
             s
         }
@@ -1422,13 +1808,25 @@ mod tests {
         fn names(&mut self) -> Vec<String> {
             self.sys.files.list("C:\\Documentos").unwrap().into_iter().map(|e| e.name).collect()
         }
-        /// Centro del botón de órdenes con ese texto (hay que haber dibujado antes).
-        fn btn(&self, c: Cmd) -> (i32, i32) {
-            let r = self.e.hits.iter().find(|(_, h)| *h == Hit::Cmd(c)).expect("botón activo").0;
-            (r.x + r.w / 2, r.y + r.h / 2)
+        /// Pulsa y suelta el botón de la cinta `id` (en la pestaña activa).
+        fn rib(&mut self, id: u32) -> (Option<DialogRequest>, Option<String>) {
+            let r = self.e.rib.item_rect(id, self.e.w).expect("botón en la pestaña activa");
+            let (x, y) = (r.x + r.w / 2, r.y + r.h / 2);
+            self.now += 100;
+            let (_, d, o) = self.cx(|e, cx| {
+                e.mouse(MouseEv::Move { x, y }, cx);
+                e.mouse(MouseEv::Down { x, y }, cx);
+                e.mouse(MouseEv::Up { x, y }, cx);
+            });
+            self.draw();
+            (d, o)
+        }
+        fn tab(&mut self, i: usize) {
+            self.e.rib.set_active(i);
+            self.draw();
         }
         fn row_y(i: i32) -> i32 {
-            NAV_H + CMD_H + HEAD_H + i * ROW_H + 5
+            RIB_H + NAV_H + HEAD_H + i * ROW_H + 5
         }
     }
 
@@ -1448,7 +1846,7 @@ mod tests {
         t.key(Key::Backspace, false); // ya en la raíz: no hace nada
         assert_eq!(t.e.title(), "Disco local (C:)");
         // Atrás deshace Backspace, luego la entrada, luego el primer open_path.
-        let (x, y) = (16, 17);
+        let (x, y) = (16, RIB_H + 17);
         t.click(x, y);
         assert_ne!(t.e.title(), "Disco local (C:)");
         t.click(x, y);
@@ -1483,8 +1881,7 @@ mod tests {
     #[test]
     fn nueva_carpeta_y_renombrar() {
         let mut t = T::new();
-        let (x, y) = t.btn(Cmd::NewFolder);
-        let (d, _) = t.click(x, y);
+        let (d, _) = t.rib(R_NEWF);
         let Some(DialogRequest::Input { tag, value, .. }) = d else { panic!("sin diálogo") };
         assert_eq!((tag, value.as_str()), (TAG_NEW, "Nueva carpeta"));
         t.answer(text("Fotos"));
@@ -1523,8 +1920,7 @@ mod tests {
         assert!(n.contains(&String::from("nota (2).txt")) && n.contains(&String::from("nota (3).txt")), "{n:?}");
         // A otra carpeta, con el botón Pegar.
         t.open("C:\\Imágenes");
-        let (x, y) = t.btn(Cmd::Paste);
-        t.click(x, y);
+        t.rib(R_PASTE);
         assert!(t.sys.files.exists("C:\\Imágenes\\nota.txt"));
         assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
     }
@@ -1561,8 +1957,7 @@ mod tests {
         let (_, o) = t.key(Key::Enter, false);
         assert!(o.is_none());
         assert_eq!(t.sys.files.trash_list().unwrap().len(), 1);
-        let (x, y) = t.btn(Cmd::Restore);
-        t.click(x, y);
+        t.rib(R_RESTORE);
         assert!(t.sys.files.exists("C:\\Documentos\\nota.txt"));
         assert!(t.sys.files.trash_list().unwrap().is_empty());
         // Vaciar pide confirmación y solo actúa con Sí.
@@ -1570,8 +1965,7 @@ mod tests {
         selecciona(&mut t, "nota.txt");
         t.key(Key::Delete, false);
         t.open(files::TRASH);
-        let (x, y) = t.btn(Cmd::EmptyTrash);
-        let (d, _) = t.click(x, y);
+        let (d, _) = t.rib(R_EMPTY);
         assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_EMPTY, buttons: Buttons::YesNo, .. })));
         t.answer(DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::No });
         assert_eq!(t.sys.files.trash_list().unwrap().len(), 1);
@@ -1613,11 +2007,11 @@ mod tests {
     #[test]
     fn panel_izquierdo_y_barra() {
         let mut t = T::new();
-        t.click(30, NAV_H + CMD_H + 8 + 4); // Escritorio
+        t.click(30, RIB_H + NAV_H + 8 + 4); // Escritorio
         assert_eq!(t.e.title(), "Escritorio");
-        t.click(30, NAV_H + CMD_H + 8 + 28 * 3 + 4); // Disco local
+        t.click(30, RIB_H + NAV_H + 8 + 28 * 3 + 4); // Disco local
         assert_eq!(t.e.title(), "Disco local (C:)");
-        t.click(30, NAV_H + CMD_H + 8 + 28 * 4 + 4); // Papelera
+        t.click(30, RIB_H + NAV_H + 8 + 28 * 4 + 4); // Papelera
         assert_eq!(t.e.title(), "Papelera");
         // Muchas filas: aparece la barra y se puede desplazar.
         let now = t.now_dt();
@@ -1726,7 +2120,7 @@ mod tests {
         let m = t.right_row("Sub");
         assert!(!m.items.iter().find(|i| i.id == M_PASTE).unwrap().disabled);
         // Fuera de la lista (cabecera, panel, barra de órdenes) no hay menú.
-        assert!(t.right(300, NAV_H + CMD_H + 5).is_none());
+        assert!(t.right(300, RIB_H + NAV_H + 5).is_none());
         assert!(t.right(30, 200).is_none());
         assert!(t.right(300, 10).is_none());
     }
@@ -1742,7 +2136,7 @@ mod tests {
             texts(&m.items),
             ["Ver >", "Ordenar por >", "Actualizar", "-", "Pegar", "Deshacer", "-", "Nuevo >", "-", "Propiedades"]
         );
-        assert_eq!(texts(&m.items[0].sub), ["Iconos grandes", "Lista", "Detalles"]);
+        assert_eq!(texts(&m.items[0].sub), ["Iconos grandes", "Iconos medianos", "Iconos pequeños", "Lista", "Detalles"]);
         assert_eq!(
             texts(&m.items[1].sub),
             ["Nombre", "Fecha de modificación", "Tipo", "Tamaño", "-", "Ascendente", "Descendente"]
@@ -1884,7 +2278,7 @@ mod tests {
     fn ordenar_con_la_cabecera() {
         let mut t = T::new();
         setup_orden(&mut t);
-        let y = NAV_H + CMD_H + 5;
+        let y = RIB_H + NAV_H + 5;
         // Tamaño (columna 3): ascendente; segundo clic, descendente.
         let x = t.e.col_x()[3] + 20;
         t.click(x, y);
@@ -1912,20 +2306,20 @@ mod tests {
         t.many(60);
         t.view(M_VIEW_ICONS);
         assert_eq!(t.e.view, View::Icons);
-        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (7, 5, 9));
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (10, 4, 7));
         // Ratón: la celda 8 está en la fila 1, columna 1.
         t.click_item(8);
         assert_eq!(t.e.sel, Some(8));
         let r8 = t.e.item_rect(8);
         assert_eq!(t.e.item_at(r8.x + 40, r8.y + 70), Some(8));
         // Zona vacía a la derecha de la última celda de la rejilla.
-        t.click(PANEL_W + 7 * CELL_W + 2, 150);
+        t.click(PANEL_W + 10 * 84 + 2, 220);
         assert_eq!(t.e.sel, None);
         t.click_item(8);
         t.key(Key::Right, false);
         assert_eq!(t.e.sel, Some(9));
         t.key(Key::Down, false);
-        assert_eq!(t.e.sel, Some(16));
+        assert_eq!(t.e.sel, Some(19));
         t.key(Key::Left, false);
         t.key(Key::Up, false);
         assert_eq!(t.e.sel, Some(8));
@@ -1933,16 +2327,16 @@ mod tests {
         for _ in 0..5 {
             t.key(Key::Down, false);
         }
-        assert_eq!(t.e.sel, Some(43));
+        assert_eq!(t.e.sel, Some(58));
         assert_eq!(t.e.top, 2);
-        let r = t.e.item_rect(43);
+        let r = t.e.item_rect(58);
         assert_eq!(t.e.area().intersect(r), r);
         t.key(Key::End, false);
-        assert_eq!((t.e.sel, t.e.top), (Some(61), 4));
+        assert_eq!((t.e.sel, t.e.top), (Some(61), 3));
         t.key(Key::Home, false);
         assert_eq!((t.e.sel, t.e.top), (Some(0), 0));
         t.key(Key::PageDown, false);
-        assert_eq!(t.e.sel, Some(35));
+        assert_eq!(t.e.sel, Some(40));
         // Doble clic: abre la carpeta.
         t.key(Key::Home, false);
         t.click_item(0);
@@ -1959,7 +2353,7 @@ mod tests {
         t.wheel(-5);
         assert_eq!(t.e.top, 0);
         t.wheel(50);
-        assert_eq!(t.e.top, 4);
+        assert_eq!(t.e.top, 3);
         let s = t.draw();
         assert!(s.px.iter().any(|&p| p != 0));
     }
@@ -1970,13 +2364,13 @@ mod tests {
         t.many(60);
         t.view(M_VIEW_LIST);
         assert_eq!(t.e.view, View::List);
-        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (17, 3, 4));
+        assert_eq!((t.e.per_line(), t.e.page(), t.e.lines()), (15, 4, 5));
         t.click_item(20);
         assert_eq!(t.e.sel, Some(20));
         t.key(Key::Down, false);
         assert_eq!(t.e.sel, Some(21));
         t.key(Key::Right, false);
-        assert_eq!(t.e.sel, Some(38));
+        assert_eq!(t.e.sel, Some(36));
         t.key(Key::Left, false);
         t.key(Key::Up, false);
         assert_eq!(t.e.sel, Some(20));
@@ -2123,13 +2517,13 @@ mod tests {
         assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=iconos\norden=tamano\ndesc=1\n");
         // Otra ventana lee lo guardado al abrirse.
         let mut e2 = make();
-        let mut s = Surface::new(760, 480, 0);
+        let mut s = Surface::new(1000, 520, 0);
         e2.draw(&mut s, &t.th, &mut t.sys, true);
         assert_eq!((e2.view, e2.sort, e2.desc), (View::Icons, Sort::Size, true));
         // Los cambios por la cabecera también se guardan.
         t.view(M_VIEW_DETAILS);
         let x = t.e.col_x()[1] + 20;
-        t.click(x, NAV_H + CMD_H + 5);
+        t.click(x, RIB_H + NAV_H + 5);
         assert_eq!(t.sys.files.read(PREFS).unwrap(), b"vista=detalles\norden=fecha\ndesc=0\n");
         // Valores que no se entienden se ignoran.
         let now = t.now_dt();
@@ -2150,10 +2544,9 @@ mod tests {
         }
         // El botón se llama "Cambiar nombre" y se puede pulsar.
         t.click_item(1);
-        let (x, y) = t.btn(Cmd::Rename);
-        let (d, _) = t.click(x, y);
+        let (d, _) = t.rib(R_REN);
         assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_RENAME, .. })));
-        let r = t.e.hits.iter().find(|(_, h)| *h == Hit::Cmd(Cmd::Delete)).unwrap().0;
-        assert!(r.right() < 680 - 140);
+        let r = t.e.rib.item_rect(R_DEL, 760).unwrap();
+        assert!(r.right() < 760);
     }
 }
