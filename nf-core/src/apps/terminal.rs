@@ -6,6 +6,7 @@ use crate::files::{file_name, join, parent, resolve, valid_name};
 use crate::fs::FsError;
 use crate::input::{Key, KeyEvent};
 use crate::platform::Platform;
+use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::Theme;
 use crate::{NAME, VERSION};
@@ -344,6 +345,10 @@ pub struct Terminal {
     scroll: usize,
     max_scroll: usize,
     vis: usize,
+    /// Filas visuales totales y tamaño del contenido (última vez dibujado), para la barra.
+    total: usize,
+    size: (i32, i32),
+    sb: ScrollBar,
     focused: bool,
     t0: u64,
     shown: bool,
@@ -364,6 +369,9 @@ impl Terminal {
             scroll: 0,
             max_scroll: 0,
             vis: 10,
+            total: 0,
+            size: (0, 0),
+            sb: ScrollBar::new(false),
             focused: false,
             t0: 0,
             shown: true,
@@ -371,6 +379,18 @@ impl Terminal {
         t.push(format!("{} {}", NAME, VERSION));
         t.push(String::from("Escribe 'ayuda' para ver las órdenes."));
         t
+    }
+
+    /// La barra cuenta desde arriba; `scroll` desde el final.
+    fn metrics(&self) -> Metrics {
+        let (w, h) = self.size;
+        Metrics {
+            rect: Rect::new(w - SB_W, 0, SB_W, h),
+            total: self.total as i32,
+            page: self.vis as i32,
+            pos: self.max_scroll.saturating_sub(self.scroll) as i32,
+            line: 1,
+        }
     }
 
     fn push(&mut self, l: String) {
@@ -410,21 +430,30 @@ impl App for Terminal {
         (320, 160)
     }
 
-    fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, focused: bool) {
+    fn draw(&mut self, s: &mut Surface, theme: &Theme, _sys: &mut dyn Platform, focused: bool) {
         self.focused = focused;
         s.fill_rect(s.bounds(), BG);
         let lh = font::line_h(SIZE);
-        let max_w = (s.w - 2 * MARGIN).max(1);
-        // Todas las filas visuales; la última línea lleva un espacio final que hace de cursor.
-        let mut rows: Vec<String> = Vec::new();
-        for l in &self.out {
-            rows.extend(wrap(l, max_w));
-        }
-        let input_rows = wrap(&format!("{}{} ", prompt(&self.cwd), self.input), max_w);
-        let n_input = input_rows.len();
-        rows.extend(input_rows);
-
         self.vis = (((s.h - 2 * MARGIN) / lh).max(1)) as usize;
+        // Todas las filas visuales; la última línea lleva un espacio final que hace de cursor.
+        // Si no caben, se vuelven a partir con el ancho que deja la barra.
+        let mut sbw = 0;
+        let (rows, n_input) = loop {
+            let max_w = (s.w - 2 * MARGIN - sbw).max(1);
+            let mut rows: Vec<String> = Vec::new();
+            for l in &self.out {
+                rows.extend(wrap(l, max_w));
+            }
+            let input_rows = wrap(&format!("{}{} ", prompt(&self.cwd), self.input), max_w);
+            let n_input = input_rows.len();
+            rows.extend(input_rows);
+            if sbw > 0 || rows.len() <= self.vis {
+                break (rows, n_input);
+            }
+            sbw = SB_W;
+        };
+        self.total = rows.len();
+        self.size = (s.w, s.h);
         self.max_scroll = rows.len().saturating_sub(self.vis);
         self.scroll = self.scroll.min(self.max_scroll);
         let first = rows.len().saturating_sub(self.vis + self.scroll);
@@ -443,6 +472,9 @@ impl App for Terminal {
             } else {
                 font::draw(s, MARGIN, y, r, SIZE, false, FG);
             }
+        }
+        if sbw > 0 {
+            self.sb.draw(s, &self.metrics(), theme);
         }
     }
 
@@ -496,6 +528,14 @@ impl App for Terminal {
     }
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+        if !matches!(ev, MouseEv::Wheel { .. }) {
+            let e = self.sb.mouse(ev, &self.metrics(), cx.now_ms);
+            if let Some(p) = e.pos {
+                self.scroll = self.max_scroll.saturating_sub(p as usize);
+            }
+            cx.redraw |= e.redraw;
+            return;
+        }
         if let MouseEv::Wheel { dz, .. } = ev {
             // dz > 0 = hacia abajo (líneas recientes); `scroll` cuenta filas desde el final.
             self.scroll = (self.scroll as i64 - dz as i64 * 3).clamp(0, self.max_scroll as i64) as usize;
@@ -504,6 +544,10 @@ impl App for Terminal {
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
+        if let Some(p) = self.sb.tick(&self.metrics(), cx.now_ms) {
+            self.scroll = self.max_scroll.saturating_sub(p as usize);
+            cx.redraw = true;
+        }
         let on = !self.focused || (cx.now_ms.saturating_sub(self.t0) / BLINK_MS) % 2 == 0;
         if on != self.shown {
             self.shown = on;
@@ -825,6 +869,47 @@ mod tests {
             assert_eq!(t.scroll, t.max_scroll);
             t.key(&ev(Key::Char('x'), Some('x')), cx);
             assert_eq!(t.scroll, 0);
+        });
+    }
+
+    #[test]
+    fn barra_solo_si_hace_falta_y_desplaza() {
+        let mut sys = TestPlatform::default();
+        let mut t = Terminal::new();
+        con_cx(|cx| {
+            let mut s = Surface::new(320, 160, 0);
+            t.draw(&mut s, &Theme::default(), &mut sys, true);
+            assert!(!t.metrics().needed());
+            assert_eq!(s.px[(80 * 320 + 310) as usize], BG);
+            for i in 0..60 {
+                escribe(&mut t, &format!("eco {}", i), cx);
+            }
+            t.draw(&mut s, &Theme::default(), &mut sys, true);
+            let m = t.metrics();
+            assert!(m.needed() && t.scroll == 0 && m.pos == m.max());
+            assert_ne!(s.px[(80 * 320 + 310) as usize], BG);
+            let bx = m.rect.x + 5;
+            // Flecha de arriba: una fila hacia atrás.
+            t.mouse(MouseEv::Down { x: bx, y: 3 }, cx);
+            t.mouse(MouseEv::Up { x: bx, y: 3 }, cx);
+            assert_eq!(t.scroll, 1);
+            // Flecha de abajo: vuelve.
+            t.mouse(MouseEv::Down { x: bx, y: 157 }, cx);
+            t.mouse(MouseEv::Up { x: bx, y: 157 }, cx);
+            assert_eq!(t.scroll, 0);
+            // Pista sobre el tirador (abajo): una página hacia arriba.
+            t.mouse(MouseEv::Down { x: bx, y: 40 }, cx);
+            t.mouse(MouseEv::Up { x: bx, y: 40 }, cx);
+            assert_eq!(t.scroll, t.vis);
+            // Arrastre hasta arriba del todo y vuelta abajo.
+            let (ts, _) = t.sb.thumb(&t.metrics());
+            t.mouse(MouseEv::Down { x: bx, y: ts + 2 }, cx);
+            t.mouse(MouseEv::Move { x: 900, y: -900 }, cx);
+            assert_eq!(t.scroll, t.max_scroll);
+            t.mouse(MouseEv::Move { x: 900, y: 9000 }, cx);
+            assert_eq!(t.scroll, 0);
+            t.mouse(MouseEv::Up { x: 0, y: 0 }, cx);
+            assert!(!t.sb.active());
         });
     }
 
