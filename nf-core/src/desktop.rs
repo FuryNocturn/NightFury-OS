@@ -289,7 +289,7 @@ pub struct Desktop {
     last_active: Option<u32>,
     /// Forma del puntero: 0 flecha; 1..=4 flechas dobles de redimensionado (ver `resize_cursor`).
     cur: u8,
-    /// Iconos del escritorio: apps, Papelera y lo que haya en `C:\Escritorio`.
+    /// Iconos del escritorio: apps, Papelera y lo que haya en la carpeta Escritorio del usuario.
     icons: Vec<DIcon>,
     files_gen: u64,
     /// ¿Se muestran las extensiones? Se lee al reconstruir los iconos, no al dibujar.
@@ -367,7 +367,7 @@ fn normalize(list: Vec<Rect>, screen: Rect) -> Vec<Rect> {
     v
 }
 
-/// Aplica `fondo=`, `enfasis=`, `iconos=` y `orden=` de `C:\Sistema\config.txt` si son válidos.
+/// Aplica `fondo=`, `enfasis=`, `iconos=` y `orden=` de la configuración del usuario si son válidos.
 fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, order: &mut Order) {
     let cfg = sys.files().config_file();
     let Ok(bytes) = sys.files().read(&cfg) else { return };
@@ -482,7 +482,7 @@ fn ext(name: &str) -> String {
     name.rsplit_once('.').map_or(String::new(), |(_, e)| e.to_lowercase())
 }
 
-/// Apps, Papelera y el contenido de `C:\Escritorio` (carpetas antes que archivos, según `order`).
+/// Apps, Papelera y el contenido de la carpeta Escritorio del usuario (carpetas antes que archivos, según `order`).
 fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIcon> {
     let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), label: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
     v.push(DIcon { name: String::from("Papelera"), label: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
@@ -910,7 +910,7 @@ impl Desktop {
         }
     }
 
-    /// Ruta del icono `i` si es un archivo o carpeta de `C:\Escritorio` (no app ni Papelera).
+    /// Ruta del icono `i` si es un archivo o carpeta de la carpeta Escritorio del usuario (no app ni Papelera).
     fn icon_path(&self, i: usize) -> Option<String> {
         match self.icons.get(i).map(|d| &d.act) {
             Some(Act::Path(p)) if p != files::TRASH => Some(p.clone()),
@@ -2394,6 +2394,12 @@ impl Desktop {
     }
 }
 
+/// Ruta de `name` dentro de la carpeta estándar `d` del usuario actual (para pruebas).
+#[cfg(test)]
+fn sp(f: &files::Files, d: Std, name: &str) -> String {
+    files::join(&f.std_dir(d), name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3026,7 +3032,9 @@ mod modal_tests {
         key(&mut d, &mut sys, Key::Enter, None, false); // Sí
         assert!(!sys.files.pending_format() && sys.files.persistent());
         assert_eq!(d.dialog_count(), 0, "formateado: no hay aviso de memoria");
-        assert!(sys.files.read(files::CONFIG_FILE).is_ok());
+        // Disco recién formateado y sin cuentas: toca el asistente, no el escritorio.
+        assert_eq!(d.login_mode(), Mode::Setup);
+        assert!(sys.files.user().is_none());
     }
 
     #[test]
@@ -3067,11 +3075,11 @@ mod modal_tests {
     fn config_is_loaded_validated_and_saved() {
         let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
         let now = sys.now();
-        sys.files.write(files::CONFIG_FILE, b"fondo=2\nenfasis=D13B3B\n", now).unwrap();
+        sys.files.write(&sys.files.config_file(), b"fondo=2\nenfasis=D13B3B\n", now).unwrap();
         let d = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d.theme.wallpaper, d.theme.accent), (2, 0xD13B3B));
         // Valores no válidos se ignoran.
-        sys.files.write(files::CONFIG_FILE, b"fondo=9\nenfasis=zz\nbasura\n", now).unwrap();
+        sys.files.write(&sys.files.config_file(), b"fondo=9\nenfasis=zz\nbasura\n", now).unwrap();
         let d = Desktop::new(1280, 800, &mut sys);
         assert_eq!(d.theme, Theme::default());
         // Guardado al cambiar el tema desde una app.
@@ -3084,7 +3092,7 @@ mod modal_tests {
             cx.theme.wallpaper = 1;
             cx.theme_changed = true;
         });
-        assert_eq!(sys.files.read(files::CONFIG_FILE).unwrap(), b"fondo=1\nenfasis=6B8E23\niconos=mediano\norden=nombre\n");
+        assert_eq!(sys.files.read(&sys.files.config_file()).unwrap(), b"fondo=1\nenfasis=6B8E23\niconos=mediano\norden=nombre\n");
         let d2 = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d2.theme.wallpaper, d2.theme.accent), (1, ACCENTS[3]));
     }
@@ -3093,9 +3101,9 @@ mod modal_tests {
     fn desktop_folder_items_become_icons() {
         let mut sys = TestPlatform { size: (1280, 400), ..Default::default() };
         let now = sys.now();
-        sys.files.mkdir("C:\\Escritorio\\Carpeta", now).unwrap();
-        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
-        sys.files.write("C:\\Escritorio\\datos.bin", b"1", now).unwrap();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Carpeta"), now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "nota.txt"), b"hola", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "datos.bin"), b"1", now).unwrap();
         let mut d = Desktop::new(1280, 400, &mut sys);
         d.booted = true;
         let names: Vec<&str> = d.icons.iter().map(|i| i.name.as_str()).collect();
@@ -3105,10 +3113,10 @@ mod modal_tests {
         // Columnas: con 400 px de alto caben 4 por columna.
         assert_eq!((d.icon_cell(3).x, d.icon_cell(4).x, d.icon_cell(4).y), (6, 90, 6));
         // Se refrescan al cambiar los archivos.
-        sys.files.write("C:\\Escritorio\\z.txt", b"z", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "z.txt"), b"z", now).unwrap();
         d.event(Event::Tick(10), &mut sys);
         assert_eq!(d.icons.len(), 10);
-        sys.files.delete("C:\\Escritorio\\z.txt").unwrap();
+        sys.files.delete(&sp(&sys.files, Std::Desktop, "z.txt")).unwrap();
         d.event(Event::Tick(20), &mut sys);
         assert_eq!(d.icons.len(), 9);
         // Doble clic: carpeta y Papelera abren el Explorador; el archivo, el Bloc de notas.
@@ -3131,14 +3139,14 @@ mod modal_tests {
     fn cx_open_routes_folders_and_files() {
         let (mut d, mut sys) = setup();
         let (mut p, _) = probe(None, false);
-        p.open = Some(String::from("C:\\Documentos"));
+        p.open = Some(String::from(sys.files.std_dir(Std::Documents)));
         d.launch_app(p, &mut sys);
         key(&mut d, &mut sys, Key::Char('o'), Some('o'), false);
         assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files]);
         let now = sys.now();
-        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "a.txt"), b"a", now).unwrap();
         let (mut p, _) = probe(None, false);
-        p.open = Some(String::from("C:\\Documentos\\a.txt"));
+        p.open = Some(String::from(&sp(&sys.files, Std::Documents, "a.txt")));
         d.launch_app(p, &mut sys);
         key(&mut d, &mut sys, Key::Char('o'), Some('o'), false);
         assert_eq!(kinds(&d), [AppKind::Notepad, AppKind::Files, AppKind::Notepad, AppKind::Notepad]);
@@ -3166,7 +3174,7 @@ mod modal_tests {
     fn incremental_equals_full_with_dialogs() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.write("C:\\Documentos\\a.txt", b"a", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "a.txt"), b"a", now).unwrap();
         d.render(&mut sys);
         let check = |d: &mut Desktop, sys: &mut TestPlatform, what: &str| {
             d.render(sys);
@@ -3175,7 +3183,7 @@ mod modal_tests {
             d.render(sys);
             assert!(inc == d.back().px, "incremental distinto del completo: {what}");
         };
-        let req = DialogRequest::Save { tag: 2, title: String::from("Guardar como"), dir: String::from("C:\\Documentos"), name: String::from("x") };
+        let req = DialogRequest::Save { tag: 2, title: String::from("Guardar como"), dir: String::from(sys.files.std_dir(Std::Documents)), name: String::from("x") };
         let (p, _) = probe(Some(req), false);
         d.launch_app(p, &mut sys);
         check(&mut d, &mut sys, "dueña");
@@ -3226,7 +3234,7 @@ mod modal_tests {
         }
         fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
             if ev.key == Key::Char('n') {
-                cx.open_new = Some(String::from("C:\\Documentos"));
+                cx.open_new = Some(cx.sys.files().std_dir(Std::Documents));
             }
         }
         fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
@@ -3395,9 +3403,9 @@ mod modal_tests {
         let explorers = |d: &Desktop| d.wins.iter().filter(|w| w.kind == AppKind::Files).count();
         assert_eq!(explorers(&d), 1);
         let id = d.wins[0].id;
-        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(String::from("C:\\Documentos")));
+        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(cx.sys.files().std_dir(Std::Documents)));
         assert_eq!(explorers(&d), 2);
-        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(String::from("C:\\Documentos")));
+        d.with_app(id, &mut sys, |_, cx| cx.open_new = Some(cx.sys.files().std_dir(Std::Documents)));
         assert_eq!(explorers(&d), 3);
     }
 
@@ -3452,8 +3460,8 @@ mod menu_tests {
     fn setup() -> (Desktop, TestPlatform) {
         let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
         let now = sys.now();
-        sys.files.mkdir("C:\\Escritorio\\Carpeta", now).unwrap();
-        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Carpeta"), now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "nota.txt"), b"hola", now).unwrap();
         let mut d = Desktop::new(1280, 800, &mut sys);
         d.booted = true;
         (d, sys)
@@ -3514,8 +3522,8 @@ mod menu_tests {
         assert_eq!(texts(&it), ["Abrir", "Vaciar Papelera"]);
         assert!(it[1].disabled);
         let now = sys.now();
-        sys.files.write("C:\\Escritorio\\viejo.txt", b"x", now).unwrap();
-        sys.files.trash("C:\\Escritorio\\viejo.txt", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "viejo.txt"), b"x", now).unwrap();
+        sys.files.trash(&sp(&sys.files, Std::Desktop, "viejo.txt"), now).unwrap();
         assert!(!d.icon_items(5, &mut sys)[1].disabled);
         // Archivo.
         let it = d.icon_items(7, &mut sys);
@@ -3528,7 +3536,7 @@ mod menu_tests {
         let want = ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
         assert_eq!(texts(&it), want);
         assert!(it[5].disabled);
-        sys.files.set_clip("C:\\Escritorio\\nota.txt", false);
+        sys.files.set_clip(&sp(&sys.files, Std::Desktop, "nota.txt"), false);
         assert!(!d.icon_items(6, &mut sys)[5].disabled);
     }
 
@@ -3546,9 +3554,9 @@ mod menu_tests {
         assert!(it[4].disabled && it[5].disabled);
         assert_eq!(it[5].shortcut, "Ctrl+Z");
         // Con portapapeles y algo que deshacer.
-        sys.files.set_clip("C:\\Escritorio\\nota.txt", false);
+        sys.files.set_clip(&sp(&sys.files, Std::Desktop, "nota.txt"), false);
         let now = sys.now();
-        sys.files.user_trash("C:\\Escritorio\\nota.txt", now).unwrap();
+        sys.files.user_trash(&sp(&sys.files, Std::Desktop, "nota.txt"), now).unwrap();
         let it = d.bg_items(&mut sys);
         assert!(!it[4].disabled);
         assert_eq!((it[5].text.as_str(), it[5].disabled), ("Deshacer Eliminar", false));
@@ -3594,29 +3602,29 @@ mod menu_tests {
         // Copiar y pegar dentro de la carpeta.
         pick(&mut d, &mut sys, Some(7), M_COPY);
         pick(&mut d, &mut sys, Some(6), M_PASTE_IN);
-        assert!(sys.files.exists("C:\\Escritorio\\Carpeta\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "Carpeta\\nota.txt")));
         // Pegar en el fondo: nombre libre.
         pick(&mut d, &mut sys, None, M_PASTE);
-        assert!(sys.files.exists("C:\\Escritorio\\nota (2).txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota (2).txt")));
         assert_eq!(sys.files.undo_label(), Some("Copiar"));
         pick(&mut d, &mut sys, None, M_UNDO);
-        assert!(!sys.files.exists("C:\\Escritorio\\nota (2).txt"));
+        assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota (2).txt")));
         // Cortar y pegar en la carpeta mueve.
         pick(&mut d, &mut sys, Some(7), M_CUT);
         pick(&mut d, &mut sys, Some(6), M_PASTE_IN);
-        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
-        assert!(sys.files.exists("C:\\Escritorio\\Carpeta\\nota (2).txt"));
+        assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "Carpeta\\nota (2).txt")));
         pick(&mut d, &mut sys, None, M_UNDO);
-        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         // Eliminar manda a la Papelera, los iconos se actualizan y se puede deshacer.
         let n = d.icons.len();
         let i = d.icons.iter().position(|x| x.name == "nota.txt").unwrap();
         pick(&mut d, &mut sys, Some(i), M_DELETE);
-        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         assert_eq!(d.icons.len(), n - 1);
         assert_eq!(sys.files.trash_list().unwrap().len(), 2);
         pick(&mut d, &mut sys, None, M_UNDO);
-        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         assert_eq!(d.icons.len(), n);
         // Sin nada que deshacer: mensaje de error, sin colgarse.
         assert_eq!(d.dialog_count(), 0);
@@ -3629,55 +3637,55 @@ mod menu_tests {
         let (mut d, mut sys) = setup();
         // Cambiar nombre: el diálogo guarda la ruta.
         pick(&mut d, &mut sys, Some(7), M_RENAME);
-        assert_eq!((d.dialog_count(), d.pending.as_deref()), (1, Some("C:\\Escritorio\\nota.txt")));
+        assert_eq!((d.dialog_count(), d.pending.as_deref()), (1, Some(sp(&sys.files, Std::Desktop, "nota.txt").as_str())));
         answer_text(&mut d, &mut sys, TAG_RENAME, "lista.txt");
-        assert!(sys.files.exists("C:\\Escritorio\\lista.txt") && d.pending.is_none());
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "lista.txt")) && d.pending.is_none());
         assert_eq!(sys.files.undo_label(), Some("Cambiar nombre"));
         // Nombre inválido: error y no cambia nada.
         let before = d.dialog_count();
         pick(&mut d, &mut sys, Some(7), M_RENAME);
         answer_text(&mut d, &mut sys, TAG_RENAME, "a/b");
         assert_eq!(d.dialog_count(), before + 2);
-        assert!(sys.files.exists("C:\\Escritorio\\lista.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "lista.txt")));
         // Cancelar no hace nada y limpia lo pendiente.
         pick(&mut d, &mut sys, Some(7), M_RENAME);
         d.system_result(DialogResult::Text { tag: TAG_RENAME, value: None }, &mut sys);
         assert!(d.pending.is_none());
         // Documento sin extensión: se añade .txt. Con extensión se respeta.
         answer_text(&mut d, &mut sys, TAG_NEWDOC, "apuntes");
-        assert!(sys.files.exists("C:\\Escritorio\\apuntes.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "apuntes.txt")));
         answer_text(&mut d, &mut sys, TAG_NEWDOC, "datos.csv");
-        assert!(sys.files.exists("C:\\Escritorio\\datos.csv"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "datos.csv")));
         // Ya existe: error.
         let n = d.dialog_count();
         answer_text(&mut d, &mut sys, TAG_NEWDOC, "apuntes");
         assert_eq!(d.dialog_count(), n + 1);
         answer_text(&mut d, &mut sys, TAG_NEWDIR, "Cosas");
-        assert!(sys.files.stat("C:\\Escritorio\\Cosas").unwrap().dir);
+        assert!(sys.files.stat(&sp(&sys.files, Std::Desktop, "Cosas")).unwrap().dir);
         assert!(d.icons.iter().any(|i| i.name == "Cosas"));
         pick(&mut d, &mut sys, None, M_UNDO);
-        assert!(!sys.files.exists("C:\\Escritorio\\Cosas"));
+        assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "Cosas")));
     }
 
     #[test]
     fn new_folder_dialog_proposes_free_name_and_accepts_typing() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.mkdir("C:\\Escritorio\\Nueva carpeta", now).unwrap();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Nueva carpeta"), now).unwrap();
         pick(&mut d, &mut sys, None, M_NEWDIR);
         assert_eq!(d.dialog_count(), 1);
         key(&mut d, &mut sys, Key::Char('z'), Some('z'), false);
         key(&mut d, &mut sys, Key::Enter, None, false);
         assert_eq!(d.dialog_count(), 0);
         // Proponía "Nueva carpeta (2)" y se le ha añadido la z.
-        assert!(sys.files.exists("C:\\Escritorio\\Nueva carpeta (2)z"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "Nueva carpeta (2)z")));
     }
 
     #[test]
     fn empty_trash_asks_first() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.user_trash("C:\\Escritorio\\nota.txt", now).unwrap();
+        sys.files.user_trash(&sp(&sys.files, Std::Desktop, "nota.txt"), now).unwrap();
         pick(&mut d, &mut sys, Some(5), M_EMPTY);
         assert_eq!(d.dialog_count(), 1);
         // No (o cerrar) no vacía.
@@ -3707,15 +3715,21 @@ mod menu_tests {
     #[test]
     fn properties_text() {
         let (mut d, mut sys) = setup();
-        let (title, text) = props_text(&mut sys, "C:\\Escritorio\\nota.txt").unwrap();
+        let path = sp(&sys.files, Std::Desktop, "nota.txt");
+        let (title, text) = props_text(&mut sys, &path).unwrap();
         assert_eq!(title, "Propiedades de nota.txt");
-        let want = "Nombre: nota.txt\nTipo: Documento de texto\nUbicación: C:\\Escritorio\nTamaño: 4 bytes\nModificado: 15/11/2026 21:37";
+        let want = format!(
+            "Nombre: nota.txt\nTipo: Documento de texto\nUbicación: {}\nTamaño: 4 bytes\nModificado: 15/11/2026 21:37",
+            sys.files.std_dir(Std::Desktop)
+        );
         assert_eq!(text, want);
         let now = sys.now();
-        sys.files.write("C:\\Escritorio\\Carpeta\\a.bin", &[0u8; 2000], now).unwrap();
-        let (_, text) = props_text(&mut sys, "C:\\Escritorio\\Carpeta").unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "Carpeta\\a.bin"), &[0u8; 2000], now).unwrap();
+        let path = sp(&sys.files, Std::Desktop, "Carpeta");
+        let (_, text) = props_text(&mut sys, &path).unwrap();
         assert!(text.contains("Tipo: Carpeta de archivos") && text.contains("Contiene: 1 elemento\n"), "{text}");
-        let (_, text) = props_text(&mut sys, "C:\\Escritorio\\Carpeta\\a.bin").unwrap();
+        let path = sp(&sys.files, Std::Desktop, "Carpeta\\a.bin");
+        let (_, text) = props_text(&mut sys, &path).unwrap();
         assert!(text.contains("Tipo: Archivo") && text.contains("Tamaño: 2 KB (2000 bytes)"), "{text}");
         pick(&mut d, &mut sys, Some(7), M_PROPS);
         assert_eq!(d.dialog_count(), 1);
@@ -3750,13 +3764,13 @@ mod menu_tests {
     fn order_sorts_desktop_files_after_apps_and_trash() {
         let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
         let mut t = sys.now();
-        sys.files.mkdir("C:\\Escritorio\\Zeta", t).unwrap();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Zeta"), t).unwrap();
         t.month = 1;
-        sys.files.write("C:\\Escritorio\\a.txt", b"12345", t).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "a.txt"), b"12345", t).unwrap();
         t.month = 3;
-        sys.files.write("C:\\Escritorio\\b.bin", b"1", t).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "b.bin"), b"1", t).unwrap();
         t.month = 2;
-        sys.files.write("C:\\Escritorio\\c.abc", b"123", t).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "c.abc"), b"123", t).unwrap();
         let mut d = Desktop::new(1280, 800, &mut sys);
         d.booted = true;
         let names = |d: &Desktop| d.icons.iter().skip(6).map(|i| i.name.clone()).collect::<Vec<_>>();
@@ -3782,18 +3796,18 @@ mod menu_tests {
     fn size_and_order_are_saved_loaded_and_foreign_lines_kept() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.write(files::CONFIG_FILE, b"explorador=lista\nfondo=1\n", now).unwrap();
+        sys.files.write(&sys.files.config_file(), b"explorador=lista\nfondo=1\n", now).unwrap();
         pick(&mut d, &mut sys, None, M_VIEW);
         pick(&mut d, &mut sys, None, M_SORT + 2);
-        let text = String::from_utf8(sys.files.read(files::CONFIG_FILE).unwrap()).unwrap();
+        let text = String::from_utf8(sys.files.read(&sys.files.config_file()).unwrap()).unwrap();
         assert_eq!(text, "fondo=0\nenfasis=0078D4\niconos=grande\norden=tipo\nexplorador=lista\n".replace("0078D4", &format!("{:06X}", d.theme.accent & 0xFFFFFF)));
         let d2 = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d2.size, d2.order), (IconSize::Big, Order::Kind));
         // Valores no válidos se ignoran.
-        sys.files.write(files::CONFIG_FILE, b"iconos=enorme\norden=azar\n", now).unwrap();
+        sys.files.write(&sys.files.config_file(), b"iconos=enorme\norden=azar\n", now).unwrap();
         let d3 = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d3.size, d3.order), (IconSize::Mid, Order::Name));
-        sys.files.write(files::CONFIG_FILE, b"iconos=pequeno\norden=fecha\n", now).unwrap();
+        sys.files.write(&sys.files.config_file(), b"iconos=pequeno\norden=fecha\n", now).unwrap();
         let d4 = Desktop::new(1280, 800, &mut sys);
         assert_eq!((d4.size, d4.order), (IconSize::Small, Order::Date));
     }
@@ -3801,21 +3815,21 @@ mod menu_tests {
     #[test]
     fn desktop_keys_undo_delete_rename_only_without_windows() {
         let (mut d, mut sys) = setup();
-        sys.files.user_rename("C:\\Escritorio\\nota.txt", "C:\\Escritorio\\otra.txt").unwrap();
+        sys.files.user_rename(&sp(&sys.files, Std::Desktop, "nota.txt"), &sp(&sys.files, Std::Desktop, "otra.txt")).unwrap();
         // Con una ventana enfocada, Ctrl+Z no es del escritorio.
         d.launch(AppKind::Calc, &mut sys);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
-        assert!(sys.files.exists("C:\\Escritorio\\otra.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "otra.txt")));
         d.close(d.wins[0].id);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
-        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         // Supr sobre el icono seleccionado: a la Papelera.
         click_icon(&mut d, &mut sys, 7);
         key(&mut d, &mut sys, Key::Delete, None, false);
-        assert!(!sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         assert_eq!(sys.files.trash_list().unwrap().len(), 1);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
-        assert!(sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         // F2 pide el nombre; sobre una app o la Papelera no hace nada.
         click_icon(&mut d, &mut sys, 7);
         key(&mut d, &mut sys, Key::F(2), None, false);
@@ -3856,10 +3870,10 @@ mod menu_tests {
         pick(&mut d, &mut sys, None, M_VIEW + 1);
         check(&mut d, &mut sys, "iconos medianos");
         let now = sys.now();
-        sys.files.write("C:\\Escritorio\\nuevo.txt", b"n", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "nuevo.txt"), b"n", now).unwrap();
         d.event(Event::Tick(10), &mut sys);
         check(&mut d, &mut sys, "archivo creado");
-        sys.files.delete("C:\\Escritorio\\nuevo.txt").unwrap();
+        sys.files.delete(&sp(&sys.files, Std::Desktop, "nuevo.txt")).unwrap();
         d.event(Event::Tick(20), &mut sys);
         check(&mut d, &mut sys, "archivo eliminado");
         pick(&mut d, &mut sys, None, M_SORT + 1);
@@ -3882,7 +3896,7 @@ mod cinta_tests {
     fn setup() -> (Desktop, TestPlatform) {
         let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
         let now = sys.now();
-        sys.files.write("C:\\Escritorio\\nota.txt", b"hola", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "nota.txt"), b"hola", now).unwrap();
         let mut d = Desktop::new(1280, 800, &mut sys);
         d.booted = true;
         (d, sys)
@@ -3898,19 +3912,19 @@ mod cinta_tests {
         assert_eq!(labels(&d), ["nota.txt"]);
         // Ocultar extensiones: el archivo de preferencias cambia y "Actualizar" lo recoge.
         let now = sys.now();
-        sys.files.write(files::EXPLORER_PREFS, b"extensiones=no\n", now).unwrap();
+        sys.files.write(&sys.files.explorer_prefs(), b"extensiones=no\n", now).unwrap();
         d.bg_action(M_REFRESH, &mut sys);
         assert_eq!(labels(&d), ["nota"]);
         assert_eq!(d.icons[6].name, "nota.txt");
         // El diálogo propone el nombre sin extensión y la extensión original se conserva.
-        d.start_rename("C:\\Escritorio\\nota.txt", &mut sys);
+        d.start_rename(&sp(&sys.files, Std::Desktop, "nota.txt"), &mut sys);
         d.system_result(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("otra")) }, &mut sys);
-        assert!(sys.files.exists("C:\\Escritorio\\otra.txt") && !sys.files.exists("C:\\Escritorio\\nota.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "otra.txt")) && !sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         // Un nombre vacío sigue siendo inválido (no queda ".txt").
         let n = d.dialog_count();
-        d.start_rename("C:\\Escritorio\\otra.txt", &mut sys);
+        d.start_rename(&sp(&sys.files, Std::Desktop, "otra.txt"), &mut sys);
         d.system_result(DialogResult::Text { tag: TAG_RENAME, value: Some(String::from("  ")) }, &mut sys);
-        assert!(sys.files.exists("C:\\Escritorio\\otra.txt"));
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "otra.txt")));
         assert!(d.dialog_count() > n);
     }
 
@@ -3983,11 +3997,11 @@ mod cinta_tests {
     fn open_terminal_opens_a_new_terminal_in_that_folder() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.mkdir("C:\\Escritorio\\Sub", now).unwrap();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Sub"), now).unwrap();
         d.launch(AppKind::Calc, &mut sys);
         let id = d.active_id().unwrap();
-        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(String::from("C:\\Escritorio\\Sub")));
-        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(String::from("C:\\Escritorio\\Sub")));
+        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(files::join(&cx.sys.files().std_dir(Std::Desktop), "Sub")));
+        d.with_app(id, &mut sys, |_, cx| cx.open_terminal = Some(files::join(&cx.sys.files().std_dir(Std::Desktop), "Sub")));
         let terms = d.wins.iter().filter(|w| w.kind == AppKind::Terminal).count();
         assert_eq!(terms, 2);
     }
@@ -3996,8 +4010,8 @@ mod cinta_tests {
     fn cinta_copiar_tras_seleccionar_todo() {
         let (mut d, mut sys) = setup();
         let now = sys.now();
-        sys.files.write("C:\\Documentos\\a.txt", b"hola", now).unwrap();
-        sys.files.write("C:\\Documentos\\b.txt", b"hola", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "a.txt"), b"hola", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "b.txt"), b"hola", now).unwrap();
         d.launch(AppKind::Files, &mut sys);
         d.render(&mut sys);
         let c = d.wins[0].content_rect();
@@ -4013,5 +4027,352 @@ mod cinta_tests {
             d.render(&mut sys);
         }
         assert_eq!(sys.files.clip_paths().0.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+    use crate::block::RamDisk;
+    use crate::dialogs::Buttons;
+    use crate::files::Files;
+    use crate::platform::TestPlatform;
+    use alloc::rc::Rc;
+    use core::cell::Cell;
+
+    /// App de pruebas: cuenta las teclas y los clics; con `dirty` pregunta antes de cerrar.
+    struct Stub {
+        dirty: bool,
+        keys: Rc<Cell<u32>>,
+        downs: Rc<Cell<u32>>,
+    }
+
+    impl App for Stub {
+        fn kind(&self) -> AppKind {
+            AppKind::Notepad
+        }
+        fn title(&self) -> String {
+            String::from("Stub")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, s: &mut Surface, _t: &Theme, _p: &mut dyn Platform, _f: bool) {
+            let b = s.bounds();
+            s.fill_rect(b, 0xEEEEEE);
+        }
+        fn key(&mut self, ev: &KeyEvent, _cx: &mut Ctx) {
+            if matches!(ev.key, Key::Char(_)) {
+                self.keys.set(self.keys.get() + 1);
+            }
+        }
+        fn mouse(&mut self, ev: MouseEv, _cx: &mut Ctx) {
+            if matches!(ev, MouseEv::Down { .. }) {
+                self.downs.set(self.downs.get() + 1);
+            }
+        }
+        fn tick(&mut self, _cx: &mut Ctx) {}
+        fn dialog_result(&mut self, r: DialogResult, cx: &mut Ctx) {
+            if let DialogResult::Answer { tag: 9, answer: Answer::Yes } = r {
+                cx.close = true;
+            }
+        }
+        fn request_close(&mut self, cx: &mut Ctx) -> bool {
+            if self.dirty {
+                cx.dialog = Some(DialogRequest::Message {
+                    tag: 9,
+                    title: String::from("Cerrar"),
+                    text: String::from("¿Cerrar sin guardar?"),
+                    buttons: Buttons::YesNo,
+                });
+                return false;
+            }
+            true
+        }
+    }
+
+    fn stub(d: &mut Desktop, sys: &mut TestPlatform, dirty: bool) -> (Rc<Cell<u32>>, Rc<Cell<u32>>) {
+        let (k, c) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        d.launch_app(Box::new(Stub { dirty, keys: k.clone(), downs: c.clone() }), sys);
+        (k, c)
+    }
+
+    /// Disco formateado y sin cuentas.
+    fn disk() -> TestPlatform {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files = Files::probe(Some(Box::new(RamDisk::new(2048))), now);
+        sys.files.format_pending(now).unwrap();
+        sys.files.logout();
+        sys
+    }
+
+    /// Disco con estas cuentas (la primera es la administradora).
+    fn with_accounts(list: &[(&str, Option<&str>)]) -> TestPlatform {
+        let mut sys = disk();
+        let now = sys.now();
+        for (i, (n, p)) in list.iter().enumerate() {
+            sys.files.create_account(n, *p, false, [i as u8 + 1; 16], now).unwrap();
+            if i == 0 {
+                sys.files.login(n, p.unwrap_or("")).unwrap();
+            }
+        }
+        sys.files.logout();
+        sys
+    }
+
+    fn boot(sys: &mut TestPlatform) -> Desktop {
+        let mut d = Desktop::new(1280, 800, sys);
+        d.event(Event::Tick(10), sys);
+        d
+    }
+
+    fn press(d: &mut Desktop, sys: &mut TestPlatform, key: Key, ch: Option<char>) {
+        d.event(Event::Key(KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt: false }), sys);
+    }
+
+    fn typ(d: &mut Desktop, sys: &mut TestPlatform, text: &str) {
+        for c in text.chars() {
+            press(d, sys, Key::Char(c.to_ascii_lowercase()), Some(c));
+        }
+    }
+
+    fn back(d: &mut Desktop, sys: &mut TestPlatform, n: usize) {
+        for _ in 0..n {
+            press(d, sys, Key::Backspace, None);
+        }
+    }
+
+    fn click(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+        d.left_button(true, sys);
+        d.left_button(false, sys);
+    }
+
+    /// Lo dibujado por zonas es igual que un redibujado completo.
+    fn same_as_full(d: &mut Desktop, sys: &mut TestPlatform) {
+        d.render(sys);
+        let a = d.back().px.clone();
+        d.invalidate();
+        d.render(sys);
+        assert!(a == d.back().px, "el redibujado incremental difiere del completo");
+    }
+
+    #[test]
+    fn la_unidad_en_memoria_va_directa_al_escritorio() {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        assert_eq!(d.login_mode(), Mode::Off);
+        assert!(sys.files.user().is_some());
+    }
+
+    #[test]
+    fn asistente_crea_cuentas_y_pasa_al_inicio_de_sesion() {
+        let mut sys = disk();
+        let mut d = boot(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Setup);
+        same_as_full(&mut d, &mut sys);
+        // Nombre vacío o no válido: error y no se crea nada.
+        press(&mut d, &mut sys, Key::Enter, None);
+        typ(&mut d, &mut sys, "a|b");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert!(sys.files.accounts().is_empty());
+        same_as_full(&mut d, &mut sys);
+        back(&mut d, &mut sys, 3);
+        typ(&mut d, &mut sys, "Ana");
+        press(&mut d, &mut sys, Key::Enter, None);
+        let list = sys.files.accounts();
+        assert!(list.len() == 1 && list[0].admin && !list[0].has_password());
+        // Segunda tarjeta: nombre repetido, clave corta, claves distintas y por fin una buena.
+        typ(&mut d, &mut sys, "Ana");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.accounts().len(), 1);
+        back(&mut d, &mut sys, 3);
+        typ(&mut d, &mut sys, "Luis");
+        press(&mut d, &mut sys, Key::Tab, None);
+        typ(&mut d, &mut sys, "12345");
+        press(&mut d, &mut sys, Key::Tab, None);
+        typ(&mut d, &mut sys, "12345");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.accounts().len(), 1, "clave de menos de 6 caracteres");
+        back(&mut d, &mut sys, 5);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Tab, None);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.accounts().len(), 1, "las claves no coinciden");
+        back(&mut d, &mut sys, 5);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        let list = sys.files.accounts();
+        assert!(list.len() == 2 && list[1].has_password() && !list[1].admin);
+        same_as_full(&mut d, &mut sys);
+        // Terminar (5.º elemento tras Nombre).
+        for _ in 0..5 {
+            press(&mut d, &mut sys, Key::Tab, None);
+        }
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login_mode(), Mode::Pick);
+        assert!(sys.files.user().is_none());
+    }
+
+    #[test]
+    fn una_cuenta_sin_clave_entra_directa_y_con_clave_pide_la_pantalla() {
+        let mut sys = with_accounts(&[("Ana", None)]);
+        let d = boot(&mut sys);
+        assert_eq!((d.login_mode(), sys.files.user()), (Mode::Off, Some("Ana")));
+        assert!(d.window_count() == 0 && !d.icons.is_empty());
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let d = boot(&mut sys);
+        assert_eq!((d.login_mode(), sys.files.user()), (Mode::Pick, None));
+    }
+
+    #[test]
+    fn lista_de_cuentas_flechas_y_entrada_sin_clave() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1")), ("Luis", None)]);
+        let mut d = boot(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Pick);
+        same_as_full(&mut d, &mut sys);
+        press(&mut d, &mut sys, Key::Right, None);
+        same_as_full(&mut d, &mut sys);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!((d.login_mode(), sys.files.user()), (Mode::Off, Some("Luis")));
+        // Nada de la pantalla queda activo: el escritorio responde como siempre.
+        press(&mut d, &mut sys, Key::Super, None);
+        assert!(d.start_is_open());
+    }
+
+    #[test]
+    fn clave_incorrecta_espera_tras_tres_fallos_y_acierto() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        for _ in 0..2 {
+            typ(&mut d, &mut sys, "mala12");
+            press(&mut d, &mut sys, Key::Enter, None);
+            assert_eq!(sys.files.user(), None);
+        }
+        same_as_full(&mut d, &mut sys);
+        typ(&mut d, &mut sys, "mala12");
+        press(&mut d, &mut sys, Key::Enter, None);
+        // Espera de 5 s desde el último tick (10 ms): la clave buena no se acepta todavía.
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.user(), None);
+        d.event(Event::Tick(2000), &mut sys);
+        d.render(&mut sys);
+        same_as_full(&mut d, &mut sys);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.user(), None, "sigue la espera");
+        d.event(Event::Tick(5100), &mut sys);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!((d.login_mode(), sys.files.user()), (Mode::Off, Some("Ana")));
+    }
+
+    #[test]
+    fn cada_usuario_tiene_su_configuracion_y_sus_iconos() {
+        let mut sys = with_accounts(&[("Ana", None), ("Luis", None)]);
+        let mut d = boot(&mut sys);
+        let now = sys.now();
+        press(&mut d, &mut sys, Key::Enter, None);
+        let home_a = sys.files.home();
+        sys.files.write(&sys.files.config_file(), b"fondo=2\nenfasis=D13B3B\n", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "de_ana.txt"), b"a", now).unwrap();
+        d.begin_logout(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Pick);
+        press(&mut d, &mut sys, Key::Right, None);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.user(), Some("Luis"));
+        if sys.files.home() == home_a {
+            return; // estructura antigua: todos comparten carpeta (la prueba vale con la nueva)
+        }
+        assert_eq!(d.theme.wallpaper, 0);
+        assert!(!d.icons.iter().any(|i| i.name == "de_ana.txt"));
+        d.begin_logout(&mut sys);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.user(), Some("Ana"));
+        assert_eq!((d.theme.wallpaper, d.theme.accent), (2, 0xD13B3B));
+        assert!(d.icons.iter().any(|i| i.name == "de_ana.txt"));
+    }
+
+    #[test]
+    fn cerrar_sesion_respeta_la_cancelacion_de_una_ventana() {
+        let mut sys = with_accounts(&[("Ana", None)]);
+        let mut d = boot(&mut sys);
+        stub(&mut d, &mut sys, false);
+        stub(&mut d, &mut sys, true);
+        d.begin_logout(&mut sys);
+        assert_eq!(d.dialog_count(), 1, "pregunta por cambios sin guardar");
+        press(&mut d, &mut sys, Key::Escape, None); // cancela
+        assert_eq!((d.login_mode(), sys.files.user(), d.window_count()), (Mode::Off, Some("Ana"), 2));
+        d.begin_logout(&mut sys);
+        press(&mut d, &mut sys, Key::Enter, None); // Sí
+        assert_eq!((d.login_mode(), sys.files.user(), d.window_count()), (Mode::Pick, None, 0));
+        // Una cuenta sin clave tampoco vuelve a entrar sola tras cerrar sesión.
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(sys.files.user(), Some("Ana"));
+    }
+
+    #[test]
+    fn el_menu_de_apagado_ofrece_bloquear_y_cerrar_sesion_solo_con_disco() {
+        let mut sys = with_accounts(&[("Ana", None)]);
+        let mut d = boot(&mut sys);
+        assert_eq!(d.shut_count(), 4);
+        click(&mut d, &mut sys, (24, 780)); // Inicio
+        let p = d.mpower_rect();
+        click(&mut d, &mut sys, (p.x + 24, p.y + 24));
+        let r = d.shut_row(2);
+        click(&mut d, &mut sys, (r.x + 20, r.y + 20));
+        assert_eq!(d.login_mode(), Mode::Lock);
+        let mut mem = TestPlatform { size: (1280, 800), ..Default::default() };
+        assert_eq!(Desktop::new(1280, 800, &mut mem).shut_count(), 2);
+    }
+
+    #[test]
+    fn bloquear_tapa_las_ventanas_y_desbloquea_con_la_clave() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        let (keys, downs) = stub(&mut d, &mut sys, false);
+        let c = d.window_rects()[0];
+        d.lock(&mut sys);
+        assert_eq!((d.login_mode(), d.window_count()), (Mode::Lock, 1));
+        same_as_full(&mut d, &mut sys);
+        typ(&mut d, &mut sys, "x");
+        click(&mut d, &mut sys, (c.x + 40, c.y + 60));
+        assert_eq!((keys.get(), downs.get()), (0, 0), "la app no recibe nada bloqueada");
+        press(&mut d, &mut sys, Key::Enter, None); // clave vacía
+        assert_eq!(d.login_mode(), Mode::Lock);
+        typ(&mut d, &mut sys, "mala12");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login_mode(), Mode::Lock);
+        typ(&mut d, &mut sys, "secreto1");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!((d.login_mode(), d.window_count()), (Mode::Off, 1));
+        same_as_full(&mut d, &mut sys);
+        typ(&mut d, &mut sys, "x");
+        assert_eq!(keys.get(), 1);
+    }
+
+    #[test]
+    fn bloqueo_sin_clave_basta_un_clic() {
+        let mut sys = with_accounts(&[("Ana", None)]);
+        let mut d = boot(&mut sys);
+        d.lock(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Lock);
+        click(&mut d, &mut sys, (100, 100));
+        assert_eq!(d.login_mode(), Mode::Off);
+    }
+
+    #[test]
+    fn apagar_desde_la_pantalla_de_inicio() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        click(&mut d, &mut sys, (1240, 760));
+        same_as_full(&mut d, &mut sys);
+        click(&mut d, &mut sys, (1180, 672));
+        assert!(sys.halted);
     }
 }

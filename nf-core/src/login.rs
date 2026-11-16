@@ -509,6 +509,7 @@ impl Login {
 
     fn select(&mut self, i: usize) {
         if i < self.users.len() && (i != self.sel || self.err.is_some()) {
+            self.dmg_panel(); // lo que ocupaba antes (la clave aparece o no según la cuenta)
             self.sel = i;
             self.wipe_all();
             self.err = None;
