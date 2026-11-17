@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Programas instalados en `C:\Programas` (F3, v0.8): cada uno en su carpeta con `app.txt` y
-//! `programa.nfx`. CONTRATO: `Program`, `parse_manifest`, `installed`, `open`.
+//! `programa.nfx`. CONTRATO: `Program`, `parse_manifest`, `installed`, `open`, y desde la v0.9
+//! `check_source`, `install` y `uninstall` (los usa Configuración > Aplicaciones).
 //!
 //! `app.txt` (UTF-8, una clave por línea, `#` = comentario):
 //! ```text
@@ -12,12 +13,13 @@
 //! ancho=320
 //! alto=470
 //! ```
-use crate::files::{self, PROGRAMS_DIR};
+use crate::files::{self, Files, PROGRAMS_DIR};
 use crate::fs::FsError;
 use crate::bmp::{self, Picture};
 use crate::icons::Icon;
-use crate::platform::Platform;
+use crate::platform::{DateTime, Platform};
 use crate::proc::ProcApp;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -25,6 +27,8 @@ pub const MANIFEST: &str = "app.txt";
 pub const BINARY: &str = "programa.nfx";
 /// Icono propio opcional: BMP de 24 o 32 bits, cuadrado, hasta 256×256 (`bmp::decode`).
 pub const ICON: &str = "icono.bmp";
+/// Marca de los programas que trae el sistema (no se desinstalan ni se reemplazan).
+pub const SYSTEM_MARK: &str = ".sistema";
 /// Tamaño máximo de un `.nfx` que se carga (lo que cabe en memoria de sobra).
 pub const MAX_NFX: u64 = 64 << 20;
 
@@ -40,6 +44,8 @@ pub struct Program {
     pub size: (i32, i32),
     /// Icono propio (`icono.bmp` de su carpeta, v0.9). Si está, se dibuja en vez de `icon`.
     pub picture: Option<Picture>,
+    /// Viene con el sistema (`.sistema` en su carpeta).
+    pub system: bool,
 }
 
 impl Program {
@@ -62,7 +68,7 @@ fn icon_named(s: &str) -> Icon {
 
 /// Lee un `app.txt`. `None` si falta `nombre`. Lo demás tiene valores por defecto.
 pub fn parse_manifest(dir: &str, text: &str) -> Option<Program> {
-    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None };
+    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false };
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let Some((k, v)) = line.split_once('=') else { continue };
@@ -94,6 +100,7 @@ pub fn installed(sys: &mut dyn Platform) -> Vec<Program> {
         let Some(p) = parse_manifest(&dir, &String::from_utf8_lossy(&txt)) else { continue };
         if fs.stat(&p.binary()).is_ok_and(|s| !s.dir) {
             let mut p = p;
+            p.system = fs.stat(&files::join(&p.dir, SYSTEM_MARK)).is_ok();
             let pic = files::join(&p.dir, ICON);
             if fs.stat(&pic).is_ok_and(|s| s.size <= 1 << 20) {
                 p.picture = fs.read(&pic).ok().and_then(|b| bmp::decode(&b));
@@ -115,7 +122,7 @@ pub fn for_binary(sys: &mut dyn Platform, path: &str) -> Option<Program> {
         return Some(p);
     }
     let name = file.rsplit_once('.').map_or(file, |(n, _)| n);
-    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None })
+    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false })
 }
 
 /// Carga el `.nfx` de `path` y lo arranca. `Err` con el motivo para enseñarlo al usuario.
@@ -130,6 +137,84 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
     Ok(ProcApp::new(proc, &p.name, Some(p.icon)))
 }
 
+/// Comprueba una carpeta con un programa para instalar: `app.txt` con nombre válido y un
+/// `programa.nfx` que se puede cargar. Devuelve el programa (con `dir` = la carpeta de origen).
+pub fn check_source(fs: &mut Files, src: &str) -> Result<Program, String> {
+    if src.to_lowercase().starts_with(&PROGRAMS_DIR.to_lowercase()) {
+        return Err(String::from("Esa carpeta ya está dentro de C:\\Programas"));
+    }
+    let txt = fs.read(&files::join(src, MANIFEST)).map_err(|_| String::from("La carpeta no tiene app.txt: no es un programa de NightFury"))?;
+    let p = parse_manifest(src, &String::from_utf8_lossy(&txt)).ok_or_else(|| String::from("El app.txt no tiene la línea nombre="))?;
+    if !files::valid_name(&p.name) {
+        return Err(format!("«{}» no vale como nombre de carpeta", p.name));
+    }
+    let bin = p.binary();
+    let st = fs.stat(&bin).map_err(|_| String::from("Falta programa.nfx"))?;
+    if st.dir || st.size > MAX_NFX {
+        return Err(String::from("programa.nfx no es válido"));
+    }
+    let data = fs.read(&bin).map_err(fs_msg)?;
+    crate::nfx::parse(&data).map_err(|e| {
+        String::from(match e {
+            crate::nfx::NfxError::Version => "El programa es para otra versión del sistema",
+            crate::nfx::NfxError::TooBig => "El programa necesita demasiada memoria",
+            _ => "programa.nfx está dañado",
+        })
+    })?;
+    Ok(p)
+}
+
+/// `Some(es_del_sistema)` si ya hay un programa instalado con ese nombre.
+pub fn installed_as(fs: &mut Files, name: &str) -> Option<bool> {
+    let dir = files::join(PROGRAMS_DIR, name);
+    fs.stat(&dir).ok().filter(|e| e.dir)?;
+    Some(fs.stat(&files::join(&dir, SYSTEM_MARK)).is_ok())
+}
+
+/// Copia el programa `src` (de `check_source`) a `C:\Programas\<nombre>`, reemplazando el que
+/// hubiera con ese nombre salvo si es del sistema. Solo copia `app.txt`, `programa.nfx` e
+/// `icono.bmp`. Necesita una sesión de administrador (lo hacen cumplir los permisos).
+pub fn install(fs: &mut Files, src: &Program, now: DateTime) -> Result<String, String> {
+    if installed_as(fs, &src.name) == Some(true) {
+        return Err(format!("«{}» es un programa del sistema y no se puede reemplazar", src.name));
+    }
+    let dest = files::join(PROGRAMS_DIR, &src.name);
+    if fs.stat(&dest).is_err() {
+        fs.mkdir(&dest, now).map_err(install_msg)?;
+    }
+    for name in [MANIFEST, BINARY, ICON] {
+        let from = files::join(&src.dir, name);
+        let to = files::join(&dest, name);
+        match fs.read(&from) {
+            Ok(data) => fs.write(&to, &data, now).map_err(install_msg)?,
+            // Sin icono en el origen: fuera también el de una versión anterior.
+            Err(_) if name == ICON => {
+                let _ = fs.delete(&to);
+            }
+            Err(e) => return Err(install_msg(e)),
+        }
+    }
+    fs.log(&format!("Programa instalado: {}", src.name), now);
+    Ok(dest)
+}
+
+/// Manda el programa a la Papelera (los del sistema no se desinstalan).
+pub fn uninstall(fs: &mut Files, p: &Program, now: DateTime) -> Result<(), String> {
+    if p.system || installed_as(fs, &p.name) == Some(true) {
+        return Err(format!("«{}» viene con el sistema y no se puede desinstalar", p.name));
+    }
+    fs.user_trash(&p.dir, now).map_err(install_msg)?;
+    fs.log(&format!("Programa desinstalado: {}", p.name), now);
+    Ok(())
+}
+
+fn install_msg(e: FsError) -> String {
+    match e {
+        FsError::Denied => String::from("Solo un administrador puede instalar o desinstalar programas"),
+        e => String::from(e.message()),
+    }
+}
+
 fn fs_msg(e: FsError) -> String {
     String::from(match e {
         FsError::Denied => "No tienes permiso para abrir este programa",
@@ -141,7 +226,7 @@ fn fs_msg(e: FsError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::{DateTime, TestPlatform};
+    use crate::platform::TestPlatform;
 
     #[test]
     fn manifiesto() {
@@ -168,5 +253,56 @@ mod tests {
         assert_eq!(for_binary(&mut sys, "C:\\x\\juego.txt"), None);
         // La plataforma de pruebas no ejecuta programas: el motivo llega al usuario.
         assert!(open(&mut sys, &p, &p.binary()).is_err());
+        assert!(p.system, "los instalados por el sistema llevan la marca");
+    }
+
+    fn nfx_valido() -> Vec<u8> {
+        use crate::nfx::{encode, Kind, Section};
+        let b = crate::abi::USER_BASE + 0x40_0000;
+        encode(b, &[Section { kind: Kind::Code, vaddr: b, memsz: 4, data: &[0x90; 4] }])
+    }
+
+    #[test]
+    fn instalar_y_desinstalar() {
+        let mut sys = TestPlatform::default();
+        let n = DateTime::default();
+        let f = sys.files();
+        let src = "C:\\Usuarios\\Usuario\\Descargas\\Juego";
+        f.mkdir(src, n).unwrap();
+        assert!(check_source(f, src).unwrap_err().contains("app.txt"));
+        f.write(&files::join(src, MANIFEST), b"nombre=Juego\nversion=1.0\n", n).unwrap();
+        assert!(check_source(f, src).unwrap_err().contains("programa.nfx"));
+        f.write(&files::join(src, BINARY), b"NFX1 roto", n).unwrap();
+        assert!(check_source(f, src).unwrap_err().contains("dañado"));
+        f.write(&files::join(src, BINARY), &nfx_valido(), n).unwrap();
+        f.write(&files::join(src, "otro.txt"), b"no se copia", n).unwrap();
+        let p = check_source(f, src).unwrap();
+        assert_eq!(installed_as(f, "Juego"), None);
+        assert_eq!(install(f, &p, n).unwrap(), "C:\\Programas\\Juego");
+        assert_eq!(installed_as(f, "Juego"), Some(false));
+        assert!(f.stat("C:\\Programas\\Juego\\otro.txt").is_err(), "solo los archivos del programa");
+        // Reemplazar con una versión nueva sin icono quita el icono viejo.
+        f.write("C:\\Programas\\Juego\\icono.bmp", b"BM", n).unwrap();
+        f.write(&files::join(src, MANIFEST), b"nombre=Juego\nversion=2.0\n", n).unwrap();
+        let p2 = check_source(f, src).unwrap();
+        install(f, &p2, n).unwrap();
+        assert!(f.stat("C:\\Programas\\Juego\\icono.bmp").is_err());
+        let v = installed(&mut sys);
+        let j = v.iter().find(|p| p.name == "Juego").unwrap().clone();
+        assert_eq!(j.version, "2.0");
+        assert!(!j.system);
+        // Los del sistema no se reemplazan ni se desinstalan.
+        let f = sys.files();
+        f.install_system_program("Calculadora", &[(MANIFEST, b"nombre=Calculadora\n"), (BINARY, &nfx_valido())], n).unwrap();
+        f.write(&files::join(src, MANIFEST), b"nombre=Calculadora\n", n).unwrap();
+        let p3 = check_source(f, src).unwrap();
+        assert!(install(f, &p3, n).unwrap_err().contains("del sistema"));
+        let calc = installed(&mut sys).into_iter().find(|p| p.name == "Calculadora").unwrap();
+        assert!(uninstall(sys.files(), &calc, n).is_err());
+        // Desinstalar: a la Papelera.
+        uninstall(sys.files(), &j, n).unwrap();
+        assert!(installed(&mut sys).iter().all(|p| p.name != "Juego"));
+        // Desde dentro de C:\Programas no se instala.
+        assert!(check_source(sys.files(), "C:\\Programas\\Calculadora").is_err());
     }
 }
