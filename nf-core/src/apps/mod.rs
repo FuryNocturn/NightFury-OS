@@ -9,6 +9,7 @@ use crate::surface::Surface;
 use crate::theme::Theme;
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 mod calc;
 mod explorer;
@@ -49,6 +50,12 @@ pub enum MouseEv {
     Leave,
 }
 
+/// Arrastre de archivos entre ventanas y el escritorio: rutas absolutas de lo que se arrastra.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DragRequest {
+    pub paths: Vec<String>,
+}
+
 /// Lo que una app puede usar y pedir al atender un evento. Se crea con `Ctx::new`.
 /// Los archivos se usan con `cx.sys.files()`.
 pub struct Ctx<'a> {
@@ -72,11 +79,15 @@ pub struct Ctx<'a> {
     pub menu: Option<MenuRequest>,
     /// La app pide abrir un Terminal nuevo situado en esta carpeta (`App::open_path`).
     pub open_terminal: Option<String>,
+    /// La app empieza a arrastrar archivos (v0.7.0). Se pone al atender un `MouseEv::Move` con el
+    /// botón pulsado. Desde ese momento el escritorio lleva el arrastre: la app ya no recibe más
+    /// eventos de esa pulsación (ni `Up`), salvo `App::drag_over(None, ..)` al terminar.
+    pub drag: Option<DragRequest>,
 }
 
 impl<'a> Ctx<'a> {
     pub fn new(sys: &'a mut dyn Platform, theme: &'a mut Theme, now_ms: u64) -> Self {
-        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None, open_new: None, menu: None, open_terminal: None }
+        Ctx { sys, theme, now_ms, redraw: false, close: false, theme_changed: false, dialog: None, open: None, open_new: None, menu: None, open_terminal: None, drag: None }
     }
 }
 
@@ -97,6 +108,14 @@ pub trait App {
     fn dialog_result(&mut self, _result: DialogResult, _cx: &mut Ctx) {}
     /// Elemento elegido en el menú pedido con `cx.menu` (si se cierra sin elegir no se llama).
     fn menu_result(&mut self, _tag: u32, _id: u32, _cx: &mut Ctx) {}
+    /// Se están arrastrando archivos sobre esta ventana (`pos` relativo al contenido), o el
+    /// arrastre ha salido de ella o ha terminado (`None`). Devuelve `true` si soltar en ese punto
+    /// haría algo; la app resalta el destino y pide redibujar si cambia.
+    fn drag_over(&mut self, _pos: Option<(i32, i32)>, _paths: &[String], _cx: &mut Ctx) -> bool {
+        false
+    }
+    /// Se han soltado archivos en ese punto de la ventana. `copy` = Ctrl pulsado (copiar en vez de mover).
+    fn drop_files(&mut self, _x: i32, _y: i32, _paths: &[String], _copy: bool, _cx: &mut Ctx) {}
     /// Abre una ruta absoluta ("C:\\..." o `files::TRASH`) en esta ventana.
     fn open_path(&mut self, _path: &str, _cx: &mut Ctx) {}
     /// El usuario quiere cerrar la ventana. `true` = cerrar ya. `false` = la app se ocupa
