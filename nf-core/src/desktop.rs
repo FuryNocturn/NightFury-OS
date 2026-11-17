@@ -575,7 +575,7 @@ impl Desktop {
             logout_wait: None,
         };
         d.login.set_clock(d.clock);
-        if sys.files().user().is_some() {
+        if sys.files().user().is_some() && !sys.files().disk_locked() {
             d.load_session(sys);
         } else {
             // Disco con cuentas: hasta el primer tick (`boot_flow`) solo se ve el fondo oscuro.
@@ -634,6 +634,12 @@ impl Desktop {
 
     /// Orden del arranque: aviso/diálogo de disco, asistente si hace falta, inicio de sesión, escritorio.
     fn enter_flow(&mut self, sys: &mut dyn Platform) {
+        // Disco cifrado: primero su clave, antes del asistente y del inicio de sesión.
+        if sys.files().disk_locked() {
+            self.login.start_disk();
+            self.screen_on();
+            return;
+        }
         if sys.files().user().is_some() {
             if self.login.mode != Mode::Off {
                 self.open_session(sys);
@@ -658,6 +664,8 @@ impl Desktop {
     fn show_pick(&mut self, sys: &mut dyn Platform) {
         let users = sys.files().accounts().iter().map(|a| (a.name.clone(), a.has_password())).collect();
         self.login.start_pick(users);
+        let enc = self.login.user_names().into_iter().map(|n| sys.files().account_encrypted(&n)).collect();
+        self.login.set_recoverable(enc);
         self.screen_on();
     }
 
@@ -673,7 +681,7 @@ impl Desktop {
                 self.files_gen = 0;
                 self.dmg_all();
             }
-            Out::SetupDone => self.enter_flow(sys),
+            Out::SetupDone | Out::DiskDone => self.enter_flow(sys),
             Out::Shutdown => sys.shutdown(),
             Out::Reboot => sys.reboot(),
         }
@@ -684,6 +692,8 @@ impl Desktop {
     pub fn lock(&mut self, sys: &mut dyn Platform) {
         let Some(name) = sys.files().user().map(String::from) else { return };
         let has = sys.files().has_password();
+        // La llave de la carpeta se borra de la memoria hasta que se desbloquee con la clave.
+        sys.files().lock_keys();
         self.login.start_lock(&name, has);
         self.screen_on();
         self.flush_login();
@@ -2148,8 +2158,8 @@ impl Desktop {
 
     fn tick(&mut self, ms: u64, sys: &mut dyn Platform) {
         self.now_ms = ms;
-        self.login.tick(ms);
-        self.flush_login();
+        let out = self.login.tick(ms, sys);
+        self.login_out(out, sys);
         if !self.booted {
             self.booted = true;
             self.boot_flow(sys);
