@@ -5,6 +5,7 @@ use nf_core::apps::{self, App, AppKind, Ctx, MouseEv};
 use nf_core::block::RamDisk;
 use nf_core::files::Files;
 use nf_core::input::{Key, KeyEvent};
+use nf_core::keys::{Pool, POOL_EVENTS_NEEDED};
 use nf_core::platform::{DateTime, TestPlatform};
 use nf_core::surface::Surface;
 use nf_core::theme::{Theme, ACCENTS};
@@ -101,9 +102,9 @@ fn main() {
         guarda(&dir, &format!("conf_{nombre}_personalizacion"), &b.dibuja(w, h));
         // Pasa el ratón sobre "Acerca de" y entra.
         b.dibuja(w, h);
-        b.ratón(MouseEv::Move { x: 60, y: 56 + 80 + 10 });
+        b.ratón(MouseEv::Move { x: 60, y: 56 + 120 + 10 });
         guarda(&dir, &format!("conf_{nombre}_hover"), &b.dibuja(w, h));
-        b.clic(60, 56 + 80 + 10);
+        b.clic(60, 56 + 120 + 10);
         guarda(&dir, &format!("conf_{nombre}_acerca"), &b.dibuja(w, h));
         // Vuelve, elige otro fondo y otro color: se busca el color en la imagen para pulsar encima.
         b.clic(60, 56 + 10);
@@ -135,6 +136,41 @@ fn main() {
             guarda(&dir, &format!("conf_{nombre}_cuentas_{}", quien.to_lowercase()), &b.dibuja(w, h));
         }
     }
+
+    // Disco: administradora (sin cifrar y cifrando al 37 %), usuario normal y sin disco.
+    for (nombre, (w, h)) in [("def", apps::default_size(AppKind::Settings)), ("min", (520, 360))] {
+        let mut b = Banco::new(AppKind::Settings);
+        b.dibuja(w, h);
+        b.clic(60, 56 + 80 + 10);
+        guarda(&dir, &format!("conf_{nombre}_disco_sin_disco"), &b.dibuja(w, h));
+        for quien in ["Ana", "Luis"] {
+            let mut b = Banco::new(AppKind::Settings);
+            b.sys.files = con_cuentas(quien);
+            b.dibuja(w, h);
+            b.clic(60, 56 + 80 + 10);
+            guarda(&dir, &format!("conf_{nombre}_disco_{}", quien.to_lowercase()), &b.dibuja(w, h));
+        }
+        let mut b = Banco::new(AppKind::Settings);
+        b.sys.files = con_cuentas("Ana");
+        cifrando(&mut b.sys.files, 37);
+        b.dibuja(w, h);
+        b.clic(60, 56 + 80 + 10);
+        guarda(&dir, &format!("conf_{nombre}_disco_cifrando"), &b.dibuja(w, h));
+        // Tras terminar la conversión: los tres botones de un disco cifrado.
+        while !b.sys.files.convert_step(500, DateTime::default()).unwrap() {}
+        guarda(&dir, &format!("conf_{nombre}_disco_cifrado"), &b.dibuja(w, h));
+    }
+}
+
+/// Activa el cifrado total y avanza la conversión hasta el `porcentaje` indicado.
+fn cifrando(f: &mut Files, porcentaje: u64) {
+    let mut pool = Pool::new();
+    for i in 0..POOL_EVENTS_NEEDED as i32 {
+        pool.add_event(i, i * 5, i as u64, i as u64 * 11);
+    }
+    f.encrypt_disk("clave-del-disco-9!", &mut pool, DateTime::default()).unwrap();
+    let (_, total, _) = f.disk_conversion().unwrap();
+    f.convert_step((total * porcentaje).div_ceil(100) as u32, DateTime::default()).unwrap();
 }
 
 /// Disco en memoria con la administradora Ana y el usuario normal Luis (más la normal Marta);

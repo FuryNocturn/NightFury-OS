@@ -299,6 +299,23 @@ fn input(cx: &mut Ctx, tag: u32, label: &str, value: &str) {
     cx.dialog = Some(DialogRequest::Input { tag, title: String::from(TITLE), label: String::from(label), value: String::from(value) });
 }
 
+/// Texto gris que salta de línea para caber en `width` píxeles. Devuelve la `y` siguiente.
+fn note(s: &mut Surface, x: i32, mut y: i32, width: i32, text: &str) -> i32 {
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let try_line = if line.is_empty() { String::from(word) } else { format!("{line} {word}") };
+        if !line.is_empty() && font::width(&try_line, 9, false) > width {
+            font::draw(s, x, y, &line, 9, false, GRAY);
+            y += font::line_h(9);
+            line = String::from(word);
+        } else {
+            line = try_line;
+        }
+    }
+    font::draw(s, x, y, &line, 9, false, GRAY);
+    y + font::line_h(9)
+}
+
 fn confirm(cx: &mut Ctx, text: &str) {
     cx.dialog = Some(DialogRequest::Message { tag: T_CONF, title: String::from(TITLE), text: String::from(text), buttons: Buttons::YesNo });
 }
@@ -387,8 +404,8 @@ impl Settings {
             ("Clave", String::from(if has_pwd { "Puesta" } else { "Sin clave" })),
             ("Carpeta cifrada", String::from(crypt)),
         ] {
-            font::draw_in(s, Rect::new(x0, y, 90, 22), label, 9, false, GRAY, Align::Left);
-            font::draw_in(s, Rect::new(x0 + 90, y, (right - x0 - 90).max(0), 22), &value, 9, false, TEXT, Align::Left);
+            font::draw_in(s, Rect::new(x0, y, 120, 22), label, 9, false, GRAY, Align::Left);
+            font::draw_in(s, Rect::new(x0 + 120, y, (right - x0 - 120).max(0), 22), &value, 9, false, TEXT, Align::Left);
             y += 22;
         }
         y += 6;
@@ -408,9 +425,7 @@ impl Settings {
                 self.button_if(s, &mut at, x0, right, "Nuevo código de recuperación", Act::HomeCode, on, theme);
             }
         } else {
-            at = (x0, at.1 + BTN_H + 6);
-            font::draw(s, x0, at.1, "Para cifrar tu carpeta, primero pon una clave.", 9, false, GRAY);
-            at.1 += font::line_h(9) - BTN_H;
+            at = (x0, note(s, x0, at.1 + BTN_H + 6, right - x0, "Para cifrar tu carpeta, primero pon una clave.") - BTN_H);
         }
         y = at.1 + BTN_H + if compact { 12 } else { 20 };
         if admin {
@@ -484,8 +499,7 @@ impl Settings {
             }
             y = at.1 + BTN_H;
         } else {
-            font::draw(s, x0, y, "Solo un administrador puede cambiar el cifrado del disco.", 9, false, GRAY);
-            y += font::line_h(9);
+            y = note(s, x0, y, right - x0, "Solo un administrador puede cambiar el cifrado del disco.");
         }
         self.content_h = y + self.scroll + 16;
     }
