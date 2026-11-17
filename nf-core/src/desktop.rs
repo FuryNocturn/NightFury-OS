@@ -1740,7 +1740,9 @@ impl Desktop {
     }
 
     fn show_notice(&mut self, sys: &mut dyn Platform) {
-        if let Some(text) = sys.files().notice() {
+        // Con un disco cifrado esperando su clave, el aviso de "solo en memoria" sobra: primero
+        // va la pantalla del disco (si elige seguir sin él, ya se le advierte allí).
+        if let Some(text) = sys.files().notice().filter(|_| !sys.files().disk_locked()) {
             let req = DialogRequest::Message { tag: u32::MAX, title: String::from("Almacenamiento"), text: String::from(text), buttons: Buttons::Ok };
             self.open_dialog(None, req, sys);
         } else {
@@ -4802,7 +4804,6 @@ mod login_tests {
     /// un disco cifrado arranca en la pantalla "Disco cifrado", rechaza una clave mala, se abre con la
     /// buena o con el código de recuperación, y sigue con el inicio de sesión.
     #[test]
-    #[ignore = "necesita el cifrado de disco de files.rs"]
     fn disco_cifrado_real_pide_su_clave_antes_del_inicio_de_sesion() {
         let ram = Shared(Rc::new(core::cell::RefCell::new(vec![0; 4096 * crate::block::BLOCK])));
         let now = DateTime { year: 2026, month: 11, day: 15, hour: 21, minute: 37, second: 5 };
