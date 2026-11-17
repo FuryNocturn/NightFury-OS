@@ -5,16 +5,23 @@
 //! eliminar una cuenta) encadenan diálogos; lo que se va recogiendo vive en `Job`. Las claves
 //! solo pasan por `Secret`, que las borra de la memoria al soltarlas, y nunca van a un título,
 //! al registro ni a un archivo.
+//!
+//! Cifrado (v0.6.0): "Mi cuenta" cifra la carpeta del usuario y la página Disco el disco entero.
+//! Ambos flujos son largos (aviso, clave, repetir, pantalla del ratón, código de recuperación);
+//! las claves viven en `Job` solo entre un diálogo y el siguiente y el código de recuperación
+//! solo existe mientras se construye el diálogo que lo muestra.
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::accounts::{salt_from, AccountError, MIN_PASSWORD};
 use crate::crypto::{ct_eq, wipe};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
+use crate::files::Files;
 use crate::fs::same;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::KeyEvent;
-use crate::platform::Platform;
+use crate::keys::{self, Pool};
+use crate::platform::{DateTime, Platform};
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::{render_wallpaper, Theme, ACCENTS, WALLPAPERS};
@@ -27,9 +34,10 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 3] = [("Personalización", Icon::Palette), ("Cuentas", Icon::Logo), ("Acerca de", Icon::Info)];
+const SECTIONS: [(&str, Icon); 4] = [("Personalización", Icon::Palette), ("Cuentas", Icon::Cuentas), ("Disco", Icon::DiscoSeguro), ("Acerca de", Icon::Info)];
 const PAGE_ACCOUNTS: usize = 1;
-const PAGE_ABOUT: usize = 2;
+const PAGE_DISK: usize = 2;
+const PAGE_ABOUT: usize = 3;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -46,6 +54,14 @@ const T_ADD_ADMIN: u32 = 23;
 const T_REN: u32 = 30;
 const T_DEL_FILES: u32 = 40;
 const T_DEL_NAME: u32 = 41;
+const T_CONF: u32 = 50;
+const T_SEC: u32 = 51;
+const T_NEWK: u32 = 52;
+const T_REPK: u32 = 53;
+const T_WEAK: u32 = 54;
+const T_ENT: u32 = 55;
+const T_CODE: u32 = 56;
+const T_ASK_HOME: u32 = 57;
 const NO_MATCH: &str = "Las claves no coinciden.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -58,6 +74,13 @@ enum Act {
     Rename(usize),
     Admin(usize),
     Delete(usize),
+    HomeEnc,
+    HomeDec,
+    HomeCode,
+    DiskEnc,
+    DiskDec,
+    DiskChange,
+    DiskCode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,6 +116,13 @@ enum Op {
     Add,
     Rename,
     Delete,
+    HomeEnc,
+    HomeDec,
+    HomeCode,
+    DiskEnc,
+    DiskDec,
+    DiskChange,
+    DiskCode,
 }
 
 /// Operación de cuentas en marcha entre un diálogo y el siguiente.
@@ -102,6 +132,8 @@ struct Job {
     name: String,
     old: Secret,
     new: Secret,
+    /// Mensaje que se muestra al cerrar el diálogo del código de recuperación.
+    after: &'static str,
 }
 
 struct Settings {
@@ -267,6 +299,27 @@ fn input(cx: &mut Ctx, tag: u32, label: &str, value: &str) {
     cx.dialog = Some(DialogRequest::Input { tag, title: String::from(TITLE), label: String::from(label), value: String::from(value) });
 }
 
+fn confirm(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_CONF, title: String::from(TITLE), text: String::from(text), buttons: Buttons::YesNo });
+}
+
+/// Llama a `f` con el sistema de archivos y el acumulador de aleatoriedad del sistema. El
+/// acumulador se saca de `sys` (son dos préstamos del mismo objeto) y SIEMPRE se devuelve.
+fn with_pool<R>(cx: &mut Ctx, f: impl FnOnce(&mut Files, &mut Pool) -> R) -> R {
+    let mut pool = core::mem::take(cx.sys.pool());
+    let r = f(cx.sys.files(), &mut pool);
+    *cx.sys.pool() = pool;
+    r
+}
+
+/// Muestra el código de recuperación (una sola vez) y borra la copia que se tenía aquí.
+fn show_code(cx: &mut Ctx, mut code: String) {
+    let text = format!("{code}\n\nApúntalo en papel y guárdalo en un lugar seguro. Es la única forma de recuperar tus datos si olvidas la clave. No se volverá a mostrar.");
+    // SAFETY: se escriben ceros, que son UTF-8 válido.
+    wipe(unsafe { code.as_bytes_mut() });
+    cx.dialog = Some(DialogRequest::Message { tag: T_CODE, title: String::from("Código de recuperación"), text, buttons: Buttons::Ok });
+}
+
 fn salt(cx: &mut Ctx) -> [u8; 16] {
     let (a, b) = (cx.sys.entropy(), cx.sys.entropy());
     salt_from(a, b)
@@ -276,11 +329,24 @@ fn salt(cx: &mut Ctx) -> [u8; 16] {
 impl Settings {
     /// Botón en la posición del cursor `at`; salta de línea si no cabe. Devuelve su ancho.
     fn button(&mut self, s: &mut Surface, at: &mut (i32, i32), x0: i32, right: i32, label: &str, act: Act, theme: &Theme) {
+        self.button_if(s, at, x0, right, label, act, true, theme);
+    }
+
+    /// Como `button`; con `on == false` se dibuja apagado y no se puede pulsar.
+    #[allow(clippy::too_many_arguments)]
+    fn button_if(&mut self, s: &mut Surface, at: &mut (i32, i32), x0: i32, right: i32, label: &str, act: Act, on: bool, theme: &Theme) {
         let w = font::width(label, 9, false) + 24;
         if at.0 > x0 && at.0 + w > right {
             *at = (x0, at.1 + BTN_H + 6);
         }
         let r = Rect::new(at.0, at.1, w, BTN_H);
+        if !on {
+            s.fill_rect(r, 0xF0F0F0);
+            s.frame(r, 0xCFCFCF);
+            font::draw_in(s, r, label, 9, false, 0xA8A8A8, Align::Center);
+            at.0 += w + 8;
+            return;
+        }
         let hot = self.hover_hit == Some(act);
         s.fill_rect(r, if hot { 0xD8D8D8 } else { 0xE6E6E6 });
         s.frame(r, if hot { theme.accent } else { 0xA0A0A0 });
@@ -308,7 +374,19 @@ impl Settings {
         let list = sys.files().accounts();
         font::draw(s, x0, y, "Mi cuenta", 11, true, TEXT);
         y += font::line_h(11) + 6;
-        for (label, value) in [("Nombre", me.clone()), ("Tipo", String::from(if admin { "Administrador" } else { "Usuario" })), ("Clave", String::from(if has_pwd { "Puesta" } else { "Sin clave" }))] {
+        let busy = sys.files().home_conversion();
+        let crypt = match busy {
+            Some((_, _, true)) => "Cifrando…",
+            Some((_, _, false)) => "Descifrando…",
+            None if sys.files().home_encrypted() => "Sí",
+            None => "No",
+        };
+        for (label, value) in [
+            ("Nombre", me.clone()),
+            ("Tipo", String::from(if admin { "Administrador" } else { "Usuario" })),
+            ("Clave", String::from(if has_pwd { "Puesta" } else { "Sin clave" })),
+            ("Carpeta cifrada", String::from(crypt)),
+        ] {
             font::draw_in(s, Rect::new(x0, y, 90, 22), label, 9, false, GRAY, Align::Left);
             font::draw_in(s, Rect::new(x0 + 90, y, (right - x0 - 90).max(0), 22), &value, 9, false, TEXT, Align::Left);
             y += 22;
@@ -320,6 +398,19 @@ impl Settings {
             self.button(s, &mut at, x0, right, "Quitar clave", Act::RemovePwd, theme);
         } else {
             self.button(s, &mut at, x0, right, "Poner clave", Act::SetPwd, theme);
+        }
+        if has_pwd {
+            let (enc, on) = (sys.files().home_encrypted(), busy.is_none());
+            if !enc {
+                self.button_if(s, &mut at, x0, right, "Cifrar mi carpeta", Act::HomeEnc, on, theme);
+            } else {
+                self.button_if(s, &mut at, x0, right, "Quitar el cifrado", Act::HomeDec, on, theme);
+                self.button_if(s, &mut at, x0, right, "Nuevo código de recuperación", Act::HomeCode, on, theme);
+            }
+        } else {
+            at = (x0, at.1 + BTN_H + 6);
+            font::draw(s, x0, at.1, "Para cifrar tu carpeta, primero pon una clave.", 9, false, GRAY);
+            at.1 += font::line_h(9) - BTN_H;
         }
         y = at.1 + BTN_H + if compact { 12 } else { 20 };
         if admin {
@@ -348,6 +439,61 @@ impl Settings {
         self.content_h = y + self.scroll + 16;
     }
 
+    fn disk_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, "Disco", 18, false, TEXT);
+        y += font::line_h(18) + if compact { 6 } else { 12 };
+        if !sys.files().persistent() {
+            font::draw(s, x0, y, "Sin disco no hay nada que cifrar.", 9, false, GRAY);
+            self.content_h = y + self.scroll + font::line_h(9) + 16;
+            return;
+        }
+        let units = super::terminal::units;
+        let (total, free) = sys.files().space();
+        let admin = sys.files().is_admin();
+        let enc = sys.files().disk_encrypted();
+        let busy = sys.files().disk_conversion();
+        let state = match busy {
+            Some((done, all, encrypting)) => format!("{}… {} %", if encrypting { "Cifrando" } else { "Descifrando" }, if all == 0 { 0 } else { (done.min(all) * 100 / all) as u32 }),
+            None => String::from(if enc { "Sí" } else { "No" }),
+        };
+        for (label, value) in [
+            ("Unidad", String::from("C:")),
+            ("Tamaño", units(total)),
+            ("Espacio libre", units(free)),
+            ("Persistente", String::from("Sí")),
+            ("Cifrado total", state),
+        ] {
+            font::draw_in(s, Rect::new(x0, y, 120, 22), label, 9, false, GRAY, Align::Left);
+            font::draw_in(s, Rect::new(x0 + 120, y, (right - x0 - 120).max(0), 22), &value, 9, false, TEXT, Align::Left);
+            y += 22;
+        }
+        y += 6;
+        if admin {
+            let mut at = (x0, y);
+            let on = busy.is_none();
+            if enc {
+                self.button_if(s, &mut at, x0, right, "Quitar cifrado total", Act::DiskDec, on, theme);
+                self.button_if(s, &mut at, x0, right, "Cambiar la clave del disco", Act::DiskChange, on, theme);
+                self.button_if(s, &mut at, x0, right, "Nuevo código de recuperación", Act::DiskCode, on, theme);
+            } else {
+                self.button_if(s, &mut at, x0, right, "Activar cifrado total", Act::DiskEnc, on, theme);
+            }
+            y = at.1 + BTN_H;
+        } else {
+            font::draw(s, x0, y, "Solo un administrador puede cambiar el cifrado del disco.", 9, false, GRAY);
+            y += font::line_h(9);
+        }
+        self.content_h = y + self.scroll + 16;
+    }
+
+    fn scrolls(&self) -> bool {
+        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK
+    }
+
     fn metrics(&self) -> Metrics {
         Metrics { rect: Rect::new(self.size.0 - SB_W, 0, SB_W, self.size.1), total: self.content_h, page: self.size.1, pos: self.scroll, line: STEP }
     }
@@ -360,6 +506,22 @@ impl Settings {
 // ---- Página Cuentas: operaciones ----
 impl Settings {
     fn start(&mut self, act: Act, cx: &mut Ctx) {
+        let crypto = match act {
+            Act::HomeEnc => Some(Op::HomeEnc),
+            Act::HomeDec => Some(Op::HomeDec),
+            Act::HomeCode => Some(Op::HomeCode),
+            Act::DiskEnc => Some(Op::DiskEnc),
+            Act::DiskDec => Some(Op::DiskDec),
+            Act::DiskChange => Some(Op::DiskChange),
+            Act::DiskCode => Some(Op::DiskCode),
+            _ => None,
+        };
+        if let Some(op) = crypto {
+            return self.start_crypto(op, cx);
+        }
+        if act == Act::RemovePwd && cx.sys.files().home_encrypted() {
+            return message(cx, AccountError::Encrypted.text());
+        }
         let other = |i: usize| self.others.get(i).cloned();
         let (op, name) = match act {
             Act::SetPwd => (Op::SetPwd, String::new()),
@@ -374,6 +536,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -398,13 +561,84 @@ impl Settings {
                 })
             }
         }
-        self.job = Some(Job { op, name, old: Secret::default(), new: Secret::default() });
+        self.job = Some(Job { op, name, old: Secret::default(), new: Secret::default(), after: "" });
+    }
+
+    /// Primer paso de las operaciones de cifrado: el aviso o la primera clave.
+    fn start_crypto(&mut self, op: Op, cx: &mut Ctx) {
+        match op {
+            Op::HomeEnc => confirm(cx, "Tus archivos quedarán cifrados con una llave que solo abre tu clave. Si olvidas la clave y pierdes el código de recuperación, no se podrán recuperar. ¿Continuar?"),
+            Op::HomeDec => confirm(cx, "Tu carpeta se descifrará y sus archivos quedarán sin protección. ¿Continuar?"),
+            Op::HomeCode => password(cx, T_SEC, "Tu clave actual:"),
+            Op::DiskEnc => confirm(cx, "Se cifrará todo el disco con una clave del disco, distinta de las claves de usuario. Se pedirá cada vez que arranques. Haz antes una copia de seguridad: si olvidas la clave y pierdes el código de recuperación, se pierde todo. ¿Continuar?"),
+            Op::DiskDec => confirm(cx, "Se descifrará todo el disco y quedará sin protección. ¿Continuar?"),
+            Op::DiskChange => password(cx, T_SEC, "Clave actual del disco:"),
+            _ => password(cx, T_SEC, "Clave del disco:"),
+        }
+        self.job = Some(Job { op, name: String::new(), old: Secret::default(), new: Secret::default(), after: "" });
+    }
+
+    /// Pantalla del ratón; al terminar se ejecuta la operación.
+    fn entropy(&mut self, job: Job, cx: &mut Ctx) {
+        cx.dialog = Some(DialogRequest::Entropy { tag: T_ENT, title: String::from(TITLE) });
+        self.job = Some(job);
+    }
+
+    /// Ejecuta la operación de cifrado con las claves recogidas y las borra al terminar.
+    fn run_crypto(&mut self, mut job: Job, cx: &mut Ctx) {
+        let now: DateTime = cx.sys.now();
+        let (old, new) = (&job.old.0, &job.new.0);
+        let r = with_pool(cx, |f, pool| match job.op {
+            Op::HomeEnc => f.encrypt_home(old, pool, now).map(Some),
+            Op::HomeDec => f.decrypt_home(old, now).map(|()| None),
+            Op::HomeCode => f.new_home_recovery(old, pool, now).map(Some),
+            Op::DiskEnc => f.encrypt_disk(new, pool, now).map(Some),
+            Op::DiskDec => f.decrypt_disk(old, now).map(|()| None),
+            Op::DiskChange => f.change_disk_password(old, new, pool, now).map(|()| None),
+            Op::DiskCode => f.new_disk_recovery(old, pool, now).map(Some),
+            _ => Ok(None),
+        });
+        job.old = Secret::default();
+        job.new = Secret::default();
+        match r {
+            Err(e) => message(cx, e.text()),
+            Ok(None) => message(
+                cx,
+                match job.op {
+                    Op::HomeDec => "Se está descifrando tu carpeta.",
+                    Op::DiskDec => "Se está descifrando el disco. Puedes seguir usando el equipo.",
+                    _ => "Se ha cambiado la clave del disco.",
+                },
+            ),
+            Ok(Some(code)) => {
+                job.after = match job.op {
+                    Op::HomeEnc => "Se está cifrando tu carpeta. Puedes seguir usando el equipo.",
+                    Op::DiskEnc => "El disco se está cifrando. Puedes seguir usando el equipo.",
+                    _ => "",
+                };
+                show_code(cx, code);
+                self.job = Some(job);
+            }
+        }
     }
 
     /// Termina la operación de clave con la clave nueva ya repetida (`None` = quitarla).
-    fn finish_password(&mut self, job: Job, new: Option<&str>, cx: &mut Ctx) {
+    fn finish_password(&mut self, mut job: Job, new: Option<&str>, cx: &mut Ctx) {
         let (now, salt) = (cx.sys.now(), salt(cx));
-        match cx.sys.files().set_password(&job.old.0, new, salt, now) {
+        let r = cx.sys.files().set_password(&job.old.0, new, salt, now);
+        if r.is_ok() && job.op == Op::SetPwd {
+            // Recién puesta la clave: se ofrece cifrar la carpeta con ella, sin volver a pedirla.
+            job.new = Secret(String::from(new.unwrap_or("")));
+            cx.dialog = Some(DialogRequest::Message {
+                tag: T_ASK_HOME,
+                title: String::from(TITLE),
+                text: String::from("Se ha puesto la clave.\n¿Cifrar también tu carpeta? (Recomendado)"),
+                buttons: Buttons::YesNo,
+            });
+            self.job = Some(job);
+            return;
+        }
+        match r {
             Ok(()) => message(
                 cx,
                 match job.op {
@@ -454,6 +688,47 @@ impl Settings {
                 let new = Secret(core::mem::take(&mut job.new.0));
                 return self.finish_password(job, Some(&new.0), cx);
             }
+            T_SEC => {
+                job.old = v;
+                match job.op {
+                    Op::HomeEnc | Op::HomeDec | Op::HomeCode => {
+                        if !cx.sys.files().verify_password(&job.old.0) {
+                            return message(cx, AccountError::WrongPassword.text());
+                        }
+                        return if job.op == Op::HomeDec { self.run_crypto(job, cx) } else { self.entropy(job, cx) };
+                    }
+                    Op::DiskDec => return self.run_crypto(job, cx),
+                    Op::DiskCode => return self.entropy(job, cx),
+                    Op::DiskChange => password(cx, T_NEWK, "Clave nueva del disco (mínimo 6 caracteres):"),
+                    _ => return,
+                }
+            }
+            T_NEWK => {
+                if v.0.chars().count() < MIN_PASSWORD {
+                    return message(cx, keys::KeyError::Weak.text());
+                }
+                job.new = v;
+                password(cx, T_REPK, "Repite la clave del disco:");
+            }
+            T_REPK => {
+                if !job.new.same(&v) {
+                    return message(cx, NO_MATCH);
+                }
+                if job.op == Op::DiskChange {
+                    return self.run_crypto(job, cx);
+                }
+                if keys::strength(&job.new.0) < 2 {
+                    cx.dialog = Some(DialogRequest::Message {
+                        tag: T_WEAK,
+                        title: String::from(TITLE),
+                        text: String::from("La clave es débil. ¿Usarla de todos modos?"),
+                        buttons: Buttons::YesNo,
+                    });
+                    self.job = Some(job);
+                    return;
+                }
+                return self.entropy(job, cx);
+            }
             T_ADD_NAME => {
                 if !crate::accounts::valid_user_name(&v.0) {
                     return message(cx, AccountError::BadName.text());
@@ -501,11 +776,33 @@ impl Settings {
     }
 
     fn step_answer(&mut self, tag: u32, answer: Answer, cx: &mut Ctx) {
-        let Some(job) = self.job.take() else { return };
-        if answer == Answer::Cancel {
+        let Some(mut job) = self.job.take() else { return };
+        if tag == T_CODE {
+            if !job.after.is_empty() {
+                message(cx, job.after);
+            }
+            return;
+        }
+        if answer == Answer::Cancel || (answer == Answer::No && matches!(tag, T_CONF | T_WEAK | T_ASK_HOME)) {
             return;
         }
         match tag {
+            T_CONF => {
+                match job.op {
+                    Op::HomeEnc | Op::HomeDec => password(cx, T_SEC, "Tu clave actual:"),
+                    Op::DiskEnc => password(cx, T_NEWK, "Clave nueva del disco (mínimo 6 caracteres):"),
+                    Op::DiskDec => password(cx, T_SEC, "Clave del disco:"),
+                    _ => return,
+                }
+                self.job = Some(job);
+            }
+            T_WEAK => self.entropy(job, cx),
+            T_ASK_HOME => {
+                job.old = Secret(core::mem::take(&mut job.new.0));
+                job.op = Op::HomeEnc;
+                self.entropy(job, cx);
+            }
+            T_ENT => self.run_crypto(job, cx),
             T_ADD_ADMIN => {
                 let (now, salt) = (cx.sys.now(), salt(cx));
                 let pw = Some(job.new.0.as_str()).filter(|p| !p.is_empty());
@@ -555,15 +852,16 @@ impl App for Settings {
             match self.page {
                 0 => self.personalization(s, theme),
                 PAGE_ACCOUNTS => self.accounts_page(s, theme, sys),
+                PAGE_DISK => self.disk_page(s, theme, sys),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
-            if self.page != PAGE_ACCOUNTS || self.scroll <= self.max_scroll() {
+            if !self.scrolls() || self.scroll <= self.max_scroll() {
                 break;
             }
             self.scroll = self.max_scroll();
         }
-        if self.page == PAGE_ACCOUNTS && self.metrics().needed() {
+        if self.scrolls() && self.metrics().needed() {
             s.set_clip(Rect::new(PANEL_W, 0, (s.w - PANEL_W).max(0), s.h));
             self.sb.draw(s, &self.metrics(), theme);
             s.reset_clip();
@@ -574,7 +872,7 @@ impl App for Settings {
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         let at = |s: &Self, x: i32, y: i32| s.hits.iter().find(|(r, _)| r.contains(x, y)).map(|h| h.1);
-        if self.page == PAGE_ACCOUNTS {
+        if self.scrolls() {
             if let MouseEv::Wheel { dz, .. } = ev {
                 let to = (self.scroll + dz * STEP * 2).clamp(0, self.max_scroll());
                 if to != self.scroll {
@@ -648,7 +946,7 @@ impl App for Settings {
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
-        if self.page == PAGE_ACCOUNTS {
+        if self.scrolls() {
             let m = self.metrics();
             if let Some(p) = self.sb.tick(&m, cx.now_ms) {
                 self.scroll = p;
@@ -657,7 +955,13 @@ impl App for Settings {
         }
         // "Tiempo encendido" y memoria cambian solos: redibuja una vez por segundo.
         let sec = cx.now_ms / 1000;
-        if self.page == PAGE_ABOUT && sec != self.last_sec {
+        // El avance de las conversiones de cifrado también cambia solo.
+        let moving = match self.page {
+            PAGE_ABOUT | PAGE_DISK => true,
+            PAGE_ACCOUNTS => cx.sys.files().home_conversion().is_some(),
+            _ => false,
+        };
+        if moving && sec != self.last_sec {
             self.last_sec = sec;
             cx.redraw = true;
         }

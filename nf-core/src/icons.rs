@@ -54,6 +54,10 @@ pub enum Icon {
     Imagenes,
     Musica,
     Videos,
+    /// Cuentas de usuario (busto).
+    Cuentas,
+    /// Disco con candado (cifrado).
+    DiscoSeguro,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -405,6 +409,22 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
                 cell(s, o, k, (x0, 8.0 - h, x0 + 1.0, 8.0 + h), rgb(0xF2, 0x8B, 0x30));
             }
         }
+        Icon::Cuentas => {
+            // Busto: cabeza y hombros.
+            let (hx, hy) = p(8.0, 5.2);
+            s.fill_circle(hx, hy, 3.0 * k, fg, 255);
+            let (bx, by) = p(8.0, 15.5);
+            s.fill_circle(bx, by, 6.0 * k, fg, 255);
+        }
+        Icon::DiscoSeguro => {
+            // Unidad de disco con un candado dorado delante.
+            draw(s, Icon::Drive, x, y - iround(1.5 * k), size, fg);
+            cell(s, o, k, (9.0, 10.0, 15.0, 15.5), rgb(0xE0, 0x9F, 0x1E));
+            cell(s, o, k, (10.0, 8.0, 11.0, 10.0), OSCURO);
+            cell(s, o, k, (13.0, 8.0, 14.0, 10.0), OSCURO);
+            cell(s, o, k, (10.0, 7.2, 14.0, 8.2), OSCURO);
+            cell(s, o, k, (11.6, 11.8, 12.4, 13.6), OSCURO);
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -421,7 +441,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 41] = [
+    const ALL: [Icon; 43] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -463,6 +483,8 @@ mod tests {
         Icon::Imagenes,
         Icon::Musica,
         Icon::Videos,
+        Icon::Cuentas,
+        Icon::DiscoSeguro,
     ];
     const SENT: u32 = 0x123456;
 
