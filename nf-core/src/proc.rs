@@ -416,7 +416,7 @@ impl ProcApp {
         let st = self.proc.state();
         let out = core::mem::take(&mut st.out);
         let status = st.status.clone();
-        let hung = st.not_responding(now);
+        let hung = st.status == Status::Alive && st.not_responding(now);
         if let Some(f) = out.frame {
             self.frame = Some(f);
             cx.redraw = true;
