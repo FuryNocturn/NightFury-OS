@@ -61,7 +61,7 @@ pub const E_NOSYS: i64 = -4;
 
 pub const LOG_MAX: usize = 1024;
 pub const TITLE_MAX: usize = 256;
-pub const MAX_DIM: u64 = 8192;
+pub const MAX_DIM: u64 = 4096;
 
 // ---------- Eventos ----------
 pub const EV_NONE: u32 = 0;

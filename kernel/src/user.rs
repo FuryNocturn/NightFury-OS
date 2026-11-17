@@ -336,6 +336,10 @@ impl Drop for Proc {
 }
 
 impl UserMem for Proc {
+    fn check(&self, addr: u64, len: u64, write: bool) -> bool {
+        paging::cr3() == self.pml4 as u64 && self.regions.check(addr, len, write)
+    }
+
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> bool {
         // Con CR3 de otro espacio no se tocaría el programa: se niega en vez de leer cualquier cosa.
         if paging::cr3() != self.pml4 as u64 || !self.regions.check(addr, buf.len() as u64, false) {

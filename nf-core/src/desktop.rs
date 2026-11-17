@@ -2341,7 +2341,9 @@ impl Desktop {
         let new = build_icons(sys, self.order, self.show_ext);
         let same = new.len() == self.icons.len()
             && new.iter().zip(&self.icons).all(|(a, b)| a.name == b.name && a.label == b.label && a.icon == b.icon);
+        // Mismo aspecto pero otro destino (la app interna pasa a ser un programa): se cambia sin repintar.
         if same {
+            self.icons = new;
             return;
         }
         for i in 0..self.icons.len().max(new.len()) {

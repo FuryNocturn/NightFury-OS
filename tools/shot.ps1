@@ -56,7 +56,13 @@ try {
     if (-not $cli) { throw 'No se pudo conectar al monitor de QEMU' }
     $w = New-Object System.IO.StreamWriter($cli.GetStream())
     $w.AutoFlush = $true
-    foreach ($c in $Commands) { $w.WriteLine($c.Trim()); Start-Sleep -Milliseconds 700 }
+    foreach ($c in $Commands) {
+        if ($c.Trim() -eq 'doble') {
+            # Doble clic: las cuatro órdenes seguidas (con 700 ms entre ellas no sería doble).
+            foreach ($b in 1, 0, 1, 0) { $w.WriteLine("mouse_button $b"); Start-Sleep -Milliseconds 60 }
+        } else { $w.WriteLine($c.Trim()) }
+        Start-Sleep -Milliseconds 700
+    }
     Start-Sleep -Milliseconds 800
     $w.WriteLine("screendump $ppm")  # el monitor no admite comillas: la ruta no debe tener espacios
     for ($i = 0; $i -lt 30 -and -not (Test-Path $ppm); $i++) { Start-Sleep -Milliseconds 300 }

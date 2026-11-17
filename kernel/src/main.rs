@@ -64,6 +64,15 @@ unsafe impl GlobalAlloc for Asignador {
     }
 }
 
+/// Programas que trae el sistema (los compila `tools\programas.ps1` antes que el núcleo).
+const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[(
+    "Calculadora",
+    &[
+        ("app.txt", include_bytes!("../../programs/calculadora/app.txt")),
+        ("programa.nfx", include_bytes!("../../target/programas/Calculadora/programa.nfx")),
+    ],
+)];
+
 #[global_allocator]
 static ASIGNADOR: Asignador = Asignador;
 
@@ -266,7 +275,18 @@ extern "C" fn kmain() -> ! {
     let mut raton = Ps2Mouse::new();
     raton.set_wheel(con_rueda);
     let mut ultimo = u64::MAX;
+    let mut programas_listos = false;
     loop {
+        // Programas del sistema: se instalan (o actualizan) en cuanto el disco está listo.
+        if !programas_listos && !plat.files.disk_locked() && !plat.files.pending_format() {
+            programas_listos = true;
+            let now = plat.now();
+            for (dir, items) in PROGRAMAS_SISTEMA {
+                if let Err(e) = plat.files.install_system_program(dir, items, now) {
+                    traza!("NF programas: no se pudo instalar {}: {:?}", dir, e);
+                }
+            }
+        }
         while let Some(b) = ps2::TECLADO.pop() {
             if TRAZA_BYTES {
                 traza!("tecla byte={:#04x}", b);

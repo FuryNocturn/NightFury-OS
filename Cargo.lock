@@ -12,32 +12,32 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-app"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.7.2"
+version = "0.8.0"
 
 [[package]]
 name = "nfdisk"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfpack"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "nf-core",
 ]

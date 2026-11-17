@@ -1,10 +1,10 @@
-﻿[workspace]
+[workspace]
 members = ["nf-core", "kernel", "tools/nfdisk", "nf-app", "tools/nfpack", "programs/calculadora", "programs/plantilla"]
 default-members = ["nf-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 
 [profile.dev]

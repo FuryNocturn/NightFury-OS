@@ -1336,6 +1336,8 @@ impl Files {
             }
         }
         if changed {
+            // El escritorio rehace sus iconos y el menú Inicio.
+            self.generation += 1;
             self.log(&format!("Programa del sistema instalado: {folder}"), now);
         }
         Ok(changed)

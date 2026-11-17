@@ -55,6 +55,8 @@ impl Regions {
 /// Acceso a la memoria del programa desde el núcleo. Cada método comprueba `Regions` primero y
 /// devuelve `false` (sin tocar nada) si el rango no es válido.
 pub trait UserMem {
+    /// ¿Se puede leer (o escribir, con `write`) `[addr, addr+len)` entero? No toca nada.
+    fn check(&self, addr: u64, len: u64, write: bool) -> bool;
     fn read(&mut self, addr: u64, buf: &mut [u8]) -> bool;
     fn write(&mut self, addr: u64, data: &[u8]) -> bool;
     /// Mapea páginas nuevas a cero con lectura y escritura en `[start, end)` (alineados a página).
@@ -179,6 +181,10 @@ fn read_text(mem: &mut dyn UserMem, ptr: u64, len: u64, max: usize) -> Result<St
 fn present(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, w: u64, h: u64, stride: u64) -> i64 {
     if w > MAX_DIM || h > MAX_DIM || stride < w || stride > MAX_DIM {
         return E_INVAL;
+    }
+    // Antes de reservar nada en el núcleo: todas las filas tienen que estar en su memoria.
+    if h > 0 && !(0..h).all(|y| ptr.checked_add(y * stride * 4).is_some_and(|a| mem.check(a, w * 4, false))) {
+        return E_FAULT;
     }
     let mut s = Surface::new(w as i32, h as i32, 0xFFFFFF);
     let mut row = vec![0u8; w as usize * 4];
@@ -428,6 +434,9 @@ pub(crate) mod tests {
     }
 
     impl UserMem for FakeMem {
+        fn check(&self, addr: u64, len: u64, write: bool) -> bool {
+            self.regions.check(addr, len, write)
+        }
         fn read(&mut self, addr: u64, buf: &mut [u8]) -> bool {
             if !self.regions.check(addr, buf.len() as u64, false) {
                 return false;
