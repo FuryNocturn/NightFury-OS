@@ -15,6 +15,8 @@ pub struct BootInfo {
     pub heap_base: u64,
     pub heap_size: u64,
     pub ram_total: u64,
+    /// Fin (exclusivo) de la RAM más alta según el mapa de memoria.
+    pub ram_end: u64,
     pub runtime: *mut RuntimeServices,
 }
 
@@ -27,6 +29,7 @@ static mut BOOT: BootInfo = BootInfo {
     heap_base: 0,
     heap_size: 0,
     ram_total: 0,
+    ram_end: 0,
     runtime: null_mut(),
 };
 
@@ -130,6 +133,7 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
 
     // Salida de los servicios de arranque (el mapa puede cambiar, así que se reintenta).
     let mut ram_total = 0u64;
+    let mut ram_end = 0u64;
     let mut exited = false;
     for _ in 0..3 {
         let mut map_size = MAP_PAGES * 4096;
@@ -141,9 +145,10 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
             // Descriptor: tipo u32 en el desplazamiento 0, número de páginas u64 en el 24.
             for off in (0..map_size).step_by(dsize) {
                 let d = (map_addr as usize + off) as *const u8;
-                let (ty, pages) = unsafe { (d.cast::<u32>().read_unaligned(), d.add(24).cast::<u64>().read_unaligned()) };
+                let (ty, start, pages) = unsafe { (d.cast::<u32>().read_unaligned(), d.add(8).cast::<u64>().read_unaligned(), d.add(24).cast::<u64>().read_unaligned()) };
                 if matches!(ty, 1..=7 | 9 | 10 | 14) {
                     ram_total += pages * 4096;
+                    ram_end = ram_end.max(start + pages * 4096);
                 }
             }
             exited = true;
@@ -166,6 +171,7 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
             heap_base: base + STACK_SIZE,
             heap_size: size - STACK_SIZE,
             ram_total,
+            ram_end,
             runtime: st.runtime_services,
         });
         let top = (base + STACK_SIZE) & !15;
