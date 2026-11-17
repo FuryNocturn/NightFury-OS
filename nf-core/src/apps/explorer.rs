@@ -2137,6 +2137,8 @@ mod tests {
         open_new: Option<String>,
         term: Option<String>,
         closed: bool,
+        drag: Option<DragRequest>,
+        redraw: bool,
     }
 
     impl T {
@@ -2148,7 +2150,7 @@ mod tests {
             T::with(sys)
         }
         fn with(sys: TestPlatform) -> T {
-            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None, term: None, closed: false };
+            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None, term: None, closed: false, drag: None, redraw: false };
             t.draw();
             t
         }
@@ -2164,6 +2166,8 @@ mod tests {
             self.open_new = cx.open_new.take();
             self.term = cx.open_terminal.take();
             self.closed |= cx.close;
+            self.drag = cx.drag.take().or(self.drag.take());
+            self.redraw = cx.redraw;
             (r, cx.dialog.take(), cx.open.take())
         }
         fn key(&mut self, key: Key, ctrl: bool) -> (Option<DialogRequest>, Option<String>) {
@@ -3628,6 +3632,359 @@ mod tests {
         let (d, _) = t.rib(R_NEWF);
         assert!(matches!(d, Some(DialogRequest::Input { .. })));
         assert!(t.answer(text("Libre")).is_none() && t.sys.files.exists(pth(Std::Documents, "Libre").as_str()));
+    }
+
+    // ---- v0.7.0: recuadro de selección y arrastre ----
+
+    impl T {
+        fn down(&mut self, x: i32, y: i32) {
+            self.now += 600;
+            self.press(x, y);
+        }
+        fn mv(&mut self, x: i32, y: i32) {
+            self.cx(|e, cx| e.mouse(MouseEv::Move { x, y }, cx));
+            self.draw();
+        }
+        fn pt(&self, i: usize) -> (i32, i32) {
+            let r = self.e.item_rect(i);
+            (r.x + 10, r.y + 5)
+        }
+        fn tick(&mut self, ms: u64) {
+            self.now += ms;
+            self.cx(|e, cx| e.tick(cx));
+            self.draw();
+        }
+        /// Ctrl pulsado (el escritorio lo avisa con `Key::Other`).
+        fn ctrl(&mut self, on: bool) {
+            self.mods(on, false);
+        }
+        fn over(&mut self, p: Option<(i32, i32)>, paths: &[String]) -> (bool, bool) {
+            let (r, ..) = self.cx(|e, cx| e.drag_over(p, paths, cx));
+            (r, self.redraw)
+        }
+        fn drop_at(&mut self, p: (i32, i32), paths: &[String], copy: bool) -> Option<DialogRequest> {
+            let (_, d, _) = self.cx(|e, cx| e.drop_files(p.0, p.1, paths, copy, cx));
+            self.draw();
+            d
+        }
+        fn place_pt(i: i32) -> (i32, i32) {
+            (30, RIB_H + NAV_H + 8 + PLACE_H * i + 4)
+        }
+        fn exists_in(&mut self, d: Std, n: &str) -> bool {
+            self.sys.files.exists(pth(d, n).as_str())
+        }
+    }
+
+    #[test]
+    fn recuadro_en_detalles_con_ctrl_y_clic_vacio() {
+        let mut t = T::new();
+        t.many(5); // Sub, f00..f04, nota.txt
+        let (ex, ey) = EMPTY;
+        // Sin arrastrar: un clic en zona vacía deselecciona.
+        t.click_item(1);
+        t.click(ex, ey);
+        assert!(t.marked().is_empty());
+        // Recuadro de abajo hacia arriba hasta la fila 2.
+        let (_, y2) = t.pt(2);
+        t.down(ex, ey);
+        t.mv(ex, y2);
+        assert_eq!(t.marked(), [2, 3, 4, 5, 6]);
+        assert!(t.e.mq_rect().is_some());
+        t.mv(ex, t.pt(5).1);
+        assert_eq!(t.marked(), [5, 6], "al encoger, suelta los que ya no toca");
+        t.up_(ex, t.pt(5).1);
+        assert_eq!(t.marked(), [5, 6], "al soltar queda la selección");
+        assert!(t.e.mq_rect().is_none());
+        // Con Ctrl, los que toca cambian de estado respecto a la selección inicial.
+        t.click_item(0);
+        t.ctrl(true);
+        t.down(ex, ey);
+        t.mv(ex, t.pt(0).1);
+        assert_eq!(t.marked(), [1, 2, 3, 4, 5, 6]);
+        t.up_(ex, t.pt(0).1);
+        t.ctrl(false);
+        // Clic simple con Ctrl en zona vacía conserva la selección.
+        t.ctrl(true);
+        t.click(ex, ey);
+        t.ctrl(false);
+        assert_eq!(t.marked(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn recuadro_en_lista_e_iconos() {
+        let mut t = T::new();
+        t.many(5);
+        t.e.view = View::List;
+        t.draw();
+        let (_, y2) = t.pt(2);
+        t.down(600, 300);
+        t.mv(t.pt(2).0, y2);
+        assert_eq!(t.marked(), [2, 3, 4, 5, 6]);
+        t.up_(600, 300);
+        t.e.view = View::Icons;
+        t.e.clear_sel();
+        t.draw();
+        let (x4, _) = t.pt(4);
+        t.down(x4 + 20, 400);
+        t.mv(t.pt(1).0, t.pt(1).1);
+        assert_eq!(t.marked(), [1, 2, 3, 4]);
+        t.up_(0, 0);
+    }
+
+    #[test]
+    fn recuadro_se_desplaza_solo_en_el_borde() {
+        let mut t = T::new();
+        t.many(80); // 82 elementos
+        t.e.view = View::Icons;
+        t.draw();
+        t.key(Key::End, false);
+        let top = t.e.top;
+        assert!(top >= 3);
+        // Empieza en un hueco de la última línea (a la derecha del último elemento).
+        let last = t.e.rows.len() - 1;
+        let r = t.e.item_rect(last);
+        t.down(r.right() + 30, r.y + 5);
+        assert!(t.e.mq.is_some());
+        // Puntero por encima de la zona: sube de línea en línea con `tick`, sin mover el ratón.
+        let a = t.e.area();
+        t.mv(a.x + 5, a.y - 3);
+        let sel0 = t.marked().len();
+        t.tick(100);
+        assert_eq!(t.e.top, top - 1);
+        assert!(t.marked().len() > sel0, "el recuadro sigue anclado al contenido");
+        t.tick(10);
+        assert_eq!(t.e.top, top - 1, "respeta el ritmo");
+        for _ in 0..top {
+            t.tick(100);
+        }
+        assert_eq!(t.e.top, 0);
+        assert!(t.marked().contains(&0) && t.marked().contains(&last));
+        // Por debajo: baja.
+        t.mv(a.x + 5, a.bottom() + 3);
+        t.tick(100);
+        assert_eq!(t.e.top, 1);
+        // Soltado el botón, ya no se mueve.
+        t.up_(a.x, a.bottom());
+        t.tick(500);
+        assert_eq!(t.e.top, 1);
+        // Lista: avance lateral.
+        t.e.view = View::List;
+        t.e.top = 0;
+        t.draw();
+        t.key(Key::End, false);
+        let top = t.e.top;
+        assert!(top >= 1);
+        let a = t.e.area();
+        let r = t.e.item_rect(t.e.rows.len() - 1);
+        t.down(r.x + 5, r.bottom() + 5);
+        t.mv(a.x - 3, r.y);
+        t.tick(100);
+        assert_eq!(t.e.top, top - 1);
+    }
+
+    #[test]
+    fn origen_del_arrastre() {
+        let mut t = T::new();
+        t.many(5); // Sub, f00..f04, nota.txt
+        let p = |n: &str| pth(Std::Documents, n);
+        // Menos de 5 px: no arrastra.
+        let (x, y) = t.pt(3);
+        t.down(x, y);
+        t.mv(x + 3, y + 2);
+        assert!(t.drag.is_none());
+        t.up_(x + 3, y + 2);
+        assert_eq!(t.marked(), [3]);
+        // Más de 5 px: arrastra la selección (un no seleccionado se selecciona y va solo).
+        t.down(x, y);
+        t.mv(x + 8, y);
+        assert_eq!(t.drag.take().map(|d| d.paths), Some(vec![p("f02")]));
+        let (x5, y5) = t.pt(5);
+        t.down(x5, y5);
+        t.mv(x5, y5 + 12);
+        assert_eq!(t.drag.take().unwrap().paths, vec![p("f04")]);
+        assert_eq!(t.marked(), [5]);
+        t.mv(x5, y5 + 40);
+        assert!(t.drag.is_none(), "una vez pedido, no se repite");
+        // Selección múltiple: pulsar un seleccionado no la deshace; arrastra todo.
+        t.select_range(2, 4);
+        let (x3, y3) = t.pt(3);
+        t.down(x3, y3);
+        assert_eq!(t.marked(), [2, 3, 4]);
+        t.mv(x3 + 10, y3);
+        assert_eq!(t.drag.take().unwrap().paths, vec![p("f01"), p("f02"), p("f03")]);
+        assert_eq!(t.marked(), [2, 3, 4]);
+        // Sin arrastre, al soltar queda solo ese.
+        t.select_range(2, 4);
+        t.down(x3, y3);
+        t.mv(x3 + 2, y3);
+        t.up_(x3, y3);
+        assert_eq!(t.marked(), [3]);
+        // Con Ctrl no se arrastra.
+        t.ctrl(true);
+        t.down(x3, y3 + ROW_H);
+        t.mv(x3 + 20, y3 + ROW_H);
+        t.ctrl(false);
+        assert!(t.drag.is_none());
+        // Doble clic sigue abriendo.
+        t.up_(0, 0);
+        t.click_item(0);
+        t.click_item(0);
+        assert_eq!(t.e.cwd, p("Sub"));
+        // Papelera: no se arrastra.
+        let now = t.now_dt();
+        t.sys.files.trash(&p("f00"), now).ok();
+        t.open(files::TRASH);
+        assert!(!t.rows().is_empty());
+        let (xt, yt) = t.pt(0);
+        t.down(xt, yt);
+        t.mv(xt + 20, yt);
+        assert!(t.drag.is_none());
+        t.up_(xt, yt);
+        // Carpetas protegidas: no se arrastran.
+        t.open(dd(Std::Documents).rsplit_once('\\').unwrap().0);
+        let i = t.rows().iter().position(|n| n == "Documentos").unwrap();
+        let (xp, yp) = t.pt(i);
+        t.down(xp, yp);
+        t.mv(xp + 20, yp);
+        assert!(t.drag.is_none());
+        t.up_(xp, yp);
+        assert_eq!(t.marked(), [i]);
+    }
+
+    #[test]
+    fn destino_del_arrastre() {
+        let mut t = T::new();
+        t.many(2); // Sub, f00, f01, nota.txt
+        let p = |n: &str| pth(Std::Documents, n);
+        let now = t.now_dt();
+        let otra = pth(Std::Pictures, "x.txt");
+        t.sys.files.write(&otra, b"x", now).unwrap();
+        // Sobre una carpeta de la lista: sí, con resaltado; redibuja solo al cambiar.
+        let sub = t.pt(0);
+        assert_eq!(t.over(Some(sub), &[p("f00")]), (true, true));
+        assert_eq!(t.e.drop_tgt, Some(Tgt::Row(0)));
+        assert_eq!(t.over(Some((sub.0 + 3, sub.1)), &[p("f00")]), (true, false));
+        // Sobre un archivo o zona vacía de la misma carpeta: no, y quita el resaltado.
+        assert_eq!(t.over(Some(t.pt(2)), &[p("f00")]), (false, true));
+        assert_eq!(t.e.drop_tgt, None);
+        // Zona vacía con archivos de otra carpeta: sí, sin resaltar.
+        assert_eq!(t.over(Some(EMPTY), &[otra.clone()]), (true, false));
+        assert_eq!(t.e.drop_tgt, None);
+        // Panel: Imágenes sí; la carpeta donde ya están, no; Papelera sí.
+        assert_eq!(t.over(Some(T::place_pt(3)), &[p("f00")]), (true, true));
+        assert_eq!(t.e.drop_tgt, Some(Tgt::Place(3)));
+        assert_eq!(t.over(Some(T::place_pt(1)), &[p("f00")]), (false, true));
+        assert_eq!(t.over(Some(T::place_pt(7)), &[p("f00")]), (true, true));
+        assert_eq!(t.e.drop_tgt, Some(Tgt::Place(7)));
+        // Sobre sí misma o dentro de sí misma: no.
+        assert_eq!(t.over(Some(sub), &[p("Sub")]).0, false);
+        let now = t.now_dt();
+        t.sys.files.mkdir(&join(&p("Sub"), "Hijo"), now).unwrap();
+        t.open(&p("Sub"));
+        assert_eq!(t.over(Some(t.pt(0)), &[p("Sub")]).0, false, "dentro de lo arrastrado");
+        // Fuera de la ventana: quita el resaltado.
+        assert_eq!(t.over(Some(T::place_pt(2)), &[otra.clone()]).0, true);
+        assert_eq!(t.over(None, &[otra.clone()]), (false, true));
+        assert_eq!(t.e.drop_tgt, None);
+        // La Papelera: su lista no admite soltar; la cinta tampoco.
+        t.open(files::TRASH);
+        assert_eq!(t.over(Some(EMPTY), &[otra.clone()]).0, false);
+        assert_eq!(t.over(Some((500, 40)), &[otra.clone()]).0, false);
+        // Donde no se puede escribir (directamente en Usuarios).
+        t.open(files::USERS_DIR);
+        assert_eq!(t.over(Some(EMPTY), &[otra.clone()]).0, false);
+        let sub = t.pt(0);
+        assert_eq!(t.over(Some(sub), &[otra]).0, false);
+    }
+
+    #[test]
+    fn soltar_mueve_copia_y_va_a_la_papelera() {
+        let mut t = T::new();
+        t.many(3);
+        let p = |n: &str| pth(Std::Documents, n);
+        // Mover a una carpeta de la lista; deshacer como un lote.
+        let sub = t.pt(0);
+        t.over(Some(sub), &[p("f00"), p("f01")]);
+        assert!(t.drop_at(sub, &[p("f00"), p("f01")], false).is_none());
+        assert_eq!(t.e.drop_tgt, None);
+        assert!(!t.exists_in(Std::Documents, "f00") && !t.exists_in(Std::Documents, "f01"));
+        assert!(t.sys.files.exists(&join(&p("Sub"), "f00")) && t.sys.files.exists(&join(&p("Sub"), "f01")));
+        t.key(Key::Char('z'), true);
+        assert!(t.exists_in(Std::Documents, "f00") && t.exists_in(Std::Documents, "f01"));
+        assert!(!t.sys.files.exists(&join(&p("Sub"), "f00")));
+        // Copiar (Ctrl).
+        t.drop_at(sub, &[p("f02")], true);
+        assert!(t.exists_in(Std::Documents, "f02") && t.sys.files.exists(&join(&p("Sub"), "f02")));
+        // A una entrada del panel.
+        t.drop_at(T::place_pt(3), &[p("f00")], false);
+        assert!(!t.exists_in(Std::Documents, "f00") && t.exists_in(Std::Pictures, "f00"));
+        // A la Papelera, y se deshace.
+        t.drop_at(T::place_pt(7), &[p("f01")], false);
+        assert!(!t.exists_in(Std::Documents, "f01"));
+        assert_eq!(t.sys.files.trash_list().unwrap().len(), 1);
+        t.key(Key::Char('z'), true);
+        assert!(t.exists_in(Std::Documents, "f01"));
+        // A la misma carpeta: nada.
+        let antes = t.names();
+        t.drop_at(EMPTY, &[p("f01")], false);
+        t.drop_at(EMPTY, &[p("f01")], true);
+        assert_eq!(t.names(), antes);
+        // Carpeta dentro de sí misma: nada y no se pierde.
+        let sub = t.pt(0);
+        assert!(t.drop_at(sub, &[p("Sub")], false).is_none());
+        assert!(t.sys.files.exists(&p("Sub")) && t.names() == antes);
+        // Lo movido a la carpeta visible queda seleccionado.
+        t.open(&p("Sub"));
+        t.drop_at(EMPTY, &[p("f01")], false);
+        assert_eq!(t.rows().iter().filter(|n| *n == "f01").count(), 1);
+        assert_eq!(t.sel_name().as_deref(), Some("f01"));
+    }
+
+    #[test]
+    fn soltar_con_permiso_denegado() {
+        let mut t = T::with(con_cuentas("Luis"));
+        let now = t.now_dt();
+        t.sys.files.login("Ana", "").unwrap();
+        let ajeno = "C:\\Usuarios\\Ana\\Documentos\\secreto.txt";
+        t.sys.files.write(ajeno, b"x", now).unwrap();
+        t.sys.files.login("Luis", "").unwrap();
+        let mia = t.sys.files.std_dir(Std::Documents);
+        t.go_dir(&mia);
+        let d = t.drop_at(EMPTY, &[String::from(ajeno)], false);
+        let (tag, text, _) = mensaje(d);
+        assert_eq!((tag, text.as_str()), (TAG_ERROR, "No tienes permiso para hacer eso."));
+        t.sys.files.login("Ana", "").unwrap();
+        assert!(t.sys.files.exists(ajeno), "no se pierde nada");
+    }
+
+    #[test]
+    fn soltar_en_sistema_pide_confirmacion() {
+        let mut t = T::new();
+        let now = t.now_dt();
+        let temp = "C:\\Sistema\\temp";
+        let nota = pth(Std::Documents, "nota.txt");
+        t.sys.files.write("C:\\Sistema\\temp\\viejo.txt", b"x", now).unwrap();
+        t.open(temp);
+        // Destino en Sistema: pregunta; No no hace nada; Sí mueve.
+        let (tag, ..) = mensaje(t.drop_at(EMPTY, &[nota.clone()], false));
+        assert_eq!(tag, TAG_SYS);
+        t.answer(DialogResult::Answer { tag: TAG_SYS, answer: Answer::No });
+        assert!(t.sys.files.exists(&nota) && !t.sys.files.exists("C:\\Sistema\\temp\\nota.txt"));
+        t.drop_at(EMPTY, &[nota.clone()], false);
+        t.answer(DialogResult::Answer { tag: TAG_SYS, answer: Answer::Yes });
+        assert!(!t.sys.files.exists(&nota) && t.sys.files.exists("C:\\Sistema\\temp\\nota.txt"));
+        // Origen en Sistema: también pregunta.
+        let (tag, ..) = mensaje(t.drop_at(T::place_pt(1), &[String::from("C:\\Sistema\\temp\\viejo.txt")], false));
+        assert_eq!(tag, TAG_SYS);
+        t.answer(DialogResult::Answer { tag: TAG_SYS, answer: Answer::No });
+        assert!(t.sys.files.exists("C:\\Sistema\\temp\\viejo.txt"));
+        t.drop_at(T::place_pt(1), &[String::from("C:\\Sistema\\temp\\viejo.txt")], false);
+        t.answer(DialogResult::Answer { tag: TAG_SYS, answer: Answer::Yes });
+        assert!(t.exists_in(Std::Documents, "viejo.txt"));
+        // Copiar desde Sistema no modifica Sistema: sin aviso.
+        t.sys.files.write("C:\\Sistema\\temp\\otro.txt", b"y", now).unwrap();
+        assert!(t.drop_at(T::place_pt(1), &[String::from("C:\\Sistema\\temp\\otro.txt")], true).is_none());
+        assert!(t.exists_in(Std::Documents, "otro.txt") && t.sys.files.exists("C:\\Sistema\\temp\\otro.txt"));
     }
 
     /// Capturas para revisar a ojo: `NF_CAPTURAS=carpeta cargo test -p nf-core capturas -- --ignored`.
