@@ -948,18 +948,23 @@ impl Login {
                 wipe_str(&mut norm);
                 wipe_str(&mut newpw);
                 self.wipe_all();
-                match res {
-                    Ok(()) => {
-                        self.enter(Mode::Pick);
-                        self.focus = self.order().first().copied().unwrap_or(Item::Ok);
-                        self.say("Clave cambiada. Ya puedes iniciar sesión.", true);
-                    }
-                    Err(e) => {
-                        self.focus = if e == KeyError::Weak { Item::Pw } else { Item::Code };
-                        self.say(e.text(), false);
-                    }
-                }
+                self.recover_result(res);
                 Out::None
+            }
+        }
+    }
+
+    /// Resultado de recuperar la cuenta: vuelve al inicio de sesión con un aviso, o muestra el error.
+    fn recover_result(&mut self, res: Result<(), KeyError>) {
+        match res {
+            Ok(()) => {
+                self.enter(Mode::Pick);
+                self.focus = self.order().first().copied().unwrap_or(Item::Ok);
+                self.say("Clave cambiada. Ya puedes iniciar sesión.", true);
+            }
+            Err(e) => {
+                self.focus = if e == KeyError::Weak { Item::Pw } else { Item::Code };
+                self.say(e.text(), false);
             }
         }
     }
@@ -1402,5 +1407,293 @@ impl Login {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::POOL_EVENTS_NEEDED;
+    use crate::platform::TestPlatform;
+
+    const CODE: &str = "ABCDEFGHJKMNPQRSTUVWXYZ023456789ABCDEFGH";
+
+    fn sys() -> TestPlatform {
+        TestPlatform { size: (1280, 800), ..Default::default() }
+    }
+
+    fn disk() -> (Login, TestPlatform) {
+        let mut l = Login::new(1280, 800);
+        l.start_disk();
+        (l, sys())
+    }
+
+    fn press(l: &mut Login, sys: &mut TestPlatform, key: Key, ch: Option<char>) -> Out {
+        l.key(&KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt: false }, sys)
+    }
+
+    fn typ(l: &mut Login, sys: &mut TestPlatform, text: &str) {
+        for c in text.chars() {
+            press(l, sys, Key::Char(c.to_ascii_lowercase()), Some(c));
+        }
+    }
+
+    fn rect(l: &Login, it: Item) -> Rect {
+        l.layout().items.iter().find(|i| i.0 == it).unwrap().1
+    }
+
+    fn click(l: &mut Login, sys: &mut TestPlatform, it: Item) -> Out {
+        let r = rect(l, it);
+        l.click(r.x + r.w / 2, r.y + r.h / 2, sys)
+    }
+
+    fn msg(l: &Login) -> String {
+        l.msg_text().unwrap_or_default()
+    }
+
+    #[test]
+    fn disco_sin_clave_avisa_y_no_deriva_nada() {
+        let (mut l, mut sys) = disk();
+        assert!(l.covers());
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert_eq!(msg(&l), "Escribe la clave del disco.");
+        assert!(l.job.is_none());
+    }
+
+    #[test]
+    fn disco_dice_comprobando_y_deriva_un_tick_despues() {
+        let (mut l, mut sys) = disk();
+        l.tick(100, &mut sys);
+        typ(&mut l, &mut sys, "clavedisco");
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert_eq!(msg(&l), "Comprobando…");
+        // Mientras tanto no se acepta nada más.
+        typ(&mut l, &mut sys, "x");
+        assert_eq!(l.pw.chars().count(), 10);
+        assert_eq!(l.tick(110, &mut sys), Out::None);
+        assert!(l.job.is_some());
+        // El disco de la plataforma de pruebas no está cifrado: error normal, que no cuenta como fallo.
+        assert_eq!(l.tick(100 + JOB_DELAY_MS, &mut sys), Out::None);
+        assert_eq!(msg(&l), KeyError::NotEncrypted.text());
+        assert_eq!((l.fails, l.pw.len()), (0, 0));
+    }
+
+    #[test]
+    fn disco_en_modo_codigo_valida_antes_de_derivar() {
+        let (mut l, mut sys) = disk();
+        assert!(!l.plain(Item::Pw));
+        click(&mut l, &mut sys, Item::Link);
+        assert!(l.recovery_mode && l.plain(Item::Pw));
+        typ(&mut l, &mut sys, "abcd-efgh");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(msg(&l), "El código debe tener 40 caracteres.");
+        assert!(l.job.is_none());
+        // Con 40 caracteres válidos (minúsculas, espacios y guiones incluidos) sí se pone en marcha.
+        for _ in 0..9 {
+            press(&mut l, &mut sys, Key::Backspace, None);
+        }
+        let spaced: String = CODE.to_lowercase().as_bytes().chunks(5).map(|c| core::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-");
+        typ(&mut l, &mut sys, &spaced);
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert!(l.job.is_some());
+        // Un carácter fuera del alfabeto se avisa aparte.
+        assert!(check_code(&CODE.replace('A', "I")).is_err());
+        assert_eq!(check_code(&CODE.replace('A', "I")), Err("El código tiene caracteres que no son válidos."));
+        // Volver a la clave borra lo escrito.
+        l.job = None;
+        click(&mut l, &mut sys, Item::Link);
+        assert!(!l.recovery_mode && l.pw.is_empty());
+    }
+
+    #[test]
+    fn disco_espera_creciente_tras_tres_fallos() {
+        let (mut l, mut sys) = disk();
+        l.tick(1000, &mut sys);
+        for _ in 0..2 {
+            assert_eq!(l.disk_result(Err(KeyError::WrongSecret)), Out::None);
+            assert!(!l.waiting());
+        }
+        // Otros errores no cuentan.
+        l.disk_result(Err(KeyError::NotEncrypted));
+        assert!(!l.waiting());
+        l.disk_result(Err(KeyError::WrongSecret));
+        assert!(l.waiting());
+        assert!(msg(&l).starts_with("Demasiados intentos. Espera 5 s"));
+        typ(&mut l, &mut sys, "x");
+        assert!(l.pw.is_empty());
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert!(l.job.is_none());
+        l.tick(1000 + 5000, &mut sys);
+        assert!(!l.waiting());
+        typ(&mut l, &mut sys, "x");
+        assert_eq!(l.pw.len(), 1);
+        // Siguientes esperas: 15 s a los 6 fallos.
+        for _ in 0..3 {
+            l.disk_result(Err(KeyError::WrongSecret));
+        }
+        assert_eq!(l.last_secs, 15);
+        // Acertar lo reinicia todo.
+        l.until = None;
+        assert_eq!(l.disk_result(Ok(())), Out::DiskDone);
+        assert_eq!((l.fails, l.until), (0, None));
+    }
+
+    #[test]
+    fn disco_seguir_sin_disco_pide_confirmacion() {
+        let (mut l, mut sys) = disk();
+        typ(&mut l, &mut sys, "algo");
+        assert_eq!(click(&mut l, &mut sys, Item::Skip), Out::None);
+        assert!(l.confirm_skip && l.pw.is_empty());
+        assert_eq!(l.layout().items.iter().filter(|i| matches!(i.0, Item::Done | Item::Back)).count(), 2);
+        // Volver (o Escape) no hace nada más.
+        assert_eq!(click(&mut l, &mut sys, Item::Back), Out::None);
+        assert!(!l.confirm_skip);
+        click(&mut l, &mut sys, Item::Skip);
+        press(&mut l, &mut sys, Key::Escape, None);
+        assert!(!l.confirm_skip);
+        // Confirmar sigue el arranque.
+        click(&mut l, &mut sys, Item::Skip);
+        assert_eq!(click(&mut l, &mut sys, Item::Done), Out::DiskDone);
+    }
+
+    #[test]
+    fn disco_se_dibuja_en_los_dos_modos_y_con_confirmacion() {
+        let (mut l, mut sys) = disk();
+        let mut s = Surface::new(1280, 800, 0x101010);
+        l.paint(&mut s, 0x3B7DD8);
+        let antes = s.px.clone();
+        click(&mut l, &mut sys, Item::Link);
+        typ(&mut l, &mut sys, "abcde");
+        l.paint(&mut s, 0x3B7DD8);
+        assert!(s.px != antes);
+        click(&mut l, &mut sys, Item::Skip);
+        l.paint(&mut s, 0x3B7DD8);
+        // La clave no se ve nunca: en modo clave el campo solo lleva puntos.
+        assert!(!l.plain(Item::Pw2) && l.users.is_empty());
+    }
+
+    #[test]
+    fn fortaleza_se_pinta_en_el_asistente() {
+        let mut l = Login::new(1280, 800);
+        let mut sys = sys();
+        l.start_setup();
+        l.focus = Item::Pw;
+        let lh = font::line_h(8);
+        let probe = |l: &Login| {
+            let r = rect(l, Item::Pw);
+            let mut s = Surface::new(1280, 800, 0x101010);
+            l.paint(&mut s, 0x3B7DD8);
+            (s.px[((r.y - lh - 2 + lh / 2) * 1280 + r.right() - STRENGTH_W + 2) as usize], s)
+        };
+        let vacio = probe(&l).0;
+        for (pw, nivel) in [("abc123", 1u8), ("Abc12345", 2), ("abcdefgh1234", 3), ("Abc12345xyz!qwertyz", 4)] {
+            wipe_str(&mut l.pw);
+            typ(&mut l, &mut sys, pw);
+            assert_eq!(keys::strength(pw), nivel, "{pw}");
+            let (px, _) = probe(&l);
+            assert_eq!(px, STRENGTH[nivel as usize].1);
+            assert_ne!(px, vacio);
+        }
+        // También en "Añadir otra cuenta" (misma tarjeta con la segunda cuenta).
+        l.second = true;
+        assert_eq!(probe(&l).0, STRENGTH[4].1);
+    }
+
+    #[test]
+    fn fortaleza_ensucia_su_zona_al_teclear() {
+        let mut l = Login::new(1280, 800);
+        let mut sys = sys();
+        l.start_setup();
+        l.focus = Item::Pw;
+        l.take_damage();
+        typ(&mut l, &mut sys, "a");
+        let lh = font::line_h(8);
+        let r = rect(&l, Item::Pw);
+        let zona = Rect::new(r.right() - STRENGTH_W, r.y - lh - 2, STRENGTH_W, lh);
+        assert!(l.take_damage().iter().any(|d| d.x <= zona.x && d.right() >= zona.right() && d.y <= zona.y && d.bottom() >= zona.bottom()));
+    }
+
+    fn pick_recuperable() -> (Login, TestPlatform) {
+        let mut l = Login::new(1280, 800);
+        l.start_pick(alloc::vec![(String::from("Ana"), true), (String::from("Luis"), true)]);
+        l.set_recoverable(alloc::vec![true, false]);
+        (l, sys())
+    }
+
+    #[test]
+    fn recuperar_cuenta_solo_se_ofrece_si_esta_cifrada() {
+        let (mut l, mut sys) = pick_recuperable();
+        assert!(l.layout().items.iter().any(|i| i.0 == Item::Link));
+        press(&mut l, &mut sys, Key::Right, None);
+        assert!(l.layout().items.iter().all(|i| i.0 != Item::Link));
+        press(&mut l, &mut sys, Key::Left, None);
+        assert_eq!(l.order(), [Item::Pw, Item::Link, Item::Ok]);
+    }
+
+    #[test]
+    fn recuperar_cuenta_valida_el_formulario_y_borra_los_buffers() {
+        let (mut l, mut sys) = pick_recuperable();
+        click(&mut l, &mut sys, Item::Link);
+        assert_eq!(l.mode, Mode::Recover);
+        // Código corto.
+        typ(&mut l, &mut sys, "abc");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Code, "El código debe tener 40 caracteres.")));
+        // Claves distintas.
+        for _ in 0..3 {
+            press(&mut l, &mut sys, Key::Backspace, None);
+        }
+        typ(&mut l, &mut sys, CODE);
+        press(&mut l, &mut sys, Key::Tab, None);
+        typ(&mut l, &mut sys, "nueva123");
+        press(&mut l, &mut sys, Key::Tab, None);
+        typ(&mut l, &mut sys, "nueva124");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw2, "Las claves no coinciden.")));
+        // Iguales: "Comprobando…" y, un tick después, el resultado (el disco de pruebas no está cifrado).
+        press(&mut l, &mut sys, Key::Backspace, None);
+        typ(&mut l, &mut sys, "3");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(msg(&l), "Comprobando…");
+        l.tick(500, &mut sys);
+        assert_eq!(msg(&l), KeyError::NotEncrypted.text());
+        assert_eq!((l.code.len(), l.pw.len(), l.pw2.len()), (0, 0, 0));
+        assert_eq!(l.mode, Mode::Recover);
+        // Cancelar vuelve al inicio de sesión.
+        click(&mut l, &mut sys, Item::Done);
+        assert_eq!(l.mode, Mode::Pick);
+        assert_eq!(l.users.len(), 2);
+    }
+
+    #[test]
+    fn recuperar_cuenta_con_exito_vuelve_con_un_aviso_verde() {
+        let (mut l, mut sys) = pick_recuperable();
+        click(&mut l, &mut sys, Item::Link);
+        l.recover_result(Ok(()));
+        assert_eq!(l.mode, Mode::Pick);
+        assert_eq!(msg(&l), "Clave cambiada. Ya puedes iniciar sesión.");
+        assert!(l.good);
+        // Un intento posterior con clave mala vuelve a ser rojo.
+        typ(&mut l, &mut sys, "mala");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert!(!l.good);
+        // Y un error de clave floja apunta al campo de la clave nueva.
+        click(&mut l, &mut sys, Item::Link);
+        l.recover_result(Err(KeyError::Weak));
+        assert_eq!((l.focus, msg(&l).as_str()), (Item::Pw, KeyError::Weak.text()));
+    }
+
+    #[test]
+    fn el_acumulador_vuelve_con_sus_eventos_tras_prestarse() {
+        let mut sys = sys();
+        for i in 0..POOL_EVENTS_NEEDED {
+            sys.pool.add_event(i as i32, 1, 1, i as u64);
+        }
+        let r = with_pool(&mut sys, |_, pool| {
+            assert!(pool.ready());
+            7
+        });
+        assert_eq!(r, 7);
+        assert!(sys.pool.ready());
     }
 }
