@@ -2174,9 +2174,18 @@ mod tests {
         }
         fn click(&mut self, x: i32, y: i32) -> (Option<DialogRequest>, Option<String>) {
             self.now += 100;
-            let (_, d, o) = self.cx(|e, cx| e.mouse(MouseEv::Down { x, y }, cx));
+            let (_, d, o) = self.cx(|e, cx| {
+                e.mouse(MouseEv::Down { x, y }, cx);
+                e.mouse(MouseEv::Up { x, y }, cx);
+            });
             self.draw();
             (d, o)
+        }
+        /// Solo pulsa (sin soltar).
+        fn press(&mut self, x: i32, y: i32) {
+            self.now += 100;
+            self.cx(|e, cx| e.mouse(MouseEv::Down { x, y }, cx));
+            self.draw();
         }
         fn answer(&mut self, r: DialogResult) -> Option<DialogRequest> {
             let (_, d, _) = self.cx(|e, cx| e.dialog_result(r, cx));
@@ -3372,7 +3381,7 @@ mod tests {
         assert_eq!(t.e.area().w, 1000 - PANEL_W - SB_W);
         // Flecha de abajo: una línea; mantenida, se repite con tick.
         let (x, y) = (m.rect.x + 4, m.rect.bottom() - 4);
-        t.click(x, y);
+        t.press(x, y);
         assert_eq!(t.e.top, 1);
         t.now += 450;
         t.cx(|e, cx| e.tick(cx));
@@ -3385,11 +3394,11 @@ mod tests {
         // Pista: una página.
         let page = t.e.page();
         let (_, len) = t.e.sb_v.thumb(&t.e.metrics());
-        t.click(x, m.rect.y + SB_W + 8 + len + 20);
+        t.press(x, m.rect.y + SB_W + 8 + len + 20);
         t.up_(x, y);
         assert_eq!(t.e.top, top + page);
         // Flecha de arriba.
-        t.click(x, m.rect.y + 4);
+        t.press(x, m.rect.y + 4);
         t.up_(x, y);
         assert_eq!(t.e.top, top + page - 1);
         // La rueda y el teclado siguen igual.
@@ -3399,7 +3408,7 @@ mod tests {
         assert_eq!(t.e.top, t.e.max_top());
         // Los clics en la barra no tocan la selección.
         let sel = t.marked();
-        t.click(x, y);
+        t.press(x, y);
         t.up_(x, y);
         assert_eq!(t.marked(), sel);
         // Al quedar pocos elementos, desaparece.
