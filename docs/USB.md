@@ -79,3 +79,20 @@ Si el disco se cifró desde NightFury (Configuración › Disco), `nfdisk` lo de
 - `formatear --forzar` en un disco cifrado exige además la clave y deja un NFFS normal sin cifrar.
 - `nfdisk` **no activa ni quita** el cifrado: eso lo hace NightFury, con barra de progreso y reanudable.
 - Cierra QEMU antes de usarlo, igual que siempre, y haz copia de seguridad de la imagen antes de convertirla desde NightFury.
+
+### Carpetas de usuario cifradas
+Si una cuenta cifró su carpeta desde NightFury (Configuración › Cuentas), `nfdisk` la reconoce por su archivo de llaves
+(`Sistema\config\llaves\<cuenta>`):
+- **Sin clave de usuario**, `listar` muestra la carpeta tal como está en el disco: los nombres de archivos y carpetas dentro de
+  `Usuarios\<cuenta>` salen cifrados (empiezan por `$e`) y se indica «(carpeta cifrada)». Se ve cuántos elementos hay, su tamaño
+  aproximado y sus fechas, pero no nombres ni contenido. `ver`, `sacar`, `meter`, `carpeta` y `borrar` se niegan a tocar dentro
+  de ella (lo que se escribiera iría en claro).
+- **Con `--usuario <nombre>`** y la clave de esa cuenta en la variable de entorno `NFDISK_CLAVE_USUARIO` (o preguntada por teclado;
+  nunca por argumento), `listar`, `ver`, `sacar`, `meter`, `carpeta` y `borrar` trabajan en claro dentro de su carpeta, con las
+  rutas de siempre y con los permisos de esa cuenta. Una cuenta sin clave entra sin pedirla.
+  ```powershell
+  $env:NFDISK_CLAVE_USUARIO = "clave de Ana"
+  nfdisk ver disco.img C:\Usuarios\Ana\Documentos\nota.txt --usuario Ana
+  Remove-Item Env:NFDISK_CLAVE_USUARIO
+  ```
+- Se puede combinar con el cifrado total (`NFDISK_CLAVE` para el disco y `NFDISK_CLAVE_USUARIO` para la cuenta).
