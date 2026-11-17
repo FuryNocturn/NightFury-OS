@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Reloj CMOS (MC146818).
 use crate::arch::{inb, outb};
 use nf_core::platform::DateTime;

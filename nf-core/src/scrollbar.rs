@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Barra de desplazamiento compartida (v0.4.0). Ver docs/PLAN-cinta.md.
 //!
 //! La barra solo guarda el estado de la interacción; la geometría y la posición las pasa la app

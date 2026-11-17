@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Runtime de un programa NightFury en modo usuario (F3, v0.8).
 //!
 //! Un programa es un `Box<dyn App>` (el mismo trait que las apps del sistema). Este crate pone lo

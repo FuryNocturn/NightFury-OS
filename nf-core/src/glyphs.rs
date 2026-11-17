@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Datos de los glifos: trazos propios (diseño original de NightFury).
 //! Unidades: y hacia arriba, línea base y=0, minúsculas 5, mayúsculas y cifras 7, descendentes hasta -2.
 //! La tinta empieza en x=0 y `w` es su ancho.

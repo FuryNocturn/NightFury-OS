@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Matemáticas mínimas: `core` no trae raíz, seno ni redondeo.
 
 pub const PI: f32 = 3.141_592_7;

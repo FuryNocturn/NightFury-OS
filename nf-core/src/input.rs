@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Entrada: tipos de evento (CONTRATO, no cambian) y decodificadores de teclado y ratón PS/2.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

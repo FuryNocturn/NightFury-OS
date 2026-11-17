@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! nfdisk: lee y escribe imágenes de disco NFFS (el `disco.img` de QEMU) desde Windows.
 //! Solo escribe en archivos regulares; nunca en dispositivos ni unidades.
 use nf_core::block::{BlockDev, DiskError, BLOCK};

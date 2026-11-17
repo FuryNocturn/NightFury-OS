@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Tablas de páginas: las del núcleo (identidad con páginas de 2 MiB, solo supervisor) y las
 //! piezas para que cada programa tenga las suyas (`user.rs`).
 use alloc::alloc::{alloc_zeroed, Layout};

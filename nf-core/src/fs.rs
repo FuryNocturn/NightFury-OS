@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! NFFS: sistema de archivos propio de NightFury. CONTRATO: `FsError`, `Entry` y las firmas
 //! públicas de `Nffs` no cambian.
 //!

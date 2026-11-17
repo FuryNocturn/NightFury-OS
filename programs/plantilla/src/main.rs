@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! PLANTILLA de programa NightFury. Copia esta carpeta, cambia el nombre en `Cargo.toml` y en
 //! `app.txt`, y reescribe `Plantilla` a tu gusto. Ver docs/KIT-programas.md.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Controlador PS/2 (8042): teclado y ratón por interrupciones, con colas sin cerrojo.
 use crate::arch::{inb, outb};
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering::*};

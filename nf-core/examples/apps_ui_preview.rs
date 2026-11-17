@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa de Calculadora y Configuración:
 //! `cargo run --release -p nf-core --example apps_ui_preview -- carpeta`
 //! Guarda BMP de varias situaciones (tamaño por defecto y mínimo).

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Archivos tal como los ven las apps: unidad C:, rutas estilo Windows, Papelera y copias.
 //! CONTRATO: las firmas públicas no cambian.
 //!

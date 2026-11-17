@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Configuración: personalización (fondo y color de énfasis), cuentas y datos del sistema.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 //!
@@ -284,6 +286,11 @@ impl Settings {
         }
         y += if compact { 6 } else { 14 };
         font::draw(s, x0, y, "Sistema operativo escrito desde cero en Rust.", 9, false, GRAY);
+        y += font::line_h(9) + 6;
+        for line in [crate::CREDIT, crate::CREDIT_URL, crate::LICENSE_LINE] {
+            font::draw(s, x0, y, line, 9, false, GRAY);
+            y += font::line_h(9) + 2;
+        }
     }
 }
 

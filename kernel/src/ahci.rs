@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Controlador SATA (AHCI) por sondeo, sin interrupciones. Una orden cada vez, en la ranura 0.
 use crate::serial::traza;
 use alloc::alloc::{alloc_zeroed, Layout};

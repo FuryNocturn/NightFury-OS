@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Configuración PCI por el mecanismo de puertos 0xCF8 (dirección) y 0xCFC (datos).
 use crate::arch::{inl, outl};
 

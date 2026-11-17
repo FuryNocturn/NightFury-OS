@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cifrado de la carpeta de usuario (v0.6.0): lógica pura, sin disco. La unión con los archivos
 //! está en `files.rs`.
 //!

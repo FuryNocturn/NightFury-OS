@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cifrado total del disco (v0.6.0): capa de bloques cifrada con AES-256-XTS. Ver docs/PLAN-estructura.md.
 //!
 //! # Formato (dispositivo de N bloques)

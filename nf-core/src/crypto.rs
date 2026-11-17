@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Primitivas criptográficas propias (clean room): escritas a partir de las normas públicas,
 //! sin copiar código de nadie. Cada una se comprueba con los vectores oficiales en las pruebas.
 //!

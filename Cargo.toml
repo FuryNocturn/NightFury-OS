@@ -6,6 +6,9 @@ resolver = "2"
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
+license = "GPL-3.0-only"
+authors = ["Tare Fernandez Salas (FuryNocturn)"]
+repository = "https://github.com/FuryNocturn/NightFury-OS"
 
 [profile.dev]
 panic = "abort"

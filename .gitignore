@@ -5,3 +5,5 @@
 /.serena
 disco.img
 *.img
+/PLAN.md
+/docs/PLAN-*.md

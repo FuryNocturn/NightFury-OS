@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Codificador BMP (24 bits) para volcar una superficie a un archivo en las vistas previas del PC.
 use crate::surface::Surface;
 use alloc::vec::Vec;

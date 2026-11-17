@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Llaves de cifrado: de dónde salen y cómo se guardan. Lógica pura sobre `crypto` y `cipher`.
 //!
 //! - `Pool`: acumulador de aleatoriedad (ratón, teclado, reloj fino, generador del procesador).

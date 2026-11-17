@@ -37,6 +37,5 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa
 tablas (tiempos dependientes de los datos); se acepta mientras el sistema sea un solo programa. Sirve para uso personal.
 
-## Pendiente antes de publicar
-- El nombre "NightFury" coincide con un personaje de DreamWorks: cambiarlo.
-- Elegir licencia y revisar la skill `cumplimiento`.
+## Licencia
+GPL-3.0 con un término adicional de crédito (§7(b)); ver `LICENSE` y `NOTICE`.

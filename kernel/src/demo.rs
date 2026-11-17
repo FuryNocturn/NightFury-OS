@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Programas de prueba en modo usuario (feature `demo`): una ventana que pinta y se cierra, uno
 //! que lee memoria del núcleo y uno que se cuelga. Son código independiente de la posición:
 //! se copian sus bytes a una sección Code de un `.nfx` armado aquí mismo.

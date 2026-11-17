@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa de las pantallas de cuentas: `cargo run -p nf-core --example login_preview -- carpeta`
 //! Guarda BMP (1280x800) del asistente, de su segunda tarjeta, del inicio de sesión, del bloqueo y de las
 //! pantallas del cifrado: disco cifrado (clave y código), recuperar cuenta, aleatoriedad y aviso de progreso.
