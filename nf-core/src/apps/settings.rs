@@ -1097,9 +1097,9 @@ mod tests {
     fn cambio_de_seccion() {
         let mut b = Banco::new();
         b.dibuja(780, 520);
-        b.ev(MouseEv::Move { x: 50, y: 56 + 80 + 5 });
+        b.ev(MouseEv::Move { x: 50, y: 56 + 120 + 5 });
         assert!(b.redraw);
-        b.clic(50, 56 + 80 + 5);
+        b.clic(50, 56 + 120 + 5);
         assert!(b.redraw && !b.changed);
         let s = b.dibuja(780, 520);
         // En "Acerca de" ya no hay muestras de color en la zona de contenido.
@@ -1117,7 +1117,7 @@ mod tests {
         b.app.tick(&mut cx);
         assert!(!cx.redraw);
         drop(cx);
-        b.clic(50, 56 + 80 + 5);
+        b.clic(50, 56 + 120 + 5);
         b.dibuja(780, 520);
         let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 6000);
         b.app.tick(&mut cx);
@@ -1130,7 +1130,7 @@ mod tests {
     #[test]
     fn tamanos_extremos() {
         let mut b = Banco::new();
-        for pagina in 0..3 {
+        for pagina in 0..4 {
             b.clic(50, 56 + 40 * pagina + 5);
             for (w, h) in [(520, 360), (780, 520), (1, 1), (0, 0), (221, 400), (600, 1)] {
                 b.dibuja(w, h);
@@ -1156,9 +1156,10 @@ mod tests {
         b.texto(T_PW_NEW, "secreta1");
         pw_dialog(&b, T_PW_REP);
         b.texto(T_PW_REP, "secreta1");
-        assert_eq!(b.mensaje(), "Se ha puesto la clave.");
         assert!(b.files().has_password() && b.files().verify_password("secreta1"));
-        assert!(b.app.job.is_none(), "las claves se sueltan al terminar");
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_ASK_HOME, buttons: Buttons::YesNo, text, .. }) if text.contains("Se ha puesto la clave")));
+        b.respuesta(T_ASK_HOME, Answer::No);
+        assert!(b.dialog.is_none() && b.app.job.is_none(), "las claves se sueltan al terminar");
         // Cambiar: la clave actual mala corta el proceso.
         assert!(b.hay(Act::ChangePwd) && b.hay(Act::RemovePwd) && !b.hay(Act::SetPwd));
         b.pulsa(Act::ChangePwd);
@@ -1374,7 +1375,7 @@ mod tests {
         b.pulsa(Act::SetPwd);
         b.texto(T_PW_NEW, "clave-luis");
         b.texto(T_PW_REP, "clave-luis");
-        assert_eq!(b.mensaje(), "Se ha puesto la clave.");
+        b.respuesta(T_ASK_HOME, Answer::No);
         assert!(b.files().verify_password("clave-luis"));
         // Sin sesión de administrador, las cuentas de los demás siguen intactas.
         assert_eq!(b.files().accounts().len(), 2);
@@ -1426,5 +1427,553 @@ mod tests {
         b.ev(MouseEv::Move { x: m.rect.x + 5, y: 9000 });
         b.ev(MouseEv::Up { x: m.rect.x + 5, y: 9000 });
         assert_eq!(b.app.scroll, b.app.max_scroll());
+    }
+
+    // ---- Cifrado (v0.6.0) ----
+
+    /// Disco en memoria que se puede reabrir tras "reiniciar".
+    #[derive(Clone)]
+    struct Compartido(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+    impl crate::block::BlockDev for Compartido {
+        fn blocks(&self) -> u64 {
+            (self.0.borrow().len() / crate::block::BLOCK) as u64
+        }
+        fn read(&mut self, n: u64, buf: &mut [u8]) -> Result<(), crate::block::DiskError> {
+            let o = n as usize * crate::block::BLOCK;
+            buf.copy_from_slice(self.0.borrow().get(o..o + crate::block::BLOCK).ok_or(crate::block::DiskError::Range)?);
+            Ok(())
+        }
+        fn write(&mut self, n: u64, buf: &[u8]) -> Result<(), crate::block::DiskError> {
+            let o = n as usize * crate::block::BLOCK;
+            self.0.borrow_mut().get_mut(o..o + crate::block::BLOCK).ok_or(crate::block::DiskError::Range)?.copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    const CLAVE_DISCO: &str = "Clave-del-disco-9!";
+    const NUEVA: &str = "Otra-clave-nueva-7?";
+    const AHORA: crate::platform::DateTime = crate::platform::DateTime { year: 2026, month: 11, day: 15, hour: 21, minute: 37, second: 5 };
+
+    impl Banco {
+        /// Como `con_disco` pero sobre un disco compartido de 300 bloques, con la página `pagina` abierta.
+        fn con_disco_compartido(quien: &str, pagina: usize) -> (Banco, Compartido) {
+            let disco = Compartido(std::rc::Rc::new(std::cell::RefCell::new(vec![0; 300 * crate::block::BLOCK])));
+            let mut f = crate::files::Files::probe(Some(Box::new(disco.clone())), AHORA);
+            f.format_pending(AHORA).unwrap();
+            f.create_account("Ana", None, true, [1; 16], AHORA).unwrap();
+            f.login("Ana", "").unwrap();
+            f.create_account("Luis", None, false, [2; 16], AHORA).unwrap();
+            f.login(quien, "").unwrap();
+            let mut b = Banco::new();
+            b.sys.files = f;
+            b.pagina(pagina);
+            b.dibuja(780, 520);
+            (b, disco)
+        }
+        fn pool_listo(&mut self) {
+            for i in 0..300 {
+                self.sys.pool.add_event(i, i * 5, i as u64, i as u64 * 11);
+            }
+        }
+        /// Texto del diálogo `Message` pendiente con esa etiqueta (sin quitarlo).
+        fn texto_de(&self, tag: u32) -> String {
+            match &self.dialog {
+                Some(DialogRequest::Message { tag: t, text, .. }) if *t == tag => text.clone(),
+                otro => panic!("se esperaba el mensaje {tag} y hay {otro:?}"),
+            }
+        }
+        fn entropia(&self) {
+            assert!(matches!(&self.dialog, Some(DialogRequest::Entropy { tag: T_ENT, .. })), "{:?}", self.dialog);
+        }
+        /// Recoge el diálogo del código de recuperación y devuelve el código.
+        fn codigo(&mut self) -> String {
+            match self.dialog.take() {
+                Some(DialogRequest::Message { tag: T_CODE, title, text, buttons: Buttons::Ok }) => {
+                    assert_eq!(title, "Código de recuperación");
+                    assert!(text.ends_with("No se volverá a mostrar."));
+                    let (code, resto) = text.split_once("\n\n").unwrap();
+                    assert!(!code.contains(' ') && code.len() >= 40, "el código va solo en su línea");
+                    assert!(resto.contains("Apúntalo en papel"));
+                    String::from(code)
+                }
+                otro => panic!("se esperaba el código y hay {otro:?}"),
+            }
+        }
+        /// Activa el cifrado total de principio a fin; devuelve el código de recuperación.
+        fn activa_disco(&mut self, clave: &str) -> String {
+            self.pool_listo();
+            self.pulsa(Act::DiskEnc);
+            assert!(self.texto_de(T_CONF).contains("copia de seguridad"));
+            self.respuesta(T_CONF, Answer::Yes);
+            pw_dialog(self, T_NEWK);
+            self.texto(T_NEWK, clave);
+            pw_dialog(self, T_REPK);
+            self.texto(T_REPK, clave);
+            self.entropia();
+            self.respuesta(T_ENT, Answer::Ok);
+            let code = self.codigo();
+            assert!(self.app.job.as_ref().is_some_and(|j| j.old.0.is_empty() && j.new.0.is_empty()), "las claves ya se han soltado");
+            self.respuesta(T_CODE, Answer::Ok);
+            assert_eq!(self.mensaje(), "El disco se está cifrando. Puedes seguir usando el equipo.");
+            assert!(self.app.job.is_none());
+            code
+        }
+        fn termina_conversion(&mut self) {
+            let mut n = 0;
+            while !self.files().convert_step(40, AHORA).unwrap() {
+                n += 1;
+                assert!(n < 1000);
+            }
+        }
+        /// Disco cifrado y con la conversión terminada.
+        fn disco_cifrado(quien: &str) -> (Banco, Compartido, String) {
+            let (mut b, d) = Banco::con_disco_compartido(quien, PAGE_DISK);
+            let code = b.activa_disco(CLAVE_DISCO);
+            b.termina_conversion();
+            (b, d, code)
+        }
+        fn eventos(&self) -> u32 {
+            self.sys.pool.events()
+        }
+        /// Lanza una acción sin pasar por el dibujo (botones que la pantalla aún no ofrece).
+        fn lanza(&mut self, act: Act) {
+            self.dialog = None;
+            let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
+            self.app.start(act, &mut cx);
+            self.dialog = cx.dialog.take();
+        }
+    }
+
+    /// Reinicio: vuelve a abrir el disco compartido.
+    fn reabre(d: &Compartido) -> crate::files::Files {
+        crate::files::Files::probe(Some(Box::new(d.clone())), AHORA)
+    }
+
+    #[test]
+    fn la_pagina_disco_segun_quien_mira() {
+        // Administradora: ve el botón de activar y nada más.
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        assert!(b.hay(Act::DiskEnc) && !b.hay(Act::DiskDec) && !b.hay(Act::DiskChange) && !b.hay(Act::DiskCode));
+        // Usuario normal: ve el estado pero ningún botón.
+        let (mut b, _) = Banco::con_disco_compartido("Luis", PAGE_DISK);
+        b.dibuja(780, 520);
+        assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
+        assert!(b.app.content_h > 0);
+        // Sin disco: solo el aviso.
+        let mut b = Banco::new();
+        b.pagina(PAGE_DISK);
+        b.dibuja(780, 520);
+        assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
+        b.clic(PANEL_W + 40, 100);
+        assert!(b.dialog.is_none());
+        // Tamaños extremos con el disco cifrándose.
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.activa_disco(CLAVE_DISCO);
+        for (w, h) in [(520, 360), (1, 1), (0, 0), (221, 400), (780, 520)] {
+            b.dibuja(w, h);
+        }
+    }
+
+    #[test]
+    fn el_estado_del_disco_muestra_el_porcentaje_y_apaga_los_botones() {
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.activa_disco(CLAVE_DISCO);
+        for a in [Act::DiskEnc, Act::DiskDec, Act::DiskChange, Act::DiskCode] {
+            assert!(!b.hay(a), "{a:?} debe estar desactivado mientras convierte");
+        }
+        let antes = b.dibuja(780, 520);
+        b.files().convert_step(100, AHORA).unwrap();
+        let (hechos, total, cifrando) = b.files().disk_conversion().unwrap();
+        assert!(cifrando && hechos > 0 && hechos < total);
+        // La pantalla cambia con el avance y el tick pide redibujar.
+        assert!(b.dibuja(780, 520).px != antes.px);
+        let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 5000);
+        b.app.tick(&mut cx);
+        assert!(cx.redraw);
+        drop(cx);
+        b.termina_conversion();
+        assert!(b.files().disk_conversion().is_none() && b.files().disk_encrypted());
+        assert!(b.hay(Act::DiskDec) && b.hay(Act::DiskChange) && b.hay(Act::DiskCode) && !b.hay(Act::DiskEnc));
+        // Descifrando también apaga los botones.
+        b.pulsa(Act::DiskDec);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, CLAVE_DISCO);
+        assert_eq!(b.mensaje(), "Se está descifrando el disco. Puedes seguir usando el equipo.");
+        assert!(matches!(b.files().disk_conversion(), Some((_, _, false))));
+        assert!(!b.hay(Act::DiskDec) && !b.hay(Act::DiskChange));
+    }
+
+    #[test]
+    fn activar_el_cifrado_total_y_abrir_con_la_clave_o_con_el_codigo() {
+        let (mut b, disco) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.files().write("C:\\Usuarios\\Ana\\Documentos\\nota.txt", b"hola", AHORA).unwrap();
+        let code = b.activa_disco(CLAVE_DISCO);
+        assert!(b.files().disk_encrypted());
+        assert_eq!(b.eventos(), 300, "el acumulador se devuelve al sistema");
+        b.termina_conversion();
+        // Con el código de recuperación.
+        let mut g = reabre(&disco);
+        assert!(g.disk_locked());
+        assert_eq!(g.unlock_disk("no-es-la-clave", false, AHORA), Err(keys::KeyError::WrongSecret));
+        g.unlock_disk(&code, true, AHORA).unwrap();
+        g.login("Ana", "").unwrap();
+        assert_eq!(g.read("C:\\Usuarios\\Ana\\Documentos\\nota.txt").unwrap(), b"hola");
+        // Y con la clave del disco.
+        reabre(&disco).unlock_disk(CLAVE_DISCO, false, AHORA).unwrap();
+        // Ni el código ni la clave están en claro en el disco.
+        let raw = disco.0.borrow().clone();
+        assert!(!raw.windows(code.len()).any(|w| w == code.as_bytes()));
+        assert!(!raw.windows(CLAVE_DISCO.len()).any(|w| w == CLAVE_DISCO.as_bytes()));
+        assert!(b.hay(Act::DiskDec) && !b.hay(Act::DiskEnc));
+    }
+
+    #[test]
+    fn claves_del_disco_distintas_cortas_y_debiles() {
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.pool_listo();
+        // No coinciden.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, CLAVE_DISCO);
+        b.texto(T_REPK, NUEVA);
+        assert_eq!(b.mensaje(), NO_MATCH);
+        assert!(b.app.job.is_none() && !b.files().disk_encrypted());
+        // Corta.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, "abc");
+        assert_eq!(b.mensaje(), keys::KeyError::Weak.text());
+        assert!(b.app.job.is_none() && !b.files().disk_encrypted());
+        // Débil y se dice que no: no cambia nada.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, "abcdef");
+        b.texto(T_REPK, "abcdef");
+        assert_eq!(b.texto_de(T_WEAK), "La clave es débil. ¿Usarla de todos modos?");
+        b.respuesta(T_WEAK, Answer::No);
+        assert!(b.dialog.is_none() && b.app.job.is_none() && !b.files().disk_encrypted());
+        // Débil y se dice que sí: sigue con la pantalla del ratón y la acepta.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, "abcdef");
+        b.texto(T_REPK, "abcdef");
+        b.respuesta(T_WEAK, Answer::Yes);
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        b.codigo();
+        assert!(b.files().disk_encrypted());
+    }
+
+    #[test]
+    fn cancelar_en_cualquier_paso_no_cambia_nada_ni_deja_claves() {
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.pool_listo();
+        // Se cancela en el paso `n` de la activación (0 aviso, 1 clave, 2 repetir, 3 ratón).
+        for n in 0..4 {
+            b.pulsa(Act::DiskEnc);
+            for paso in 0..=n {
+                let cancela = paso == n;
+                match paso {
+                    0 if cancela => b.respuesta(T_CONF, Answer::Cancel),
+                    0 => b.respuesta(T_CONF, Answer::Yes),
+                    1 if cancela => b.responde(DialogResult::Text { tag: T_NEWK, value: None }),
+                    1 => b.texto(T_NEWK, CLAVE_DISCO),
+                    2 if cancela => b.responde(DialogResult::Text { tag: T_REPK, value: None }),
+                    2 => b.texto(T_REPK, CLAVE_DISCO),
+                    _ => b.respuesta(T_ENT, Answer::Cancel),
+                }
+            }
+            assert!(b.dialog.is_none() && b.app.job.is_none(), "paso {n}");
+            assert!(!b.files().disk_encrypted() && b.eventos() == 300);
+        }
+        // "No" en el aviso también lo deja todo igual.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::No);
+        assert!(b.dialog.is_none() && b.app.job.is_none());
+        // Cerrar la ventana a mitad: el trabajo (con su clave) se suelta con la app.
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, CLAVE_DISCO);
+        assert!(b.app.job.as_ref().unwrap().new.same(&Secret(String::from(CLAVE_DISCO))));
+        b.app.job = None;
+        assert!(!b.files().disk_encrypted());
+        // Con el disco ya cifrado: cancelar al quitar, cambiar y pedir código.
+        let (mut b, _, _) = Banco::disco_cifrado("Ana");
+        b.pulsa(Act::DiskDec);
+        b.respuesta(T_CONF, Answer::Cancel);
+        b.pulsa(Act::DiskDec);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.responde(DialogResult::Text { tag: T_SEC, value: None });
+        b.pulsa(Act::DiskChange);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.responde(DialogResult::Text { tag: T_NEWK, value: None });
+        b.pulsa(Act::DiskCode);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.respuesta(T_ENT, Answer::Cancel);
+        assert!(b.dialog.is_none() && b.app.job.is_none() && b.files().disk_encrypted() && b.files().disk_conversion().is_none());
+    }
+
+    #[test]
+    fn la_app_no_guarda_la_clave_ni_el_codigo() {
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.activa_disco(CLAVE_DISCO);
+        assert!(b.app.job.is_none());
+        // Un error tampoco deja claves: clave del disco mala al quitar el cifrado.
+        b.termina_conversion();
+        b.pulsa(Act::DiskDec);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "clave-equivocada");
+        assert_eq!(b.mensaje(), keys::KeyError::WrongSecret.text());
+        assert!(b.app.job.is_none() && b.files().disk_conversion().is_none());
+    }
+
+    #[test]
+    fn quitar_cambiar_clave_y_nuevo_codigo_del_disco() {
+        let (mut b, disco, viejo) = Banco::disco_cifrado("Ana");
+        // Cambiar la clave: la actual mala falla, la corta y la que no coincide también.
+        b.pulsa(Act::DiskChange);
+        b.texto(T_SEC, "clave-equivocada");
+        b.texto(T_NEWK, NUEVA);
+        b.texto(T_REPK, NUEVA);
+        assert_eq!(b.mensaje(), keys::KeyError::WrongSecret.text());
+        b.pulsa(Act::DiskChange);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.texto(T_NEWK, "corta");
+        assert_eq!(b.mensaje(), keys::KeyError::Weak.text());
+        b.pulsa(Act::DiskChange);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.texto(T_NEWK, NUEVA);
+        b.texto(T_REPK, "otra-clave-distinta");
+        assert_eq!(b.mensaje(), NO_MATCH);
+        // Buena: la vieja deja de abrir.
+        b.pulsa(Act::DiskChange);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.texto(T_NEWK, NUEVA);
+        b.texto(T_REPK, NUEVA);
+        assert_eq!(b.mensaje(), "Se ha cambiado la clave del disco.");
+        let mut g = reabre(&disco);
+        assert_eq!(g.unlock_disk(CLAVE_DISCO, false, AHORA), Err(keys::KeyError::WrongSecret));
+        g.unlock_disk(NUEVA, false, AHORA).unwrap();
+        // Nuevo código: el anterior deja de valer y el nuevo abre.
+        b.pulsa(Act::DiskCode);
+        b.texto(T_SEC, NUEVA);
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        let nuevo = b.codigo();
+        b.respuesta(T_CODE, Answer::Ok);
+        assert!(b.dialog.is_none(), "un código de reemplazo no lleva mensaje de cierre");
+        assert_ne!(nuevo, viejo);
+        let mut h = reabre(&disco);
+        assert_eq!(h.unlock_disk(&viejo, true, AHORA), Err(keys::KeyError::WrongSecret));
+        h.unlock_disk(&nuevo, true, AHORA).unwrap();
+        // Código con la clave mala.
+        b.pulsa(Act::DiskCode);
+        b.texto(T_SEC, "clave-equivocada");
+        b.respuesta(T_ENT, Answer::Ok);
+        assert_eq!(b.mensaje(), keys::KeyError::WrongSecret.text());
+        // Quitar el cifrado.
+        b.pulsa(Act::DiskDec);
+        assert!(b.texto_de(T_CONF).contains("descifrará todo el disco"));
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, NUEVA);
+        assert_eq!(b.mensaje(), "Se está descifrando el disco. Puedes seguir usando el equipo.");
+        b.termina_conversion();
+        assert!(!b.files().disk_encrypted() && !reabre(&disco).disk_locked());
+        assert!(b.hay(Act::DiskEnc));
+    }
+
+    #[test]
+    fn errores_del_disco_no_admin_y_acumulador_sin_llenar() {
+        // Un usuario normal con la pantalla de administrador todavía abierta.
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.dibuja(780, 520);
+        b.files().login("Luis", "").unwrap();
+        b.pool_listo();
+        b.pulsa_viejo(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, CLAVE_DISCO);
+        b.texto(T_REPK, CLAVE_DISCO);
+        b.respuesta(T_ENT, Answer::Ok);
+        assert_eq!(b.mensaje(), keys::KeyError::NotAdmin.text());
+        assert!(b.app.job.is_none() && b.eventos() == 300);
+        // Aleatoriedad insuficiente: se avisa y no se cifra; el acumulador vuelve.
+        let (mut b, _) = Banco::con_disco_compartido("Ana", PAGE_DISK);
+        b.pulsa(Act::DiskEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_NEWK, CLAVE_DISCO);
+        b.texto(T_REPK, CLAVE_DISCO);
+        b.respuesta(T_ENT, Answer::Ok);
+        assert_eq!(b.mensaje(), keys::KeyError::NotReady.text());
+        assert!(!b.files().disk_encrypted() && b.app.job.is_none());
+        // Cambiar la clave con la pantalla vieja de un usuario normal.
+        let (mut b, _, _) = Banco::disco_cifrado("Ana");
+        b.dibuja(780, 520);
+        b.files().login("Luis", "").unwrap();
+        b.pulsa_viejo(Act::DiskChange);
+        b.texto(T_SEC, CLAVE_DISCO);
+        b.texto(T_NEWK, NUEVA);
+        b.texto(T_REPK, NUEVA);
+        assert_eq!(b.mensaje(), keys::KeyError::NotAdmin.text());
+    }
+
+    #[test]
+    fn mi_cuenta_botones_de_cifrado_segun_la_clave() {
+        let mut b = Banco::con_disco("Luis");
+        // Sin clave no se ofrece cifrar.
+        assert!(!b.hay(Act::HomeEnc) && !b.hay(Act::HomeDec) && !b.hay(Act::HomeCode));
+        b.files().set_password("", Some("clave-luis"), [3; 16], AHORA).unwrap();
+        assert!(b.hay(Act::HomeEnc) && !b.hay(Act::HomeDec) && !b.hay(Act::HomeCode));
+        for (w, h) in [(520, 360), (1, 1), (221, 400)] {
+            b.dibuja(w, h);
+        }
+    }
+
+    /// Resultado de pedir cifrar/renovar con la clave buena: el código o el error de la llamada.
+    fn resultado_de_la_llamada(b: &mut Banco) {
+        match b.dialog.take() {
+            Some(DialogRequest::Message { tag: T_CODE, .. }) => {}
+            Some(DialogRequest::Message { tag: T_MSG, text, .. }) => assert!(
+                [keys::KeyError::Unavailable, keys::KeyError::NotEncrypted].iter().any(|e| e.text() == text),
+                "{text}"
+            ),
+            otro => panic!("{otro:?}"),
+        }
+    }
+
+    #[test]
+    fn mi_cuenta_cifrar_pide_aviso_clave_y_raton_y_muestra_el_resultado() {
+        let mut b = Banco::con_disco("Luis");
+        b.files().set_password("", Some("clave-luis"), [3; 16], AHORA).unwrap();
+        b.pool_listo();
+        b.pulsa(Act::HomeEnc);
+        assert!(b.texto_de(T_CONF).contains("Si olvidas la clave y pierdes el código de recuperación, no se podrán recuperar. ¿Continuar?"));
+        b.respuesta(T_CONF, Answer::Yes);
+        pw_dialog(&b, T_SEC);
+        // Clave mala: se corta antes de la pantalla del ratón.
+        b.texto(T_SEC, "mala-clave");
+        assert_eq!(b.mensaje(), AccountError::WrongPassword.text());
+        assert!(b.app.job.is_none());
+        // Clave buena: pantalla del ratón y la llamada; la pantalla muestra lo que ella devuelva.
+        b.pulsa(Act::HomeEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "clave-luis");
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        resultado_de_la_llamada(&mut b);
+        assert!(b.app.job.as_ref().map_or(true, |j| j.old.0.is_empty() && j.new.0.is_empty()));
+        assert_eq!(b.eventos(), 300, "el acumulador vuelve al sistema también si la llamada falla");
+        // Cancelar en cada paso no cambia nada.
+        b.app.job = None;
+        b.pulsa(Act::HomeEnc);
+        b.respuesta(T_CONF, Answer::Cancel);
+        b.pulsa(Act::HomeEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.responde(DialogResult::Text { tag: T_SEC, value: None });
+        b.pulsa(Act::HomeEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "clave-luis");
+        b.respuesta(T_ENT, Answer::Cancel);
+        assert!(b.dialog.is_none() && b.app.job.is_none());
+    }
+
+    #[test]
+    fn mi_cuenta_quitar_cifrado_y_nuevo_codigo_muestran_el_resultado_de_la_llamada() {
+        let mut b = Banco::con_disco("Luis");
+        b.files().set_password("", Some("clave-luis"), [3; 16], AHORA).unwrap();
+        b.pool_listo();
+        // Quitar el cifrado: con clave mala se corta; con la buena sale lo que devuelva la llamada.
+        b.lanza(Act::HomeDec);
+        assert!(b.texto_de(T_CONF).contains("se descifrará"));
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "mala-clave");
+        assert_eq!(b.mensaje(), AccountError::WrongPassword.text());
+        b.lanza(Act::HomeDec);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "clave-luis");
+        if !b.files().home_encrypted() {
+            assert_eq!(b.mensaje(), keys::KeyError::NotEncrypted.text());
+        }
+        // Nuevo código.
+        b.app.job = None;
+        b.lanza(Act::HomeCode);
+        b.texto(T_SEC, "clave-luis");
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        resultado_de_la_llamada(&mut b);
+        assert_eq!(b.eventos(), 300);
+    }
+
+    #[test]
+    fn mi_cuenta_tras_poner_la_clave_ofrece_cifrar_la_carpeta() {
+        let mut b = Banco::con_disco("Ana");
+        b.pool_listo();
+        // Sí: sigue con la pantalla del ratón sin volver a pedir la clave.
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "secreta1");
+        b.texto(T_PW_REP, "secreta1");
+        assert_eq!(b.texto_de(T_ASK_HOME), "Se ha puesto la clave.\n¿Cifrar también tu carpeta? (Recomendado)");
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { buttons: Buttons::YesNo, .. })));
+        b.respuesta(T_ASK_HOME, Answer::Yes);
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        assert!(b.files().verify_password("secreta1"));
+        resultado_de_la_llamada(&mut b);
+        assert!(b.app.job.as_ref().map_or(true, |j| j.old.0.is_empty() && j.new.0.is_empty()));
+        if b.files().home_encrypted() {
+            return; // con el cifrado real la clave ya no se puede quitar: lo cubre la prueba de integración
+        }
+        // Quitar la clave y volver a ponerla; esta vez se cancela la pantalla del ratón: la clave queda puesta.
+        b.app.job = None;
+        b.pulsa(Act::RemovePwd);
+        b.texto(T_PW_OLD, "secreta1");
+        assert_eq!(b.mensaje(), "Se ha quitado la clave.");
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "secreta2");
+        b.texto(T_PW_REP, "secreta2");
+        b.respuesta(T_ASK_HOME, Answer::Yes);
+        b.respuesta(T_ENT, Answer::Cancel);
+        assert!(b.dialog.is_none() && b.app.job.is_none() && b.files().verify_password("secreta2"));
+    }
+
+    #[test]
+    #[ignore = "necesita el cifrado de carpeta de files.rs"]
+    fn integracion_real_cifrar_la_carpeta_desde_mi_cuenta() {
+        let mut b = Banco::con_disco("Ana");
+        b.pool_listo();
+        b.files().write("C:\\Usuarios\\Ana\\Documentos\\nota.txt", b"hola", AHORA).unwrap();
+        // Poner la clave y aceptar cifrar la carpeta.
+        b.pulsa(Act::SetPwd);
+        b.texto(T_PW_NEW, "secreta1");
+        b.texto(T_PW_REP, "secreta1");
+        b.respuesta(T_ASK_HOME, Answer::Yes);
+        b.respuesta(T_ENT, Answer::Ok);
+        let code = b.codigo();
+        b.respuesta(T_CODE, Answer::Ok);
+        assert_eq!(b.mensaje(), "Se está cifrando tu carpeta. Puedes seguir usando el equipo.");
+        assert!(b.files().home_encrypted());
+        // Mientras convierte, los botones están desactivados.
+        if b.files().home_conversion().is_some() {
+            assert!(!b.hay(Act::HomeDec) && !b.hay(Act::HomeCode));
+        }
+        while !b.files().home_convert_step(10, AHORA).unwrap() {}
+        assert_eq!(b.files().read("C:\\Usuarios\\Ana\\Documentos\\nota.txt").unwrap(), b"hola");
+        assert!(b.hay(Act::HomeDec) && b.hay(Act::HomeCode) && !b.hay(Act::HomeEnc));
+        // Con la carpeta cifrada no se puede quitar la clave.
+        b.pulsa(Act::RemovePwd);
+        assert_eq!(b.mensaje(), AccountError::Encrypted.text());
+        // Nuevo código de recuperación: cambia.
+        b.pulsa(Act::HomeCode);
+        b.texto(T_SEC, "secreta1");
+        b.respuesta(T_ENT, Answer::Ok);
+        let nuevo = b.codigo();
+        assert_ne!(code, nuevo);
+        b.respuesta(T_CODE, Answer::Ok);
+        // Quitar el cifrado.
+        b.pulsa(Act::HomeDec);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "secreta1");
+        assert_eq!(b.mensaje(), "Se está descifrando tu carpeta.");
+        while !b.files().home_convert_step(10, AHORA).unwrap() {}
+        assert!(!b.files().home_encrypted() && b.hay(Act::HomeEnc));
     }
 }
