@@ -3706,11 +3706,10 @@ mod modal_tests {
         d.event(Event::Tick(20), &mut sys);
         assert_eq!(d.dialog_count(), 1, "el flujo solo ocurre una vez");
         key(&mut d, &mut sys, Key::Enter, None, false); // Sí
-        assert!(!sys.files.pending_format() && sys.files.persistent());
-        assert_eq!(d.dialog_count(), 0, "formateado: no hay aviso de memoria");
-        // Disco recién formateado y sin cuentas: toca el asistente, no el escritorio.
+        // Con el asistente nuevo el disco se formatea al final: antes se pregunta el cifrado.
+        assert!(sys.files.pending_format() && !sys.files.persistent());
+        assert_eq!(d.dialog_count(), 0, "sin aviso de memoria");
         assert_eq!(d.login_mode(), Mode::Setup);
-        assert!(sys.files.user().is_none());
     }
 
     #[test]
@@ -5319,6 +5318,251 @@ mod login_tests {
         press(&mut d, &mut sys, Key::Enter, None);
         d.event(Event::Tick(d.now_ms + 200), &mut sys);
         assert_eq!(d.login_mode(), Mode::Pick);
+    }
+
+    // ---------------------------------------------------------------- disco nuevo: asistente de cifrado (v0.7.1)
+
+    fn ram_nueva() -> Shared {
+        Shared(Rc::new(core::cell::RefCell::new(vec![0; 4096 * crate::block::BLOCK])))
+    }
+
+    fn disco_nuevo(ram: &Shared) -> TestPlatform {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files = Files::probe(Some(Box::new(ram.clone())), now);
+        assert!(sys.files.pending_format());
+        sys
+    }
+
+    /// Arranca con un disco en blanco, contesta Sí a "Disco nuevo" y deja el asistente en la elección.
+    fn arranca_nuevo(sys: &mut TestPlatform) -> Desktop {
+        let mut d = Desktop::new(1280, 800, sys);
+        d.event(Event::Tick(10), sys);
+        assert_eq!(d.dialog_count(), 1);
+        press(&mut d, sys, Key::Enter, None);
+        assert_eq!((d.login_mode(), d.login.step_name()), (Mode::Setup, "cifrado"));
+        assert!(sys.files.pending_format(), "hasta Terminar no se toca el disco");
+        d
+    }
+
+    /// Elige la opción `i` (0 Ninguno, 1 Mi carpeta, 2 Disco entero, 3 Ambos) con las flechas y sigue.
+    fn elige_y_sigue(d: &mut Desktop, sys: &mut TestPlatform, i: usize) {
+        for _ in 0..(i + 3) % 4 {
+            press(d, sys, Key::Down, None);
+        }
+        press(d, sys, Key::Enter, None);
+    }
+
+    fn clave_disco(d: &mut Desktop, sys: &mut TestPlatform, clave: &str) {
+        assert_eq!(d.login.step_name(), "clave del disco");
+        typ(d, sys, clave);
+        press(d, sys, Key::Tab, None);
+        typ(d, sys, clave);
+        press(d, sys, Key::Enter, None);
+    }
+
+    fn cuenta(d: &mut Desktop, sys: &mut TestPlatform, nombre: &str, clave: &str) {
+        typ(d, sys, nombre);
+        if !clave.is_empty() {
+            press(d, sys, Key::Tab, None);
+            typ(d, sys, clave);
+            press(d, sys, Key::Tab, None);
+            typ(d, sys, clave);
+        }
+        press(d, sys, Key::Enter, None);
+    }
+
+    /// Terminar (el sexto elemento de la tarjeta "¿Añadir otra cuenta?").
+    fn terminar(d: &mut Desktop, sys: &mut TestPlatform) {
+        for _ in 0..5 {
+            press(d, sys, Key::Tab, None);
+        }
+        press(d, sys, Key::Enter, None);
+    }
+
+    /// Mueve el ratón sobre la ventana de aleatoriedad hasta llenarla y pulsa "Continuar".
+    fn mueve_el_raton(d: &mut Desktop, sys: &mut TestPlatform) {
+        d.render(sys);
+        let (c, (w, h)) = {
+            let win = d.wins.last().unwrap();
+            (win.content_rect(), win.dlg.as_ref().unwrap().size())
+        };
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED as i32 {
+            d.mouse_to(c.x + 5 + i % 450, c.y + 60 + i / 450, sys);
+        }
+        d.render(sys);
+        d.mouse_to(c.x + w - 150, c.y + h - 30, sys);
+        d.left_button(true, sys);
+        d.left_button(false, sys);
+    }
+
+    fn tick_mas(d: &mut Desktop, sys: &mut TestPlatform) {
+        d.event(Event::Tick(d.now_ms + 200), sys);
+    }
+
+    /// Recorre una opción completa (Ana con clave y Luis sin ella cuando la carpeta se cifra) y devuelve los
+    /// códigos mostrados, en orden. Comprueba el redibujado incremental en cada pantalla.
+    fn recorrido(opcion: usize, ram: &Shared) -> (TestPlatform, Vec<(String, String)>) {
+        let mut sys = disco_nuevo(ram);
+        let mut d = arranca_nuevo(&mut sys);
+        same_as_full(&mut d, &mut sys);
+        elige_y_sigue(&mut d, &mut sys, opcion);
+        if opcion >= 2 {
+            same_as_full(&mut d, &mut sys);
+            clave_disco(&mut d, &mut sys, "claveDisco1");
+        }
+        assert_eq!(d.login.step_name(), "cuentas");
+        same_as_full(&mut d, &mut sys);
+        cuenta(&mut d, &mut sys, "Ana", "secreto1");
+        // Luis sin clave: con la carpeta cifrada avisa primero.
+        typ(&mut d, &mut sys, "Luis");
+        press(&mut d, &mut sys, Key::Enter, None);
+        if opcion == 1 || opcion == 3 {
+            assert!(d.login.pend_len() == 1, "avisa de la carpeta sin cifrar");
+            press(&mut d, &mut sys, Key::Enter, None);
+        }
+        assert_eq!(d.login.pend_len(), 2);
+        same_as_full(&mut d, &mut sys);
+        terminar(&mut d, &mut sys);
+        if opcion == 0 {
+            assert_eq!(d.dialog_count(), 0, "sin cifrado no hay ventana del ratón");
+        } else {
+            assert_eq!((d.dialog_count(), d.login_mode()), (1, Mode::Boot));
+            assert!(sys.files.pending_format());
+            same_as_full(&mut d, &mut sys);
+            mueve_el_raton(&mut d, &mut sys);
+            assert_eq!(d.dialog_count(), 0);
+        }
+        // "Preparando…" se pinta antes del trabajo: el disco aún no está formateado.
+        assert_eq!((d.login_mode(), d.login.step_name()), (Mode::Setup, "preparando"));
+        assert!(sys.files.pending_format());
+        same_as_full(&mut d, &mut sys);
+        tick_mas(&mut d, &mut sys);
+        let mut codes = Vec::new();
+        while d.login.step_name() == "codigos" {
+            same_as_full(&mut d, &mut sys);
+            codes.push(d.login.shown_code().unwrap());
+            press(&mut d, &mut sys, Key::Enter, None);
+        }
+        // Tras el último código sigue el inicio de sesión (hay dos cuentas).
+        assert_eq!(d.login_mode(), Mode::Pick);
+        same_as_full(&mut d, &mut sys);
+        (sys, codes)
+    }
+
+    #[test]
+    fn disco_nuevo_ninguno_no_cifra_nada() {
+        let ram = ram_nueva();
+        let (mut sys, codes) = recorrido(0, &ram);
+        assert!(codes.is_empty());
+        assert!(!sys.files.disk_encrypted() && !sys.files.account_encrypted("Ana") && !sys.files.account_encrypted("Luis"));
+        assert_eq!(sys.files.accounts().len(), 2);
+        sys.files.login("Ana", "secreto1").unwrap();
+    }
+
+    #[test]
+    fn disco_nuevo_mi_carpeta_cifra_la_carpeta_de_cada_cuenta_con_clave() {
+        let ram = ram_nueva();
+        let (mut sys, codes) = recorrido(1, &ram);
+        assert_eq!(codes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["de la cuenta Ana"]);
+        assert!(!sys.files.disk_encrypted() && sys.files.account_encrypted("Ana") && !sys.files.account_encrypted("Luis"));
+        // El código abre la cuenta: recuperarla con una clave nueva.
+        let now = sys.now();
+        let code = crate::keys::normalize_recovery(&codes[0].1).unwrap();
+        let mut pool = core::mem::take(&mut sys.pool);
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED {
+            pool.add_event(i as i32, 5, 1, i as u64 * 31);
+        }
+        sys.files.recover_account("Ana", &code, "nuevaClave1", &mut pool, now).unwrap();
+        sys.files.login("Ana", "nuevaClave1").unwrap();
+    }
+
+    #[test]
+    fn disco_nuevo_disco_entero_cifra_el_disco_y_su_codigo_lo_abre() {
+        let ram = ram_nueva();
+        let (mut sys, codes) = recorrido(2, &ram);
+        assert_eq!(codes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["del disco"]);
+        assert!(sys.files.disk_encrypted() && !sys.files.account_encrypted("Ana"));
+        drop(sys);
+        // Reiniciar: el disco pide su clave y se abre con el código (y con la clave).
+        let now = TestPlatform::default().now();
+        let mut otra = TestPlatform { size: (1280, 800), ..Default::default() };
+        otra.files = Files::probe(Some(Box::new(ram.clone())), now);
+        assert!(otra.files.disk_locked());
+        otra.files.unlock_disk(&codes[0].1, true, now).unwrap();
+        assert_eq!(otra.files.accounts().len(), 2);
+        let mut otra = TestPlatform { size: (1280, 800), ..Default::default() };
+        otra.files = Files::probe(Some(Box::new(ram.clone())), now);
+        otra.files.unlock_disk("claveDisco1", false, now).unwrap();
+    }
+
+    #[test]
+    fn disco_nuevo_ambos_cifra_disco_y_carpetas_y_muestra_los_codigos_en_orden() {
+        let ram = ram_nueva();
+        let (mut sys, codes) = recorrido(3, &ram);
+        assert_eq!(codes.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(), ["del disco", "de la cuenta Ana"]);
+        assert!(sys.files.disk_encrypted() && sys.files.account_encrypted("Ana") && !sys.files.account_encrypted("Luis"));
+        drop(sys);
+        let now = TestPlatform::default().now();
+        let mut otra = TestPlatform { size: (1280, 800), ..Default::default() };
+        otra.files = Files::probe(Some(Box::new(ram.clone())), now);
+        otra.files.unlock_disk(&codes[0].1, true, now).unwrap();
+        assert!(otra.files.account_encrypted("Ana"));
+        otra.files.login("Ana", "secreto1").unwrap();
+    }
+
+    #[test]
+    fn disco_nuevo_cancelar_la_ventana_del_raton_no_toca_el_disco() {
+        let ram = ram_nueva();
+        let mut sys = disco_nuevo(&ram);
+        let mut d = arranca_nuevo(&mut sys);
+        press(&mut d, &mut sys, Key::Enter, None); // Mi carpeta
+        cuenta(&mut d, &mut sys, "Ana", "secreto1");
+        terminar(&mut d, &mut sys);
+        assert_eq!((d.dialog_count(), d.login_mode()), (1, Mode::Boot));
+        press(&mut d, &mut sys, Key::Escape, None);
+        assert_eq!((d.dialog_count(), d.login_mode(), d.login.step_name()), (0, Mode::Setup, "cuentas"));
+        assert!(sys.files.pending_format() && !sys.files.persistent());
+        same_as_full(&mut d, &mut sys);
+        // Y se puede volver a intentar: ahora sí.
+        terminar(&mut d, &mut sys);
+        mueve_el_raton(&mut d, &mut sys);
+        tick_mas(&mut d, &mut sys);
+        assert_eq!(d.login.step_name(), "codigos");
+        assert!(sys.files.persistent() && sys.files.account_encrypted("Ana"));
+    }
+
+    #[test]
+    fn disco_nuevo_un_error_al_preparar_vuelve_a_la_eleccion() {
+        // Un disco de 64 bloques sirve para el modo "Ninguno" pero no para el cifrado total (NoRoom).
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files = Files::probe(Some(Box::new(RamDisk::new(64))), now);
+        let mut d = arranca_nuevo(&mut sys);
+        elige_y_sigue(&mut d, &mut sys, 2);
+        clave_disco(&mut d, &mut sys, "claveDisco1");
+        cuenta(&mut d, &mut sys, "Ana", "");
+        terminar(&mut d, &mut sys);
+        mueve_el_raton(&mut d, &mut sys);
+        tick_mas(&mut d, &mut sys);
+        assert_eq!((d.login_mode(), d.login.step_name()), (Mode::Setup, "cifrado"));
+        assert_eq!(d.login.msg_text().as_deref(), Some(crate::keys::KeyError::NoRoom.text()));
+        assert!(sys.files.pending_format() && sys.files.accounts().is_empty());
+        same_as_full(&mut d, &mut sys);
+        // Sin cifrado de disco, este disco diminuto tampoco cabe: otro error, y otra vez a la elección,
+        // con el disco aún sin formatear y sin cuentas a medias.
+        press(&mut d, &mut sys, Key::Up, None);
+        press(&mut d, &mut sys, Key::Up, None);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login.step_name(), "cuentas");
+        cuenta(&mut d, &mut sys, "Ana", "");
+        terminar(&mut d, &mut sys);
+        tick_mas(&mut d, &mut sys);
+        assert_eq!((d.login_mode(), d.login.step_name()), (Mode::Setup, "cifrado"));
+        assert_eq!(d.login.msg_text().as_deref(), Some("No queda espacio en el disco."));
+        // (`format_pending` consume el disco pendiente aunque falle: un reinicio lo vuelve a ofrecer.)
+        assert!(sys.files.accounts().is_empty() && d.login.pend_len() == 0);
+        same_as_full(&mut d, &mut sys);
     }
 }
 

@@ -532,7 +532,7 @@ impl Login {
         }
     }
 
-    fn msg_text(&self) -> Option<String> {
+    pub(crate) fn msg_text(&self) -> Option<String> {
         if self.job.is_some() {
             return Some(String::from("Comprobando…"));
         }
@@ -1498,6 +1498,12 @@ impl Login {
             Step::Preparing => "preparando",
             Step::Codes => "codigos",
         }
+    }
+
+    /// Solo para pruebas: cuentas tecleadas en el asistente de disco nuevo.
+    #[cfg(test)]
+    pub(crate) fn pend_len(&self) -> usize {
+        self.pend.len()
     }
 
     /// Solo para pruebas: (a quién pertenece, código) del código que se muestra.
