@@ -128,4 +128,55 @@ fn main() {
     d.mouse_to(900, 500, &mut sys2);
     d.preview_conversion(true, true, 37);
     guarda(&dir, "10_progreso_disco", &mut d, &mut sys2);
+    // Disco nuevo (v0.7.1): elección de cifrado, clave del disco, cuenta con clave obligatoria,
+    // preparando y tarjeta de código de recuperación.
+    let mut sys5 = TestPlatform { ms: 1000, size: (1280, 800), ..Default::default() };
+    sys5.files = Files::probe(Some(Box::new(RamDisk::new(4096))), now);
+    let mut d = Desktop::new(1280, 800, &mut sys5);
+    d.event(Event::Tick(10), &mut sys5);
+    press(&mut d, &mut sys5, Key::Enter, None); // Sí: preparar el disco
+    guarda(&dir, "11_cifrado_eleccion", &mut d, &mut sys5);
+    press(&mut d, &mut sys5, Key::Down, None);
+    press(&mut d, &mut sys5, Key::Down, None); // Ambos
+    press(&mut d, &mut sys5, Key::Enter, None);
+    typ(&mut d, &mut sys5, "abcdef");
+    press(&mut d, &mut sys5, Key::Tab, None);
+    typ(&mut d, &mut sys5, "abcdeg");
+    press(&mut d, &mut sys5, Key::Enter, None);
+    guarda(&dir, "12_clave_disco_error", &mut d, &mut sys5);
+    press(&mut d, &mut sys5, Key::Backspace, None);
+    typ(&mut d, &mut sys5, "f");
+    press(&mut d, &mut sys5, Key::Enter, None);
+    guarda(&dir, "13_clave_disco_debil", &mut d, &mut sys5);
+    press(&mut d, &mut sys5, Key::Enter, None);
+    typ(&mut d, &mut sys5, "Ana");
+    press(&mut d, &mut sys5, Key::Enter, None);
+    guarda(&dir, "14_cuenta_clave_obligatoria", &mut d, &mut sys5);
+    // El error deja el foco en la clave.
+    typ(&mut d, &mut sys5, "Secreto-2026");
+    press(&mut d, &mut sys5, Key::Tab, None);
+    typ(&mut d, &mut sys5, "Secreto-2026");
+    press(&mut d, &mut sys5, Key::Enter, None);
+    typ(&mut d, &mut sys5, "Luis");
+    press(&mut d, &mut sys5, Key::Enter, None);
+    guarda(&dir, "15_cuenta_sin_clave_aviso", &mut d, &mut sys5);
+    press(&mut d, &mut sys5, Key::Enter, None);
+    for _ in 0..5 {
+        press(&mut d, &mut sys5, Key::Tab, None);
+    }
+    press(&mut d, &mut sys5, Key::Enter, None); // Terminar: ventana del ratón
+    d.render(&mut sys5);
+    for i in 0..400 {
+        d.mouse_to(380 + (i * 37) % 520, 300 + (i * 53) % 170, &mut sys5);
+    }
+    d.render(&mut sys5);
+    guarda(&dir, "16_raton_asistente", &mut d, &mut sys5);
+    d.mouse_to(742, 507, &mut sys5); // Continuar
+    d.left_button(true, &mut sys5);
+    d.left_button(false, &mut sys5);
+    guarda(&dir, "17_preparando", &mut d, &mut sys5);
+    d.event(Event::Tick(1500), &mut sys5);
+    guarda(&dir, "18_codigo_disco", &mut d, &mut sys5);
+    press(&mut d, &mut sys5, Key::Enter, None);
+    guarda(&dir, "19_codigo_cuenta", &mut d, &mut sys5);
 }

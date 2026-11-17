@@ -1783,7 +1783,6 @@ impl Login {
                         (Item::Code, _) => "Código de recuperación",
                         (Item::Pw, true) => "Clave nueva (mínimo 6 caracteres)",
                         (Item::Pw, false) if self.fresh && self.enc.home() && !self.second => "Clave (obligatoria, mínimo 6 caracteres)",
-                        (Item::Pw, false) if self.fresh && self.enc.home() => "Clave (opcional: sin clave no se cifra su carpeta)",
                         (Item::Pw, false) => "Clave (opcional, mínimo 6 caracteres)",
                         (_, true) => "Repite la clave nueva",
                         _ => "Repite la clave",
