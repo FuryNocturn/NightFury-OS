@@ -120,7 +120,51 @@ enum Drag {
     Resize { id: u32, edge: u8, start: Rect, px: i32, py: i32 },
     Cap(u32, u8),
     Content(u32),
+    /// Pulsado un icono de archivo o carpeta del escritorio: si se mueve más de 5 px empieza el arrastre.
+    /// `collapse`: era uno de varios seleccionados; si se suelta sin arrastrar, la selección se queda en él.
+    Icon { i: usize, x: i32, y: i32, collapse: bool },
+    /// Recuadro de selección desde (x, y) del fondo del escritorio.
+    Band(i32, i32),
+    /// Arrastre de archivos llevado por el escritorio (ver `Dnd`).
+    Files,
+    /// Arrastre cancelado con el botón aún pulsado: se ignora hasta soltar.
+    Dead,
 }
+
+/// Arrastre de archivos en curso.
+struct Dnd {
+    paths: Vec<String>,
+    /// Ventana de origen (`None` = el escritorio).
+    src: Option<u32>,
+    /// Ventana que tiene ahora el `drag_over` y lo que contestó la última vez.
+    over: Option<u32>,
+    ok: bool,
+    /// Se ha cerrado la ventana de origen: se cancela en cuanto se pueda.
+    dead: bool,
+}
+
+/// Qué hay bajo el puntero durante un arrastre de archivos.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tgt {
+    Win(u32),
+    /// Fondo del escritorio.
+    Desk,
+    /// Icono del escritorio que admite soltar: una carpeta o la Papelera.
+    Icon(usize),
+    Nothing,
+}
+
+/// Destino de un mover, copiar o eliminar hecho por el escritorio.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Dest {
+    Dir(String),
+    Trash,
+}
+
+/// Píxeles que hay que mover un icono pulsado para que empiece el arrastre.
+const DRAG_PX: i32 = 5;
+/// Píxeles que hay que mover desde el fondo para que aparezca el recuadro de selección.
+const BAND_PX: i32 = 4;
 
 struct Window {
     id: u32,
@@ -183,6 +227,8 @@ const TAG_NEWDOC: u32 = 0xFFFF_FF12;
 const TAG_EMPTY: u32 = 0xFFFF_FF13;
 /// Mensajes de información o error sin respuesta que tratar.
 const TAG_INFO: u32 = 0xFFFF_FF14;
+/// Confirmación de soltar archivos sobre o desde `C:\Sistema`.
+const TAG_DROP: u32 = 0xFFFF_FF15;
 
 /// Etiquetas e identificadores de los menús contextuales del escritorio.
 const MENU_ICON: u32 = 1;
@@ -296,7 +342,9 @@ pub struct Desktop {
     launched: u32,
     start_open: bool,
     shut_open: bool,
-    sel: Option<usize>,
+    /// Iconos seleccionados (índices, ordenados) y el ancla del Mayús+clic.
+    sel: Vec<usize>,
+    anchor: usize,
     hot: Hit,
     drag: Drag,
     chover: Option<u32>,
@@ -339,6 +387,17 @@ pub struct Desktop {
     conv: Option<Conv>,
     conv_note: Option<(&'static str, u64)>,
     conv_failed: bool,
+    /// Arrastre de archivos en curso, su etiqueta (último rectángulo pintado) y el icono resaltado como destino.
+    dnd: Option<Dnd>,
+    dnd_lbl: Rect,
+    dnd_hl: Option<usize>,
+    /// Una app ha pedido empezar a arrastrar (se atiende en el movimiento que la provocó).
+    drag_req: Option<(u32, Vec<String>)>,
+    /// Recuadro de selección visible y la selección que había antes de empezarlo (con Ctrl).
+    band: Option<Rect>,
+    band_base: Vec<usize>,
+    /// Soltar pendiente de confirmar (toca `C:\Sistema`): destino, rutas y si es copiar.
+    pending_drop: Option<(Dest, Vec<String>, bool)>,
 }
 
 /// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
@@ -586,7 +645,8 @@ impl Desktop {
             launched: 0,
             start_open: false,
             shut_open: false,
-            sel: None,
+            sel: Vec::new(),
+            anchor: 0,
             hot: Hit::None,
             drag: Drag::None,
             chover: None,
@@ -616,6 +676,13 @@ impl Desktop {
             conv: None,
             conv_note: None,
             conv_failed: false,
+            dnd: None,
+            dnd_lbl: Rect::default(),
+            dnd_hl: None,
+            drag_req: None,
+            band: None,
+            band_base: Vec::new(),
+            pending_drop: None,
         };
         d.login.set_clock(d.clock);
         if sys.files().user().is_some() && !sys.files().disk_locked() {
@@ -639,7 +706,7 @@ impl Desktop {
         self.icons = build_icons(sys, self.order, self.show_ext);
         self.files_gen = sys.files().generation();
         self.can_session = sys.files().persistent();
-        self.sel = None;
+        self.sel.clear();
         self.dmg_all();
     }
 
@@ -650,7 +717,12 @@ impl Desktop {
         self.close_menu();
         self.drag = Drag::None;
         self.chover = None;
-        self.sel = None;
+        self.sel.clear();
+        self.dnd = None;
+        self.band = None;
+        self.dnd_hl = None;
+        self.dnd_lbl = Rect::default();
+        self.pending_drop = None;
         let mut dim = Surface::new(self.w, self.h, 0);
         dim.blit(&self.wall, 0, 0);
         dim.blend_rect(Rect::new(0, 0, self.w, self.h), 0x000000, 150);
@@ -871,6 +943,7 @@ impl Desktop {
         let has = sys.files().has_password();
         // La llave de la carpeta se borra de la memoria hasta que se desbloquee con la clave.
         sys.files().lock_keys();
+        self.cancel_dnd(sys);
         self.login.start_lock(&name, has);
         self.screen_on();
         self.flush_login();
@@ -881,6 +954,7 @@ impl Desktop {
     fn begin_logout(&mut self, sys: &mut dyn Platform) {
         self.set_start(false);
         self.set_shut(false);
+        self.cancel_dnd(sys);
         self.logging_out = true;
         self.logout_step(sys);
     }
@@ -975,6 +1049,7 @@ impl Desktop {
         self.my = y;
         self.dmg(cursor_rect(x, y));
         if self.login.covers() {
+            self.cancel_dnd(sys);
             self.login.hover(x, y);
             self.flush_login();
             return;
@@ -982,6 +1057,21 @@ impl Desktop {
         if self.menu.is_some() {
             self.menu_edit(|m| m.hover(x, y));
             return;
+        }
+        match self.drag {
+            Drag::Icon { i, x: px, y: py, .. } => {
+                if (x - px).abs() > DRAG_PX || (y - py).abs() > DRAG_PX {
+                    let paths = self.sel_paths();
+                    if paths.is_empty() || !self.sel.contains(&i) {
+                        self.drag = Drag::Dead;
+                    } else {
+                        self.begin_dnd(None, paths, sys);
+                    }
+                }
+            }
+            Drag::Band(x0, y0) => self.band_move(x0, y0),
+            Drag::Files => self.update_dnd(sys),
+            _ => {}
         }
         match self.drag {
             Drag::Move { id, ox, oy } => {
@@ -1003,7 +1093,15 @@ impl Desktop {
         }
         self.after(sys);
         match self.drag {
-            Drag::Content(id) => self.send(id, sys, |x, y| MouseEv::Move { x, y }),
+            Drag::Content(id) => {
+                self.send(id, sys, |x, y| MouseEv::Move { x, y });
+                if let Some((wid, paths)) = self.drag_req.take() {
+                    if wid == id && self.drag == Drag::Content(id) {
+                        self.begin_dnd(Some(id), paths, sys);
+                        self.after(sys);
+                    }
+                }
+            }
             Drag::None => {
                 if let Some(id) = self.chover {
                     self.send(id, sys, |x, y| MouseEv::Move { x, y });
@@ -1020,6 +1118,7 @@ impl Desktop {
         }
         self.btn = down;
         if self.login.covers() {
+            self.cancel_dnd(sys);
             if down {
                 let out = self.login.click(self.mx, self.my, sys);
                 self.login_out(out, sys);
@@ -1048,7 +1147,7 @@ impl Desktop {
             return;
         }
         self.rbtn = down;
-        if !down || self.login.covers() {
+        if !down || self.login.covers() || matches!(self.drag, Drag::Files | Drag::Band(..) | Drag::Icon { .. }) {
             return;
         }
         if self.menu.is_some() {
@@ -1093,28 +1192,37 @@ impl Desktop {
         self.set_shut(false);
         match self.hit(x, y) {
             Hit::Icon(i) => {
-                self.select(Some(i));
-                let items = self.icon_items(i, sys);
+                // Sobre un icono ya seleccionado se conserva la selección; si no, se selecciona solo.
+                if !self.sel.contains(&i) {
+                    self.set_sel(vec![i]);
+                }
+                self.anchor = i;
+                let items = self.icon_items(sys);
                 self.open_menu(None, MENU_ICON, x, y, items);
             }
             _ => {
-                self.select(None);
+                self.set_sel(Vec::new());
                 let items = self.bg_items(sys);
                 self.open_menu(None, MENU_DESK, x, y, items);
             }
         }
     }
 
-    fn select(&mut self, i: Option<usize>) {
-        if self.sel != i {
-            if let Some(o) = self.sel {
-                self.dmg(self.icon_cell(o));
-            }
-            if let Some(n) = i {
-                self.dmg(self.icon_cell(n));
-            }
-            self.sel = i;
+    /// Cambia la selección (índices ordenados y sin repetir) ensuciando solo los iconos que cambian.
+    fn set_sel(&mut self, v: Vec<usize>) {
+        if self.sel == v {
+            return;
         }
+        let old = core::mem::replace(&mut self.sel, v);
+        let changed: Vec<usize> = old.iter().filter(|i| !self.sel.contains(i)).chain(self.sel.iter().filter(|i| !old.contains(i))).copied().collect();
+        for i in changed {
+            self.dmg(self.icon_cell(i));
+        }
+    }
+
+    /// Rutas de los iconos seleccionados que son archivos o carpetas (no apps ni Papelera).
+    fn sel_paths(&self) -> Vec<String> {
+        self.sel.iter().filter_map(|&i| self.icon_path(i)).collect()
     }
 
     /// Ruta del icono `i` si es un archivo o carpeta de la carpeta Escritorio del usuario (no app ni Papelera).
@@ -1125,7 +1233,23 @@ impl Desktop {
         }
     }
 
-    fn icon_items(&self, i: usize, sys: &mut dyn Platform) -> Vec<MenuItem> {
+    fn icon_items(&self, sys: &mut dyn Platform) -> Vec<MenuItem> {
+        if self.sel.len() > 1 {
+            let none = self.sel_paths().is_empty();
+            return vec![
+                MenuItem::new(M_OPEN, "Abrir").bold().disabled(true),
+                MenuItem::new(M_NOTEPAD, "Abrir con").disabled(true),
+                MenuItem::sep(),
+                MenuItem::new(M_CUT, "Cortar").disabled(none),
+                MenuItem::new(M_COPY, "Copiar").disabled(none),
+                MenuItem::sep(),
+                MenuItem::new(M_DELETE, "Eliminar").disabled(none),
+                MenuItem::new(M_RENAME, "Cambiar nombre").disabled(true),
+                MenuItem::sep(),
+                MenuItem::new(M_PROPS, "Propiedades"),
+            ];
+        }
+        let Some(&i) = self.sel.first() else { return Vec::new() };
         let open = MenuItem::new(M_OPEN, "Abrir").bold();
         let Some(DIcon { act, icon, .. }) = self.icons.get(i) else { return Vec::new() };
         let Act::Path(p) = act else { return vec![open] };
@@ -1179,13 +1303,34 @@ impl Desktop {
     /// Elección en un menú del escritorio (`owner == None`).
     fn desktop_menu_result(&mut self, tag: u32, id: u32, sys: &mut dyn Platform) {
         if tag == MENU_ICON {
-            if let Some(i) = self.sel {
+            if self.sel.len() > 1 {
+                self.multi_action(id, sys);
+            } else if let Some(&i) = self.sel.first() {
                 self.icon_action(i, id, sys);
             }
         } else {
             self.bg_action(id, sys);
         }
         self.refresh_icons(sys);
+    }
+
+    /// Órdenes del menú con varios iconos seleccionados (los de apps y la Papelera se ignoran).
+    fn multi_action(&mut self, id: u32, sys: &mut dyn Platform) {
+        let now = sys.now();
+        let paths = self.sel_paths();
+        match id {
+            M_CUT | M_COPY if !paths.is_empty() => sys.files().set_clip_many(&paths, id == M_CUT),
+            M_DELETE if !paths.is_empty() => {
+                if let Err(e) = sys.files().user_trash_many(&paths, now) {
+                    self.info("No se puede eliminar", e.message(), sys);
+                }
+            }
+            M_PROPS => {
+                let text = format!("{} elementos seleccionados.", self.sel.len());
+                self.info("Propiedades", &text, sys);
+            }
+            _ => {}
+        }
     }
 
     fn icon_action(&mut self, i: usize, id: u32, sys: &mut dyn Platform) {
@@ -1300,14 +1445,21 @@ impl Desktop {
     }
     /// Teclas con el foco en el escritorio (ninguna ventana abierta a la vista).
     fn desktop_key(&mut self, k: KeyEvent, sys: &mut dyn Platform) {
-        let path = self.sel.and_then(|i| self.icon_path(i));
-        match (k.key, path) {
-            (Key::Char('z'), _) if k.ctrl => self.undo(sys),
-            (Key::Delete, Some(p)) => {
-                self.trash_path(&p, sys);
+        let paths = self.sel_paths();
+        match k.key {
+            Key::Char('z') if k.ctrl => self.undo(sys),
+            Key::Char('a') if k.ctrl => {
+                self.set_sel((0..self.icons.len()).collect());
+                self.anchor = 0;
+            }
+            Key::Delete if !paths.is_empty() => {
+                let now = sys.now();
+                if let Err(e) = sys.files().user_trash_many(&paths, now) {
+                    self.info("No se puede eliminar", e.message(), sys);
+                }
                 self.refresh_icons(sys);
             }
-            (Key::F(2), Some(p)) => self.start_rename(&p, sys),
+            Key::F(2) if self.sel.len() == 1 && paths.len() == 1 => self.start_rename(&paths[0], sys),
             _ => {}
         }
     }
@@ -1540,6 +1692,7 @@ impl Desktop {
         let (dialog, open) = (cx.dialog.take(), cx.open.take());
         let (open_new, menu) = (cx.open_new.take(), cx.menu.take());
         let open_term = cx.open_terminal.take();
+        let drag = cx.drag.take();
         if themed {
             self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
             for w in self.wins.iter_mut() {
@@ -1569,6 +1722,9 @@ impl Desktop {
         }
         if let Some(p) = open_term {
             self.open_terminal_at(&p, sys);
+        }
+        if let Some(req) = drag.filter(|r| !r.paths.is_empty() && self.drag == Drag::Content(id)) {
+            self.drag_req = Some((id, req.paths));
         }
         if let Some(req) = menu {
             // De coordenadas del contenido de la ventana a las de pantalla.
@@ -1692,6 +1848,13 @@ impl Desktop {
                 }
                 self.refresh_icons(sys);
             }
+            DialogResult::Answer { tag: TAG_DROP, answer } => {
+                if let Some((dest, paths, copy)) = self.pending_drop.take() {
+                    if answer == Answer::Yes {
+                        self.run_drop(dest, paths, copy, sys);
+                    }
+                }
+            }
             DialogResult::Text { tag: TAG_RENAME, value } => {
                 let from = self.pending.take();
                 if let (Some(from), Some(v)) = (from, value) {
@@ -1805,6 +1968,12 @@ impl Desktop {
 
     fn close(&mut self, id: u32) {
         self.close_dialogs_of(id);
+        if let Some(d) = self.dnd.as_mut() {
+            d.dead |= d.src == Some(id);
+            if d.over == Some(id) {
+                d.over = None;
+            }
+        }
         if let Some(i) = self.pos(id) {
             self.wins.remove(i);
             self.forget(id);
@@ -1822,7 +1991,7 @@ impl Desktop {
         }
         let d = match self.drag {
             Drag::Move { id: i, .. } | Drag::Resize { id: i, .. } | Drag::Cap(i, _) | Drag::Content(i) => i == id,
-            Drag::None => false,
+            Drag::None | Drag::Icon { .. } | Drag::Band(..) | Drag::Files | Drag::Dead => false,
         };
         if d {
             self.drag = Drag::None;
@@ -1978,9 +2147,11 @@ impl Desktop {
         for i in 0..self.icons.len().max(new.len()) {
             self.dmg(self.icon_cell(i));
         }
-        let name = self.sel.and_then(|s| self.icons.get(s)).map(|d| d.name.clone());
+        let names: Vec<String> = self.sel.iter().filter_map(|&s| self.icons.get(s)).map(|d| d.name.clone()).collect();
+        let anchor = self.icons.get(self.anchor).map(|d| d.name.clone());
         self.icons = new;
-        self.sel = name.and_then(|n| self.icons.iter().position(|d| d.name == n));
+        self.sel = self.icons.iter().enumerate().filter(|(_, d)| names.contains(&d.name)).map(|(i, _)| i).collect();
+        self.anchor = anchor.and_then(|n| self.icons.iter().position(|d| d.name == n)).unwrap_or(0);
     }
 
     /// Abre el icono `i` del escritorio.
@@ -2099,6 +2270,9 @@ impl Desktop {
 
     /// Tras cualquier cambio: actualiza el resaltado y avisa a la app que el puntero abandona.
     fn after(&mut self, sys: &mut dyn Platform) {
+        if self.dnd.as_ref().is_some_and(|d| d.dead) {
+            self.cancel_dnd(sys);
+        }
         let hit = self.hit(self.mx, self.my);
         let cur = match (self.drag, hit) {
             (Drag::Resize { edge, .. }, _) | (Drag::None, Hit::Edge(_, edge)) => resize_cursor(edge),
@@ -2166,19 +2340,15 @@ impl Desktop {
                     self.minimize(id);
                 }
             }
-            Hit::Icon(i) => {
-                let old = self.sel.replace(i);
-                if let Some(o) = old {
-                    self.dmg(self.icon_cell(o));
-                }
-                self.dmg(self.icon_cell(i));
-                if self.double(hit) {
-                    self.activate_icon(i, sys);
-                }
-            }
+            Hit::Icon(i) => self.press_icon(i, hit, sys),
             Hit::None => {
-                if let Some(o) = self.sel.take() {
-                    self.dmg(self.icon_cell(o));
+                // Fondo: empieza el recuadro (con Ctrl se suma a lo seleccionado).
+                if self.login.mode == Mode::Off {
+                    self.band_base = if self.mods.0 { self.sel.clone() } else { Vec::new() };
+                    self.set_sel(self.band_base.clone());
+                    self.drag = Drag::Band(self.mx, self.my);
+                } else {
+                    self.set_sel(Vec::new());
                 }
             }
             Hit::Cap(id, k) => {
@@ -2216,6 +2386,7 @@ impl Desktop {
                 if self.modal_of(id).is_none() {
                     self.drag = Drag::Content(id);
                     self.send(id, sys, |x, y| MouseEv::Down { x, y });
+                    self.drag_req = None;
                 }
             }
             Hit::Bar | Hit::MenuBg => {}
@@ -2235,8 +2406,275 @@ impl Desktop {
                 }
             }
             Drag::Content(id) => self.send(id, sys, |x, y| MouseEv::Up { x, y }),
+            Drag::Icon { i, collapse: true, .. } => self.set_sel(vec![i]),
+            Drag::Band(..) => self.end_band(),
+            Drag::Files => self.end_dnd(true, sys),
             _ => {}
         }
+    }
+
+    /// Pulsación sobre el icono `i`: selección (Ctrl suma o quita, Mayús rango) y posible inicio de arrastre.
+    fn press_icon(&mut self, i: usize, hit: Hit, sys: &mut dyn Platform) {
+        let (ctrl, shift) = self.mods;
+        let mut collapse = false;
+        if shift {
+            let (a, b) = (self.anchor.min(i), self.anchor.max(i));
+            let mut v: Vec<usize> = (a..=b).collect();
+            if ctrl {
+                v.extend(self.sel.iter().copied());
+                v.sort_unstable();
+                v.dedup();
+            }
+            self.set_sel(v);
+        } else if ctrl {
+            let mut v = self.sel.clone();
+            match v.iter().position(|&x| x == i) {
+                Some(p) => {
+                    v.remove(p);
+                }
+                None => {
+                    v.push(i);
+                    v.sort_unstable();
+                }
+            }
+            self.set_sel(v);
+            self.anchor = i;
+        } else {
+            self.anchor = i;
+            if self.sel.contains(&i) {
+                collapse = self.sel.len() > 1;
+            } else {
+                self.set_sel(vec![i]);
+            }
+            if self.double(hit) {
+                self.set_sel(vec![i]);
+                self.activate_icon(i, sys);
+                return;
+            }
+        }
+        if self.sel.contains(&i) && self.icon_path(i).is_some() {
+            self.drag = Drag::Icon { i, x: self.mx, y: self.my, collapse };
+        }
+    }
+
+    // ---------------------------------------------------------------- arrastre de archivos
+
+    /// Qué hay bajo el puntero como destino de `paths`.
+    fn dnd_target(&self, paths: &[String]) -> Tgt {
+        match self.hit(self.mx, self.my) {
+            Hit::Content(id) if self.modal_of(id).is_none() && self.pos(id).is_some_and(|i| self.wins[i].dlg.is_none()) => Tgt::Win(id),
+            Hit::None if self.login.mode == Mode::Off => Tgt::Desk,
+            Hit::Icon(i) => match self.icons.get(i) {
+                Some(DIcon { act: Act::Path(p), icon, .. }) if (p == files::TRASH || *icon == Icon::Folder) && !paths.contains(p) => Tgt::Icon(i),
+                _ => Tgt::Nothing,
+            },
+            _ => Tgt::Nothing,
+        }
+    }
+
+    /// El escritorio toma el arrastre (de la ventana `src`, o de sus propios iconos si es `None`).
+    fn begin_dnd(&mut self, src: Option<u32>, paths: Vec<String>, sys: &mut dyn Platform) {
+        self.drag = Drag::Files;
+        self.dnd = Some(Dnd { paths, src, over: None, ok: false, dead: false });
+        self.update_dnd(sys);
+    }
+
+    /// Con el puntero en una posición nueva: avisa a la ventana que deja y a la que entra, y
+    /// resalta el icono destino.
+    fn update_dnd(&mut self, sys: &mut dyn Platform) {
+        let Some(d) = self.dnd.as_ref() else { return };
+        let paths = d.paths.clone();
+        let tgt = self.dnd_target(&paths);
+        let win = if let Tgt::Win(id) = tgt { Some(id) } else { None };
+        if d.over != win {
+            if let Some(o) = d.over {
+                self.with_app(o, sys, |a, cx| {
+                    a.drag_over(None, &paths, cx);
+                });
+            }
+            if let Some(d) = self.dnd.as_mut() {
+                d.over = win;
+            }
+        }
+        let mut ok = matches!(tgt, Tgt::Desk | Tgt::Icon(_));
+        if let Some(id) = win {
+            if let Some(i) = self.pos(id) {
+                let c = self.wins[i].content_rect();
+                let pos = (self.mx - c.x, self.my - c.y);
+                self.with_app(id, sys, |a, cx| ok = a.drag_over(Some(pos), &paths, cx));
+            }
+        }
+        if let Some(d) = self.dnd.as_mut() {
+            d.ok = ok;
+        }
+        let hl = if let Tgt::Icon(i) = tgt { Some(i) } else { None };
+        if hl != self.dnd_hl {
+            for i in self.dnd_hl.into_iter().chain(hl) {
+                self.dmg(self.icon_cell(i));
+            }
+            self.dnd_hl = hl;
+        }
+        self.dnd_paint();
+    }
+
+    /// Texto de la etiqueta que acompaña al puntero.
+    fn dnd_text(&self) -> String {
+        let Some(d) = &self.dnd else { return String::new() };
+        let mut t = match d.paths.as_slice() {
+            [one] => String::from(dialogs::fit(files::file_name(one), 8, 220)),
+            v => format!("{} elementos", v.len()),
+        };
+        if self.mods.0 {
+            t.push_str("  + Copiar");
+        }
+        t
+    }
+
+    fn dnd_rect(&self) -> Rect {
+        if self.dnd.is_none() {
+            return Rect::default();
+        }
+        let (w, h) = (font::width(&self.dnd_text(), 8, false) + 16, font::line_h(8) + 8);
+        Rect::new((self.mx + 14).min(self.w - w).max(0), (self.my + 18).min(self.h - h).max(0), w, h)
+    }
+
+    /// Ensucia la etiqueta donde estaba y donde está ahora.
+    fn dnd_paint(&mut self) {
+        let n = self.dnd_rect();
+        self.dmg(self.dnd_lbl);
+        self.dmg(n);
+        self.dnd_lbl = n;
+    }
+
+    fn paint_dnd(&self, s: &mut Surface) {
+        let Some(d) = &self.dnd else { return };
+        let r = self.dnd_rect();
+        if !r.intersects(s.clip()) {
+            return;
+        }
+        if d.ok {
+            s.fill_rect(r, 0xF2F2F2);
+            s.frame(r, self.theme.accent);
+            text_in(s, r, &self.dnd_text(), 8, 0x000000, Align::Center);
+        } else {
+            s.blend_rect(r, 0xF2F2F2, 130);
+            s.frame(r, 0x9A9A9A);
+            text_in(s, r, &self.dnd_text(), 8, 0x6E6E6E, Align::Center);
+        }
+    }
+
+    /// Termina el arrastre; con `drop` y un destino que lo admite, hace lo que toque.
+    fn end_dnd(&mut self, drop: bool, sys: &mut dyn Platform) {
+        let Some(d) = self.dnd.take() else { return };
+        if self.drag == Drag::Files {
+            self.drag = Drag::None;
+        }
+        let copy = self.mods.0;
+        let tgt = if drop && !d.dead && !self.login.covers() { self.dnd_target(&d.paths) } else { Tgt::Nothing };
+        match tgt {
+            Tgt::Win(id) if d.over == Some(id) && d.ok => {
+                self.raise(id);
+                if let Some(i) = self.pos(id) {
+                    let c = self.wins[i].content_rect();
+                    let (x, y) = (self.mx - c.x, self.my - c.y);
+                    self.with_app(id, sys, |a, cx| a.drop_files(x, y, &d.paths, copy, cx));
+                }
+            }
+            Tgt::Desk => {
+                let dir = sys.files().std_dir(Std::Desktop);
+                self.desk_drop(Dest::Dir(dir), d.paths.clone(), copy, sys);
+            }
+            Tgt::Icon(i) => {
+                let dest = match self.icons.get(i).map(|x| &x.act) {
+                    Some(Act::Path(p)) if p == files::TRASH => Some(Dest::Trash),
+                    Some(Act::Path(p)) => Some(Dest::Dir(p.clone())),
+                    _ => None,
+                };
+                if let Some(dest) = dest {
+                    self.desk_drop(dest, d.paths.clone(), copy, sys);
+                }
+            }
+            _ => {}
+        }
+        if let Some(o) = d.over {
+            self.with_app(o, sys, |a, cx| {
+                a.drag_over(None, &d.paths, cx);
+            });
+        }
+        self.dmg(self.dnd_lbl);
+        self.dnd_lbl = Rect::default();
+        if let Some(i) = self.dnd_hl.take() {
+            self.dmg(self.icon_cell(i));
+        }
+    }
+
+    /// Cancela el arrastre en curso (Esc, ventana de origen cerrada, bloqueo...) sin hacer nada.
+    fn cancel_dnd(&mut self, sys: &mut dyn Platform) {
+        if self.dnd.is_none() {
+            return;
+        }
+        let files = self.drag == Drag::Files;
+        self.end_dnd(false, sys);
+        if files {
+            self.drag = Drag::Dead;
+        }
+    }
+
+    /// Mover, copiar o eliminar lo arrastrado; si toca `C:\Sistema` pregunta antes.
+    fn desk_drop(&mut self, dest: Dest, paths: Vec<String>, copy: bool, sys: &mut dyn Platform) {
+        let touches = match &dest {
+            Dest::Dir(d) => files::in_system(d) || (!copy && paths.iter().any(|p| files::in_system(p))),
+            Dest::Trash => paths.iter().any(|p| files::in_system(p)),
+        };
+        if touches {
+            self.pending_drop = Some((dest, paths, copy));
+            let text = "Vas a modificar una carpeta del sistema. Si cambias o borras algo aquí, NightFury puede dejar de funcionar. ¿Continuar?";
+            let req = DialogRequest::Message { tag: TAG_DROP, title: String::from("Carpeta del sistema"), text: String::from(text), buttons: Buttons::YesNo };
+            self.open_dialog(None, req, sys);
+        } else {
+            self.run_drop(dest, paths, copy, sys);
+        }
+    }
+
+    fn run_drop(&mut self, dest: Dest, paths: Vec<String>, copy: bool, sys: &mut dyn Platform) {
+        let now = sys.now();
+        let (res, what) = match &dest {
+            Dest::Dir(d) => (sys.files().transfer(&paths, d, !copy, now).map(|_| ()), if copy { "No se puede copiar" } else { "No se puede mover" }),
+            Dest::Trash => (sys.files().user_trash_many(&paths, now), "No se puede eliminar"),
+        };
+        if let Err(e) = res {
+            self.info(what, e.message(), sys);
+        }
+        self.refresh_icons(sys);
+    }
+
+    /// Recuadro de selección: sigue al puntero y selecciona los iconos que toca.
+    fn band_move(&mut self, x0: i32, y0: i32) {
+        let (x, y) = (self.mx, self.my);
+        let shown = (x - x0).abs() >= BAND_PX || (y - y0).abs() >= BAND_PX || self.band.is_some();
+        let new = shown.then(|| Rect::new(x0.min(x), y0.min(y), (x0 - x).abs() + 1, (y0 - y).abs() + 1));
+        if new == self.band {
+            return;
+        }
+        if let Some(o) = self.band {
+            self.dmg(o);
+        }
+        if let Some(n) = new {
+            self.dmg(n);
+            let mut v = self.band_base.clone();
+            v.extend((0..self.icons.len()).filter(|&i| self.icon_cell(i).intersects(n)));
+            v.sort_unstable();
+            v.dedup();
+            self.set_sel(v);
+        }
+        self.band = new;
+    }
+
+    fn end_band(&mut self) {
+        if let Some(b) = self.band.take() {
+            self.dmg(b);
+        }
+        self.band_base.clear();
     }
 
     /// ¿Es este clic el segundo de un doble clic sobre el mismo elemento?
@@ -2285,6 +2723,9 @@ impl Desktop {
         // Ctrl y Mayús llegan como `Key::Other`; se reparten aparte (ver `sync_mods`).
         if k.key == Key::Other {
             self.mods = (k.ctrl, k.shift);
+            if self.dnd.is_some() {
+                self.dnd_paint();
+            }
             self.sync_mods(sys);
             self.after(sys);
             return;
@@ -2294,6 +2735,14 @@ impl Desktop {
         }
         let fine = sys.entropy();
         sys.pool().add_event(key_code(k.key), 0, self.now_ms, fine);
+        if self.dnd.is_some() && !self.login.covers() {
+            // Durante un arrastre solo vale Esc (cancelar); el resto del teclado no se usa.
+            if k.key == Key::Escape {
+                self.cancel_dnd(sys);
+            }
+            self.after(sys);
+            return;
+        }
         if self.login.covers() {
             let out = self.login.key(&k, sys);
             self.login_out(out, sys);
@@ -2377,6 +2826,10 @@ impl Desktop {
         if self.login.mode == Mode::Off {
             s.blit(&self.wall, 0, 0);
             self.paint_icons(s);
+            if let Some(b) = self.band {
+                s.blend_rect(b, self.theme.accent, 70);
+                s.frame(b, lighten(self.theme.accent, 70));
+            }
         } else {
             s.blit(&self.dim, 0, 0);
         }
@@ -2398,6 +2851,7 @@ impl Desktop {
                 if let Some(m) = &self.menu {
                     m.menu.draw(s);
                 }
+                self.paint_dnd(s);
             }
         }
         if !cursor_rect(self.mx, self.my).intersects(s.clip()) {
@@ -2435,9 +2889,14 @@ impl Desktop {
             if !c.intersects(s.clip()) {
                 continue;
             }
-            if self.sel == Some(i) {
+            if self.sel.contains(&i) {
                 s.blend_rect(c, self.theme.accent, 110);
                 s.frame(c, lighten(self.theme.accent, 70));
+            }
+            if self.dnd_hl == Some(i) {
+                // Destino del arrastre: más fuerte que la selección.
+                s.blend_rect(c, self.theme.accent, 190);
+                s.frame(c, 0xFFFFFF);
             }
             let (_, _, isz, iy, ty) = self.size.metrics();
             icons::draw(s, *icon, c.x + (c.w - isz) / 2, c.y + iy, isz, 0xFFFFFF);
@@ -2841,7 +3300,7 @@ mod tests {
         let (mut d, mut sys) = setup(1280, 800);
         let p = center(d.icon_cell(0));
         click!(d, sys, p);
-        assert_eq!((d.window_count(), d.sel), (0, Some(0)));
+        assert_eq!((d.window_count(), d.sel.clone()), (0, vec![0]));
         click!(d, sys, p);
         assert_eq!(kinds(&d), [AppKind::Notepad]);
         // Dos clics demasiado separados en el tiempo no abren.
@@ -3703,7 +4162,7 @@ mod menu_tests {
     fn pick(d: &mut Desktop, sys: &mut TestPlatform, icon: Option<usize>, id: u32) {
         match icon {
             Some(i) => {
-                d.sel = Some(i);
+                d.sel = vec![i];
                 d.desktop_menu_result(MENU_ICON, id, sys);
             }
             None => d.desktop_menu_result(MENU_DESK, id, sys),
@@ -3716,40 +4175,45 @@ mod menu_tests {
         click_at(d, sys, center(d.icon_cell(i)));
     }
 
+    fn items_of(d: &mut Desktop, i: usize, sys: &mut TestPlatform) -> Vec<MenuItem> {
+        d.sel = vec![i];
+        d.icon_items(sys)
+    }
+
     fn answer_text(d: &mut Desktop, sys: &mut TestPlatform, tag: u32, v: &str) {
         d.system_result(DialogResult::Text { tag, value: Some(String::from(v)) }, sys);
     }
 
     #[test]
     fn icon_menus_have_the_right_items() {
-        let (d, mut sys) = setup();
+        let (mut d, mut sys) = setup();
         assert_eq!(d.icons[6].name, "Carpeta");
         assert_eq!(d.icons[7].name, "nota.txt");
         // App: solo Abrir, en negrita.
-        let it = d.icon_items(0, &mut sys);
+        let it = items_of(&mut d, 0, &mut sys);
         assert_eq!(texts(&it), ["Abrir"]);
         assert!(it[0].bold);
         // Papelera vacía: Vaciar desactivado; con algo dentro, activo.
-        let it = d.icon_items(5, &mut sys);
+        let it = items_of(&mut d, 5, &mut sys);
         assert_eq!(texts(&it), ["Abrir", "Vaciar Papelera"]);
         assert!(it[1].disabled);
         let now = sys.now();
         sys.files.write(&sp(&sys.files, Std::Desktop, "viejo.txt"), b"x", now).unwrap();
         sys.files.trash(&sp(&sys.files, Std::Desktop, "viejo.txt"), now).unwrap();
-        assert!(!d.icon_items(5, &mut sys)[1].disabled);
+        assert!(!items_of(&mut d, 5, &mut sys)[1].disabled);
         // Archivo.
-        let it = d.icon_items(7, &mut sys);
+        let it = items_of(&mut d, 7, &mut sys);
         let want = ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
         assert_eq!(texts(&it), want);
         assert!(it[0].bold && it.iter().all(|i| !i.disabled));
         assert_eq!(it[1].sub[0].text, "Bloc de notas");
         // Carpeta: Pegar desactivado hasta que haya portapapeles.
-        let it = d.icon_items(6, &mut sys);
+        let it = items_of(&mut d, 6, &mut sys);
         let want = ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
         assert_eq!(texts(&it), want);
         assert!(it[5].disabled);
         sys.files.set_clip(&sp(&sys.files, Std::Desktop, "nota.txt"), false);
-        assert!(!d.icon_items(6, &mut sys)[5].disabled);
+        assert!(!items_of(&mut d, 6, &mut sys)[5].disabled);
     }
 
     #[test]
@@ -3784,7 +4248,7 @@ mod menu_tests {
     fn right_click_selects_icon_opens_menu_and_open_works() {
         let (mut d, mut sys) = setup();
         { let p = center(d.icon_cell(7)); right_click(&mut d, &mut sys, p); }
-        assert_eq!(d.sel, Some(7));
+        assert_eq!(d.sel, vec![7]);
         let m = d.menu().expect("menú del icono");
         let r = m.item_rect(0);
         click_at(&mut d, &mut sys, center(r));
@@ -3793,7 +4257,7 @@ mod menu_tests {
         // Sobre el fondo: menú del fondo y sin selección.
         d.close(d.wins[0].id);
         right_click(&mut d, &mut sys, (900, 500));
-        assert!(d.menu().is_some() && d.sel.is_none());
+        assert!(d.menu().is_some() && d.sel.is_empty());
         d.close_menu();
         // Sobre una ventana no se abre el menú del escritorio.
         d.launch(AppKind::Calc, &mut sys);
@@ -3999,9 +4463,9 @@ mod menu_tests {
         assert_eq!(d.icons[5].name, "Papelera");
         assert_eq!(d.icons[0].name, "Bloc de notas");
         // La selección sigue al icono al reordenar.
-        d.sel = Some(7);
+        d.sel = vec![7];
         pick(&mut d, &mut sys, None, M_SORT + 1);
-        assert_eq!(d.icons[d.sel.unwrap()].name, "a.txt");
+        assert_eq!(d.icons[d.sel[0]].name, "a.txt");
     }
 
     #[test]
@@ -4850,5 +5314,666 @@ mod login_tests {
         press(&mut d, &mut sys, Key::Enter, None);
         d.event(Event::Tick(d.now_ms + 200), &mut sys);
         assert_eq!(d.login_mode(), Mode::Pick);
+    }
+}
+
+#[cfg(test)]
+mod dnd_tests {
+    use super::*;
+    use crate::apps::DragRequest;
+    use crate::platform::TestPlatform;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+
+    type Log = Rc<RefCell<Vec<String>>>;
+
+    /// App de pruebas que registra todo lo que recibe. Con `drag`, el primer `Move` tras un `Down` pide arrastrar.
+    struct DProbe {
+        log: Log,
+        drag: Option<Vec<String>>,
+        accept: bool,
+        down: bool,
+    }
+
+    impl App for DProbe {
+        fn kind(&self) -> AppKind {
+            AppKind::Notepad
+        }
+        fn title(&self) -> String {
+            String::from("DProbe")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {
+            let b = s.bounds();
+            s.fill_rect(b, 0xEEEEEE);
+        }
+        fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
+        fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
+            let mut l = self.log.borrow_mut();
+            match ev {
+                MouseEv::Down { x, y } => {
+                    self.down = true;
+                    l.push(format!("down {x},{y}"));
+                }
+                MouseEv::Move { x, y } => {
+                    l.push(format!("move {x},{y}"));
+                    if self.down {
+                        if let Some(paths) = self.drag.take() {
+                            cx.drag = Some(DragRequest { paths });
+                        }
+                    }
+                }
+                MouseEv::Up { .. } => {
+                    self.down = false;
+                    l.push(String::from("up"));
+                }
+                MouseEv::Leave => l.push(String::from("leave")),
+                _ => {}
+            }
+        }
+        fn tick(&mut self, _cx: &mut Ctx) {}
+        fn drag_over(&mut self, pos: Option<(i32, i32)>, _paths: &[String], _cx: &mut Ctx) -> bool {
+            self.log.borrow_mut().push(match pos {
+                Some((x, y)) => format!("over {x},{y}"),
+                None => String::from("over none"),
+            });
+            self.accept && pos.is_some()
+        }
+        fn drop_files(&mut self, x: i32, y: i32, paths: &[String], copy: bool, _cx: &mut Ctx) {
+            self.log.borrow_mut().push(format!("drop {x},{y} {copy} {}", paths.join("|")));
+        }
+    }
+
+    /// Escritorio: iconos 0..5 apps, 5 Papelera, 6 Carpeta, 7 a.txt, 8 b.txt; Documentos con f.txt y g.txt.
+    fn setup() -> (Desktop, TestPlatform) {
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        let now = sys.now();
+        sys.files.mkdir(&sp(&sys.files, Std::Desktop, "Carpeta"), now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "a.txt"), b"a", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Desktop, "b.txt"), b"b", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "f.txt"), b"f", now).unwrap();
+        sys.files.write(&sp(&sys.files, Std::Documents, "g.txt"), b"g", now).unwrap();
+        let mut d = Desktop::new(1280, 800, &mut sys);
+        d.booted = true;
+        (d, sys)
+    }
+
+    fn docs(sys: &TestPlatform, name: &str) -> String {
+        sp(&sys.files, Std::Documents, name)
+    }
+
+    fn desk(sys: &TestPlatform, name: &str) -> String {
+        sp(&sys.files, Std::Desktop, name)
+    }
+
+    /// Abre una app de pruebas en `rect` (marco exterior).
+    fn add(d: &mut Desktop, sys: &mut TestPlatform, rect: Rect, drag: Option<Vec<String>>, accept: bool) -> (u32, Log) {
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        d.launch_app(Box::new(DProbe { log: log.clone(), drag, accept, down: false }), sys);
+        let id = d.wins.last().unwrap().id;
+        let i = d.pos(id).unwrap();
+        d.set_rect(i, rect);
+        (id, log)
+    }
+
+    /// Cambia la app de la ventana `id` por una nueva que arrastrará `paths`.
+    fn rearm(d: &mut Desktop, id: u32, paths: Vec<String>) {
+        let i = d.pos(id).unwrap();
+        d.wins[i].app = Box::new(DProbe { log: Rc::new(RefCell::new(Vec::new())), drag: Some(paths), accept: true, down: false });
+    }
+
+    /// Punto (dx, dy) del contenido de la ventana, en pantalla.
+    fn at(d: &Desktop, id: u32, dx: i32, dy: i32) -> (i32, i32) {
+        let c = d.wins[d.pos(id).unwrap()].content_rect();
+        (c.x + dx, c.y + dy)
+    }
+
+    fn mv(d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)) {
+        d.mouse_to(p.0, p.1, sys);
+    }
+
+    /// Mueve el puntero al punto (dx, dy) del contenido de la ventana `id`.
+    fn go(d: &mut Desktop, sys: &mut TestPlatform, id: u32, dx: i32, dy: i32) {
+        let p = at(d, id, dx, dy);
+        d.mouse_to(p.0, p.1, sys);
+    }
+
+    /// Mueve el puntero al centro del icono `i`.
+    fn goi(d: &mut Desktop, sys: &mut TestPlatform, i: usize) {
+        let p = center(d.icon_cell(i));
+        d.mouse_to(p.0, p.1, sys);
+    }
+
+    fn center(r: Rect) -> (i32, i32) {
+        (r.x + r.w / 2, r.y + r.h / 2)
+    }
+
+    fn mods(d: &mut Desktop, sys: &mut TestPlatform, ctrl: bool, shift: bool) {
+        d.event(Event::Key(KeyEvent { key: Key::Other, ch: None, down: ctrl || shift, shift, ctrl, alt: false }), sys);
+    }
+
+    fn key(d: &mut Desktop, sys: &mut TestPlatform, key: Key, ch: Option<char>, ctrl: bool) {
+        d.event(Event::Key(KeyEvent { key, ch, down: true, shift: false, ctrl, alt: false }), sys);
+    }
+
+    fn snapshot(l: &Log) -> Vec<String> {
+        l.borrow().clone()
+    }
+
+    fn count(l: &Log, what: &str) -> usize {
+        l.borrow().iter().filter(|s| s.as_str() == what).count()
+    }
+
+    fn has(l: &Log, prefix: &str) -> bool {
+        l.borrow().iter().any(|s| s.starts_with(prefix))
+    }
+
+    /// Clic sobre el icono `i` (el reloj avanza para que no cuente como doble clic).
+    fn click_icon(d: &mut Desktop, sys: &mut TestPlatform, i: usize) {
+        d.event(Event::Tick(d.now_ms + 1000), sys);
+        goi(d, sys, i);
+        d.left_button(true, sys);
+        d.left_button(false, sys);
+    }
+
+    fn render_equal(d: &mut Desktop, sys: &mut TestPlatform, what: &str) {
+        d.render(sys);
+        let inc = d.back().px.clone();
+        d.invalidate();
+        d.render(sys);
+        assert!(inc == d.back().px, "incremental distinto del completo: {what}");
+    }
+
+    /// Dos ventanas: la 1 arrastra `paths`; la 2 está a la derecha. Devuelve ids y registros.
+    fn two(d: &mut Desktop, sys: &mut TestPlatform, paths: Vec<String>, accept: bool) -> ((u32, Log), (u32, Log)) {
+        let a = add(d, sys, Rect::new(300, 100, 300, 300), Some(paths), true);
+        let b = add(d, sys, Rect::new(700, 100, 300, 300), None, accept);
+        (a, b)
+    }
+
+    /// Pulsa en la ventana 1 y se mueve lo justo para que empiece el arrastre.
+    fn start_from(d: &mut Desktop, sys: &mut TestPlatform, id: u32) {
+        go(d, sys, id, 10, 10);
+        d.left_button(true, sys);
+        go(d, sys, id, 20, 20);
+    }
+
+    #[test]
+    fn la_app_deja_de_recibir_eventos_al_pedir_arrastrar() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, la), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        start_from(&mut d, &mut sys, a);
+        let n = snapshot(&la).len();
+        assert!(has(&la, "down 10,10") && has(&la, "move 20,20"));
+        assert!(d.dnd.is_some() && d.drag == Drag::Files);
+        // La propia ventana de origen también recibe drag_over con coordenadas de contenido.
+        assert!(has(&la, "over 20,20"));
+        // Más movimientos y el Up ya no llegan a la app de origen (solo drag_over).
+        go(&mut d, &mut sys, a, 40, 40);
+        go(&mut d, &mut sys, b, 15, 25);
+        d.left_button(false, &mut sys);
+        let l = snapshot(&la);
+        assert!(l[n..].iter().all(|s| s.starts_with("over") || s == "leave"), "{l:?}");
+        assert!(!l.iter().any(|s| s == "up"));
+        assert_eq!(count(&la, "move 40,40"), 0);
+        // Salir de la ventana de origen: drag_over(None) una vez; en la destino, coordenadas de contenido.
+        assert_eq!(count(&la, "over none"), 1);
+        assert!(has(&lb, "over 15,25"));
+        assert!(has(&lb, "drop 15,25 false"), "{:?}", snapshot(&lb));
+        assert_eq!(count(&lb, "over none"), 1);
+        assert!(d.dnd.is_none() && d.drag == Drag::None);
+    }
+
+    #[test]
+    fn drag_over_sale_una_vez_y_drop_solo_si_la_ultima_respuesta_fue_si() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _la), (b, lb)) = two(&mut d, &mut sys, vec![f], false);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        go(&mut d, &mut sys, b, 12, 10);
+        assert!(!d.dnd.as_ref().unwrap().ok);
+        d.left_button(false, &mut sys);
+        assert!(!has(&lb, "drop"), "no admite: no hay drop");
+        assert_eq!(count(&lb, "over none"), 1);
+        // Salir de la ventana a otra zona del escritorio avisa una vez.
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f], true);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        mv(&mut d, &mut sys, (1100, 600));
+        mv(&mut d, &mut sys, (1110, 610));
+        assert_eq!(count(&lb, "over none"), 1);
+        // Al soltar en el fondo no hay más avisos a la ventana.
+        d.left_button(false, &mut sys);
+        assert_eq!(count(&lb, "over none"), 1);
+    }
+
+    #[test]
+    fn con_ctrl_el_drop_llega_como_copiar() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        mods(&mut d, &mut sys, true, false);
+        d.left_button(false, &mut sys);
+        assert!(has(&lb, &format!("drop 10,10 true {f}")), "{:?}", snapshot(&lb));
+    }
+
+    #[test]
+    fn esc_cancela_sin_mover_nada_y_la_app_no_recibe_mas() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, la), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        assert!(d.dnd.is_none());
+        assert_eq!(count(&lb, "over none"), 1);
+        let n = snapshot(&la).len();
+        go(&mut d, &mut sys, a, 50, 50);
+        go(&mut d, &mut sys, b, 50, 50);
+        d.left_button(false, &mut sys);
+        assert!(!has(&lb, "drop") && snapshot(&la).len() == n);
+        assert!(sys.files.exists(&f));
+        assert_eq!(d.drag, Drag::None);
+        // Una pulsación nueva funciona con normalidad.
+        go(&mut d, &mut sys, b, 5, 5);
+        d.left_button(true, &mut sys);
+        d.left_button(false, &mut sys);
+        assert!(has(&lb, "down 5,5") && count(&lb, "up") == 1);
+    }
+
+    #[test]
+    fn cerrar_la_ventana_de_origen_o_bloquear_cancela() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        d.close(a);
+        go(&mut d, &mut sys, b, 11, 10);
+        assert!(d.dnd.is_none());
+        d.left_button(false, &mut sys);
+        assert!(!has(&lb, "drop") && sys.files.exists(&f));
+        // Bloqueo.
+        let (mut d, mut sys) = setup();
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        start_from(&mut d, &mut sys, a);
+        go(&mut d, &mut sys, b, 10, 10);
+        d.lock(&mut sys);
+        assert!(d.dnd.is_none());
+        d.left_button(false, &mut sys);
+        assert!(!has(&lb, "drop"));
+        assert_eq!(count(&lb, "over none"), 1);
+    }
+
+    #[test]
+    fn una_ventana_con_dialogo_modal_no_recibe_arrastres() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f], true);
+        d.open_dialog(
+            Some(b),
+            DialogRequest::Message { tag: 1, title: String::from("T"), text: String::from("x"), buttons: crate::dialogs::Buttons::Ok },
+            &mut sys,
+        );
+        start_from(&mut d, &mut sys, a);
+        // Sobre la ventana bloqueada (fuera del diálogo) y sobre el propio diálogo.
+        for p in [at(&d, b, 2, 2), at(&d, b, 150, 150), (710, 400)] {
+            mv(&mut d, &mut sys, p);
+            assert!(!has(&lb, "over"), "{:?}", snapshot(&lb));
+        }
+        d.left_button(false, &mut sys);
+        assert!(!has(&lb, "drop"));
+    }
+
+    #[test]
+    fn soltar_en_barra_inicio_y_titulos_no_hace_nada() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
+        let title = d.wins[d.pos(b).unwrap()].title_rect();
+        // Barra de tareas, borde de ventana y título de ventana.
+        for p in [(400, 790), (title.x + 40, title.y + 5), (d.wins[d.pos(b).unwrap()].rect.x, 200)] {
+            rearm(&mut d, a, vec![f.clone()]);
+            start_from(&mut d, &mut sys, a);
+            mv(&mut d, &mut sys, p);
+            assert!(!d.dnd.as_ref().unwrap().ok, "{p:?}");
+            d.left_button(false, &mut sys);
+            assert!(sys.files.exists(&f) && !has(&lb, "drop") && d.dialog_count() == 0, "{p:?}");
+        }
+        // Menú Inicio abierto: soltar sobre él tampoco hace nada.
+        rearm(&mut d, a, vec![f.clone()]);
+        start_from(&mut d, &mut sys, a);
+        d.set_start(true);
+        let m = center(d.menu_rect());
+        mv(&mut d, &mut sys, m);
+        assert!(!d.dnd.as_ref().unwrap().ok);
+        d.left_button(false, &mut sys);
+        assert!(sys.files.exists(&f) && d.window_count() == 2);
+    }
+
+    #[test]
+    fn el_escritorio_como_destino_fondo_carpeta_papelera_app_y_misma_carpeta() {
+        let (mut d, mut sys) = setup();
+        let (f, g) = (docs(&sys, "f.txt"), docs(&sys, "g.txt"));
+        let a = add(&mut d, &mut sys, Rect::new(400, 100, 300, 300), Some(vec![f.clone()]), true).0;
+        assert_eq!(d.hit(1000, 500), Hit::None);
+        // Fondo: mueve a Escritorio.
+        start_from(&mut d, &mut sys, a);
+        mv(&mut d, &mut sys, (1000, 500));
+        assert!(d.dnd.as_ref().unwrap().ok);
+        d.left_button(false, &mut sys);
+        assert!(!sys.files.exists(&f) && sys.files.exists(&desk(&sys, "f.txt")));
+        // Deshacer con Ctrl+Z (sin ventanas a la vista el atajo es del escritorio).
+        d.minimize(a);
+        key(&mut d, &mut sys, Key::Char('z'), Some('z'), true);
+        assert!(sys.files.exists(&f) && !sys.files.exists(&desk(&sys, "f.txt")));
+        d.raise(a);
+        // Con Ctrl, copia.
+        rearm(&mut d, a, vec![f.clone()]);
+        start_from(&mut d, &mut sys, a);
+        mv(&mut d, &mut sys, (1000, 500));
+        mods(&mut d, &mut sys, true, false);
+        d.left_button(false, &mut sys);
+        mods(&mut d, &mut sys, false, false);
+        assert!(sys.files.exists(&f) && sys.files.exists(&desk(&sys, "f.txt")));
+        // Carpeta del escritorio: resalta y mueve dentro.
+        d.event(Event::Tick(50), &mut sys);
+        let carpeta = d.icons.iter().position(|i| i.name == "Carpeta").unwrap();
+        rearm(&mut d, a, vec![g.clone()]);
+        start_from(&mut d, &mut sys, a);
+        goi(&mut d, &mut sys, carpeta);
+        assert_eq!(d.dnd_hl, Some(carpeta));
+        render_equal(&mut d, &mut sys, "icono destino resaltado");
+        d.left_button(false, &mut sys);
+        assert_eq!(d.dnd_hl, None);
+        assert!(!sys.files.exists(&g) && sys.files.exists(&format!("{}\\g.txt", desk(&sys, "Carpeta"))));
+        // Papelera.
+        let h = docs(&sys, "h.txt");
+        let now = sys.now();
+        sys.files.write(&h, b"h", now).unwrap();
+        rearm(&mut d, a, vec![h.clone()]);
+        start_from(&mut d, &mut sys, a);
+        goi(&mut d, &mut sys, 5);
+        assert_eq!(d.dnd_hl, Some(5));
+        d.left_button(false, &mut sys);
+        assert!(!sys.files.exists(&h) && sys.files.trash_list().unwrap().len() == 1);
+        // Icono de app: nada, y la etiqueta se ve atenuada.
+        let k = docs(&sys, "k.txt");
+        sys.files.write(&k, b"k", now).unwrap();
+        rearm(&mut d, a, vec![k.clone()]);
+        start_from(&mut d, &mut sys, a);
+        goi(&mut d, &mut sys, 1);
+        assert!(!d.dnd.as_ref().unwrap().ok && d.dnd_hl.is_none());
+        d.left_button(false, &mut sys);
+        assert!(sys.files.exists(&k));
+        // Misma carpeta: soltar un archivo del escritorio en el fondo no cambia nada ni da error.
+        let ad = desk(&sys, "a.txt");
+        rearm(&mut d, a, vec![ad.clone()]);
+        start_from(&mut d, &mut sys, a);
+        mv(&mut d, &mut sys, (1000, 500));
+        d.left_button(false, &mut sys);
+        assert!(sys.files.exists(&ad) && d.dialog_count() == 0);
+        // Una carpeta no se puede soltar sobre sí misma.
+        let car = desk(&sys, "Carpeta");
+        rearm(&mut d, a, vec![car]);
+        start_from(&mut d, &mut sys, a);
+        goi(&mut d, &mut sys, carpeta);
+        assert_eq!(d.dnd_hl, None);
+        d.left_button(false, &mut sys);
+    }
+
+    #[test]
+    fn soltar_desde_o_hacia_sistema_pide_confirmacion() {
+        let (mut d, mut sys) = setup();
+        let now = sys.now();
+        let s = String::from("C:\\Sistema\\temp\\x.txt");
+        sys.files.write(&s, b"x", now).unwrap();
+        let a = add(&mut d, &mut sys, Rect::new(400, 100, 300, 300), Some(vec![s.clone()]), true).0;
+        start_from(&mut d, &mut sys, a);
+        mv(&mut d, &mut sys, (1000, 500));
+        d.left_button(false, &mut sys);
+        assert_eq!(d.dialog_count(), 1);
+        assert!(sys.files.exists(&s), "no se mueve hasta confirmar");
+        // No: nada.
+        d.system_result(DialogResult::Answer { tag: TAG_DROP, answer: Answer::No }, &mut sys);
+        assert!(sys.files.exists(&s) && d.pending_drop.is_none());
+        // Sí: se mueve.
+        rearm(&mut d, a, vec![s.clone()]);
+        d.wins.retain(|w| w.dlg.is_none());
+        start_from(&mut d, &mut sys, a);
+        mv(&mut d, &mut sys, (1000, 500));
+        d.left_button(false, &mut sys);
+        d.system_result(DialogResult::Answer { tag: TAG_DROP, answer: Answer::Yes }, &mut sys);
+        assert!(!sys.files.exists(&s) && sys.files.exists(&desk(&sys, "x.txt")));
+    }
+
+    #[test]
+    fn el_escritorio_como_origen_umbral_seleccion_y_exclusiones() {
+        let (mut d, mut sys) = setup();
+        let (_, lb) = add(&mut d, &mut sys, Rect::new(500, 100, 300, 300), None, true);
+        let b = d.wins.last().unwrap().id;
+        let p = center(d.icon_cell(7));
+        mv(&mut d, &mut sys, p);
+        d.left_button(true, &mut sys);
+        mv(&mut d, &mut sys, (p.0 + 5, p.1 + 5));
+        assert!(d.dnd.is_none(), "5 px aún no es arrastre");
+        mv(&mut d, &mut sys, (p.0 + 6, p.1));
+        assert_eq!(d.dnd.as_ref().map(|x| x.paths.clone()), Some(vec![desk(&sys, "a.txt")]));
+        go(&mut d, &mut sys, b, 20, 30);
+        assert!(has(&lb, "over 20,30"));
+        d.left_button(false, &mut sys);
+        assert!(has(&lb, &format!("drop 20,30 false {}", desk(&sys, "a.txt"))));
+        // Las apps y la Papelera no se arrastran.
+        for i in [1usize, 5] {
+            let p = center(d.icon_cell(i));
+            d.event(Event::Tick(d.now_ms + 1000), &mut sys);
+            mv(&mut d, &mut sys, p);
+            d.left_button(true, &mut sys);
+            mv(&mut d, &mut sys, (p.0 + 20, p.1 + 20));
+            assert!(d.dnd.is_none(), "icono {i}");
+            d.left_button(false, &mut sys);
+        }
+        // Una selección de varios se arrastra entera; el arrastre desde uno no seleccionado lleva solo ese.
+        click_icon(&mut d, &mut sys, 7);
+        mods(&mut d, &mut sys, true, false);
+        click_icon(&mut d, &mut sys, 8);
+        mods(&mut d, &mut sys, false, false);
+        assert_eq!(d.sel, vec![7, 8]);
+        let p = center(d.icon_cell(8));
+        d.event(Event::Tick(d.now_ms + 1000), &mut sys);
+        mv(&mut d, &mut sys, p);
+        d.left_button(true, &mut sys);
+        mv(&mut d, &mut sys, (p.0 + 20, p.1));
+        assert_eq!(d.dnd.as_ref().unwrap().paths.len(), 2);
+        // Soltar sobre la carpeta del propio escritorio.
+        goi(&mut d, &mut sys, 6);
+        d.left_button(false, &mut sys);
+        assert!(sys.files.exists(&format!("{}\\a.txt", desk(&sys, "Carpeta"))));
+        assert!(sys.files.exists(&format!("{}\\b.txt", desk(&sys, "Carpeta"))));
+        d.event(Event::Tick(d.now_ms + 1000), &mut sys);
+        assert_eq!(d.icons.len(), 7, "los iconos se recargan");
+        click_icon(&mut d, &mut sys, 8);
+        click_icon(&mut d, &mut sys, 6);
+        assert_eq!(d.sel, vec![6]);
+    }
+
+    #[test]
+    fn seleccion_multiple_ctrl_mayus_ctrl_a_y_recuadro() {
+        let (mut d, mut sys) = setup();
+        click_icon(&mut d, &mut sys, 6);
+        assert_eq!(d.sel, vec![6]);
+        mods(&mut d, &mut sys, true, false);
+        click_icon(&mut d, &mut sys, 8);
+        assert_eq!(d.sel, vec![6, 8]);
+        click_icon(&mut d, &mut sys, 6);
+        assert_eq!(d.sel, vec![8]);
+        mods(&mut d, &mut sys, false, false);
+        click_icon(&mut d, &mut sys, 6);
+        mods(&mut d, &mut sys, false, true);
+        click_icon(&mut d, &mut sys, 8);
+        mods(&mut d, &mut sys, false, false);
+        assert_eq!(d.sel, vec![6, 7, 8]);
+        // Clic sobre un icono ya seleccionado de varios: se conserva hasta soltar; al soltar se queda solo él.
+        d.event(Event::Tick(d.now_ms + 1000), &mut sys);
+        goi(&mut d, &mut sys, 7);
+        d.left_button(true, &mut sys);
+        assert_eq!(d.sel, vec![6, 7, 8]);
+        d.left_button(false, &mut sys);
+        assert_eq!(d.sel, vec![7]);
+        // Ctrl+A.
+        key(&mut d, &mut sys, Key::Char('a'), Some('a'), true);
+        assert_eq!(d.sel, (0..d.icons.len()).collect::<Vec<_>>());
+        // Recuadro: sin Ctrl, reemplaza.
+        // 8 iconos por columna: 0..=7 en la primera y 8 arriba en la segunda.
+        let c6 = d.icon_cell(6);
+        let start = (110, d.icon_cell(7).bottom() + 22);
+        assert_eq!(d.hit(start.0, start.1), Hit::None);
+        mv(&mut d, &mut sys, start);
+        d.left_button(true, &mut sys);
+        assert!(d.sel.is_empty());
+        mv(&mut d, &mut sys, (start.0 - 2, start.1 - 2));
+        assert!(d.band.is_none(), "movimiento mínimo: aún sin recuadro");
+        mv(&mut d, &mut sys, (c6.x + 5, c6.y + 5));
+        assert!(d.band.is_some());
+        assert_eq!(d.sel, vec![6, 7]);
+        render_equal(&mut d, &mut sys, "recuadro");
+        d.left_button(false, &mut sys);
+        assert!(d.band.is_none() && d.sel == vec![6, 7]);
+        render_equal(&mut d, &mut sys, "recuadro soltado");
+        // Con Ctrl suma a lo que había.
+        click_icon(&mut d, &mut sys, 8);
+        mods(&mut d, &mut sys, true, false);
+        mv(&mut d, &mut sys, start);
+        d.left_button(true, &mut sys);
+        let y7 = d.icon_cell(7).y + 10;
+        mv(&mut d, &mut sys, (c6.x + 5, y7));
+        d.left_button(false, &mut sys);
+        mods(&mut d, &mut sys, false, false);
+        assert_eq!(d.sel, vec![7, 8]);
+        // Pulsar fuera del escritorio (ventana o barra) no inicia recuadro.
+        let w = add(&mut d, &mut sys, Rect::new(500, 100, 300, 300), None, true).0;
+        go(&mut d, &mut sys, w, 20, 20);
+        d.left_button(true, &mut sys);
+        assert!(!matches!(d.drag, Drag::Band(..)));
+        d.left_button(false, &mut sys);
+        mv(&mut d, &mut sys, (400, 790));
+        d.left_button(true, &mut sys);
+        assert!(!matches!(d.drag, Drag::Band(..)));
+        d.left_button(false, &mut sys);
+    }
+
+    #[test]
+    fn supr_cortar_copiar_y_menu_actuan_sobre_todos_los_seleccionados() {
+        let (mut d, mut sys) = setup();
+        let right_click = |d: &mut Desktop, sys: &mut TestPlatform, p: (i32, i32)| {
+            d.mouse_to(p.0, p.1, sys);
+            d.right_button(true, sys);
+            d.right_button(false, sys);
+        };
+        click_icon(&mut d, &mut sys, 7);
+        mods(&mut d, &mut sys, true, false);
+        click_icon(&mut d, &mut sys, 8);
+        mods(&mut d, &mut sys, false, false);
+        // Clic derecho sobre uno ya seleccionado conserva la selección y sale el menú de varios.
+        let p = center(d.icon_cell(7));
+        right_click(&mut d, &mut sys, p);
+        assert_eq!(d.sel, vec![7, 8]);
+        assert!(d.menu().is_some());
+        let it = d.icon_items(&mut sys);
+        let off: Vec<&str> = it.iter().filter(|i| i.disabled).map(|i| i.text.as_str()).collect();
+        assert_eq!(off, ["Abrir", "Abrir con", "Cambiar nombre"]);
+        d.desktop_menu_result(MENU_ICON, M_PROPS, &mut sys);
+        assert_eq!(d.dialog_count(), 1);
+        d.wins.retain(|w| w.dlg.is_none());
+        d.desktop_menu_result(MENU_ICON, M_COPY, &mut sys);
+        assert_eq!(sys.files.clip_paths().0.len(), 2);
+        d.close_menu();
+        // Sobre uno no seleccionado: lo selecciona solo.
+        let p = center(d.icon_cell(6));
+        right_click(&mut d, &mut sys, p);
+        assert_eq!(d.sel, vec![6]);
+        d.close_menu();
+        // F2 exige uno solo.
+        d.set_sel(vec![7, 8]);
+        key(&mut d, &mut sys, Key::F(2), None, false);
+        assert_eq!(d.dialog_count(), 0);
+        // Ctrl+A y Supr: solo se eliminan archivos y carpetas; las apps y la Papelera se quedan.
+        key(&mut d, &mut sys, Key::Char('a'), Some('a'), true);
+        key(&mut d, &mut sys, Key::Delete, None, false);
+        assert_eq!(d.icons.len(), 6);
+        assert_eq!(d.dialog_count(), 0);
+        // Deshacer lo devuelve como un solo lote.
+        key(&mut d, &mut sys, Key::Char('z'), Some('z'), true);
+        d.event(Event::Tick(d.now_ms + 10), &mut sys);
+        assert_eq!(d.icons.len(), 9);
+        // Todo apps: Cortar y Eliminar en gris.
+        d.set_sel(vec![0, 1]);
+        let it = d.icon_items(&mut sys);
+        assert!(it.iter().filter(|i| ["Cortar", "Copiar", "Eliminar"].contains(&i.text.as_str())).all(|i| i.disabled));
+    }
+
+    #[test]
+    fn zonas_danadas_de_etiqueta_recuadro_y_resaltado_son_exactas() {
+        let (mut d, mut sys) = setup();
+        let f = docs(&sys, "f.txt");
+        let g = docs(&sys, "g.txt");
+        let a = add(&mut d, &mut sys, Rect::new(400, 100, 300, 300), Some(vec![f.clone(), g]), true).0;
+        d.render(&mut sys);
+        start_from(&mut d, &mut sys, a);
+        render_equal(&mut d, &mut sys, "etiqueta al empezar");
+        for p in [(450, 300), (800, 500), (1270, 780), (5, 5), (center(d.icon_cell(6)).0, center(d.icon_cell(6)).1), (600, 200)] {
+            mv(&mut d, &mut sys, p);
+            render_equal(&mut d, &mut sys, "etiqueta en movimiento");
+        }
+        mods(&mut d, &mut sys, true, false);
+        render_equal(&mut d, &mut sys, "etiqueta con + Copiar");
+        mods(&mut d, &mut sys, false, false);
+        key(&mut d, &mut sys, Key::Escape, None, false);
+        render_equal(&mut d, &mut sys, "arrastre cancelado");
+        d.left_button(false, &mut sys);
+        render_equal(&mut d, &mut sys, "tras soltar");
+        // Recuadro creciendo, encogiendo y soltado.
+        d.minimize(a);
+        mv(&mut d, &mut sys, (600, 700));
+        d.left_button(true, &mut sys);
+        for p in [(400, 500), (100, 100), (300, 300), (1000, 750)] {
+            mv(&mut d, &mut sys, p);
+            render_equal(&mut d, &mut sys, "recuadro");
+        }
+        d.left_button(false, &mut sys);
+        render_equal(&mut d, &mut sys, "recuadro soltado");
+    }
+
+    /// Capturas para revisar a ojo: `NF_CAPTURAS=carpeta cargo test -p nf-core capturas_del_arrastre`.
+    #[test]
+    fn capturas_del_arrastre() {
+        let Ok(dir) = std::env::var("NF_CAPTURAS") else { return };
+        let save = |d: &mut Desktop, sys: &mut TestPlatform, n: &str| {
+            d.render(sys);
+            std::fs::write(format!("{dir}/{n}.bmp"), crate::bmp::encode(d.back())).unwrap();
+        };
+        let (mut d, mut sys) = setup();
+        // Recuadro de selección sobre los iconos del escritorio.
+        mv(&mut d, &mut sys, (180, 520));
+        d.left_button(true, &mut sys);
+        mv(&mut d, &mut sys, (20, 150));
+        save(&mut d, &mut sys, "escritorio_recuadro");
+        d.left_button(false, &mut sys);
+        // Etiqueta de arrastre sobre una carpeta resaltada.
+        let lista = vec![docs(&sys, "f.txt"), docs(&sys, "g.txt")];
+        let a = add(&mut d, &mut sys, Rect::new(400, 100, 300, 300), Some(lista), true).0;
+        start_from(&mut d, &mut sys, a);
+        let c = d.icon_cell(6);
+        mv(&mut d, &mut sys, (c.x + 30, c.y + 20));
+        mods(&mut d, &mut sys, true, false);
+        save(&mut d, &mut sys, "escritorio_etiqueta_carpeta");
     }
 }
