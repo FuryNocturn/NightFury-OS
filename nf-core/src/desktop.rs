@@ -11,6 +11,7 @@ use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
+use crate::keys::KeyError;
 use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::platform::{DateTime, Platform};
@@ -334,6 +335,45 @@ pub struct Desktop {
     /// Cerrando sesión: se pide cerrar cada ventana, una a una; espera la respuesta de esta.
     logging_out: bool,
     logout_wait: Option<u32>,
+    /// Conversión de cifrado en curso (la que muestra el aviso), aviso final y si falló.
+    conv: Option<Conv>,
+    conv_note: Option<(&'static str, u64)>,
+    conv_failed: bool,
+}
+
+/// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
+const CONV_DISK_BLOCKS: u32 = 16;
+/// Archivos de la carpeta que se convierten en cada tick.
+const CONV_HOME_FILES: u32 = 1;
+/// Cuánto se ve "Cifrado completado".
+const CONV_NOTE_MS: u64 = 4000;
+/// Confirmaciones de apagar (0), reiniciar (1) y cerrar sesión (3) con un cifrado en curso.
+const TAG_POWER: u32 = 0xFFFF_FF20;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvWhat {
+    Disk,
+    Home,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Conv {
+    what: ConvWhat,
+    /// `true` = cifrando, `false` = descifrando.
+    enc: bool,
+    pct: u32,
+}
+
+impl Conv {
+    fn text(&self) -> String {
+        let (verb, what) = match (self.enc, self.what) {
+            (true, ConvWhat::Disk) => ("Cifrando", "el disco"),
+            (false, ConvWhat::Disk) => ("Descifrando", "el disco"),
+            (true, ConvWhat::Home) => ("Cifrando", "tu carpeta"),
+            (false, ConvWhat::Home) => ("Descifrando", "tu carpeta"),
+        };
+        format!("{verb} {what}… {} %", self.pct)
+    }
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -573,6 +613,9 @@ impl Desktop {
             can_session: sys.files().persistent(),
             logging_out: false,
             logout_wait: None,
+            conv: None,
+            conv_note: None,
+            conv_failed: false,
         };
         d.login.set_clock(d.clock);
         if sys.files().user().is_some() && !sys.files().disk_locked() {
@@ -686,6 +729,140 @@ impl Desktop {
             Out::Reboot => sys.reboot(),
         }
         self.flush_login();
+    }
+
+    /// Apagar (0), reiniciar (1) o cerrar sesión (3). Con un cifrado en curso, antes pide confirmación.
+    fn power(&mut self, act: u32, sys: &mut dyn Platform) {
+        if self.converting(sys) {
+            let (title, what) = match act {
+                0 => ("Apagar", "apagar: continuará al volver a arrancar"),
+                1 => ("Reiniciar", "reiniciar: continuará al volver a arrancar"),
+                _ => ("Cerrar sesión", "cerrar la sesión: continuará al volver a entrar"),
+            };
+            let text = format!("Hay un cifrado en curso. Puedes {what}.");
+            let req = DialogRequest::Message { tag: TAG_POWER + act, title: String::from(title), text, buttons: Buttons::YesNo };
+            self.open_dialog(None, req, sys);
+            return;
+        }
+        self.do_power(act, sys);
+    }
+
+    fn do_power(&mut self, act: u32, sys: &mut dyn Platform) {
+        match act {
+            0 => sys.shutdown(),
+            1 => sys.reboot(),
+            _ => self.begin_logout(sys),
+        }
+    }
+
+    /// ¿Hay una conversión de cifrado en marcha?
+    fn converting(&self, sys: &mut dyn Platform) -> bool {
+        self.conv.is_some() || sys.files().disk_conversion().is_some() || sys.files().home_conversion().is_some()
+    }
+
+    fn conv_rect(&self) -> Rect {
+        Rect::new(self.w - 292, self.bar_y() - 60, 280, 52)
+    }
+
+    /// Un paso de la conversión en curso (si la hay) y actualización del aviso. Si falla, no se
+    /// reintenta: un diálogo lo cuenta una sola vez.
+    fn convert_tick(&mut self, sys: &mut dyn Platform) {
+        if let Some((_, until)) = self.conv_note {
+            if self.now_ms >= until {
+                self.conv_note = None;
+                self.dmg(self.conv_rect());
+            }
+        }
+        if self.conv_failed || !self.booted || sys.files().disk_locked() {
+            return;
+        }
+        let now = sys.now();
+        let (what, res) = if sys.files().disk_conversion().is_some() {
+            (ConvWhat::Disk, sys.files().convert_step(CONV_DISK_BLOCKS, now))
+        } else if sys.files().home_conversion().is_some() {
+            (ConvWhat::Home, sys.files().home_convert_step(CONV_HOME_FILES, now))
+        } else {
+            self.set_conv(ConvWhat::Disk, None);
+            return;
+        };
+        match res {
+            Ok(_) => {
+                let state = if what == ConvWhat::Disk { sys.files().disk_conversion() } else { sys.files().home_conversion() };
+                self.set_conv(what, state);
+            }
+            Err(e) => self.conv_error(e, sys),
+        }
+    }
+
+    /// Anota el estado de la conversión: (hechos, total, cifrando) o `None` si ya terminó.
+    fn set_conv(&mut self, what: ConvWhat, state: Option<(u64, u64, bool)>) {
+        let old = self.conv;
+        match state {
+            Some((done, total, enc)) => {
+                let pct = if total == 0 { 100 } else { (done.min(total) * 100 / total) as u32 };
+                self.conv = Some(Conv { what, enc, pct });
+                self.conv_note = None;
+            }
+            None => {
+                if let Some(c) = self.conv.take() {
+                    self.conv_note = Some((if c.enc { "Cifrado completado" } else { "Descifrado completado" }, self.now_ms + CONV_NOTE_MS));
+                }
+            }
+        }
+        if self.conv != old || (old.is_some() && self.conv.is_none()) {
+            self.dmg(self.conv_rect());
+        }
+    }
+
+    fn conv_error(&mut self, e: KeyError, sys: &mut dyn Platform) {
+        self.conv_failed = true;
+        self.conv = None;
+        self.dmg(self.conv_rect());
+        let now = sys.now();
+        sys.files().log(&format!("Conversión de cifrado detenida: {e:?}"), now);
+        let text = format!("El cifrado se ha detenido. {}", e.text());
+        let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Cifrado"), text, buttons: Buttons::Ok };
+        self.open_dialog(None, req, sys);
+    }
+
+    fn paint_conv(&self, s: &mut Surface) {
+        let r = self.conv_rect();
+        if !r.intersects(s.clip()) {
+            return;
+        }
+        let (text, pct) = match (&self.conv, self.conv_note) {
+            (Some(c), _) => (c.text(), Some(c.pct)),
+            (None, Some((t, _))) => (String::from(t), None),
+            _ => return,
+        };
+        s.fill_rect(r, 0x2B2B2B);
+        s.frame(r, blend(0x2B2B2B, 0xFFFFFF, 40));
+        text_in(s, Rect::new(r.x + 14, r.y + 6, r.w - 28, 26), &text, 9, 0xFFFFFF, Align::Left);
+        if let Some(p) = pct {
+            let track = Rect::new(r.x + 14, r.bottom() - 14, r.w - 28, 4);
+            s.fill_rect(track, 0x555555);
+            s.fill_rect(Rect::new(track.x, track.y, track.w * p as i32 / 100, track.h), self.theme.accent);
+        }
+    }
+
+    /// Solo para vistas previas: pinta el aviso de conversión sin tocar el disco.
+    #[doc(hidden)]
+    pub fn preview_conversion(&mut self, disk: bool, enc: bool, pct: u32) {
+        self.set_conv(if disk { ConvWhat::Disk } else { ConvWhat::Home }, Some((pct as u64, 100, enc)));
+    }
+
+    /// Solo para vistas previas y pruebas: muestra la pantalla "Disco cifrado".
+    #[doc(hidden)]
+    pub fn preview_disk_screen(&mut self) {
+        self.login.start_disk();
+        self.screen_on();
+    }
+
+    /// Solo para vistas previas: abre el diálogo de aleatoriedad como diálogo del sistema.
+    #[doc(hidden)]
+    pub fn preview_entropy(&mut self, sys: &mut dyn Platform) {
+        let req = DialogRequest::Entropy { tag: TAG_SYS, title: String::from("Generar la llave") };
+        self.open_dialog(None, req, sys);
     }
 
     /// Bloquea: las ventanas siguen abiertas pero no se ven ni reciben nada.
@@ -1507,6 +1684,7 @@ impl Desktop {
                 self.show_notice(sys);
             }
             DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            DialogResult::Answer { tag: t @ TAG_POWER..=0xFFFF_FF23, answer: Answer::Yes } => self.do_power(t - TAG_POWER, sys),
             DialogResult::Answer { tag: u32::MAX, .. } => self.enter_flow(sys),
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
                 if let Err(e) = sys.files().empty_trash() {
@@ -1966,10 +2144,8 @@ impl Desktop {
             Hit::Shut(i) => {
                 self.set_shut(false);
                 match i {
-                    0 => sys.shutdown(),
-                    1 => sys.reboot(),
                     2 => self.lock(sys),
-                    _ => self.begin_logout(sys),
+                    _ => self.power(i as u32, sys),
                 }
             }
             Hit::MPower => self.set_shut(!shut_was),
@@ -2164,6 +2340,7 @@ impl Desktop {
             self.booted = true;
             self.boot_flow(sys);
         }
+        self.convert_tick(sys);
         self.refresh_icons(sys);
         self.sync_mods(sys);
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
@@ -2209,6 +2386,7 @@ impl Desktop {
             }
             if self.login.mode == Mode::Off {
                 self.paint_bar(s, active);
+                self.paint_conv(s);
                 if self.start_open {
                     self.paint_menu(s);
                 }
