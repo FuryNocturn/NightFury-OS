@@ -1853,4 +1853,82 @@ mod tests {
         assert!(done.values().all(|&n| n > 200), "{done:?}");
         assert!(errors > 300 && errors < 5000, "{errors}");
     }
+
+    #[test]
+    fn format_with_reserves_tail_and_old_volumes_still_mount() {
+        let sh = Shared::new(100);
+        let mut fs = Nffs::format_with(Box::new(sh.clone()), 98, t()).unwrap();
+        assert_eq!(fs.volume_blocks(), 98);
+        fs.write("a.txt", &pattern(9000, 1), t()).unwrap();
+        let mut fs = remount(fs);
+        assert_eq!(fs.read("a.txt").unwrap(), pattern(9000, 1));
+        fs.check().unwrap();
+        // Los dos últimos bloques del dispositivo no se han tocado.
+        assert!(sh.bytes()[98 * BLOCK..].iter().all(|&b| b == 0));
+        assert!(Nffs::format_with(Box::new(Shared::new(100)), 101, t()).is_err());
+        // `format` sigue usando todo el dispositivo.
+        let (_, fs) = fresh(100);
+        assert_eq!(fs.volume_blocks(), 100);
+        assert_eq!(Nffs::volume_blocks_of(&mut Shared::new(100)), None);
+    }
+
+    #[test]
+    fn shrink_tail_needs_free_tail_and_survives_cuts() {
+        let (sh, mut fs) = fresh(100);
+        fs.write("a.txt", &pattern(5000, 2), t()).unwrap();
+        fs.shrink_tail(2).unwrap();
+        fs.check().unwrap();
+        assert_eq!(fs.volume_blocks(), 98);
+        assert_eq!(fs.dev_blocks(), 100);
+        let mut fs = remount(fs);
+        assert_eq!(fs.volume_blocks(), 98);
+        assert_eq!(fs.read("a.txt").unwrap(), pattern(5000, 2));
+        fs.check().unwrap();
+        // Se sigue pudiendo escribir hasta llenar sin salirse del volumen reducido.
+        let mut i = 0u8;
+        while fs.write(&format!("f{i}"), &pattern(4096 * 5, i), t()).is_ok() {
+            i += 1;
+        }
+        fs.check().unwrap();
+        // Con alguno de los bloques del final ocupado no se reduce y no cambia nada.
+        for used in [98u64, 99] {
+            let (sh2, mut full) = fresh(100);
+            full.write("a.txt", &pattern(5000, 2), t()).unwrap();
+            set_bit(&mut full.free, used, true);
+            let before = sh2.bytes();
+            assert_eq!(full.shrink_tail(2), Err(FsError::Invalid));
+            assert_eq!(sh2.bytes(), before);
+            assert_eq!(full.volume_blocks(), 100);
+        }
+        let (_, mut full) = fresh(100);
+        assert_eq!(full.shrink_tail(0), Err(FsError::Invalid));
+        let _ = sh;
+        // Un corte en cualquier escritura deja el volumen entero (100) o reducido (98), nunca roto.
+        for k in 0..12 {
+            let (sh, mut fs) = fresh(100);
+            fs.write("a.txt", &pattern(5000, 2), t()).unwrap();
+            sh.limit.set(sh.writes.get() + k);
+            let _ = fs.shrink_tail(2);
+            let mut after = Nffs::mount(Box::new(Shared::from_bytes(sh.bytes()))).unwrap();
+            assert!(matches!(after.volume_blocks(), 100 | 98), "k={k}");
+            assert_eq!(after.read("a.txt").unwrap(), pattern(5000, 2), "k={k}");
+            after.check().unwrap();
+        }
+    }
+
+    #[test]
+    fn swap_dev_keeps_the_mounted_volume() {
+        let (sh, mut fs) = fresh(100);
+        fs.write("a.txt", &pattern(5000, 3), t()).unwrap();
+        let mut called = false;
+        fs.swap_dev(|d| {
+            called = true;
+            d
+        });
+        assert!(called);
+        assert_eq!(fs.read("a.txt").unwrap(), pattern(5000, 3));
+        fs.write("b.txt", b"hola", t()).unwrap();
+        let mut again = Nffs::mount(Box::new(Shared::from_bytes(sh.bytes()))).unwrap();
+        assert_eq!(again.read("b.txt").unwrap(), b"hola");
+    }
 }

@@ -22,10 +22,14 @@
 //! continúa donde se quedó.
 use crate::accounts::{self, Account, AccountError};
 use crate::block::{BlockDev, RamDisk};
+use crate::cryptdev::{self, Core, CryptDev, Header, State};
+use crate::crypto::wipe;
 use crate::fs::{same, Entry, FsError, Nffs};
-use crate::keys::{KeyError, Pool};
+use crate::keys::{self, KeyError, Pool};
 use crate::platform::DateTime;
 use alloc::boxed::Box;
+use alloc::rc::Rc;
+use core::cell::RefCell;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -100,6 +104,10 @@ const NOTICE_IGNORED: &str =
     "El disco tiene otro contenido y se ha ignorado para no dañarlo: los archivos se guardan solo en la memoria y se perderán al apagar.";
 const NOTICE_DAMAGED: &str =
     "El disco de NightFury está dañado y no se ha tocado: los archivos se guardan solo en la memoria y se perderán al apagar.";
+const NOTICE_LOCKED: &str =
+    "Disco cifrado: escribe su clave para abrirlo. Mientras, los archivos se guardan solo en la memoria y se perderán al apagar.";
+const NOTICE_LOCKED_SKIPPED: &str =
+    "Disco cifrado sin abrir: no se ha tocado y los archivos se guardan solo en la memoria y se perderán al apagar.";
 const NOTICE_NEW: &str =
     "Disco sin formato: mientras no se prepare, los archivos se guardan solo en la memoria y se perderán al apagar.";
 
@@ -337,6 +345,13 @@ fn copy_all(src: &mut Nffs, dst: &mut Nffs) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Cifrado total del disco: dispositivo cifrado a la espera de su clave, o capa de cifrado en uso.
+#[derive(Default)]
+struct DiskState {
+    locked: Option<(Box<dyn BlockDev>, Header)>,
+    core: Option<Rc<RefCell<Core>>>,
+}
+
 pub struct Files {
     fs: Nffs,
     persistent: bool,
@@ -347,6 +362,7 @@ pub struct Files {
     undo: Option<(Vec<Undo>, &'static str)>,
     /// Sesión abierta: (nombre de la cuenta, es administrador).
     user: Option<(String, bool)>,
+    disk: DiskState,
 }
 
 impl Default for Files {
@@ -358,7 +374,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)) }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default() }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -374,11 +390,20 @@ impl Files {
         let Some(mut dev) = dev else {
             return Files::memory(NOTICE_NO_DISK, None, now);
         };
+        // Disco cifrado (cabecera íntegra en el último bloque): no se toca hasta `unlock_disk`. Si el
+        // NFFS ocupa todo el dispositivo, el último bloque es suyo y no una cabecera.
+        if let Some(h) = cryptdev::detect(&mut *dev) {
+            if Nffs::volume_blocks_of(&mut *dev) != Some(dev.blocks()) {
+                let mut f = Files::memory(NOTICE_LOCKED, None, now);
+                f.disk.locked = Some((dev, h));
+                return f;
+            }
+        }
         if Nffs::is_formatted(&mut *dev) {
             // Con NFFS dañado no se formatea nunca: se deja el disco como está.
             return match Nffs::mount(dev) {
                 Ok(fs) => {
-                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None };
+                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default() };
                     f.startup(now);
                     f
                 }
@@ -407,7 +432,9 @@ impl Files {
     /// `DEFAULT_USER` que venía de la memoria la adopta la primera cuenta que se cree.
     pub fn format_pending(&mut self, now: DateTime) -> Result<(), FsError> {
         let dev = self.pending.take().ok_or(FsError::Invalid)?;
-        let mut fs = Nffs::format(dev, now)?;
+        // Se dejan sin usar los dos últimos bloques: sitio para el cifrado total.
+        let total = dev.blocks().saturating_sub(cryptdev::RESERVED);
+        let mut fs = Nffs::format_with(dev, total, now)?;
         ensure_structure(&mut fs, now);
         fs.write(rel(VERSION_FILE), b"2\n", now)?;
         // El estado va antes de la copia: si se corta, lo que llegó al disco no queda sin dueño.
@@ -1389,52 +1416,221 @@ impl Files {
 impl Files {
     /// Hay un disco cifrado esperando su clave (mientras, C: está en memoria).
     pub fn disk_locked(&self) -> bool {
-        false
+        self.disk.locked.is_some()
     }
 
     /// Abre el disco cifrado con la clave del disco (`recovery == false`) o con su código de
-    /// recuperación. Tras abrirlo no hay sesión: sigue el inicio de sesión normal.
-    pub fn unlock_disk(&mut self, _secret: &str, _recovery: bool, _now: DateTime) -> Result<(), KeyError> {
-        Err(KeyError::NotEncrypted)
+    /// recuperación. Tras abrirlo no hay sesión: sigue el inicio de sesión normal. Si hay una
+    /// conversión a medias, queda en curso. Con una clave mala no se escribe nada.
+    pub fn unlock_disk(&mut self, secret: &str, recovery: bool, now: DateTime) -> Result<(), KeyError> {
+        let (dev, hdr) = self.disk.locked.take().ok_or(KeyError::NotEncrypted)?;
+        let core = match cryptdev::open(dev, hdr, secret, recovery) {
+            Ok(c) => Rc::new(RefCell::new(c)),
+            Err((dev, hdr, e)) => {
+                self.disk.locked = Some((dev, hdr));
+                return Err(e);
+            }
+        };
+        // Con la clave buena ya se puede escribir: rehace el bloque que quedó a medias y, si la
+        // conversión estaba terminada, la remata. Si algo falla, el disco vuelve a quedar cerrado.
+        let rec = core.borrow_mut().recover().map_err(cryptdev::disk_err);
+        let ready = rec.and_then(|()| Nffs::mount(Box::new(CryptDev::new(core.clone()))).map_err(|_| KeyError::Fs(FsError::Corrupt)));
+        match ready {
+            Ok(fs) => {
+                self.fs = fs;
+                self.persistent = true;
+                self.notice = None;
+                self.user = None;
+                self.clip = None;
+                self.undo = None;
+                self.generation += 1;
+                self.disk.core = Some(core);
+                self.startup(now);
+                self.log("Disco cifrado abierto", now);
+                Ok(())
+            }
+            Err(e) => {
+                let hdr = core.borrow().header().clone();
+                let dev = core.borrow_mut().take_dev();
+                if let Some(dev) = dev {
+                    self.disk.locked = Some((dev, hdr));
+                }
+                Err(e)
+            }
+        }
     }
 
-    /// El usuario prefiere seguir sin abrir el disco cifrado (archivos solo en memoria).
-    pub fn skip_locked_disk(&mut self) {}
+    /// El usuario prefiere seguir sin abrir el disco cifrado (archivos solo en memoria). Suelta el
+    /// dispositivo sin tocarlo.
+    pub fn skip_locked_disk(&mut self) {
+        if self.disk.locked.take().is_some() {
+            self.notice = Some(NOTICE_LOCKED_SKIPPED);
+        }
+    }
 
     /// El disco en uso está cifrado (o se está cifrando).
     pub fn disk_encrypted(&self) -> bool {
-        false
+        self.disk.core.is_some()
     }
 
     /// Conversión del disco en curso: (bloques hechos, total, `true` = cifrando).
     pub fn disk_conversion(&self) -> Option<(u64, u64, bool)> {
-        None
+        self.disk.core.as_ref()?.borrow().progress()
     }
 
     /// Activa el cifrado total (solo administrador). Devuelve el código de recuperación y deja
-    /// una conversión en curso.
-    pub fn encrypt_disk(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
-        Err(KeyError::Unavailable)
+    /// una conversión en curso. En un disco antiguo (sin los dos bloques reservados del final)
+    /// hace falta que esos bloques estén libres: si no, `NoRoom`.
+    pub fn encrypt_disk(&mut self, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError> {
+        if !self.is_admin() {
+            return Err(KeyError::NotAdmin);
+        }
+        if password.chars().count() < accounts::MIN_PASSWORD {
+            return Err(KeyError::Weak);
+        }
+        if !pool.ready() {
+            return Err(KeyError::NotReady);
+        }
+        if let Some(c) = &self.disk.core {
+            let busy = c.borrow().progress().is_some();
+            return Err(if busy { KeyError::Busy } else { KeyError::AlreadyEncrypted });
+        }
+        if !self.persistent {
+            return Err(KeyError::Unavailable);
+        }
+        let (n, vol) = (self.fs.dev_blocks(), self.fs.volume_blocks());
+        if n < 66 || vol > n {
+            return Err(KeyError::NoRoom);
+        }
+        if vol > n - cryptdev::RESERVED {
+            let r = self.fs.shrink_tail(vol - (n - cryptdev::RESERVED));
+            r.map_err(|e| if e == FsError::Invalid { KeyError::NoRoom } else { KeyError::Fs(e) })?;
+        }
+        let mut master = pool.master();
+        let (mut s1, mut i1, mut s2, mut i2) = ([0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16]);
+        pool.take(&mut s1);
+        pool.take(&mut i1);
+        pool.take(&mut s2);
+        pool.take(&mut i2);
+        let code = keys::recovery_code(pool);
+        let mut rsecret = keys::normalize_recovery(&code).unwrap_or_default().into_bytes();
+        let hdr = Header {
+            state: State::Encrypting,
+            next: 0,
+            pending: false,
+            disk: keys::Slot::wrap(&master, password.as_bytes(), s1, i1),
+            recovery: keys::Slot::wrap(&master, &rsecret, s2, i2),
+        };
+        wipe(&mut rsecret);
+        // La cabecera llega al disco antes de cifrar nada; después el volumen pasa a la capa de cifrado.
+        let (mut core, mut failed) = (None, None);
+        self.fs.swap_dev(|mut dev| match cryptdev::write_header(&mut *dev, &hdr) {
+            Ok(()) => {
+                let c = Rc::new(RefCell::new(Core::new(dev, hdr.clone(), &master)));
+                core = Some(c.clone());
+                Box::new(CryptDev::new(c))
+            }
+            Err(e) => {
+                failed = Some(e);
+                dev
+            }
+        });
+        wipe(&mut master);
+        for b in [&mut s1, &mut i1, &mut s2, &mut i2] {
+            wipe(b);
+        }
+        if let Some(e) = failed {
+            return Err(cryptdev::disk_err(e));
+        }
+        self.disk.core = core;
+        self.log("Cifrado total activado", now);
+        Ok(code)
     }
 
     /// Quita el cifrado total (solo administrador; pide la clave del disco). Deja una conversión en curso.
-    pub fn decrypt_disk(&mut self, _password: &str, _now: DateTime) -> Result<(), KeyError> {
-        Err(KeyError::NotEncrypted)
+    pub fn decrypt_disk(&mut self, password: &str, _now: DateTime) -> Result<(), KeyError> {
+        if !self.is_admin() {
+            return Err(KeyError::NotAdmin);
+        }
+        let core = self.disk.core.clone().ok_or(KeyError::NotEncrypted)?;
+        if core.borrow().progress().is_some() {
+            return Err(KeyError::Busy);
+        }
+        let hdr = core.borrow().header().clone();
+        wipe(&mut cryptdev::unlock(&hdr, password, false)?);
+        let r = core.borrow_mut().start_decrypt();
+        r.map_err(cryptdev::disk_err)
     }
 
     /// Avanza la conversión del disco como mucho `blocks` bloques. `Ok(true)` cuando ha terminado.
-    pub fn convert_step(&mut self, _blocks: u32, _now: DateTime) -> Result<bool, KeyError> {
-        Ok(true)
+    /// Al terminar de descifrar, el volumen vuelve a usar el dispositivo directo.
+    pub fn convert_step(&mut self, blocks: u32, now: DateTime) -> Result<bool, KeyError> {
+        let Some(core) = self.disk.core.clone() else { return Ok(true) };
+        let was = core.borrow().progress().is_some();
+        let done = core.borrow_mut().step(blocks).map_err(cryptdev::disk_err)?;
+        if done && was {
+            let decrypted = core.borrow().header().state == State::Decrypting;
+            if decrypted {
+                let dev = core.borrow_mut().take_dev().ok_or(KeyError::Unavailable)?;
+                self.fs.swap_dev(|_| dev);
+                self.disk.core = None;
+                self.log("Cifrado total quitado", now);
+            } else {
+                self.log("Cifrado total: conversión terminada", now);
+            }
+        }
+        Ok(done)
     }
 
-    /// Cambia la clave del disco (solo administrador). No recifra datos.
-    pub fn change_disk_password(&mut self, _old: &str, _new: &str, _pool: &mut Pool, _now: DateTime) -> Result<(), KeyError> {
-        Err(KeyError::NotEncrypted)
+    /// Cambia la clave del disco (solo administrador). No recifra datos: vuelve a envolver la
+    /// misma llave maestra con sal e iv nuevos.
+    pub fn change_disk_password(&mut self, old: &str, new: &str, pool: &mut Pool, now: DateTime) -> Result<(), KeyError> {
+        if !self.is_admin() {
+            return Err(KeyError::NotAdmin);
+        }
+        let core = self.disk.core.clone().ok_or(KeyError::NotEncrypted)?;
+        if new.chars().count() < accounts::MIN_PASSWORD {
+            return Err(KeyError::Weak);
+        }
+        if !pool.ready() {
+            return Err(KeyError::NotReady);
+        }
+        let hdr = core.borrow().header().clone();
+        let mut master = cryptdev::unlock(&hdr, old, false)?;
+        let (mut salt, mut iv) = ([0u8; 16], [0u8; 16]);
+        pool.take(&mut salt);
+        pool.take(&mut iv);
+        let slot = keys::Slot::wrap(&master, new.as_bytes(), salt, iv);
+        wipe(&mut master);
+        let r = core.borrow_mut().set_slots(Some(slot), None);
+        r.map_err(cryptdev::disk_err)?;
+        self.log("Clave del disco cambiada", now);
+        Ok(())
     }
 
     /// Código de recuperación nuevo para el disco (invalida el anterior). Pide la clave del disco.
-    pub fn new_disk_recovery(&mut self, _password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
-        Err(KeyError::NotEncrypted)
+    pub fn new_disk_recovery(&mut self, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError> {
+        if !self.is_admin() {
+            return Err(KeyError::NotAdmin);
+        }
+        let core = self.disk.core.clone().ok_or(KeyError::NotEncrypted)?;
+        if !pool.ready() {
+            return Err(KeyError::NotReady);
+        }
+        let hdr = core.borrow().header().clone();
+        let mut master = cryptdev::unlock(&hdr, password, false)?;
+        let (mut salt, mut iv) = ([0u8; 16], [0u8; 16]);
+        pool.take(&mut salt);
+        pool.take(&mut iv);
+        let code = keys::recovery_code(pool);
+        let mut secret = keys::normalize_recovery(&code).unwrap_or_default().into_bytes();
+        let slot = keys::Slot::wrap(&master, &secret, salt, iv);
+        wipe(&mut secret);
+        wipe(&mut master);
+        let r = core.borrow_mut().set_slots(None, Some(slot));
+        r.map_err(cryptdev::disk_err)?;
+        self.log("Código de recuperación del disco renovado", now);
+        Ok(code)
     }
 
     /// La carpeta de la cuenta `name` está cifrada (o se está cifrando).
