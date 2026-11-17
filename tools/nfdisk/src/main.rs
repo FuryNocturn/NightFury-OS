@@ -25,6 +25,10 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
   nfdisk ayuda\n\
+Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
+y la clave de esa cuenta en la variable NFDISK_CLAVE_USUARIO (o por teclado; nunca por argumento), «listar», «ver», «sacar», «meter»,\n\
+«carpeta» y «borrar» trabajan en claro dentro de su carpeta, con las rutas de siempre (C:\\Usuarios\\Ana\\Documentos\\nota.txt).\n\
+Sin --usuario, meter, ver, sacar, carpeta y borrar se niegan a tocar dentro de una carpeta cifrada.\n\
 Discos con cifrado total: sin clave, «info» y «comprobar» solo dicen «disco cifrado de NightFury». Las demás órdenes piden la clave\n\
 del disco (variable de entorno NFDISK_CLAVE, o se pregunta por teclado; nunca por argumento) y con ella trabajan como siempre, también\n\
 sobre un disco a medio convertir. --recuperacion: la clave es el código de recuperación del disco. --clave: pregunta la clave en «info» y\n\
@@ -205,9 +209,9 @@ mod noecho {
     }
 }
 
-/// Clave de `NFDISK_CLAVE` o, si `ask`, preguntada por teclado (sin eco si se puede).
-fn read_secret(ask: bool) -> Option<String> {
-    if let Some(v) = std::env::var_os("NFDISK_CLAVE") {
+/// Clave de la variable de entorno `env` o, si `ask`, preguntada por teclado (sin eco si se puede).
+fn read_line_secret(env: &str, prompt: &str, ask: bool) -> Option<String> {
+    if let Some(v) = std::env::var_os(env) {
         return v.into_string().ok().filter(|s| !s.is_empty());
     }
     if !ask {
@@ -221,7 +225,7 @@ fn read_secret(ask: bool) -> Option<String> {
     #[cfg(not(windows))]
     let hidden = false;
     if tty {
-        eprint!("Clave del disco{}: ", if hidden { "" } else { " (se verá lo que escribes)" });
+        eprint!("{prompt}{}: ", if hidden { "" } else { " (se verá lo que escribes)" });
         let _ = std::io::stderr().flush();
     }
     let mut line = String::new();
@@ -232,6 +236,19 @@ fn read_secret(ask: bool) -> Option<String> {
     let line = line.trim_end_matches(['\r', '\n']).to_string();
     (r.is_ok() && !line.is_empty()).then_some(line)
 }
+
+/// Clave del disco: `NFDISK_CLAVE` o teclado.
+fn read_secret(ask: bool) -> Option<String> {
+    read_line_secret("NFDISK_CLAVE", "Clave del disco", ask)
+}
+
+/// Clave de una cuenta: `NFDISK_CLAVE_USUARIO` o teclado. Nunca por argumento.
+fn read_user_secret(user: &str, ask: bool) -> Option<String> {
+    read_line_secret("NFDISK_CLAVE_USUARIO", &format!("Clave de {user}"), ask)
+}
+
+/// De dónde sale la clave de una cuenta (las pruebas la dan a mano).
+type UserSecret<'a> = &'a dyn Fn(&str, bool) -> Option<String>;
 
 /// Fecha UTC de ahora (días desde 1970 → calendario civil, a mano).
 fn now() -> DateTime {
@@ -294,27 +311,146 @@ fn show(e: &Entry) -> String {
     format!("{:04}-{:02}-{:02} {:02}:{:02}  {:>9}  {}", m.year, m.month, m.day, m.hour, m.minute, kind, e.name)
 }
 
-fn list(fs: &mut Nffs, dir: &str, recurse: bool, depth: usize) -> R<()> {
+/// Nombre de la cuenta si `rel` es (o está dentro de) la carpeta de una cuenta cifrada.
+fn encrypted_home(fs: &mut Nffs, rel: &str) -> Option<String> {
+    let mut c = rel.split('\\').filter(|c| !c.is_empty());
+    let (top, name) = (c.next()?, c.next()?);
+    (top.eq_ignore_ascii_case("Usuarios") && fs.stat(&format!("Sistema\\config\\llaves\\{name}")).is_ok()).then(|| name.to_string())
+}
+
+/// Sin `--usuario` no se toca dentro de una carpeta cifrada: lo que se escribiera iría en claro.
+fn not_encrypted(fs: &mut Nffs, rel: &str) -> R<()> {
+    match encrypted_home(fs, rel) {
+        Some(n) if rel.split('\\').filter(|c| !c.is_empty()).count() >= 3 => {
+            Err(format!("«{rel}» está en la carpeta cifrada de {n}: usa --usuario {n} (clave en NFDISK_CLAVE_USUARIO)."))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn list(fs: &mut Nffs, dir: &str, recurse: bool, depth: usize, out: &mut Vec<String>) -> R<()> {
     let mut v = fs.list(dir).map_err(fs_err)?;
     if dir.is_empty() {
         v.retain(|e| !e.name.eq_ignore_ascii_case("$Papelera"));
     }
     v.sort_by_key(|e| (!e.dir, e.name.to_lowercase()));
+    if depth == 0 && encrypted_home(fs, dir).is_some() {
+        out.push("(carpeta cifrada: se muestra tal como está en el disco; usa --usuario para verla en claro)".into());
+    }
     for e in &v {
-        println!("{}{}", "  ".repeat(depth), show(e));
+        let sub = if dir.is_empty() { e.name.clone() } else { format!("{dir}\\{}", e.name) };
+        let enc = e.dir && dir.eq_ignore_ascii_case("Usuarios") && encrypted_home(fs, &sub).is_some();
+        out.push(format!("{}{}{}", "  ".repeat(depth), show(e), if enc { "  (carpeta cifrada)" } else { "" }));
         if recurse && e.dir {
-            let sub = if dir.is_empty() { e.name.clone() } else { format!("{dir}\\{}", e.name) };
-            list(fs, &sub, true, depth + 1)?;
+            list(fs, &sub, true, depth + 1, out)?;
         }
     }
     Ok(())
 }
 
-fn run(args: &[String]) -> R<()> {
-    run_with(args, &read_secret)
+/// Abre la imagen y la sesión de `user` (con su clave) para trabajar en claro dentro de su carpeta.
+fn open_user(path: &str, write: bool, o: Opts, user: &str, usecret: UserSecret) -> R<Files> {
+    let mut f = Files::on_volume(mount(path, write, o)?);
+    let has_pw = f.accounts().iter().find(|a| a.name.eq_ignore_ascii_case(user)).ok_or_else(|| format!("No existe la cuenta «{user}»."))?.has_password();
+    let pw = if has_pw { usecret(user, true).ok_or("Hace falta la clave de la cuenta (variable NFDISK_CLAVE_USUARIO o por teclado).")? } else { String::new() };
+    f.login(user, &pw).map_err(|e| e.text().to_string())?;
+    Ok(f)
 }
 
-fn run_with(args: &[String], secret: Secret) -> R<()> {
+/// Órdenes con `--usuario`: lo mismo que sin él, pero en claro dentro de la carpeta cifrada de `user`
+/// (con los permisos de esa cuenta).
+fn user_cmd(cmd: &str, pos: &[&str], flags: (bool, bool), user: &str, o: Opts, usecret: UserSecret) -> R<()> {
+    let (recurse, replace) = flags;
+    let abs = |p: &str| rel(p).map(|r| format!("C:\\{r}"));
+    let need = |n: usize| if pos.len() == n { Ok(()) } else { Err("Número de argumentos incorrecto. Prueba «nfdisk ayuda».".to_string()) };
+    match cmd {
+        "listar" => {
+            if pos.len() != 1 && pos.len() != 2 {
+                return need(1);
+            }
+            let mut f = open_user(pos[0], false, o, user, usecret)?;
+            let start = match pos.get(1) {
+                Some(p) => abs(p)?,
+                None => format!("C:\\Usuarios\\{user}"),
+            };
+            let mut stack = vec![(start, 0usize)];
+            while let Some((dir, depth)) = stack.pop() {
+                let mut kids = Vec::new();
+                for e in f.list(&dir).map_err(fs_err)? {
+                    println!("{}{}", "  ".repeat(depth), show(&e));
+                    if recurse && e.dir {
+                        kids.push((nf_core::files::join(&dir, &e.name), depth + 1));
+                    }
+                }
+                kids.reverse();
+                stack.extend(kids);
+            }
+        }
+        "ver" => {
+            need(2)?;
+            let data = open_user(pos[0], false, o, user, usecret)?.read(&abs(pos[1])?).map_err(fs_err)?;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(String::from_utf8_lossy(&data).as_bytes());
+            let _ = out.flush();
+        }
+        "sacar" => {
+            need(3)?;
+            let data = open_user(pos[0], false, o, user, usecret)?.read(&abs(pos[1])?).map_err(fs_err)?;
+            check_regular(pos[2])?;
+            if Path::new(pos[2]).exists() && !replace {
+                return Err(format!("«{}» ya existe. Usa --reemplazar para sustituirlo.", pos[2]));
+            }
+            std::fs::write(pos[2], &data).map_err(|e| format!("No se puede escribir «{}»: {e}", pos[2]))?;
+            println!("Copiados {} bytes a {}.", data.len(), pos[2]);
+        }
+        "meter" => {
+            need(3)?;
+            let data = std::fs::read(pos[1]).map_err(|e| format!("No se puede leer «{}»: {e}", pos[1]))?;
+            let dest = abs(pos[2])?;
+            let mut f = open_user(pos[0], true, o, user, usecret)?;
+            match f.stat(&dest) {
+                Ok(e) if e.dir => return Err(fs_err(FsError::IsDir)),
+                Ok(_) if !replace => return Err("Ya existe en la imagen. Usa --reemplazar para sustituirlo.".into()),
+                _ => {}
+            }
+            f.write(&dest, &data, now()).map_err(fs_err)?;
+            println!("Copiados {} bytes a {}.", data.len(), pos[2]);
+        }
+        "carpeta" => {
+            need(2)?;
+            open_user(pos[0], true, o, user, usecret)?.mkdir(&abs(pos[1])?, now()).map_err(fs_err)?;
+            println!("Carpeta creada.");
+        }
+        "borrar" => {
+            need(2)?;
+            let p = abs(pos[1])?;
+            if is_protected(&p) {
+                return Err(format!("«{}» es una carpeta del sistema o de una cuenta y no se puede borrar.", pos[1]));
+            }
+            open_user(pos[0], true, o, user, usecret)?.delete(&p).map_err(fs_err)?;
+            println!("Borrado.");
+        }
+        _ => return Err("--usuario solo vale con listar, ver, sacar, meter, carpeta y borrar.".into()),
+    }
+    Ok(())
+}
+
+fn run(args: &[String]) -> R<()> {
+    run_with(args, &read_secret, &read_user_secret)
+}
+
+fn run_with(args: &[String], secret: Secret, usecret: UserSecret) -> R<()> {
+    // `--usuario <nombre>` se quita antes: el nombre no es un argumento de posición.
+    let (mut user, mut rest) = (None, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--usuario" {
+            user = Some(it.next().ok_or("--usuario necesita el nombre de la cuenta.")?.clone());
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    let args = &rest[..];
     let flag = |f: &str| args.iter().any(|a| a == f);
     let opts = |ask: bool| Opts { secret, recovery: flag("--recuperacion"), ask };
     let all = opts(true);
@@ -322,6 +458,9 @@ fn run_with(args: &[String], secret: Secret) -> R<()> {
     let pos: Vec<&str> = args.iter().skip(1).filter(|a| !a.starts_with("--") && a.as_str() != "-r").map(|s| s.as_str()).collect();
     let need = |n: usize| if pos.len() == n { Ok(()) } else { Err("Número de argumentos incorrecto. Prueba «nfdisk ayuda».".to_string()) };
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("ayuda");
+    if let Some(u) = &user {
+        return user_cmd(cmd, &pos, (flag("-r"), flag("--reemplazar")), u, all, usecret);
+    }
     match cmd {
         "ayuda" | "--ayuda" | "-h" | "--help" => println!("{AYUDA}"),
         "crear" => {
@@ -380,13 +519,17 @@ fn run_with(args: &[String], secret: Secret) -> R<()> {
             }
             let mut fs = mount(pos[0], false, all)?;
             let dir = rel(pos.get(1).copied().unwrap_or(""))?;
-            list(&mut fs, &dir, flag("-r"), 0)?;
+            let mut lines = Vec::new();
+            let r = list(&mut fs, &dir, flag("-r"), 0, &mut lines);
+            lines.iter().for_each(|l| println!("{l}"));
+            r?;
         }
         "meter" => {
             need(3)?;
             let data = std::fs::read(pos[1]).map_err(|e| format!("No se puede leer «{}»: {e}", pos[1]))?;
             let dest = rel_item(pos[2])?;
             let mut fs = mount(pos[0], true, all)?;
+            not_encrypted(&mut fs, &dest)?;
             match fs.stat(&dest) {
                 Ok(e) if e.dir => return Err(fs_err(FsError::IsDir)),
                 Ok(_) if !flag("--reemplazar") => return Err("Ya existe en la imagen. Usa --reemplazar para sustituirlo.".into()),
@@ -398,7 +541,9 @@ fn run_with(args: &[String], secret: Secret) -> R<()> {
         "sacar" => {
             need(3)?;
             let src = rel_item(pos[1])?;
-            let data = mount(pos[0], false, all)?.read(&src).map_err(fs_err)?;
+            let mut fs = mount(pos[0], false, all)?;
+            not_encrypted(&mut fs, &src)?;
+            let data = fs.read(&src).map_err(fs_err)?;
             check_regular(pos[2])?;
             if Path::new(pos[2]).exists() && !flag("--reemplazar") {
                 return Err(format!("«{}» ya existe. Usa --reemplazar para sustituirlo.", pos[2]));
@@ -409,7 +554,9 @@ fn run_with(args: &[String], secret: Secret) -> R<()> {
         "carpeta" => {
             need(2)?;
             let p = rel_item(pos[1])?;
-            mount(pos[0], true, all)?.mkdir(&p, now()).map_err(fs_err)?;
+            let mut fs = mount(pos[0], true, all)?;
+            not_encrypted(&mut fs, &p)?;
+            fs.mkdir(&p, now()).map_err(fs_err)?;
             println!("Carpeta creada.");
         }
         "borrar" => {
@@ -418,13 +565,17 @@ fn run_with(args: &[String], secret: Secret) -> R<()> {
             if is_protected(&p) {
                 return Err(format!("«{p}» es una carpeta del sistema o de una cuenta y no se puede borrar."));
             }
-            mount(pos[0], true, all)?.remove(&p).map_err(fs_err)?;
+            let mut fs = mount(pos[0], true, all)?;
+            not_encrypted(&mut fs, &p)?;
+            fs.remove(&p).map_err(fs_err)?;
             println!("Borrado.");
         }
         "ver" => {
             need(2)?;
             let p = rel_item(pos[1])?;
-            let data = mount(pos[0], false, all)?.read(&p).map_err(fs_err)?;
+            let mut fs = mount(pos[0], false, all)?;
+            not_encrypted(&mut fs, &p)?;
+            let data = fs.read(&p).map_err(fs_err)?;
             let mut o = std::io::stdout();
             let _ = o.write_all(String::from_utf8_lossy(&data).as_bytes());
             let _ = o.flush();
@@ -479,7 +630,12 @@ mod tests {
 
     fn go_key(a: &[&str], key: Option<&str>) -> R<()> {
         let key = key.map(String::from);
-        run_with(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &move |_| key.clone())
+        run_with(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &move |_| key.clone(), &|_, _| None)
+    }
+
+    fn go_user(a: &[&str], ukey: Option<&str>) -> R<()> {
+        let ukey = ukey.map(String::from);
+        run_with(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &|_| None, &move |_, _| ukey.clone())
     }
 
     #[test]
@@ -727,5 +883,102 @@ mod tests {
         ok.unwrap();
         info.unwrap();
         assert!(mala.is_err());
+    }
+
+    #[test]
+    fn carpeta_cifrada_de_usuario_en_claro_solo_con_la_clave_de_la_cuenta() {
+        use nf_core::keys::{Pool, POOL_EVENTS_NEEDED};
+        let (img, src, out) = (Tmp::new("img"), Tmp::new("bin"), Tmp::new("out"));
+        go(&["crear", &img.0, "2"]).unwrap();
+        let t = now();
+        {
+            let dev = open(&img.0, true).unwrap();
+            let mut f = Files::probe(Some(Box::new(dev)), t);
+            f.create_account("Ana", Some("clave-ana-1"), true, [1; 16], t).unwrap();
+            f.login("Ana", "clave-ana-1").unwrap();
+            f.write("C:\\Usuarios\\Ana\\Documentos\\secreto-largo-nombre.txt", b"CONTENIDO-SECRETO-NFDISK", t).unwrap();
+            let mut pool = Pool::new();
+            for i in 0..POOL_EVENTS_NEEDED as i32 {
+                pool.add_event(i, i * 5, i as u64, i as u64 * 11);
+            }
+            f.encrypt_home("clave-ana-1", &mut pool, t).unwrap();
+            while !f.home_convert_step(100, t).unwrap() {}
+        }
+        let raw = std::fs::read(&img.0).unwrap();
+        for needle in ["CONTENIDO-SECRETO-NFDISK", "secreto-largo-nombre", "Documentos"] {
+            assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
+        }
+        // Sin clave de usuario: se ve tal como está en disco y no se toca por dentro.
+        let mut fs = mount(&img.0, false, plain()).unwrap();
+        let mut lines = Vec::new();
+        list(&mut fs, "Usuarios", false, 0, &mut lines).unwrap();
+        assert!(lines.iter().any(|l| l.contains("Ana") && l.contains("(carpeta cifrada)")), "{lines:?}");
+        let mut inside = Vec::new();
+        list(&mut fs, "Usuarios\\Ana", true, 0, &mut inside).unwrap();
+        assert!(inside[0].contains("carpeta cifrada") && inside.len() > 8 && inside.iter().all(|l| !l.contains("Documentos")), "{inside:?}");
+        drop(fs);
+        std::fs::write(&src.0, "NUEVO-CONTENIDO-META").unwrap();
+        let ruta = "C:\\Usuarios\\Ana\\Documentos\\secreto-largo-nombre.txt";
+        for c in [
+            vec!["ver", &img.0, ruta],
+            vec!["sacar", &img.0, ruta, &out.0],
+            vec!["meter", &img.0, &src.0, "C:\\Usuarios\\Ana\\Documentos\\nuevo.txt"],
+            vec!["carpeta", &img.0, "C:\\Usuarios\\Ana\\Documentos\\sub"],
+            vec!["borrar", &img.0, ruta],
+        ] {
+            assert!(go(&c).is_err(), "{c:?}");
+        }
+        assert!(!Path::new(&out.0).exists());
+        // Con --usuario y su clave: en claro.
+        let con = |c: &[&str], k: Option<&str>| {
+            let mut v = c.to_vec();
+            v.extend(["--usuario", "Ana"]);
+            go_user(&v, k)
+        };
+        let k = Some("clave-ana-1");
+        assert!(con(&["ver", &img.0, ruta], None).is_err());
+        assert!(con(&["ver", &img.0, ruta], Some("mala")).is_err());
+        assert!(go_user(&["ver", &img.0, ruta, "--usuario", "Nadie"], k).is_err());
+        assert!(go_user(&["info", &img.0, "--usuario", "Ana"], k).is_err());
+        con(&["ver", &img.0, ruta], k).unwrap();
+        con(&["sacar", &img.0, ruta, &out.0], k).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"CONTENIDO-SECRETO-NFDISK");
+        con(&["carpeta", &img.0, "C:\\Usuarios\\Ana\\Documentos\\sub"], k).unwrap();
+        con(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/sub/nuevo.txt"], k).unwrap();
+        assert!(con(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/sub/nuevo.txt"], k).is_err());
+        con(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/sub/nuevo.txt", "--reemplazar"], k).unwrap();
+        con(&["listar", &img.0, "C:\\Usuarios\\Ana\\Documentos", "-r"], k).unwrap();
+        con(&["listar", &img.0], k).unwrap();
+        let raw = std::fs::read(&img.0).unwrap();
+        for needle in ["NUEVO-CONTENIDO-META", "nuevo.txt", "sub"] {
+            assert!(!raw.windows(needle.len()).any(|w| w == needle.as_bytes()), "{needle}");
+        }
+        assert!(con(&["borrar", &img.0, "C:\\Usuarios\\Ana\\Documentos"], k).is_err());
+        con(&["borrar", &img.0, "C:\\Usuarios\\Ana\\Documentos\\sub"], k).unwrap();
+        go(&["comprobar", &img.0]).unwrap();
+        // NightFury lo ve igual: lo que quedó es lo de antes.
+        let dev = open(&img.0, false).unwrap();
+        let mut f = Files::probe(Some(Box::new(dev)), t);
+        f.login("Ana", "clave-ana-1").unwrap();
+        assert_eq!(f.read("C:\\Usuarios\\Ana\\Documentos\\secreto-largo-nombre.txt").unwrap(), b"CONTENIDO-SECRETO-NFDISK");
+        assert!(!f.exists("C:\\Usuarios\\Ana\\Documentos\\sub"));
+    }
+
+    #[test]
+    fn usuario_sin_clave_propia_entra_sin_pedirla() {
+        let img = Tmp::new("img");
+        go(&["crear", &img.0, "2"]).unwrap();
+        let t = now();
+        {
+            let dev = open(&img.0, true).unwrap();
+            let mut f = Files::probe(Some(Box::new(dev)), t);
+            f.create_account("Luis", None, true, [1; 16], t).unwrap();
+        }
+        go_user(&["carpeta", &img.0, "C:\\Usuarios\\Luis\\Documentos\\x", "--usuario", "Luis"], None).unwrap();
+        let mut fs = mount(&img.0, false, plain()).unwrap();
+        assert!(fs.stat("Usuarios\\Luis\\Documentos\\x").unwrap().dir);
+        // Sin cifrar, sin --usuario sigue como siempre.
+        drop(fs);
+        go(&["carpeta", &img.0, "C:\\Usuarios\\Luis\\Documentos\\y"]).unwrap();
     }
 }

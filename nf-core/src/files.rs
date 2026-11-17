@@ -423,6 +423,12 @@ impl Files {
         }
     }
 
+    /// Para herramientas (nfdisk): trabaja sobre un volumen NFFS ya montado, tal cual: sin arranque
+    /// (no crea ni migra nada), sin sesión (hay que usar `login`) y con las reglas de siempre.
+    pub fn on_volume(fs: Nffs) -> Files {
+        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default() }
+    }
+
     /// ¿Se guarda en un disco de verdad?
     pub fn persistent(&self) -> bool {
         self.persistent
