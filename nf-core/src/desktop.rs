@@ -141,6 +141,25 @@ struct Dnd {
     ok: bool,
     /// Se ha cerrado la ventana de origen: se cancela en cuanto se pueda.
     dead: bool,
+    /// Arrastre con el botón derecho: al soltar sale un menú (Mover / Copiar / Cancelar).
+    right: bool,
+}
+
+/// Botón derecho pulsado: punto de la pulsación, si ya se probó a arrastrar y si hay arrastre.
+#[derive(Clone, Copy)]
+struct RPress {
+    x: i32,
+    y: i32,
+    tried: bool,
+    dragging: bool,
+}
+
+/// Qué hace un soltar sobre un destino, calculado al soltar.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum DropAct {
+    /// Ventana, con el punto relativo a su contenido.
+    Win(u32, i32, i32),
+    To(Dest),
 }
 
 /// Qué hay bajo el puntero durante un arrastre de archivos.
@@ -237,6 +256,11 @@ const TAG_DEL: u32 = 0xFFFF_FF16;
 /// Etiquetas e identificadores de los menús contextuales del escritorio.
 const MENU_ICON: u32 = 1;
 const MENU_DESK: u32 = 2;
+/// Menú que sale al soltar un arrastre con el botón derecho.
+const MENU_DROP: u32 = 3;
+const M_MOVE_HERE: u32 = 1;
+const M_COPY_HERE: u32 = 2;
+const M_CANCEL_DROP: u32 = 3;
 const M_OPEN: u32 = 1;
 const M_NEWWIN: u32 = 2;
 const M_NOTEPAD: u32 = 3;
@@ -375,6 +399,10 @@ pub struct Desktop {
     menu: Option<OpenMenu>,
     /// Estado del botón derecho.
     rbtn: bool,
+    /// Botón derecho pulsado sin menú abierto: dónde y si ya ha empezado un arrastre.
+    rpress: Option<RPress>,
+    /// Soltar con el botón derecho pendiente de elegir en el menú: qué hacer y las rutas.
+    pending_rdrop: Option<(DropAct, Vec<String>)>,
     size: IconSize,
     order: Order,
     /// Ruta afectada por el diálogo del sistema que está abierto (cambiar nombre).
@@ -674,6 +702,8 @@ impl Desktop {
             booted: false,
             menu: None,
             rbtn: false,
+            rpress: None,
+            pending_rdrop: None,
             login: Login::new(w, h),
             dim: Surface::empty(),
             can_session: sys.files().persistent(),
@@ -730,6 +760,8 @@ impl Desktop {
         self.dnd_hl = None;
         self.dnd_lbl = Rect::default();
         self.pending_drop = None;
+        self.pending_rdrop = None;
+        self.rpress = None;
         self.pending_del = None;
         let mut dim = Surface::new(self.w, self.h, 0);
         dim.blit(&self.wall, 0, 0);
@@ -1070,6 +1102,11 @@ impl Desktop {
             self.menu_edit(|m| m.hover(x, y));
             return;
         }
+        if let Some(p) = self.rpress.filter(|p| !p.tried && self.drag == Drag::None) {
+            if (x - p.x).abs() > DRAG_PX || (y - p.y).abs() > DRAG_PX {
+                self.begin_right_drag(p.x, p.y, sys);
+            }
+        }
         match self.drag {
             Drag::Icon { i, x: px, y: py, .. } => {
                 if (x - px).abs() > DRAG_PX || (y - py).abs() > DRAG_PX {
@@ -1077,7 +1114,7 @@ impl Desktop {
                     if paths.is_empty() || !self.sel.contains(&i) {
                         self.drag = Drag::Dead;
                     } else {
-                        self.begin_dnd(None, paths, sys);
+                        self.begin_dnd(None, paths, false, sys);
                     }
                 }
             }
@@ -1109,7 +1146,7 @@ impl Desktop {
                 self.send(id, sys, |x, y| MouseEv::Move { x, y });
                 if let Some((wid, paths)) = self.drag_req.take() {
                     if wid == id && self.drag == Drag::Content(id) {
-                        self.begin_dnd(Some(id), paths, sys);
+                        self.begin_dnd(Some(id), paths, false, sys);
                         self.after(sys);
                     }
                 }
@@ -1129,6 +1166,9 @@ impl Desktop {
             return;
         }
         self.btn = down;
+        if self.rpress.is_some_and(|p| p.dragging) {
+            return; // arrastrando con el derecho: el izquierdo no hace nada
+        }
         if self.login.covers() {
             self.cancel_dnd(sys);
             if down {
@@ -1159,24 +1199,79 @@ impl Desktop {
             return;
         }
         self.rbtn = down;
-        if !down || self.login.covers() || matches!(self.drag, Drag::Files | Drag::Band(..) | Drag::Icon { .. }) {
+        if self.login.covers() {
+            self.rpress = None;
             return;
         }
-        if self.menu.is_some() {
-            self.menu_click(sys);
-            return;
-        }
-        match self.hit(self.mx, self.my) {
-            Hit::None | Hit::Icon(_) if self.login.mode == Mode::Boot => {}
-            Hit::Content(id) if self.modal_of(id).is_none() => {
-                self.set_start(false);
-                self.raise(id);
-                self.send(id, sys, |x, y| MouseEv::RightDown { x, y });
+        if down {
+            if matches!(self.drag, Drag::Files | Drag::Band(..) | Drag::Icon { .. }) {
+                return;
             }
-            Hit::None | Hit::Icon(_) => self.desktop_menu(self.mx, self.my, sys),
-            _ => {}
+            if self.menu.is_some() {
+                self.menu_click(sys);
+                return;
+            }
+            // El menú sale al soltar; ahora solo se recuerda el punto (y la ventana pasa al frente).
+            let (x, y) = (self.mx, self.my);
+            let ok = match self.hit(x, y) {
+                Hit::None | Hit::Icon(_) => self.login.mode != Mode::Boot,
+                Hit::Content(id) if self.modal_of(id).is_none() => {
+                    self.set_start(false);
+                    self.raise(id);
+                    true
+                }
+                _ => false,
+            };
+            self.rpress = ok.then_some(RPress { x, y, tried: false, dragging: false });
+            self.after(sys);
+            return;
+        }
+        let Some(p) = self.rpress.take() else { return };
+        if p.dragging {
+            if self.dnd.as_ref().is_some_and(|d| d.right) {
+                self.end_dnd(true, sys);
+            } else if self.drag == Drag::Dead {
+                self.drag = Drag::None; // se canceló con Esc: ya se puede soltar
+            }
+        } else if self.menu.is_none() {
+            match self.hit(p.x, p.y) {
+                Hit::Content(id) if self.modal_of(id).is_none() => self.send_at(id, p.x, p.y, sys, |x, y| MouseEv::RightDown { x, y }),
+                Hit::None | Hit::Icon(_) => self.desktop_menu(p.x, p.y, sys),
+                _ => {}
+            }
         }
         self.after(sys);
+    }
+
+    /// Pasado el umbral con el derecho pulsado en (x, y): empieza un arrastre de archivos si ahí hay algo.
+    fn begin_right_drag(&mut self, x: i32, y: i32, sys: &mut dyn Platform) {
+        if let Some(p) = self.rpress.as_mut() {
+            p.tried = true;
+        }
+        let mut paths = Vec::new();
+        let mut src = None;
+        match self.hit(x, y) {
+            Hit::Content(id) if self.modal_of(id).is_none() => {
+                let Some(i) = self.pos(id).filter(|&i| self.wins[i].dlg.is_none()) else { return };
+                let c = self.wins[i].content_rect();
+                self.with_app(id, sys, |a, cx| paths = a.drag_source(x - c.x, y - c.y, cx).unwrap_or_default());
+                src = Some(id);
+            }
+            Hit::Icon(i) if self.icon_path(i).is_some() => {
+                if !self.sel.contains(&i) {
+                    self.set_sel(vec![i]);
+                }
+                self.anchor = i;
+                paths = self.sel_paths();
+            }
+            _ => {}
+        }
+        if !paths.is_empty() {
+            self.begin_dnd(src, paths, true, sys);
+            if let Some(p) = self.rpress.as_mut() {
+                p.dragging = true;
+            }
+        }
     }
 
     /// Gira la rueda `dz` muescas (positivo = hacia abajo) sobre la ventana que está bajo el puntero,
@@ -1314,7 +1409,15 @@ impl Desktop {
 
     /// Elección en un menú del escritorio (`owner == None`).
     fn desktop_menu_result(&mut self, tag: u32, id: u32, sys: &mut dyn Platform) {
-        if tag == MENU_ICON {
+        if tag == MENU_DROP {
+            if let Some((act, paths)) = self.pending_rdrop.take() {
+                match id {
+                    M_MOVE_HERE => self.run_drop_act(act, paths, false, sys),
+                    M_COPY_HERE => self.run_drop_act(act, paths, true, sys),
+                    _ => {}
+                }
+            }
+        } else if tag == MENU_ICON {
             if self.sel.len() > 1 {
                 self.multi_action(id, sys);
             } else if let Some(&i) = self.sel.first() {
@@ -1773,9 +1876,14 @@ impl Desktop {
 
     /// Envía un evento de ratón con coordenadas relativas al contenido de la ventana.
     fn send(&mut self, id: u32, sys: &mut dyn Platform, f: impl Fn(i32, i32) -> MouseEv) {
+        self.send_at(id, self.mx, self.my, sys, f);
+    }
+
+    /// Igual que `send` pero con el punto de pantalla dado (no el del puntero).
+    fn send_at(&mut self, id: u32, px: i32, py: i32, sys: &mut dyn Platform, f: impl Fn(i32, i32) -> MouseEv) {
         let Some(i) = self.pos(id) else { return };
         let c = self.wins[i].content_rect();
-        let ev = f(self.mx - c.x, self.my - c.y);
+        let ev = f(px - c.x, py - c.y);
         if self.wins[i].dlg.is_some() {
             self.dlg_event(id, sys, |d, s| d.mouse(ev, s));
         } else {
@@ -2488,9 +2596,9 @@ impl Desktop {
     }
 
     /// El escritorio toma el arrastre (de la ventana `src`, o de sus propios iconos si es `None`).
-    fn begin_dnd(&mut self, src: Option<u32>, paths: Vec<String>, sys: &mut dyn Platform) {
+    fn begin_dnd(&mut self, src: Option<u32>, paths: Vec<String>, right: bool, sys: &mut dyn Platform) {
         self.drag = Drag::Files;
-        self.dnd = Some(Dnd { paths, src, over: None, ok: false, dead: false });
+        self.dnd = Some(Dnd { paths, src, over: None, ok: false, dead: false, right });
         self.update_dnd(sys);
     }
 
@@ -2539,7 +2647,7 @@ impl Desktop {
             [one] => String::from(dialogs::fit(files::file_name(one), 8, 220)),
             v => format!("{} elementos", v.len()),
         };
-        if self.mods.0 {
+        if self.mods.0 && !d.right {
             t.push_str("  + Copiar");
         }
         t
@@ -2586,30 +2694,23 @@ impl Desktop {
         }
         let copy = self.mods.0;
         let tgt = if drop && !d.dead && !self.login.covers() { self.dnd_target(&d.paths) } else { Tgt::Nothing };
-        match tgt {
-            Tgt::Win(id) if d.over == Some(id) && d.ok => {
-                self.raise(id);
-                if let Some(i) = self.pos(id) {
-                    let c = self.wins[i].content_rect();
-                    let (x, y) = (self.mx - c.x, self.my - c.y);
-                    self.with_app(id, sys, |a, cx| a.drop_files(x, y, &d.paths, copy, cx));
-                }
-            }
-            Tgt::Desk => {
-                let dir = sys.files().std_dir(Std::Desktop);
-                self.desk_drop(Dest::Dir(dir), d.paths.clone(), copy, sys);
-            }
-            Tgt::Icon(i) => {
-                let dest = match self.icons.get(i).map(|x| &x.act) {
-                    Some(Act::Path(p)) if p == files::TRASH => Some(Dest::Trash),
-                    Some(Act::Path(p)) => Some(Dest::Dir(p.clone())),
-                    _ => None,
-                };
-                if let Some(dest) = dest {
-                    self.desk_drop(dest, d.paths.clone(), copy, sys);
-                }
-            }
-            _ => {}
+        let act = match tgt {
+            Tgt::Win(id) if d.over == Some(id) && d.ok => self.pos(id).map(|i| {
+                let c = self.wins[i].content_rect();
+                DropAct::Win(id, self.mx - c.x, self.my - c.y)
+            }),
+            Tgt::Desk => Some(DropAct::To(Dest::Dir(sys.files().std_dir(Std::Desktop)))),
+            Tgt::Icon(i) => match self.icons.get(i).map(|x| &x.act) {
+                Some(Act::Path(p)) if p == files::TRASH => Some(DropAct::To(Dest::Trash)),
+                Some(Act::Path(p)) => Some(DropAct::To(Dest::Dir(p.clone()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        match act {
+            Some(act) if d.right => self.open_drop_menu(act, d.paths.clone()),
+            Some(act) => self.run_drop_act(act, d.paths.clone(), copy, sys),
+            None => {}
         }
         if let Some(o) = d.over {
             self.with_app(o, sys, |a, cx| {
@@ -2621,6 +2722,34 @@ impl Desktop {
         if let Some(i) = self.dnd_hl.take() {
             self.dmg(self.icon_cell(i));
         }
+    }
+
+    /// Hace lo que toque al soltar `paths` en `act` (mover, o copiar si `copy`).
+    fn run_drop_act(&mut self, act: DropAct, paths: Vec<String>, copy: bool, sys: &mut dyn Platform) {
+        match act {
+            DropAct::Win(id, x, y) => {
+                self.raise(id);
+                self.with_app(id, sys, |a, cx| a.drop_files(x, y, &paths, copy, cx));
+            }
+            DropAct::To(dest) => self.desk_drop(dest, paths, copy, sys),
+        }
+    }
+
+    /// Soltar con el botón derecho: el menú en el puntero decide si se mueve o se copia.
+    fn open_drop_menu(&mut self, act: DropAct, paths: Vec<String>) {
+        let items = if act == DropAct::To(Dest::Trash) {
+            vec![MenuItem::new(M_MOVE_HERE, "Mover a la Papelera").bold(), MenuItem::sep(), MenuItem::new(M_CANCEL_DROP, "Cancelar")]
+        } else {
+            vec![
+                MenuItem::new(M_MOVE_HERE, "Mover aquí").bold(),
+                MenuItem::new(M_COPY_HERE, "Copiar aquí"),
+                MenuItem::sep(),
+                MenuItem::new(M_CANCEL_DROP, "Cancelar"),
+            ]
+        };
+        self.pending_rdrop = Some((act, paths));
+        let (x, y) = (self.mx, self.my);
+        self.open_menu(None, MENU_DROP, x, y, items);
     }
 
     /// Cancela el arrastre en curso (Esc, ventana de origen cerrada, bloqueo...) sin hacer nada.

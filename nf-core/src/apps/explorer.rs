@@ -1979,6 +1979,21 @@ impl App for Explorer {
         }
     }
 
+    /// Arrastre con el botón derecho: selecciona como `RightDown` (conserva la selección múltiple si
+    /// el elemento ya estaba en ella) y da las rutas; nada en zona vacía, en la Papelera o con protegidas.
+    fn drag_source(&mut self, x: i32, y: i32, cx: &mut Ctx) -> Option<Vec<String>> {
+        let i = self.item_at(x, y).filter(|&i| i < self.rows.len())?;
+        if self.is_sel(i) {
+            self.sel = Some(i);
+        } else {
+            self.set_one(i);
+        }
+        self.last_click = None;
+        cx.redraw = true;
+        let paths = self.paths();
+        (!self.trash() && !paths.iter().any(|q| files::is_protected(q))).then_some(paths)
+    }
+
     fn drag_over(&mut self, pos: Option<(i32, i32)>, paths: &[String], cx: &mut Ctx) -> bool {
         let t = pos.and_then(|(x, y)| self.target(x, y, paths, cx.sys.files()));
         let tgt = t.as_ref().map(|(_, g)| *g).filter(|g| *g != Tgt::Area);
