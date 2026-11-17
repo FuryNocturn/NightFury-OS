@@ -1488,6 +1488,24 @@ impl Login {
         Ok(())
     }
 
+    /// Solo para pruebas: pantalla del asistente de disco nuevo.
+    #[cfg(test)]
+    pub(crate) fn step_name(&self) -> &'static str {
+        match self.step {
+            Step::Account => "cuentas",
+            Step::Choice => "cifrado",
+            Step::DiskKey => "clave del disco",
+            Step::Preparing => "preparando",
+            Step::Codes => "codigos",
+        }
+    }
+
+    /// Solo para pruebas: (a quién pertenece, código) del código que se muestra.
+    #[cfg(test)]
+    pub(crate) fn shown_code(&self) -> Option<(String, String)> {
+        self.codes.get(self.code_i).cloned()
+    }
+
     /// Un fallo al preparar: sin nada hecho vuelve a la elección de cifrado; si el disco ya se formateó o
     /// hay cuentas creadas, a la tarjeta de cuentas (para reintentar con "Terminar", que retoma lo que falta).
     fn fail_provision(&mut self, e: String) {
@@ -2281,5 +2299,331 @@ mod tests {
         });
         assert_eq!(r, 7);
         assert!(sys.pool.ready());
+    }
+
+    // ---------------------------------------------------------------- asistente de disco nuevo (v0.7.1)
+
+    fn nuevo() -> (Login, TestPlatform) {
+        let mut sys = sys();
+        let now = sys.now();
+        sys.files = Files::probe(Some(Box::new(crate::block::RamDisk::new(2048))), now);
+        let mut l = Login::new(1280, 800);
+        l.start_new_disk();
+        (l, sys)
+    }
+
+    fn llena(sys: &mut TestPlatform) {
+        for i in 0..POOL_EVENTS_NEEDED {
+            sys.pool.add_event(i as i32, 3, 1, i as u64 * 7919);
+        }
+    }
+
+    fn tecla(l: &mut Login, sys: &mut TestPlatform, key: Key) -> Out {
+        press(l, sys, key, None)
+    }
+
+    /// Añade una cuenta en la tarjeta de cuentas (Tab entre campos, Enter para crearla).
+    fn cuenta(l: &mut Login, sys: &mut TestPlatform, name: &str, pw: &str) -> Out {
+        typ(l, sys, name);
+        tecla(l, sys, Key::Tab);
+        typ(l, sys, pw);
+        tecla(l, sys, Key::Tab);
+        typ(l, sys, pw);
+        tecla(l, sys, Key::Enter)
+    }
+
+    #[test]
+    fn asistente_nuevo_ofrece_cuatro_opciones_con_mi_carpeta_marcada() {
+        let (mut l, mut sys) = nuevo();
+        assert_eq!((l.step_name(), l.enc, l.opt_index()), ("cifrado", Enc::Home, 1));
+        assert_eq!(l.layout().items.iter().filter(|i| matches!(i.0, Item::Opt(_))).count(), 4);
+        tecla(&mut l, &mut sys, Key::Down);
+        assert_eq!(l.enc, Enc::Disk);
+        tecla(&mut l, &mut sys, Key::Right);
+        assert_eq!(l.enc, Enc::Both);
+        tecla(&mut l, &mut sys, Key::Down);
+        assert_eq!(l.enc, Enc::Nothing);
+        tecla(&mut l, &mut sys, Key::Up);
+        assert_eq!(l.enc, Enc::Both);
+        click(&mut l, &mut sys, Item::Opt(1));
+        assert_eq!(l.enc, Enc::Home);
+        // Nada se ha tocado: el disco sigue sin formatear.
+        assert!(sys.files.pending_format());
+    }
+
+    #[test]
+    fn eleccion_sin_cifrado_de_disco_salta_la_clave_del_disco() {
+        for (opt, clave) in [(Item::Opt(0), false), (Item::Opt(1), false), (Item::Opt(2), true), (Item::Opt(3), true)] {
+            let (mut l, mut sys) = nuevo();
+            click(&mut l, &mut sys, opt);
+            assert_eq!(tecla(&mut l, &mut sys, Key::Enter), Out::None);
+            assert_eq!(l.step_name(), if clave { "clave del disco" } else { "cuentas" });
+        }
+    }
+
+    #[test]
+    fn clave_del_disco_corta_distinta_o_debil() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(2));
+        click(&mut l, &mut sys, Item::Ok);
+        assert_eq!(l.step_name(), "clave del disco");
+        // Vacía o corta.
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw, KeyError::Weak.text())));
+        typ(&mut l, &mut sys, "abc");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.step_name(), "clave del disco");
+        // No coinciden.
+        typ(&mut l, &mut sys, "def");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "abcdeg");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw2, "Las claves no coinciden.")));
+        // Débil ("abcdef" es nivel 0 o 1): avisa y a la segunda sigue.
+        back(&mut l, &mut sys, 1);
+        typ(&mut l, &mut sys, "f");
+        assert!(keys::strength("abcdef") < 2);
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.step_name(), "clave del disco");
+        assert!(l.weak_ok && msg(&l).starts_with("La clave es débil"));
+        let mut s = Surface::new(1280, 800, 0x101010);
+        l.paint(&mut s, 0x3B7DD8);
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.step_name(), "cuentas");
+        assert_eq!(l.disk_pw, "abcdef");
+        assert_eq!((l.pw.len(), l.pw2.len()), (0, 0));
+    }
+
+    fn back(l: &mut Login, sys: &mut TestPlatform, n: usize) {
+        for _ in 0..n {
+            press(l, sys, Key::Backspace, None);
+        }
+    }
+
+    #[test]
+    fn clave_del_disco_fuerte_sigue_sin_aviso_y_atras_borra() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(3));
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "Abc12345");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "Abc12345");
+        // Atrás vuelve a la elección y no deja nada escrito.
+        click(&mut l, &mut sys, Item::Done);
+        assert_eq!((l.step_name(), l.pw.len(), l.pw2.len(), l.disk_pw.len()), ("cifrado", 0, 0, 0));
+        assert_eq!(l.enc, Enc::Both);
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "Abc12345");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "Abc12345");
+        click(&mut l, &mut sys, Item::Ok);
+        assert_eq!(l.step_name(), "cuentas");
+        // Escape también vuelve desde la clave del disco.
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(2));
+        click(&mut l, &mut sys, Item::Ok);
+        tecla(&mut l, &mut sys, Key::Escape);
+        assert_eq!(l.step_name(), "cifrado");
+    }
+
+    #[test]
+    fn con_mi_carpeta_la_clave_de_la_cuenta_es_obligatoria() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Ok); // Mi carpeta
+        assert_eq!(l.step_name(), "cuentas");
+        typ(&mut l, &mut sys, "Ana");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.err.as_ref().map(|e| e.0), Some(Item::Pw));
+        assert!(l.pend.is_empty() && !l.second);
+        // Corta tampoco vale.
+        typ(&mut l, &mut sys, "abc");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "abc");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw, AccountError::WeakPassword.text())));
+        assert!(l.pend.is_empty());
+        // Con clave sí.
+        click(&mut l, &mut sys, Item::Pw);
+        back(&mut l, &mut sys, 3);
+        tecla(&mut l, &mut sys, Key::Tab);
+        back(&mut l, &mut sys, 3);
+        click(&mut l, &mut sys, Item::Pw);
+        typ(&mut l, &mut sys, "secreto1");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "secreto1");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!((l.pend.len(), l.second), (1, true));
+        assert!(sys.files.pending_format(), "el disco no se toca hasta Terminar");
+        // Con Ninguno la clave sigue siendo opcional.
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(0));
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "Ana");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.pend.len(), 1);
+        // Con Disco entero también.
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(2));
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Enter);
+        typ(&mut l, &mut sys, "Ana");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.pend.len(), 1);
+    }
+
+    #[test]
+    fn una_cuenta_sin_clave_avisa_de_que_su_carpeta_no_se_cifra() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Ok);
+        cuenta(&mut l, &mut sys, "Ana", "secreto1");
+        typ(&mut l, &mut sys, "Luis");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.pend.len(), 1, "el primer Enter solo avisa");
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw, "Su carpeta quedará sin cifrar. Pulsa otra vez para añadirla igualmente.")));
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.pend.len(), 2);
+        assert!(!l.pend[1].admin && l.pend[0].admin);
+        // Nombres repetidos o no válidos se rechazan ya, en su tarjeta.
+        typ(&mut l, &mut sys, "ana");
+        tecla(&mut l, &mut sys, Key::Enter);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Name, AccountError::Exists.text())));
+        assert_eq!(l.pend.len(), 2);
+    }
+
+    #[test]
+    fn cancelar_la_ventana_del_raton_vuelve_a_las_cuentas_sin_tocar_el_disco() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Ok);
+        cuenta(&mut l, &mut sys, "Ana", "secreto1");
+        assert_eq!(click(&mut l, &mut sys, Item::Done), Out::NeedEntropy);
+        assert!(!l.covers());
+        l.cancel_entropy();
+        assert_eq!((l.mode, l.step_name(), l.pend.len()), (Mode::Setup, "cuentas", 1));
+        assert!(sys.files.pending_format() && !sys.files.persistent());
+    }
+
+    /// Recorre una opción entera con el `Login` suelto y devuelve los códigos mostrados.
+    fn recorre(opt: usize, sys: &mut TestPlatform, l: &mut Login) -> Vec<(String, String)> {
+        click(l, sys, Item::Opt(opt));
+        click(l, sys, Item::Ok);
+        if l.step_name() == "clave del disco" {
+            typ(l, sys, "claveDisco1");
+            tecla(l, sys, Key::Tab);
+            typ(l, sys, "claveDisco1");
+            tecla(l, sys, Key::Enter);
+        }
+        let pw = if opt == 0 || opt == 2 { "" } else { "secreto1" };
+        cuenta(l, sys, "Ana", pw);
+        let pw2 = if opt == 0 || opt == 2 { "" } else { "otraclave1" };
+        typ(l, sys, "Luis");
+        if !pw2.is_empty() {
+            tecla(l, sys, Key::Tab);
+            typ(l, sys, pw2);
+            tecla(l, sys, Key::Tab);
+            typ(l, sys, pw2);
+        }
+        tecla(l, sys, Key::Enter);
+        assert_eq!(l.pend.len(), 2);
+        let out = click(l, sys, Item::Done);
+        if opt == 0 {
+            assert_eq!(out, Out::None);
+        } else {
+            assert_eq!(out, Out::NeedEntropy);
+            llena(sys);
+            l.begin_provision();
+        }
+        assert_eq!(l.step_name(), "preparando");
+        // Mientras se prepara no se acepta nada.
+        assert_eq!(tecla(l, sys, Key::Enter), Out::None);
+        assert!(l.job.is_some() && l.covers());
+        let mut codes = Vec::new();
+        let mut out = l.tick(l.now + 1000, sys);
+        while out == Out::None {
+            codes.push(l.shown_code().expect("código"));
+            out = tecla(l, sys, Key::Enter);
+        }
+        assert_eq!(out, Out::SetupDone);
+        codes
+    }
+
+    #[test]
+    fn las_cuatro_opciones_dejan_el_disco_y_las_carpetas_como_se_pidio() {
+        // (opción, disco cifrado, Ana cifrada, Luis cifrada, códigos)
+        let casos = [(0usize, false, false, false, 0usize), (1, false, true, true, 2), (2, true, false, false, 1), (3, true, true, true, 3)];
+        for (opt, disco, ana, luis, n) in casos {
+            let (mut l, mut sys) = nuevo();
+            let codes = recorre(opt, &mut sys, &mut l);
+            assert_eq!(codes.len(), n, "opción {opt}");
+            assert_eq!((sys.files.disk_encrypted(), sys.files.account_encrypted("Ana"), sys.files.account_encrypted("Luis")), (disco, ana, luis), "opción {opt}");
+            assert!(sys.files.persistent() && sys.files.user().is_none());
+            assert_eq!(sys.files.accounts().len(), 2);
+            // Orden: primero el del disco y luego cada cuenta, con a quién pertenece.
+            let dueños: Vec<&str> = codes.iter().map(|c| c.0.as_str()).collect();
+            let esperado: Vec<&str> = [(disco, "del disco"), (ana, "de la cuenta Ana"), (luis, "de la cuenta Luis")].iter().filter(|x| x.0).map(|x| x.1).collect();
+            assert_eq!(dueños, esperado, "opción {opt}");
+            // Todo secreto borrado al terminar.
+            assert!(l.codes.iter().all(|c| c.1.bytes().all(|b| b == 0)) && l.pend.iter().all(|p| p.pw.bytes().all(|b| b == 0)));
+            assert!(l.disk_pw.bytes().all(|b| b == 0));
+        }
+    }
+
+    #[test]
+    fn sin_aleatoriedad_suficiente_vuelve_a_la_eleccion_sin_formatear() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(2));
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Enter);
+        cuenta(&mut l, &mut sys, "Ana", "");
+        click(&mut l, &mut sys, Item::Done);
+        // Sin llenar el acumulador la preparación falla: error y de vuelta a la elección.
+        l.begin_provision();
+        assert_eq!(l.tick(l.now + 1000, &mut sys), Out::None);
+        assert_eq!((l.mode, l.step_name()), (Mode::Setup, "cifrado"));
+        assert_eq!(msg(&l), KeyError::NotReady.text());
+        assert!(sys.files.pending_format() && sys.files.accounts().is_empty());
+        assert!(l.pend.is_empty() && !l.second);
+        // Se puede elegir otra opción y seguir.
+        let mut s = Surface::new(1280, 800, 0x101010);
+        l.paint(&mut s, 0x3B7DD8);
+        click(&mut l, &mut sys, Item::Opt(0));
+        click(&mut l, &mut sys, Item::Ok);
+        cuenta(&mut l, &mut sys, "Ana", "");
+        assert_eq!(click(&mut l, &mut sys, Item::Done), Out::None);
+        assert_eq!(l.tick(l.now + 1000, &mut sys), Out::SetupDone);
+        assert!(sys.files.persistent() && sys.files.accounts().len() == 1);
+    }
+
+    #[test]
+    fn lo_he_apuntado_avanza_y_el_ultimo_codigo_termina() {
+        let (mut l, mut sys) = nuevo();
+        click(&mut l, &mut sys, Item::Opt(3));
+        click(&mut l, &mut sys, Item::Ok);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Tab);
+        typ(&mut l, &mut sys, "claveDisco1");
+        tecla(&mut l, &mut sys, Key::Enter);
+        cuenta(&mut l, &mut sys, "Ana", "secreto1");
+        assert_eq!(click(&mut l, &mut sys, Item::Done), Out::NeedEntropy);
+        llena(&mut sys);
+        l.begin_provision();
+        assert_eq!(l.tick(2000, &mut sys), Out::None);
+        assert_eq!((l.step_name(), l.codes.len()), ("codigos", 2));
+        let (dueño, c1) = l.shown_code().unwrap();
+        assert_eq!(dueño, "del disco");
+        assert_eq!(c1.len(), 47);
+        let mut s = Surface::new(1280, 800, 0x101010);
+        l.paint(&mut s, 0x3B7DD8);
+        assert_eq!(click(&mut l, &mut sys, Item::Ok), Out::None);
+        let (dueño, c2) = l.shown_code().unwrap();
+        assert_eq!(dueño, "de la cuenta Ana");
+        assert_ne!(c1, c2);
+        assert_eq!(click(&mut l, &mut sys, Item::Ok), Out::SetupDone);
+        assert!(l.codes.is_empty());
     }
 }
