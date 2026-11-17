@@ -21,6 +21,8 @@ if (-not $NoBuild) {
 }
 New-Item -ItemType Directory -Force esp\EFI\BOOT | Out-Null
 Copy-Item target\x86_64-unknown-uefi\release\nightfury.efi esp\EFI\BOOT\BOOTX64.EFI -Force
+# Si tras un reinicio el firmware de QEMU cae en su consola (UEFI Shell), este guion arranca NightFury solo.
+Set-Content -Path esp\startup.nsh -Value 'FS0:\EFI\BOOT\BOOTX64.EFI' -Encoding ascii
 
 $ppm = [System.IO.Path]::GetFullPath((Join-Path $root 'shots\_tmp.ppm'))
 Remove-Item $ppm -ErrorAction SilentlyContinue
