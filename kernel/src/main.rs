@@ -23,6 +23,7 @@ mod user;
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
@@ -37,7 +38,7 @@ use nf_core::heap::Heap;
 use nf_core::icons::{self, Icon};
 use nf_core::input::{Event, Keyboard, Ps2Mouse};
 use nf_core::platform::{DateTime, MemInfo, Platform};
-use nf_core::proc::Process;
+use nf_core::proc::{ProcInfo, Process};
 use nf_core::surface::Surface;
 use nf_core::{font, NAME};
 use serial::traza;
@@ -154,8 +155,14 @@ impl Platform for Plat {
     fn pool(&mut self) -> &mut nf_core::keys::Pool {
         &mut self.pool
     }
-    fn spawn(&mut self, nfx: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
-        user::spawn(nfx)
+    fn spawn(&mut self, nfx: &[u8], name: &str) -> Result<Box<dyn Process>, String> {
+        user::spawn(nfx, name)
+    }
+    fn processes(&mut self) -> Vec<ProcInfo> {
+        user::lista()
+    }
+    fn kill_process(&mut self, id: u64) {
+        user::finalizar(id)
     }
     fn entropy(&mut self) -> u64 {
         use core::arch::x86_64::{__cpuid, _rdtsc};
