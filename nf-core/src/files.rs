@@ -4427,4 +4427,524 @@ mod tests {
             assert_eq!(enc.home_encrypted(), !decrypting);
         }
     }
+
+    /// Ruta en disco (relativa) de un elemento de una carpeta cifrada, dada su ruta en claro.
+    fn raw_of(f: &mut Files, path: &str) -> String {
+        let c = canon(path).unwrap();
+        let found = f.find_enc(rel(&c)).unwrap();
+        join_rel(&found.parent, &found.item.unwrap().raw)
+    }
+
+    fn encrypted_ana(blocks: usize) -> (Cdisk, Files) {
+        let (disk, mut f) = hdisk(blocks);
+        fill(&mut f);
+        f.encrypt_home(PW, &mut ready_pool(), d(7)).unwrap();
+        finish_home(&mut f, 50);
+        (disk, f)
+    }
+
+    fn home_cut_everywhere(decrypting: bool) {
+        let (disk, mut f) = hdisk(160);
+        fill(&mut f);
+        if decrypting {
+            f.encrypt_home(PW, &mut ready_pool(), d(7)).unwrap();
+            finish_home(&mut f, 50);
+        }
+        let before = snap(&mut f);
+        let base = disk.bytes();
+        let run = |limit: Option<usize>| -> (Cdisk, usize) {
+            let dk = Cdisk::from_bytes(base.clone());
+            let mut g = Files::probe(Some(Box::new(dk.clone())), d(4));
+            g.login("Ana", PW).unwrap();
+            let start = dk.writes();
+            if let Some(k) = limit {
+                dk.limit.set(start + k);
+            }
+            if decrypting {
+                g.decrypt_home(PW, d(5)).unwrap();
+            } else {
+                g.encrypt_home(PW, &mut ready_pool(), d(5)).unwrap();
+            }
+            // Pasa lo que pase en memoria: lo que importa es la imagen que queda.
+            for _ in 0..5000 {
+                if !matches!(g.home_convert_step(1, d(5)), Ok(false)) {
+                    break;
+                }
+            }
+            let n = dk.writes() - start;
+            (dk, n)
+        };
+        let (_, total) = run(None);
+        assert!(total > 30, "{total}");
+        for k in 0..=total {
+            let (dk, _) = run(Some(k));
+            let (after, mut g) = reboot(&dk);
+            g.login("Ana", PW).unwrap_or_else(|e| panic!("k={k}: {e:?}"));
+            assert_eq!(snap(&mut g), before, "k={k}");
+            let started = g.account_encrypted("Ana");
+            finish_home(&mut g, 7);
+            assert_eq!(snap(&mut g), before, "k={k} tras terminar");
+            if !decrypting && started {
+                assert!(g.home_encrypted(), "k={k}");
+                assert_eq!(raw_has(&after, &NEEDLES), None, "k={k}");
+            }
+            if decrypting && !g.home_encrypted() {
+                assert!(!g.account_encrypted("Ana"), "k={k}");
+                // Sin cifrado: lo hay en claro en el disco.
+                let names: Vec<String> = g.fs.list("Usuarios\\Ana").unwrap().into_iter().map(|e| e.name).collect();
+                assert!(names.iter().any(|n| n == "Documentos") && !names.iter().any(|n| n.starts_with("$e") || n.starts_with("$E")), "k={k} {names:?}");
+            }
+            // Y tras otro reinicio sigue igual.
+            let (_, mut h) = reboot(&after);
+            h.login("Ana", PW).unwrap();
+            assert_eq!(snap(&mut h), before, "k={k} reinicio");
+        }
+    }
+
+    #[test]
+    fn power_cut_at_every_write_while_encrypting_the_home() {
+        home_cut_everywhere(false);
+    }
+
+    #[test]
+    fn power_cut_at_every_write_while_decrypting_the_home() {
+        home_cut_everywhere(true);
+    }
+
+    #[test]
+    fn altered_files_and_names_are_never_trusted() {
+        let (_, mut f) = encrypted_ana(400);
+        let p = format!("{H}\\Documentos\\{SECRET_NAME}");
+        let rawp = raw_of(&mut f, &p);
+        let orig = f.fs.read(&rawp).unwrap();
+        let h = homecrypt::HEADER;
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        for i in [0, 5, 6, 14, h + 5, orig.len() - 1] {
+            let mut b = orig.clone();
+            b[i] ^= 1;
+            cases.push(b);
+        }
+        cases.push(orig[..orig.len() - 1].to_vec());
+        cases.push(orig[..10].to_vec());
+        cases.push(orig[..h].to_vec());
+        cases.push(Vec::new());
+        let mut longer = orig.clone();
+        longer.push(0);
+        cases.push(longer);
+        cases.push(secret_body(0)); // el mismo contenido pero en claro
+        cases.push(vec![0; orig.len()]);
+        for (i, bad) in cases.iter().enumerate() {
+            f.fs.write(&rawp, bad, d(9)).unwrap();
+            assert_eq!(f.read(&p), Err(FsError::Corrupt), "caso {i}");
+            // Lo que no verifica tampoco se copia ni se mueve a otro sitio.
+            assert!(f.copy(&p, "C:\\copia-mala.txt", d(9)).is_err());
+            assert!(!f.exists("C:\\copia-mala.txt"));
+        }
+        f.fs.write(&rawp, &orig, d(2)).unwrap();
+        assert_eq!(f.read(&p).unwrap(), secret_body(0));
+        // Nombre alterado, de otra llave, o en claro: no aparece.
+        let dir = format!("{H}\\Documentos\\carpeta-reservada-secreta");
+        let raw_dir = raw_of(&mut f, &dir);
+        let file_raw = raw_of(&mut f, &format!("{dir}\\segundo.txt"));
+        let leaf = file_raw.rsplit('\\').next().unwrap().to_string();
+        let mut bad = leaf.clone().into_bytes();
+        let last = bad.len() - 2;
+        bad[last] = if bad[last] == b'A' { b'B' } else { b'A' };
+        f.fs.rename(&file_raw, &join_rel(&raw_dir, &String::from_utf8(bad).unwrap())).unwrap();
+        f.hc.cache.clear();
+        assert_eq!(f.read(&format!("{dir}\\segundo.txt")), Err(FsError::NotFound));
+        assert_eq!(names(&mut f, &dir), ["nombre-largo-subcarpeta"]);
+        let other = Keys::new(&[9; 64]);
+        let foreign = homecrypt::encode_name(&other, "intruso.txt").unwrap();
+        f.fs.write(&join_rel(&raw_dir, &foreign), b"x", d(9)).unwrap();
+        f.fs.write(&join_rel(&raw_dir, "intruso-en-claro.txt"), b"y", d(9)).unwrap();
+        f.hc.cache.clear();
+        assert_eq!(names(&mut f, &dir), ["nombre-largo-subcarpeta"]);
+        assert_eq!(f.read(&format!("{dir}\\intruso-en-claro.txt")), Err(FsError::NotFound));
+        // Borrar la carpeta se lleva también lo que no se ve.
+        f.delete(&dir).unwrap();
+        assert!(!f.fs.stat(&raw_dir).is_ok());
+    }
+
+    #[test]
+    fn without_the_key_everything_is_denied() {
+        let (_, mut f) = encrypted_ana(500);
+        f.create_account("Boss", None, true, [5; 16], d(9)).unwrap();
+        f.create_account("Luis", Some("luis-clave"), false, [6; 16], d(9)).unwrap();
+        let p = format!("{H}\\Documentos\\{SECRET_NAME}");
+        let docs = format!("{H}\\Documentos");
+        for (u, pw) in [("Luis", "luis-clave"), ("Boss", "")] {
+            f.login(u, pw).unwrap();
+            assert_eq!(f.read(&p), Err(FsError::Denied), "{u}");
+            assert_eq!(f.stat(&p), Err(FsError::Denied));
+            assert!(!f.exists(&p));
+            assert_eq!(f.list(&docs).err(), Some(FsError::Denied));
+            assert_eq!(f.list(H).err(), Some(FsError::Denied));
+            assert_eq!(f.write(&format!("{docs}\\x.txt"), b"x", d(9)), Err(FsError::Denied));
+            assert_eq!(f.mkdir(&format!("{docs}\\x"), d(9)), Err(FsError::Denied));
+            assert_eq!(f.delete(&p), Err(FsError::Denied));
+            assert_eq!(f.trash(&p, d(9)), Err(FsError::Denied));
+            assert_eq!(f.rename(&p, "C:\\x.txt"), Err(FsError::Denied));
+            assert_eq!(f.copy(&p, "C:\\x.txt", d(9)), Err(FsError::Denied));
+            assert!(f.transfer(&[p.clone()], "C:\\", false, d(9)).is_err());
+            assert_eq!(f.read("C:\\Sistema\\config\\llaves\\Ana"), Err(FsError::Denied));
+            assert_eq!(f.write("C:\\Sistema\\config\\llaves\\Ana", b"x", d(9)).is_err(), true);
+        }
+        // Sin sesión.
+        f.logout();
+        assert_eq!(f.read(&p), Err(FsError::Denied));
+        assert_eq!(f.list(&docs).err(), Some(FsError::Denied));
+        assert!(f.hc.keys.is_none() && f.hc.state.is_none());
+        // Bloqueo: la llave se va y solo la clave correcta la devuelve.
+        f.login("Ana", PW).unwrap();
+        assert_eq!(f.read(&p).unwrap(), secret_body(0));
+        f.lock_keys();
+        assert!(f.hc.keys.is_none());
+        assert_eq!(f.read(&p), Err(FsError::Denied));
+        assert_eq!(f.write(&p, b"x", d(9)), Err(FsError::Denied));
+        assert_eq!(f.list(&docs).err(), Some(FsError::Denied));
+        assert!(f.home_encrypted());
+        assert!(!f.verify_password("mala-clave"));
+        assert_eq!(f.read(&p), Err(FsError::Denied));
+        assert!(f.verify_password(PW));
+        assert_eq!(f.read(&p).unwrap(), secret_body(0));
+        // Una cuenta ajena sin cifrar sigue siendo normal para quien tiene permiso.
+        assert!(f.list("C:\\Usuarios\\Luis").is_ok());
+    }
+
+    #[test]
+    fn password_change_keeps_the_same_key_and_removing_it_is_refused() {
+        let (disk, mut f) = encrypted_ana(400);
+        let before = snap(&mut f);
+        let p = format!("{H}\\Documentos\\{SECRET_NAME}");
+        let rawp = raw_of(&mut f, &p);
+        let raw_before = f.fs.read(&rawp).unwrap();
+        let kf_before = f.fs.read("Sistema\\config\\llaves\\Ana").unwrap();
+        assert_eq!(f.set_password(PW, None, [3; 16], d(9)), Err(AccountError::Encrypted));
+        assert_eq!(f.set_password("mala", Some("clave-nueva"), [3; 16], d(9)), Err(AccountError::WrongPassword));
+        assert_eq!(f.set_password(PW, Some("abc"), [3; 16], d(9)), Err(AccountError::WeakPassword));
+        assert_eq!(f.fs.read("Sistema\\config\\llaves\\Ana").unwrap(), kf_before);
+        f.set_password(PW, Some("clave-nueva-2"), [3; 16], d(9)).unwrap();
+        // No se ha recifrado nada.
+        assert_eq!(f.fs.read(&rawp).unwrap(), raw_before);
+        let kf = String::from_utf8(f.fs.read("Sistema\\config\\llaves\\Ana").unwrap()).unwrap();
+        assert_eq!(kf.matches("clave=").count(), 1);
+        assert!(KeyFile::parse(&kf).unwrap().open_pass(PW).is_none());
+        f.logout();
+        assert_eq!(f.login("Ana", PW), Err(AccountError::WrongPassword));
+        f.login("Ana", "clave-nueva-2").unwrap();
+        assert_eq!(snap(&mut f), before);
+        let (_, mut g) = reboot(&disk);
+        g.login("Ana", "clave-nueva-2").unwrap();
+        assert_eq!(snap(&mut g), before);
+    }
+
+    #[test]
+    fn password_change_cut_at_every_write_never_locks_the_folder() {
+        let (disk, mut f) = encrypted_ana(300);
+        let before = snap(&mut f);
+        let base = disk.bytes();
+        let run = |limit: Option<usize>| -> (Cdisk, usize) {
+            let dk = Cdisk::from_bytes(base.clone());
+            let mut g = Files::probe(Some(Box::new(dk.clone())), d(4));
+            g.login("Ana", PW).unwrap();
+            let start = dk.writes();
+            if let Some(k) = limit {
+                dk.limit.set(start + k);
+            }
+            let _ = g.set_password(PW, Some("clave-nueva-2"), [3; 16], d(5));
+            (dk.clone(), dk.writes() - start)
+        };
+        let (_, total) = run(None);
+        for k in 0..=total {
+            let (dk, _) = run(Some(k));
+            let (_, mut g) = reboot(&dk);
+            // Una de las dos claves abre siempre, y con ella se ve todo.
+            if g.login("Ana", "clave-nueva-2").is_err() {
+                g.login("Ana", PW).unwrap_or_else(|e| panic!("k={k}: {e:?}"));
+            }
+            assert_eq!(snap(&mut g), before, "k={k}");
+        }
+    }
+
+    #[test]
+    fn recovery_code_resets_the_password_and_new_code_replaces_the_old() {
+        let (disk, mut f) = hdisk(400);
+        fill(&mut f);
+        let code = f.encrypt_home(PW, &mut ready_pool(), d(7)).unwrap();
+        finish_home(&mut f, 50);
+        let before = snap(&mut f);
+        // El código nuevo invalida el anterior.
+        assert_eq!(f.new_home_recovery("mala", &mut ready_pool(), d(8)), Err(KeyError::WrongSecret));
+        assert_eq!(f.new_home_recovery(PW, &mut Pool::new(), d(8)), Err(KeyError::NotReady));
+        let code2 = f.new_home_recovery(PW, &mut ready_pool(), d(8)).unwrap();
+        assert_ne!(code, code2);
+        f.logout();
+        // Sin sesión.
+        let mut pool = ready_pool();
+        assert_eq!(f.recover_account("Ana", &code, "clave-recuperada", &mut pool, d(9)), Err(KeyError::WrongSecret));
+        assert_eq!(f.recover_account("Ana", "ABCDE-ABCDE", "clave-recuperada", &mut pool, d(9)), Err(KeyError::WrongSecret));
+        assert_eq!(f.recover_account("Ana", &code2, "abc", &mut pool, d(9)), Err(KeyError::Weak));
+        assert_eq!(f.recover_account("Ana", &code2, "clave-recuperada", &mut Pool::new(), d(9)), Err(KeyError::NotReady));
+        assert_eq!(f.recover_account("Nadie", &code2, "clave-recuperada", &mut pool, d(9)), Err(KeyError::NotEncrypted));
+        // Nada ha cambiado con los intentos fallidos.
+        f.login("Ana", PW).unwrap();
+        assert_eq!(snap(&mut f), before);
+        f.logout();
+        let kf = f.fs.read("Sistema\\config\\llaves\\Ana").unwrap();
+        let snapshot_accounts = f.fs.read(rel(ACCOUNTS_FILE)).unwrap();
+        // Bien (minúsculas y espacios también valen).
+        f.recover_account("Ana", &code2.to_lowercase().replace('-', " "), "clave-recuperada", &mut pool, d(9)).unwrap();
+        assert!(f.user().is_none());
+        assert_ne!(f.fs.read("Sistema\\config\\llaves\\Ana").unwrap(), kf);
+        assert_ne!(f.fs.read(rel(ACCOUNTS_FILE)).unwrap(), snapshot_accounts);
+        assert_eq!(f.login("Ana", PW), Err(AccountError::WrongPassword));
+        f.login("Ana", "clave-recuperada").unwrap();
+        assert_eq!(snap(&mut f), before);
+        // El código sigue valiendo para repetirlo, y el de antes ya no.
+        f.logout();
+        assert_eq!(f.recover_account("Ana", &code, "otra-clave-mas", &mut pool, d(9)), Err(KeyError::WrongSecret));
+        f.recover_account("Ana", &code2, "otra-clave-mas", &mut pool, d(9)).unwrap();
+        let (_, mut g) = reboot(&disk);
+        g.login("Ana", "otra-clave-mas").unwrap();
+        assert_eq!(snap(&mut g), before);
+        // Una cuenta sin cifrar no tiene qué recuperar.
+        g.create_account("Luis", Some("luis-clave"), false, [6; 16], d(9)).unwrap();
+        g.logout();
+        assert_eq!(g.recover_account("Luis", &code2, "otra-clave-mas", &mut pool, d(9)), Err(KeyError::NotEncrypted));
+        // Y el log no lleva claves ni códigos.
+        let log = String::from_utf8(g.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
+        for s in [PW, "clave-recuperada", "otra-clave-mas"].into_iter().chain([code.as_str(), code2.as_str()]) {
+            assert!(!log.contains(s) && !log.contains(&s.replace('-', "")));
+        }
+    }
+
+    #[test]
+    fn rename_and_delete_of_an_encrypted_account() {
+        let (disk, mut f) = encrypted_ana(500);
+        f.create_account("Boss", None, true, [5; 16], d(9)).unwrap();
+        let before = snap(&mut f);
+        // Ana (administradora) se cambia el nombre: la llave sigue funcionando.
+        f.rename_account("Ana", "Ana2", d(9)).unwrap();
+        assert!(f.account_encrypted("Ana2") && !f.account_encrypted("Ana"));
+        assert_eq!(f.read(&format!("C:\\Usuarios\\Ana2\\Documentos\\{SECRET_NAME}")).unwrap(), secret_body(0));
+        f.logout();
+        f.login("Ana2", PW).unwrap();
+        let after: Vec<String> = snap_of(&mut f, "Ana2");
+        assert_eq!(after.len(), before.len());
+        let (_, mut g) = reboot(&disk);
+        g.login("Ana2", PW).unwrap();
+        assert_eq!(snap_of(&mut g, "Ana2").len(), before.len());
+        // Boss elimina la cuenta conservando la carpeta: queda ilegible; sin la carpeta, no queda nada.
+        g.logout();
+        g.login("Boss", "").unwrap();
+        g.delete_account("Ana2", true, d(10)).unwrap();
+        assert!(!g.account_encrypted("Ana2") && g.fs.stat("Usuarios\\Ana2").is_ok());
+        let names: Vec<String> = g.fs.list("Usuarios\\Ana2").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.iter().all(|n| n.starts_with("$e")), "{names:?}");
+        assert_eq!(g.create_account("Ana2", None, false, [1; 16], d(11)), Err(AccountError::Exists));
+        assert_eq!(raw_has(&disk, &NEEDLES), None);
+        // Cuenta cifrada con eliminación completa.
+        let (_, mut h) = encrypted_ana(500);
+        h.create_account("Boss", None, true, [5; 16], d(9)).unwrap();
+        h.logout();
+        h.login("Boss", "").unwrap();
+        h.delete_account("Ana", false, d(10)).unwrap();
+        assert!(h.fs.stat("Usuarios\\Ana").is_err() && !h.account_encrypted("Ana"));
+    }
+
+    fn snap_of(f: &mut Files, user: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![format!("Usuarios\\{user}")];
+        while let Some(p) = stack.pop() {
+            for e in f.r_list(&p).unwrap() {
+                let q = join_rel(&p, &e.name);
+                if e.dir {
+                    stack.push(q.clone());
+                }
+                out.push(q);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn errors_of_home_encryption() {
+        // Sin disco persistente o sin sesión.
+        let mut mem = Files::default();
+        assert_eq!(mem.encrypt_home(PW, &mut ready_pool(), d(1)), Err(KeyError::Unavailable));
+        assert!(!mem.home_encrypted() && !mem.account_encrypted("Usuario"));
+        assert_eq!(mem.decrypt_home(PW, d(1)), Err(KeyError::NotEncrypted));
+        assert_eq!(mem.new_home_recovery(PW, &mut ready_pool(), d(1)), Err(KeyError::NotEncrypted));
+        assert_eq!(mem.home_convert_step(5, d(1)), Ok(true));
+        assert_eq!(mem.home_conversion(), None);
+        let (_, mut f) = hdisk(400);
+        fill(&mut f);
+        f.create_account("Luis", None, false, [6; 16], d(1)).unwrap();
+        // Clave mala, sin clave, sin mover el ratón.
+        assert_eq!(f.encrypt_home("mala", &mut ready_pool(), d(2)), Err(KeyError::WrongSecret));
+        assert_eq!(f.encrypt_home("", &mut ready_pool(), d(2)), Err(KeyError::WrongSecret));
+        assert_eq!(f.encrypt_home(PW, &mut Pool::new(), d(2)), Err(KeyError::NotReady));
+        assert!(!f.account_encrypted("Ana"));
+        assert_eq!(f.decrypt_home(PW, d(2)), Err(KeyError::NotEncrypted));
+        f.logout();
+        assert_eq!(f.encrypt_home(PW, &mut ready_pool(), d(2)), Err(KeyError::Unavailable));
+        f.login("Luis", "").unwrap();
+        assert_eq!(f.encrypt_home("", &mut ready_pool(), d(2)), Err(KeyError::WrongSecret));
+        f.login("Ana", PW).unwrap();
+        // Un nombre que no cabría cifrado: se avisa antes de empezar y no se toca nada.
+        let long = format!("{H}\\Documentos\\{}", "a".repeat(143));
+        f.write(&long, b"x", d(2)).unwrap();
+        assert_eq!(f.encrypt_home(PW, &mut ready_pool(), d(2)), Err(KeyError::Fs(FsError::BadName)));
+        assert!(!f.account_encrypted("Ana"));
+        f.delete(&long).unwrap();
+        // En marcha: ocupado; terminado: ya cifrada.
+        f.encrypt_home(PW, &mut ready_pool(), d(3)).unwrap();
+        assert_eq!(f.encrypt_home(PW, &mut ready_pool(), d(3)), Err(KeyError::Busy));
+        assert_eq!(f.decrypt_home(PW, d(3)), Err(KeyError::Busy));
+        finish_home(&mut f, 50);
+        assert_eq!(f.encrypt_home(PW, &mut ready_pool(), d(3)), Err(KeyError::AlreadyEncrypted));
+        assert_eq!(f.decrypt_home("mala", d(3)), Err(KeyError::WrongSecret));
+        assert!(f.home_encrypted());
+        // Nombres: el más largo que cabe, sí; uno más, no; y tampoco el prefijo reservado.
+        let ok = format!("{H}\\Documentos\\{}", "b".repeat(142));
+        f.write(&ok, b"y", d(4)).unwrap();
+        assert_eq!(f.read(&ok).unwrap(), b"y");
+        for n in [143usize, 200] {
+            let bad = format!("{H}\\Documentos\\{}", "c".repeat(n));
+            assert_eq!(f.write(&bad, b"y", d(4)), Err(FsError::BadName));
+            assert_eq!(f.mkdir(&bad, d(4)), Err(FsError::BadName));
+            assert_eq!(f.rename(&ok, &bad), Err(FsError::BadName));
+        }
+        assert_eq!(f.write(&format!("{H}\\Documentos\\$ereservado.txt"), b"y", d(4)), Err(FsError::BadName));
+        assert!(f.exists(&ok));
+        // Descifrar a medias y cancelar no existe, pero sí sigue usable.
+        f.decrypt_home(PW, d(5)).unwrap();
+        assert_eq!(f.decrypt_home(PW, d(5)), Err(KeyError::Busy));
+        assert_eq!(f.write(&format!("{H}\\Documentos\\$ereservado.txt"), b"y", d(4)), Err(FsError::BadName));
+        finish_home(&mut f, 50);
+        assert!(!f.home_encrypted() && !f.account_encrypted("Ana"));
+    }
+
+    #[test]
+    fn move_and_copy_between_encrypted_home_and_outside_and_between_users() {
+        let (disk, mut f) = hdisk(700);
+        f.create_account("Luis", None, false, [6; 16], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Luis\\Documentos\\de-luis.txt", b"L", d(1)).unwrap();
+        fill(&mut f);
+        f.mkdir("C:\\Fuera", d(1)).unwrap();
+        f.encrypt_home(PW, &mut ready_pool(), d(7)).unwrap();
+        finish_home(&mut f, 50);
+        let p = format!("{H}\\Documentos\\{SECRET_NAME}");
+        let dir = format!("{H}\\Documentos\\carpeta-reservada-secreta");
+        // Sacar (descifra) conservando la fecha.
+        f.rename(&p, "C:\\Fuera\\sacado.txt").unwrap();
+        assert!(!f.exists(&p));
+        assert_eq!(f.read("C:\\Fuera\\sacado.txt").unwrap(), secret_body(0));
+        assert_eq!(f.stat("C:\\Fuera\\sacado.txt").unwrap().modified, d(2));
+        // Meter (cifra): en disco el archivo lleva firma y cabecera.
+        f.write("C:\\Fuera\\entra.txt", b"TEXTO-QUE-ENTRA", d(3)).unwrap();
+        f.rename("C:\\Fuera\\entra.txt", &format!("{H}\\Documentos\\entra.txt")).unwrap();
+        let rp = raw_of(&mut f, &format!("{H}\\Documentos\\entra.txt"));
+        let raw = f.fs.read(&rp).unwrap();
+        assert!(raw.starts_with(b"NFH1") && raw.len() == 15 + homecrypt::HEADER && !contains(&raw, "TEXTO-QUE-ENTRA"));
+        assert_eq!(f.stat(&format!("{H}\\Documentos\\entra.txt")).unwrap().modified, d(3));
+        // Copiar una carpeta entera hacia fuera y de vuelta.
+        f.copy(&dir, "C:\\Fuera\\copia", d(9)).unwrap();
+        assert_eq!(f.read("C:\\Fuera\\copia\\segundo.txt").unwrap(), secret_body(1));
+        assert!(f.exists("C:\\Fuera\\copia\\nombre-largo-subcarpeta"));
+        f.copy("C:\\Fuera\\copia", &format!("{H}\\Escritorio\\otra-copia"), d(9)).unwrap();
+        assert_eq!(f.read(&format!("{H}\\Escritorio\\otra-copia\\segundo.txt")).unwrap(), secret_body(1));
+        // Mover con transfer y deshacer.
+        f.transfer(&[format!("{H}\\Escritorio\\otra-copia")], "C:\\Fuera", true, d(10)).unwrap();
+        assert!(!f.exists(&format!("{H}\\Escritorio\\otra-copia")) && f.exists("C:\\Fuera\\otra-copia\\segundo.txt"));
+        f.undo(d(10)).unwrap();
+        assert_eq!(f.read(&format!("{H}\\Escritorio\\otra-copia\\segundo.txt")).unwrap(), secret_body(1));
+        // Destino ocupado.
+        assert_eq!(f.rename(&format!("{H}\\Documentos\\entra.txt"), "C:\\Fuera\\sacado.txt"), Err(FsError::Exists));
+        // Entre usuarios no se pasa nada, ni de una carpeta cifrada a la de otro ni al revés.
+        let luis = "C:\\Usuarios\\Luis\\Documentos";
+        assert_eq!(f.copy(&format!("{H}\\Documentos\\entra.txt"), &format!("{luis}\\x.txt"), d(11)), Err(FsError::Denied));
+        assert_eq!(f.rename(&format!("{H}\\Documentos\\entra.txt"), &format!("{luis}\\x.txt")), Err(FsError::Denied));
+        assert_eq!(f.copy(&format!("{luis}\\de-luis.txt"), &format!("{H}\\Documentos\\l.txt"), d(11)), Err(FsError::Denied));
+        assert_eq!(f.rename(&format!("{luis}\\de-luis.txt"), &format!("{H}\\Documentos\\l.txt")), Err(FsError::Denied));
+        assert!(f.transfer(&[format!("{luis}\\de-luis.txt")], &format!("{H}\\Documentos"), true, d(11)).is_err());
+        assert!(f.exists(&format!("{luis}\\de-luis.txt")) && !f.exists(&format!("{H}\\Documentos\\l.txt")));
+        // Al revés, sigue siendo cosa de cada cual: Luis no llega.
+        f.login("Luis", "").unwrap();
+        assert_eq!(f.copy(&format!("{luis}\\de-luis.txt"), &format!("{H}\\Documentos\\l.txt"), d(11)), Err(FsError::Denied));
+        let _ = disk;
+    }
+
+    #[test]
+    fn same_content_gives_different_ciphertext_and_names_are_stable() {
+        let (_, mut f) = encrypted_ana(400);
+        let (a, b) = (format!("{H}\\Documentos\\a.txt"), format!("{H}\\Documentos\\b.txt"));
+        f.write(&a, b"contenido repetido", d(2)).unwrap();
+        f.write(&b, b"contenido repetido", d(3)).unwrap();
+        let (ra, rb) = (raw_of(&mut f, &a), raw_of(&mut f, &b));
+        let (ca, cb) = (f.fs.read(&ra).unwrap(), f.fs.read(&rb).unwrap());
+        assert_ne!(ca[4..], cb[4..]);
+        assert_ne!(ca[homecrypt::HEADER..], cb[homecrypt::HEADER..]);
+        // Reescribir lo mismo, aunque sea en el mismo instante, cambia el cifrado.
+        f.write(&a, b"contenido repetido", d(2)).unwrap();
+        assert_ne!(f.fs.read(&ra).unwrap(), ca);
+        assert_eq!(f.read(&a).unwrap(), b"contenido repetido");
+        // El nombre en disco no depende del momento: mismo nombre, mismo nombre cifrado.
+        let r1 = raw_of(&mut f, &format!("{H}\\Documentos\\{SECRET_NAME}"));
+        f.logout();
+        f.login("Ana", PW).unwrap();
+        assert_eq!(raw_of(&mut f, &format!("{H}\\Documentos\\{SECRET_NAME}")), r1);
+        // Cada archivo nuevo tiene sal distinta, así que contenidos vacíos también.
+        f.write(&format!("{H}\\Documentos\\v1"), b"", d(2)).unwrap();
+        f.write(&format!("{H}\\Documentos\\v2"), b"", d(2)).unwrap();
+        let (v1, v2) = (raw_of(&mut f, &format!("{H}\\Documentos\\v1")), raw_of(&mut f, &format!("{H}\\Documentos\\v2")));
+        assert_ne!(f.fs.read(&v1).unwrap(), f.fs.read(&v2).unwrap());
+    }
+
+    #[test]
+    fn works_together_with_whole_disk_encryption() {
+        let key = "clave-del-disco";
+        let (disk, mut f) = hdisk(400);
+        fill(&mut f);
+        let before = snap(&mut f);
+        // Carpeta cifrada primero y luego el disco entero.
+        f.encrypt_home(PW, &mut ready_pool(), d(7)).unwrap();
+        finish_home(&mut f, 50);
+        f.encrypt_disk(key, &mut ready_pool(), d(8)).unwrap();
+        // Con las dos conversiones en marcha a la vez se puede seguir usando todo.
+        assert!(!f.convert_step(100, d(9)).unwrap());
+        f.write(&format!("{H}\\Documentos\\mientras.txt"), b"mientras convierte", d(9)).unwrap();
+        finish_conversion(&mut f, 60);
+        assert_eq!(f.read(&format!("{H}\\Documentos\\mientras.txt")).unwrap(), b"mientras convierte");
+        f.delete(&format!("{H}\\Documentos\\mientras.txt")).unwrap();
+        assert_eq!(snap(&mut f), before);
+        let (after, mut g) = reboot(&disk);
+        assert!(g.disk_locked());
+        g.unlock_disk(key, false, d(10)).unwrap();
+        g.login("Ana", PW).unwrap();
+        assert_eq!(snap(&mut g), before);
+        // Quitar el cifrado del disco deja la carpeta como estaba: cifrada.
+        g.decrypt_disk(key, d(11)).unwrap();
+        finish_conversion(&mut g, 60);
+        assert!(!g.disk_encrypted() && g.home_encrypted());
+        assert_eq!(snap(&mut g), before);
+        assert_eq!(raw_has(&after, &NEEDLES), None);
+        let (_, mut h) = reboot(&after);
+        assert!(!h.disk_locked());
+        h.login("Ana", PW).unwrap();
+        assert_eq!(snap(&mut h), before);
+        // Y al revés: disco cifrado y después la carpeta, con la limpieza pasando por la capa de cifrado.
+        let (disk2, mut f2) = hdisk(400);
+        fill(&mut f2);
+        f2.encrypt_disk(key, &mut ready_pool(), d(8)).unwrap();
+        finish_conversion(&mut f2, 60);
+        f2.encrypt_home(PW, &mut ready_pool(), d(9)).unwrap();
+        finish_home(&mut f2, 50);
+        assert_eq!(snap(&mut f2), before);
+        f2.decrypt_disk(key, d(11)).unwrap();
+        finish_conversion(&mut f2, 60);
+        assert_eq!(raw_has(&disk2, &NEEDLES), None);
+        assert_eq!(snap(&mut f2), before);
+    }
 }
