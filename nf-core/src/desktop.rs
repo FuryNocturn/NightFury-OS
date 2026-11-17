@@ -3405,6 +3405,17 @@ mod tests {
     }
 
     #[test]
+    fn icono_propio_sustituye_al_del_sistema() {
+        let mut s = Surface::new(8, 8, 0x000000);
+        let pic = Picture { w: 1, h: 1, argb: vec![0xFF12_3456] };
+        paint_icon(&mut s, Icon::Logo, Some(&pic), 0, 0, 4, 0xFFFFFF);
+        assert!(s.px[..4].iter().all(|&p| p == 0x123456), "el BMP llena el cuadrado");
+        assert_eq!(s.px[4], 0, "y no se sale");
+        paint_icon(&mut s, Icon::Logo, None, 4, 4, 4, 0xFFFFFF);
+        assert!(s.px.iter().any(|&p| p != 0 && p != 0x123456), "sin BMP, el del sistema");
+    }
+
+    #[test]
     fn settings_is_single_instance() {
         let (mut d, mut sys) = setup(1280, 800);
         for _ in 0..2 {

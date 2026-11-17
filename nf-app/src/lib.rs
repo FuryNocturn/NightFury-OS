@@ -22,7 +22,7 @@ pub mod bucle;
 #[cfg(target_os = "none")]
 pub mod rt;
 
-pub use bucle::{ejecutar, Llamadas};
+pub use bucle::{ejecutar, guardar_como, Llamadas, TAG_GUARDADO};
 
 /// Declara el programa: `programa!(<expresión que crea el Box<dyn App>>, <tick en ms o None>)`.
 /// Crea el punto de entrada `_start`: el núcleo lo arranca con `rsp` alineada a 16, y el ABI de

@@ -149,6 +149,9 @@ impl Llamadas for Nucleo {
     fn log(&mut self, t: &str) {
         log(t);
     }
+    fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64 {
+        syscall(SYS_SAVE_AS, datos.as_ptr() as u64, datos.len() as u64, nombre.as_ptr() as u64, nombre.len() as u64, 0)
+    }
 }
 
 /// Lo llama `programa!` desde `_start`: ejecuta la app y termina con su código.
