@@ -43,6 +43,8 @@ pub const TRASH: &str = "Papelera";
 // ---- Estructura del disco (v0.5.0). Ningún otro módulo escribe estas rutas a mano. ----
 pub const USERS_DIR: &str = "C:\\Usuarios";
 pub const SYSTEM_DIR: &str = "C:\\Sistema";
+/// Programas instalados (F3, v0.8): uno por carpeta. Solo los administradores escriben aquí.
+pub const PROGRAMS_DIR: &str = "C:\\Programas";
 pub const SYS_CONFIG_DIR: &str = "C:\\Sistema\\config";
 pub const SYS_TEMP_DIR: &str = "C:\\Sistema\\temp";
 pub const SYS_LIB_DIR: &str = "C:\\Sistema\\lib";
@@ -83,6 +85,7 @@ impl Std {
 
 const USERS: &str = "Usuarios";
 const SYSTEM: &str = "Sistema";
+const PROGRAMS: &str = "Programas";
 const SYS_SUBS: [&str; 5] = ["config", "temp", "lib", "drivers", "logs"];
 const HOME_CONFIG: &str = ".config";
 const HOME_TRASH: &str = ".papelera";
@@ -269,7 +272,7 @@ fn protected(rel: &str) -> bool {
     if same(top, USERS) {
         return c.len() <= 2 || (c.len() == 3 && is_home_sub(c[2]));
     }
-    same(top, SYSTEM) && (c.len() == 1 || (c.len() == 2 && SYS_SUBS.iter().any(|s| same(s, c[1]))))
+    (same(top, PROGRAMS) && c.len() == 1) || same(top, SYSTEM) && (c.len() == 1 || (c.len() == 2 && SYS_SUBS.iter().any(|s| same(s, c[1]))))
 }
 
 fn mk(fs: &mut Nffs, path: &str, now: DateTime) {
@@ -282,6 +285,7 @@ fn mk(fs: &mut Nffs, path: &str, now: DateTime) {
 fn ensure_structure(fs: &mut Nffs, now: DateTime) {
     mk(fs, USERS, now);
     mk(fs, SYSTEM, now);
+    mk(fs, PROGRAMS, now);
     for s in SYS_SUBS {
         mk(fs, &join_rel(SYSTEM, s), now);
     }
@@ -1312,6 +1316,30 @@ impl Files {
     pub fn explorer_prefs(&self) -> String {
         join(&join(&self.home(), HOME_CONFIG), "explorador.txt")
     }
+
+    /// Instala o actualiza un programa del sistema en `C:\Programas\<folder>` (lo llama el núcleo
+    /// al tener el disco listo, sin sesión; no pasa por los permisos). Solo escribe los archivos
+    /// que cambian. Devuelve `true` si escribió algo.
+    pub fn install_system_program(&mut self, folder: &str, items: &[(&str, &[u8])], now: DateTime) -> Result<bool, FsError> {
+        if folder.is_empty() || folder.contains(['\\', '/', ':']) || folder.starts_with('.') {
+            return Err(FsError::Invalid);
+        }
+        mk(&mut self.fs, PROGRAMS, now);
+        let dir = join_rel(PROGRAMS, folder);
+        mk(&mut self.fs, &dir, now);
+        let mut changed = false;
+        for (name, data) in items {
+            let p = join_rel(&dir, name);
+            if self.fs.read(&p).ok().as_deref() != Some(*data) {
+                self.fs.write(&p, data, now)?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.log(&format!("Programa del sistema instalado: {folder}"), now);
+        }
+        Ok(changed)
+    }
 }
 
 // ---- Permisos, registro, arranque y migración (internos salvo `log`) ----
@@ -1330,6 +1358,8 @@ impl Files {
             // Las llaves de las carpetas cifradas solo las toca el sistema, ni siquiera un administrador.
             let keys_dir = c.len() >= 3 && same(c[1], "config") && same(c[2], "llaves");
             keys_dir || (!admin && (write || accounts_file))
+        } else if same(top, PROGRAMS) {
+            write && !admin
         } else {
             write && self.user.is_none()
         };
@@ -2985,7 +3015,7 @@ mod tests {
         assert!(!f.persistent());
         assert!(!f.pending_format());
         assert!(f.notice().is_some());
-        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Programas", "Sistema", "Usuarios"]);
         for s in Std::ALL {
             assert!(f.stat(&f.std_dir(s)).unwrap().dir);
         }
@@ -3178,7 +3208,7 @@ mod tests {
         // desaparecen del sitio y de la raíz no aparece el almacén
         assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\nota.txt"));
         assert!(!f.exists("C:\\Usuarios\\Usuario\\Documentos\\carp"));
-        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Programas", "Sistema", "Usuarios"]);
         let items = f.trash_list().unwrap();
         assert_eq!(items.len(), 2);
         // lo más reciente primero
@@ -3264,7 +3294,7 @@ mod tests {
         let mut f = Files::probe(None, d(1));
         assert!(!f.persistent() && !f.pending_format());
         assert!(f.notice().is_some());
-        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Programas", "Sistema", "Usuarios"]);
         assert_eq!(f.format_pending(d(1)), Err(FsError::Invalid));
     }
 
@@ -3281,7 +3311,7 @@ mod tests {
         assert_eq!(f.notice(), None);
         assert_eq!(f.read("C:\\Mio\\x.txt").unwrap(), b"x");
         // asegura las carpetas iniciales
-        assert_eq!(names(&mut f, "C:\\"), ["Mio", "Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Mio", "Programas", "Sistema", "Usuarios"]);
         enter(&mut f, DEFAULT_USER);
         f.write("C:\\Usuarios\\Usuario\\Documentos\\n.txt", b"dato", d(3)).unwrap();
         drop(f);
@@ -3515,7 +3545,7 @@ mod tests {
     #[test]
     fn estructura_inicial_en_memoria_y_en_disco() {
         let mut m = Files::default();
-        assert_eq!(names(&mut m, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut m, "C:\\"), ["Programas", "Sistema", "Usuarios"]);
         assert_eq!(names(&mut m, "C:\\Sistema"), ["config", "drivers", "lib", "logs", "temp"]);
         assert_eq!(names(&mut m, "C:\\Usuarios"), [DEFAULT_USER]);
         assert_eq!(m.home(), "C:\\Usuarios\\Usuario");
@@ -3532,7 +3562,7 @@ mod tests {
         let disk = Disk::new(1024);
         drop(Nffs::format(Box::new(disk.clone()), d(1)).unwrap());
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(2));
-        assert_eq!(names(&mut f, "C:\\"), ["Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Programas", "Sistema", "Usuarios"]);
         assert_eq!(f.home(), "C:\\Usuarios");
         assert!(f.user().is_none() && f.needs_setup());
         assert_eq!(f.write("C:\\x.txt", b"1", d(2)), Err(FsError::Denied), "sin sesión no se escribe");
@@ -3633,10 +3663,19 @@ mod tests {
         assert_eq!(f.mkdir("C:\\Sistema\\nueva", d(3)), Err(FsError::Denied));
         assert_eq!(f.rename("C:\\Sistema\\temp\\t.txt", "C:\\Usuarios\\Luis\\t.txt"), Err(FsError::Denied));
         assert_eq!(f.read(ACCOUNTS_FILE), Err(FsError::Denied));
+        // Programas: un usuario normal los ve pero no instala ni cambia nada.
+        f.install_system_program("Calc", &[("app.txt", b"nombre=Calc\n")], d(3)).unwrap();
+        assert!(f.read("C:\\Programas\\Calc\\app.txt").is_ok());
+        assert_eq!(f.write("C:\\Programas\\Calc\\programa.nfx", b"x", d(3)), Err(FsError::Denied));
+        assert_eq!(f.mkdir("C:\\Programas\\Malo", d(3)), Err(FsError::Denied));
+        assert_eq!(f.delete("C:\\Programas\\Calc\\app.txt"), Err(FsError::Denied));
+        assert!(f.user_trash("C:\\Programas", d(3)).is_err());
         // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
         f.login("Ana", "").unwrap();
         assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Denied));
         assert!(f.read(ACCOUNTS_FILE).is_ok());
+        f.mkdir("C:\\Programas\\Nuevo", d(3)).unwrap();
+        assert!(f.user_trash("C:\\Programas", d(3)).is_err(), "la carpeta Programas no se borra");
     }
 
     #[test]
@@ -3684,7 +3723,7 @@ mod tests {
         assert!(f.exists_raw("Documentos\\a.txt") && f.exists_raw("$Papelera\\indice"));
         assert!(f.exists_raw("Sistema\\config\\antiguo\\config.txt") && !f.exists_raw("Sistema\\config.txt"));
         assert!(f.exists_raw("Sistema\\config\\migracion"));
-        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Sistema", "Usuarios"]);
+        assert_eq!(names(&mut f, "C:\\"), ["Documentos", "Escritorio", "Imágenes", "Programas", "Sistema", "Usuarios"]);
         // Reiniciar sin cuenta no cambia nada (idempotente).
         drop(f);
         let mut f = Files::probe(Some(Box::new(disk.clone())), d(6));

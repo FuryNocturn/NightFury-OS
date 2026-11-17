@@ -6,6 +6,7 @@ use crate::files::{file_name, in_system, join, parent, resolve, valid_name};
 use crate::fs::FsError;
 use crate::input::{Key, KeyEvent};
 use crate::platform::Platform;
+use crate::programs;
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -25,11 +26,13 @@ const FG: u32 = 0xCCCCCC;
 const CONFIRM: &str = "Vas a modificar una carpeta del sistema. Escribe si para continuar:";
 
 /// Efecto de una orden sobre la ventana.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Action {
     Nothing,
     Clear,
     Close,
+    /// Abrir esta ruta (un programa `.nfx`) con el escritorio.
+    Open(String),
 }
 
 fn prompt(cwd: &str) -> String {
@@ -286,6 +289,9 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
             "  escribir archivo texto: Crea o reemplaza un archivo con ese texto",
             "  disco: Tamaño, espacio libre y tipo del disco C:",
             "  quien: Muestra el usuario de la sesión y si es administrador",
+            "Programas:",
+            "  programas: Lista los programas instalados",
+            "  ejecutar nombre|ruta.nfx: Abre un programa",
             "Modificar algo dentro de C:\\Sistema pide confirmación: escribe si para continuar.",
         ]
         .iter()
@@ -333,6 +339,26 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
         "salir" => {
             act = Action::Close;
             Vec::new()
+        }
+        "programas" => {
+            let v: Vec<String> = programs::installed(sys).iter().map(|p| format!("  {}  {}", p.name, p.version)).collect();
+            if v.is_empty() {
+                one(String::from("No hay programas instalados"))
+            } else {
+                v
+            }
+        }
+        "ejecutar" if args.is_empty() => one(String::from("Uso: ejecutar nombre|ruta.nfx")),
+        "ejecutar" => {
+            let name = tokens(args).into_iter().next().unwrap_or_default();
+            let by_name = programs::installed(sys).into_iter().find(|p| p.name.eq_ignore_ascii_case(&name)).map(|p| p.binary());
+            match by_name.or_else(|| resolve(cwd, &name).ok().filter(|p| p.to_lowercase().ends_with(".nfx"))) {
+                Some(p) if sys.files().stat(&p).is_ok_and(|e| !e.dir) => {
+                    act = Action::Open(p);
+                    Vec::new()
+                }
+                _ => one(format!("No hay ningún programa llamado '{name}'")),
+            }
         }
         _ => match archivos(&lc, args, sys, cwd) {
             Some(v) => v,
@@ -548,8 +574,10 @@ impl App for Terminal {
             Key::PageDown => self.scroll = self.scroll.saturating_sub(self.vis.saturating_sub(1).max(1)),
             Key::Enter => {
                 self.scroll = 0;
-                if self.submit(&mut *cx.sys) == Action::Close {
-                    cx.close = true;
+                match self.submit(&mut *cx.sys) {
+                    Action::Close => cx.close = true,
+                    Action::Open(p) => cx.open = Some(p),
+                    _ => {}
                 }
             }
             Key::Backspace => {
@@ -988,6 +1016,19 @@ mod tests {
         assert_eq!(m[1], "Memoria del sistema, total: 256,0 MB");
         assert_eq!(m[2], "Memoria del sistema, usada: 20,0 MB");
         assert_eq!(m[3], "Memoria del sistema, libre: 236,0 MB");
+    }
+
+    #[test]
+    fn programas_y_ejecutar() {
+        let mut sys = TestPlatform::default();
+        let n = crate::platform::DateTime::default();
+        sys.files.install_system_program("Calculadora", &[("app.txt", b"nombre=Calculadora\nversion=1.0\n"), ("programa.nfx", b"NFX1")], n).unwrap();
+        let mut cwd = String::from("C:\\");
+        assert_eq!(run("programas", &mut sys, &mut cwd).0, ["  Calculadora  1.0"]);
+        assert_eq!(run("ejecutar calculadora", &mut sys, &mut cwd).1, Action::Open(String::from("C:\\Programas\\Calculadora\\programa.nfx")));
+        assert_eq!(run("ejecutar Programas\\Calculadora\\programa.nfx", &mut sys, &mut cwd).1, Action::Open(String::from("C:\\Programas\\Calculadora\\programa.nfx")));
+        assert_eq!(run("ejecutar nada", &mut sys, &mut cwd).1, Action::Nothing);
+        assert_eq!(run("ejecutar Programas\\Calculadora\\app.txt", &mut sys, &mut cwd).1, Action::Nothing);
     }
 
     #[test]

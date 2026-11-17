@@ -15,6 +15,7 @@ use crate::keys::KeyError;
 use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::platform::{DateTime, Platform};
+use crate::programs::{self, Program};
 use crate::surface::{blend, lighten, Surface};
 use crate::theme::{self, Theme, WALLPAPERS};
 use alloc::boxed::Box;
@@ -226,6 +227,29 @@ impl App for NoApp {
 enum Act {
     App(AppKind),
     Path(String),
+    /// Programa de `C:\Programas` (v0.8).
+    Program(Program),
+}
+
+/// Lo que se puede abrir desde el menú Inicio y el escritorio: apps del sistema y programas.
+struct Launcher {
+    name: String,
+    icon: Icon,
+    act: Act,
+}
+
+/// Apps del sistema y programas instalados, por nombre. Una app del sistema que ya existe como
+/// programa con el mismo nombre (la Calculadora en la v0.8) no se repite.
+fn launchers(sys: &mut dyn Platform) -> Vec<Launcher> {
+    let progs = programs::installed(sys);
+    let mut v: Vec<Launcher> = APPS
+        .iter()
+        .filter(|(_, n, _)| !progs.iter().any(|p| p.name.eq_ignore_ascii_case(n)))
+        .map(|(k, n, i)| Launcher { name: String::from(*n), icon: *i, act: Act::App(*k) })
+        .collect();
+    v.extend(progs.into_iter().map(|p| Launcher { name: p.name.clone(), icon: p.icon, act: Act::Program(p) }));
+    v.sort_by_key(|l| l.name.to_lowercase());
+    v
 }
 
 struct DIcon {
@@ -369,6 +393,10 @@ pub struct Desktop {
     wins: Vec<Window>,
     launched: u32,
     start_open: bool,
+    /// Lo que enseña el menú Inicio (se rehace al abrirlo).
+    start_items: Vec<Launcher>,
+    /// Tamaño del contenido de la próxima ventana que se abra (programas, según su `app.txt`).
+    next_size: Option<(i32, i32)>,
     shut_open: bool,
     /// Iconos seleccionados (índices, ordenados) y el ancla del Mayús+clic.
     sel: Vec<usize>,
@@ -634,7 +662,7 @@ fn ext(name: &str) -> String {
 
 /// Apps, Papelera y el contenido de la carpeta Escritorio del usuario (carpetas antes que archivos, según `order`).
 fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIcon> {
-    let mut v: Vec<DIcon> = APPS.iter().map(|(k, n, i)| DIcon { name: String::from(*n), label: String::from(*n), icon: *i, act: Act::App(*k) }).collect();
+    let mut v: Vec<DIcon> = launchers(sys).into_iter().map(|l| DIcon { label: l.name.clone(), name: l.name, icon: l.icon, act: l.act }).collect();
     v.push(DIcon { name: String::from("Papelera"), label: String::from("Papelera"), icon: Icon::Trash, act: Act::Path(String::from(files::TRASH)) });
     let dir = sys.files().std_dir(Std::Desktop);
     let mut list = sys.files().list(&dir).unwrap_or_default();
@@ -678,6 +706,8 @@ impl Desktop {
             wins: Vec::new(),
             launched: 0,
             start_open: false,
+            start_items: Vec::new(),
+            next_size: None,
             shut_open: false,
             sel: Vec::new(),
             anchor: 0,
@@ -1634,6 +1664,51 @@ impl Desktop {
         self.launch_id(kind, sys);
     }
 
+    fn toggle_start(&mut self, sys: &mut dyn Platform) {
+        if !self.start_open {
+            self.start_items = launchers(sys);
+            // shortcut: el menú no se desplaza; caben 8 mosaicos. Con más programas, lista con barra.
+            self.start_items.truncate(8);
+        }
+        self.set_start(!self.start_open);
+    }
+
+    /// Abre el elemento `i` del menú Inicio.
+    fn start_item(&mut self, i: usize, sys: &mut dyn Platform) {
+        match self.start_items.get(i).map(|l| &l.act) {
+            Some(Act::App(k)) => {
+                let k = *k;
+                self.launch(k, sys);
+            }
+            Some(Act::Program(p)) => {
+                let p = p.clone();
+                self.launch_program(&p, &p.binary(), sys);
+            }
+            Some(Act::Path(p)) => {
+                let p = p.clone();
+                self.set_start(false);
+                self.open_path(&p, sys);
+            }
+            None => {}
+        }
+    }
+
+    /// Arranca el programa `p` desde su `.nfx` (`path`). Si no se puede, lo dice en un mensaje.
+    pub fn launch_program(&mut self, p: &Program, path: &str, sys: &mut dyn Platform) {
+        self.set_start(false);
+        self.set_shut(false);
+        match programs::open(sys, p, path) {
+            Ok(app) => {
+                self.next_size = Some(p.size);
+                self.push_window(AppKind::Program, Box::new(app), None);
+            }
+            Err(e) => {
+                let text = format!("No se puede abrir «{}».\n{e}", p.name);
+                self.open_dialog(None, DialogRequest::Message { tag: TAG_INFO, title: p.name.clone(), text, buttons: Buttons::Ok }, sys);
+            }
+        }
+    }
+
     /// Para pruebas: abre una app propia (por ejemplo, una que pide diálogos).
     pub fn launch_app(&mut self, app: Box<dyn App>, _sys: &mut dyn Platform) {
         self.push_window(app.kind(), app, None);
@@ -1666,7 +1741,7 @@ impl Desktop {
     fn push_window(&mut self, kind: AppKind, app: Box<dyn App>, dlg: Option<Dialog>) -> u32 {
         let (dw, dh) = match &dlg {
             Some(d) => d.size(),
-            None => apps::default_size(kind),
+            None => self.next_size.take().unwrap_or(apps::default_size(kind)),
         };
         let cw = dw.min(self.w - 2).max(1);
         let ch = dh.min(self.h - BAR_H - TITLE_H - 2).max(1);
@@ -1861,7 +1936,9 @@ impl Desktop {
 
     /// Abre una ruta: carpeta (o Papelera) en el Explorador, archivo en un Bloc de notas nuevo.
     fn open_path(&mut self, path: &str, sys: &mut dyn Platform) {
-        if path == files::TRASH || sys.files().stat(path).is_ok_and(|e| e.dir) {
+        if let Some(p) = programs::for_binary(sys, path) {
+            self.launch_program(&p, path, sys);
+        } else if path == files::TRASH || sys.files().stat(path).is_ok_and(|e| e.dir) {
             let id = match self.wins.iter().rev().find(|w| w.kind == AppKind::Files && w.dlg.is_none()) {
                 Some(w) => w.id,
                 None => self.launch_id(AppKind::Files, sys),
@@ -2289,6 +2366,10 @@ impl Desktop {
                 self.set_start(false);
                 self.open_path(&p, sys);
             }
+            Some(Act::Program(p)) => {
+                let p = p.clone();
+                self.launch_program(&p, &p.binary(), sys);
+            }
             None => {}
         }
     }
@@ -2311,7 +2392,7 @@ impl Desktop {
             if self.mpower_rect().contains(x, y) {
                 return Hit::MPower;
             }
-            for i in 0..APPS.len() {
+            for i in 0..self.start_items.len() {
                 if self.row_rect(i).contains(x, y) {
                     return Hit::Row(i);
                 }
@@ -2449,8 +2530,8 @@ impl Desktop {
             }
             Hit::MPower => self.set_shut(!shut_was),
             Hit::MSettings => self.launch(AppKind::Settings, sys),
-            Hit::Row(i) | Hit::Tile(i) => self.launch(APPS[i].0, sys),
-            Hit::Start => self.set_start(!self.start_open),
+            Hit::Row(i) | Hit::Tile(i) => self.start_item(i, sys),
+            Hit::Start => self.toggle_start(sys),
             Hit::Task(id) => {
                 if self.active_id() == Some(id) {
                     self.minimize(id);
@@ -2902,7 +2983,7 @@ impl Desktop {
             return;
         }
         if k.key == Key::Super {
-            self.set_start(!self.start_open);
+            self.toggle_start(sys);
         } else if k.key == Key::Escape && (self.start_open || self.shut_open) {
             if self.shut_open {
                 self.set_shut(false);
@@ -3061,7 +3142,7 @@ impl Desktop {
         let tb = w.title_rect();
         s.fill_rect(tb, 0xFFFFFF);
         let ink = if active { 0x000000 } else { 0x8C8C8C };
-        let icon = APPS.iter().find(|a| a.0 == w.kind).map(|a| a.2);
+        let icon = w.app.icon().or_else(|| APPS.iter().find(|a| a.0 == w.kind).map(|a| a.2));
         if let Some(icon) = icon {
             icons::draw(s, icon, tb.x + 8, tb.y + 7, 16, 0x444444);
         }
@@ -3131,7 +3212,7 @@ impl Desktop {
             } else if self.hot == Hit::Task(id) {
                 s.fill_rect(r, HOVER_BAR);
             }
-            if let Some(icon) = APPS.iter().find(|a| a.0 == self.wins[wi].kind).map(|a| a.2) {
+            if let Some(icon) = self.wins[wi].app.icon().or_else(|| APPS.iter().find(|a| a.0 == self.wins[wi].kind).map(|a| a.2)) {
                 icons::draw(s, icon, r.x + 12, r.y + 8, 24, 0xFFFFFF);
             }
             let line = if is_active { Rect::new(r.x, r.bottom() - 2, 48, 2) } else { Rect::new(r.x + 14, r.bottom() - 2, 20, 2) };
@@ -3167,7 +3248,7 @@ impl Desktop {
             }
             icons::draw(s, icon, r.x + 12, r.y + 12, 24, 0xFFFFFF);
         }
-        for (i, (_, name, icon)) in APPS.iter().enumerate() {
+        for (i, Launcher { name, icon, .. }) in self.start_items.iter().enumerate() {
             let r = self.row_rect(i);
             if self.hot == Hit::Row(i) {
                 s.fill_rect(r, ACTIVE_BTN);
@@ -3176,7 +3257,7 @@ impl Desktop {
             text_in(s, Rect::new(r.x + 50, r.y, r.w - 50, r.h), name, 9, 0xFFFFFF, Align::Left);
         }
         text_in(s, Rect::new(m.x + 300, m.y + 10, 200, 24), "Aplicaciones", 8, 0xB5B5B5, Align::Left);
-        for (i, (_, name, icon)) in APPS.iter().enumerate() {
+        for (i, Launcher { name, icon, .. }) in self.start_items.iter().enumerate() {
             let r = self.tile_rect(i);
             let bg = if self.hot == Hit::Tile(i) { lighten(self.theme.accent, 45) } else { self.theme.accent };
             s.fill_rect(r, bg);
@@ -3718,6 +3799,27 @@ mod modal_tests {
         let mut d = Desktop::new(1280, 800, &mut sys);
         d.booted = true;
         (d, sys)
+    }
+
+    #[test]
+    fn programas_en_inicio_y_al_abrir() {
+        let (mut d, mut sys) = setup();
+        let n = sys.now();
+        sys.files.install_system_program("Calculadora", &[("app.txt", b"nombre=Calculadora\nicono=calc\n"), ("programa.nfx", b"NFX1")], n).unwrap();
+        sys.files.install_system_program("Plantilla", &[("app.txt", b"nombre=Plantilla\n"), ("programa.nfx", b"NFX1")], n).unwrap();
+        let names: Vec<String> = launchers(&mut sys).into_iter().map(|l| l.name).collect();
+        assert_eq!(names, ["Bloc de notas", "Calculadora", "Configuración", "Explorador de archivos", "Plantilla", "Terminal"]);
+        assert!(matches!(launchers(&mut sys)[1].act, Act::Program(_)), "la Calculadora es ya el programa");
+        // Abrirlo: la plataforma de pruebas no ejecuta programas, así que sale un mensaje.
+        d.toggle_start(&mut sys);
+        assert_eq!(d.start_items.len(), 6);
+        d.start_item(1, &mut sys);
+        assert!(!d.start_open);
+        assert_eq!(d.dialog_count(), 1);
+        // Un .nfx abierto desde el Explorador o la Terminal pasa por el mismo camino.
+        d.open_path("C:\\Programas\\Plantilla\\programa.nfx", &mut sys);
+        assert_eq!(d.dialog_count(), 2);
+        assert!(d.wins.iter().all(|w| w.kind != AppKind::Notepad), "no se abre como texto");
     }
 
     fn msg(tag: u32, buttons: Buttons) -> DialogRequest {

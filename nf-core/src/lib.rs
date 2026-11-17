@@ -28,6 +28,7 @@ pub mod menu;
 pub mod nfx;
 pub mod platform;
 pub mod proc;
+pub mod programs;
 pub mod ribbon;
 pub mod scrollbar;
 pub mod surface;
