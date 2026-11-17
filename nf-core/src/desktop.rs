@@ -6615,6 +6615,49 @@ mod dnd_tests {
     }
 
     #[test]
+    fn arrastre_derecho_entre_dos_exploradores_reales() {
+        let (mut d, mut sys) = setup();
+        let (dd, dk) = (sp(&sys.files, Std::Documents, ""), sp(&sys.files, Std::Desktop, ""));
+        d.open_new_explorer(&dd, &mut sys);
+        d.open_new_explorer(&dk, &mut sys);
+        let (a, b) = (d.wins[0].id, d.wins[1].id);
+        d.set_rect(0, Rect::new(10, 10, 600, 500));
+        d.set_rect(1, Rect::new(650, 10, 600, 500));
+        d.render(&mut sys);
+        let docs_n = |sys: &mut TestPlatform| ["f.txt", "g.txt"].iter().filter(|n| sys.files.exists(&docs(sys, n))).count();
+        // Busca un archivo de la lista de A: ahí el derecho arrastra.
+        let mut found = false;
+        for y in (60..260).step_by(6) {
+            let p = at(&d, a, 300, y);
+            rdown(&mut d, &mut sys, p);
+            mv(&mut d, &mut sys, (p.0 + 8, p.1));
+            if d.dnd.is_some() {
+                found = true;
+                break;
+            }
+            d.right_button(false, &mut sys);
+            d.close_menu();
+        }
+        assert!(found, "el Explorador debe ofrecer un archivo");
+        assert!(d.dnd.as_ref().unwrap().right);
+        let drop = at(&d, b, 300, 380);
+        mv(&mut d, &mut sys, drop);
+        d.right_button(false, &mut sys);
+        assert!(d.menu.as_ref().unwrap().tag == MENU_DROP);
+        assert_eq!(docs_n(&mut sys), 2, "nada se ha movido aún");
+        pick(&mut d, &mut sys, 0);
+        assert_eq!(docs_n(&mut sys), 1, "mover");
+        // Deshacer con Ctrl+Z (la ventana B tiene el foco y el Explorador lo atiende).
+        key(&mut d, &mut sys, Key::Char('z'), Some('z'), true);
+        assert_eq!(docs_n(&mut sys), 2);
+        // Soltar el derecho sin arrastrar sobre zona vacía de A: menú del Explorador (no el de soltar).
+        let q = at(&d, a, 300, 420);
+        rdown(&mut d, &mut sys, q);
+        d.right_button(false, &mut sys);
+        assert!(d.menu.as_ref().is_some_and(|m| m.owner == Some(a)));
+    }
+
+    #[test]
     fn capturas_del_arrastre() {
         let Ok(dir) = std::env::var("NF_CAPTURAS") else { return };
         let save = |d: &mut Desktop, sys: &mut TestPlatform, n: &str| {
