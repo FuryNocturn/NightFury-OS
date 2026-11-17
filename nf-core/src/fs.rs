@@ -434,9 +434,18 @@ impl Nffs {
         }
     }
 
-    /// Crea un NFFS vacío en `dev` y lo monta.
+    /// Crea un NFFS vacío en `dev` y lo monta (usa todos los bloques del dispositivo).
     pub fn format(dev: Box<dyn BlockDev>, now: DateTime) -> Result<Nffs, FsError> {
         let total = dev.blocks();
+        Nffs::format_with(dev, total, now)
+    }
+
+    /// Crea un NFFS vacío de `total` bloques (como mucho los del dispositivo) y lo monta. Los
+    /// discos nuevos se formatean con `blocks() - 2` para dejar sitio a la cabecera del cifrado total.
+    pub fn format_with(dev: Box<dyn BlockDev>, total: u64, now: DateTime) -> Result<Nffs, FsError> {
+        if total > dev.blocks() {
+            return Err(FsError::Invalid);
+        }
         if total < MIN_BLOCKS {
             return Err(FsError::NoSpace);
         }
@@ -890,6 +899,57 @@ impl Nffs {
             return Err(FsError::Corrupt);
         }
         Ok(())
+    }
+
+    /// Bloques del volumen (los que usa el NFFS; puede ser menos que los del dispositivo).
+    pub fn volume_blocks(&self) -> u64 {
+        self.sb.total
+    }
+
+    /// Bloques del volumen NFFS que dice el superbloque válido de `dev` (el mayor de las dos copias).
+    pub fn volume_blocks_of(dev: &mut dyn BlockDev) -> Option<u64> {
+        let n = dev.blocks();
+        let a = if n >= MIN_BLOCKS { read_sb(dev, 0) } else { None };
+        let b = if n >= MIN_BLOCKS { read_sb(dev, 1) } else { None };
+        a.into_iter().chain(b).map(|sb| sb.total).max()
+    }
+
+    /// Bloques del dispositivo que hay debajo.
+    pub fn dev_blocks(&self) -> u64 {
+        self.dev.blocks()
+    }
+
+    /// Cambia el dispositivo sobre el que trabaja el volumen montado (p. ej. para intercalar la
+    /// capa de cifrado) sin perder nada de lo que hay en memoria. `f` recibe el dispositivo actual
+    /// y devuelve el nuevo, que debe mostrar los mismos bloques con el mismo contenido.
+    pub fn swap_dev(&mut self, f: impl FnOnce(Box<dyn BlockDev>) -> Box<dyn BlockDev>) {
+        let old = core::mem::replace(&mut self.dev, Box::new(crate::block::RamDisk::new(0)));
+        self.dev = f(old);
+    }
+
+    /// Quita los `k` últimos bloques del volumen (para reservar sitio al final del disco) si están
+    /// libres; si no, `Invalid` y no cambia nada. Un solo superbloque nuevo lo confirma: un corte
+    /// deja el volumen entero o reducido, nunca a medias.
+    pub fn shrink_tail(&mut self, k: u64) -> Result<(), FsError> {
+        let total = self.sb.total;
+        if k == 0 || total < MIN_BLOCKS + k + RESERVE {
+            return Err(FsError::Invalid);
+        }
+        let new = total - k;
+        if (new..total).any(|b| bit(&self.free, b)) {
+            return Err(FsError::Invalid);
+        }
+        let tx = self.begin();
+        let old = self.sb;
+        self.sb.total = new;
+        self.free.truncate(new.div_ceil(8) as usize);
+        self.free_count -= k;
+        let r = self.commit(&tx, None, false);
+        if r.is_err() {
+            self.sb = old;
+            self.rollback(tx);
+        }
+        r
     }
 
     /// Devuelve el dispositivo (para inspeccionarlo en pruebas y herramientas).
