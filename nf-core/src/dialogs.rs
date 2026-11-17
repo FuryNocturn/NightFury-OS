@@ -9,6 +9,7 @@ use crate::fs::{Entry, FsError};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
+use crate::keys::POOL_EVENTS_NEEDED;
 use crate::platform::Platform;
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
@@ -56,11 +57,16 @@ pub enum DialogRequest {
     /// Elegir una carpeta. `dir` es la carpeta inicial. Solo lista carpetas (sin la Papelera ni
     /// `C:\Sistema`, salvo a un administrador); "Nueva carpeta" crea una en la carpeta actual.
     Folder { tag: u32, title: String, dir: String },
+    /// "La pantalla del ratón": pide mover el ratón de forma irregular para generar llaves.
+    /// Responde `Answer { answer: Ok }` al completar los movimientos (`keys::POOL_EVENTS_NEEDED`)
+    /// o `Cancel`. El escritorio ya alimenta el acumulador de la plataforma con cada movimiento;
+    /// el diálogo solo cuenta los suyos y muestra una vista (no es la llave).
+    Entropy { tag: u32, title: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DialogResult {
-    /// Respuesta a `Message`.
+    /// Respuesta a `Message` y `Entropy`.
     Answer { tag: u32, answer: Answer },
     /// Respuesta a `Input` y `Password`; `None` si se canceló.
     Text { tag: u32, value: Option<String> },
@@ -83,6 +89,12 @@ const DOUBLE_MS: u64 = 450;
 const PICK_W: i32 = 150;
 const NEW_W: i32 = 120;
 
+const ENTROPY_TEXT: &str = "Mueve el ratón por esta ventana de forma irregular. Tus movimientos se mezclan para crear la llave que cifrará tus datos.";
+const ENT_COLS: usize = 36;
+const ENT_ROWS: usize = 6;
+const ENT_CELL_W: i32 = 12;
+const ENT_ROW_H: i32 = 19;
+const ENT_BOX_H: i32 = ENT_ROWS as i32 * ENT_ROW_H + 14;
 const SYSTEM: &str = "Sistema";
 
 /// ¿Es `C:\Sistema` o algo dentro?
@@ -247,6 +259,7 @@ enum Mode {
     Open,
     Save,
     Folder,
+    Entropy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -281,6 +294,10 @@ pub struct Dialog {
     sb: ScrollBar,
     last_click: (usize, u64),
     dirty: bool,
+    /// Aleatoriedad: movimientos nuevos contados, última posición y letras mostradas.
+    moves: u32,
+    last_pos: Option<(i32, i32)>,
+    view: Vec<u8>,
 }
 
 impl Drop for Dialog {
@@ -312,6 +329,9 @@ impl Dialog {
             sb: ScrollBar::new(false),
             last_click: (usize::MAX, 0),
             dirty: true,
+            moves: 0,
+            last_pos: None,
+            view: Vec::new(),
         };
         let lh = font::line_h(FS);
         match req {
@@ -344,6 +364,16 @@ impl Dialog {
                 d.field.mask = true;
                 d.h = PAD + lh + 8 + 28 + 24 + BTN_H + 16;
             }
+            DialogRequest::Entropy { tag, title } => {
+                d.tag = tag;
+                d.mode = Mode::Entropy;
+                d.title = title;
+                d.w = 520;
+                d.lines = wrap(ENTROPY_TEXT, FS, d.w - 2 * PAD);
+                d.h = PAD + d.lines.len() as i32 * lh + 12 + ENT_BOX_H + 14 + 14 + 22 + BTN_H + 16;
+                d.focus = 1;
+                d.refresh_view(sys);
+            }
             DialogRequest::Open { tag, title, dir } => {
                 d.file(tag, title, Mode::Open, &dir, "", sys);
             }
@@ -355,6 +385,32 @@ impl Dialog {
             }
         }
         d
+    }
+
+    /// Rellena el recuadro con letras derivadas de la vista del acumulador (solo para mirar).
+    fn refresh_view(&mut self, sys: &mut dyn Platform) {
+        let seed = sys.pool().preview();
+        let mut st = seed.iter().fold(0xCBF2_9CE4_8422_2325u64, |a, &b| (a ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3));
+        self.view.clear();
+        for _ in 0..ENT_COLS * ENT_ROWS {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.view.push(b"0123456789ABCDEF"[(st >> 60) as usize]);
+        }
+    }
+
+    /// Aleatoriedad: ya se han hecho todos los movimientos pedidos.
+    fn entropy_done(&self) -> bool {
+        self.moves >= POOL_EVENTS_NEEDED
+    }
+
+    fn entropy_box(&self) -> Rect {
+        let top = PAD + self.lines.len() as i32 * font::line_h(FS) + 12;
+        Rect::new(PAD, top, self.w - 2 * PAD, ENT_BOX_H)
+    }
+
+    fn entropy_bar(&self) -> Rect {
+        let b = self.entropy_box();
+        Rect::new(b.x, b.bottom() + 14, b.w - 70, 14)
     }
 
     fn file(&mut self, tag: u32, title: String, mode: Mode, dir: &str, name: &str, sys: &mut dyn Platform) {
@@ -398,12 +454,13 @@ impl Dialog {
             Mode::Open => vec!["Abrir", "Cancelar"],
             Mode::Folder => vec!["Seleccionar carpeta", "Cancelar", "Nueva carpeta"],
             Mode::Input | Mode::Password => vec!["Aceptar", "Cancelar"],
+            Mode::Entropy => vec!["Continuar", "Cancelar"],
         }
     }
     /// Elementos con foco que no son botones.
     fn nbefore(&self) -> usize {
         match self.mode {
-            Mode::Message => 0,
+            Mode::Message | Mode::Entropy => 0,
             Mode::Input | Mode::Password | Mode::Folder => 1,
             _ if self.confirm.is_some() => 0,
             _ => 2,
@@ -480,6 +537,7 @@ impl Dialog {
                 text_in(s, Rect::new(PAD, PAD, self.w - 2 * PAD, lh), &self.lines[0], INK, Align::Left);
                 self.field.draw(s, self.field_rect(), self.focus == 0, theme);
             }
+            Mode::Entropy => self.draw_entropy(s, theme),
             _ => self.draw_files(s, theme),
         }
         let labels = self.labels();
@@ -487,6 +545,11 @@ impl Dialog {
         for (i, label) in labels.iter().enumerate() {
             let r = self.btn_rect(i, n);
             let focused = self.focus == self.nbefore() + i;
+            if self.mode == Mode::Entropy && i == 0 && !self.entropy_done() {
+                s.fill_rect(r, 0xD6D6D6);
+                text_in(s, r, label, 0x8A8A8A, Align::Center);
+                continue;
+            }
             if i == 0 {
                 s.fill_rect(r, theme.accent);
             } else {
@@ -499,6 +562,31 @@ impl Dialog {
             }
             text_in(s, r, label, if i == 0 { 0xFFFFFF } else { INK }, Align::Center);
         }
+    }
+
+    fn draw_entropy(&self, s: &mut Surface, theme: &Theme) {
+        let lh = font::line_h(FS);
+        for (i, l) in self.lines.iter().enumerate() {
+            text_in(s, Rect::new(PAD, PAD + i as i32 * lh, self.w - 2 * PAD, lh), l, INK, Align::Left);
+        }
+        let b = self.entropy_box();
+        s.fill_rect(b, 0x14181C);
+        s.frame(b, 0x3A4650);
+        for (i, &c) in self.view.iter().enumerate() {
+            let (row, col) = ((i / ENT_COLS) as i32, (i % ENT_COLS) as i32);
+            // Las letras (A-F) más vivas y los números más apagados.
+            let ink = if c.is_ascii_digit() { 0x7FA0B8 } else { 0xC9F0FF };
+            let cell = Rect::new(b.x + 8 + col * ENT_CELL_W, b.y + 7 + row * ENT_ROW_H, ENT_CELL_W, ENT_ROW_H);
+            let mut buf = [0u8; 4];
+            text_in(s, cell, (c as char).encode_utf8(&mut buf), ink, Align::Center);
+        }
+        let bar = self.entropy_bar();
+        s.fill_rect(bar, 0xE6E6E6);
+        s.frame(bar, 0xA0A0A0);
+        let pct = (self.moves.min(POOL_EVENTS_NEEDED) * 100 / POOL_EVENTS_NEEDED) as i32;
+        let fill = Rect::new(bar.x + 1, bar.y + 1, (bar.w - 2) * pct / 100, bar.h - 2);
+        s.fill_rect(fill, theme.accent);
+        text_in(s, Rect::new(bar.right() + 8, bar.y - 4, 62, bar.h + 8), &format!("{pct} %"), INK, Align::Left);
     }
 
     fn draw_files(&mut self, s: &mut Surface, theme: &Theme) {
@@ -581,6 +669,7 @@ impl Dialog {
                 DialogResult::Answer { tag, answer }
             }
             Mode::Input | Mode::Password => DialogResult::Text { tag, value: None },
+            Mode::Entropy => DialogResult::Answer { tag, answer: Answer::Cancel },
             _ => DialogResult::Path { tag, path: None },
         }
     }
@@ -722,6 +811,8 @@ impl Dialog {
         let tag = self.tag;
         match self.mode {
             Mode::Message => Some(DialogResult::Answer { tag, answer: self.btns[i].1 }),
+            Mode::Entropy if i == 0 => self.entropy_done().then_some(DialogResult::Answer { tag, answer: Answer::Ok }),
+            Mode::Entropy => Some(self.cancel()),
             Mode::Input => Some(DialogResult::Text { tag, value: if i == 0 { Some(self.field.text.clone()) } else { None } }),
             Mode::Password => {
                 let value = if i == 0 { Some(self.field.take()) } else { None };
@@ -824,6 +915,17 @@ impl Dialog {
                 return None;
             }
         }
+        if let (Mode::Entropy, MouseEv::Move { x, y }) = (self.mode, ev) {
+            // Solo cuenta un movimiento que cambia de posición. El acumulador ya lo ha recibido del
+            // escritorio: aquí no se vuelve a alimentar.
+            if self.last_pos != Some((x, y)) {
+                self.last_pos = Some((x, y));
+                self.moves = self.moves.saturating_add(1);
+                self.refresh_view(sys);
+                self.dirty = true;
+            }
+            return None;
+        }
         match ev {
             MouseEv::Down { x, y } => {
                 self.press = None;
@@ -840,7 +942,7 @@ impl Dialog {
                     return None;
                 }
                 let f = self.field_rect();
-                if self.mode != Mode::Message && self.mode != Mode::Folder {
+                if !matches!(self.mode, Mode::Message | Mode::Folder | Mode::Entropy) {
                     if f.contains(x, y) {
                         self.focus = if matches!(self.mode, Mode::Input | Mode::Password) { 0 } else { 1 };
                         self.field.click(x - f.x - 6, f.w - 12);
@@ -1385,5 +1487,89 @@ mod tests {
         // SAFETY: el búfer sigue reservado (clear no libera) y se lee dentro de su capacidad.
         let raw = unsafe { core::slice::from_raw_parts(p, 6) };
         assert_eq!(raw, [0u8; 6]);
+    }
+
+    // ---- Aleatoriedad ("la pantalla del ratón")
+
+    fn azar(sys: &mut TestPlatform) -> Dialog {
+        Dialog::new(DialogRequest::Entropy { tag: 3, title: "Aleatoriedad".into() }, sys)
+    }
+
+    /// Mueve el ratón como lo hace el escritorio: primero el acumulador, luego el diálogo.
+    fn mover(d: &mut Dialog, sys: &mut TestPlatform, x: i32, y: i32) -> Option<DialogResult> {
+        sys.pool.add_event(x, y, 1, x as u64 * 31 + y as u64);
+        d.mouse(MouseEv::Move { x, y }, sys)
+    }
+
+    fn pulsa(d: &mut Dialog, sys: &mut TestPlatform, i: usize) -> Option<DialogResult> {
+        let r = d.btn_rect(i, 2);
+        d.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, sys);
+        d.mouse(MouseEv::Up { x: r.x + 5, y: r.y + 5 }, sys)
+    }
+
+    #[test]
+    fn azar_no_deja_continuar_hasta_completar_y_ignora_repetidos() {
+        let mut sys = TestPlatform::default();
+        let mut d = azar(&mut sys);
+        assert!(pulsa(&mut d, &mut sys, 0).is_none());
+        for _ in 0..50 {
+            mover(&mut d, &mut sys, 100, 100); // misma posición: no cuenta
+        }
+        assert_eq!(d.moves, 1);
+        for i in 0..POOL_EVENTS_NEEDED as i32 - 2 {
+            mover(&mut d, &mut sys, 10 + i % 400, 20 + i / 400 + (i % 7));
+        }
+        assert!(d.moves < POOL_EVENTS_NEEDED);
+        assert!(pulsa(&mut d, &mut sys, 0).is_none());
+        // Uno más lo completa.
+        let mut x = 1000;
+        while d.moves < POOL_EVENTS_NEEDED {
+            x += 1;
+            mover(&mut d, &mut sys, x, 5);
+        }
+        assert_eq!(pulsa(&mut d, &mut sys, 0), Some(DialogResult::Answer { tag: 3, answer: Answer::Ok }));
+    }
+
+    #[test]
+    fn azar_cambia_las_letras_y_cancela() {
+        let mut sys = TestPlatform::default();
+        let mut d = azar(&mut sys);
+        let antes = d.view.clone();
+        assert_eq!(antes.len(), ENT_COLS * ENT_ROWS);
+        assert!(antes.iter().all(|c| c.is_ascii_hexdigit()));
+        mover(&mut d, &mut sys, 50, 60);
+        assert_ne!(d.view, antes);
+        let medio = d.view.clone();
+        mover(&mut d, &mut sys, 51, 60);
+        assert_ne!(d.view, medio);
+        assert_eq!(pulsa(&mut d, &mut sys, 1), Some(DialogResult::Answer { tag: 3, answer: Answer::Cancel }));
+        assert_eq!(d.key(&kev(Key::Escape, None), &mut sys), Some(DialogResult::Answer { tag: 3, answer: Answer::Cancel }));
+        assert_eq!(d.cancel(), DialogResult::Answer { tag: 3, answer: Answer::Cancel });
+    }
+
+    #[test]
+    fn azar_no_alimenta_el_acumulador_por_su_cuenta() {
+        let mut sys = TestPlatform::default();
+        let mut d = azar(&mut sys);
+        d.mouse(MouseEv::Move { x: 5, y: 5 }, &mut sys);
+        d.mouse(MouseEv::Move { x: 6, y: 5 }, &mut sys);
+        assert_eq!(sys.pool.events(), 0);
+        assert_eq!(d.moves, 2);
+    }
+
+    #[test]
+    fn azar_se_dibuja_con_barra_y_boton_apagado() {
+        let mut sys = TestPlatform::default();
+        let mut d = azar(&mut sys);
+        let (w, h) = d.size();
+        let mut s = Surface::new(w, h, 0);
+        d.draw(&mut s, &Theme::default());
+        let bar = d.entropy_bar();
+        let vacio = s.px[((bar.y + 5) * w + bar.x + 5) as usize];
+        for i in 0..100 {
+            mover(&mut d, &mut sys, 10 + i, 30);
+        }
+        d.draw(&mut s, &Theme::default());
+        assert_ne!(s.px[((bar.y + 5) * w + bar.x + 5) as usize], vacio);
     }
 }
