@@ -14,6 +14,7 @@
 //! ```
 use crate::files::{self, PROGRAMS_DIR};
 use crate::fs::FsError;
+use crate::bmp::{self, Picture};
 use crate::icons::Icon;
 use crate::platform::Platform;
 use crate::proc::ProcApp;
@@ -22,6 +23,8 @@ use alloc::vec::Vec;
 
 pub const MANIFEST: &str = "app.txt";
 pub const BINARY: &str = "programa.nfx";
+/// Icono propio opcional: BMP de 24 o 32 bits, cuadrado, hasta 256×256 (`bmp::decode`).
+pub const ICON: &str = "icono.bmp";
 /// Tamaño máximo de un `.nfx` que se carga (lo que cabe en memoria de sobra).
 pub const MAX_NFX: u64 = 64 << 20;
 
@@ -35,6 +38,8 @@ pub struct Program {
     pub icon: Icon,
     /// Tamaño inicial del contenido.
     pub size: (i32, i32),
+    /// Icono propio (`icono.bmp` de su carpeta, v0.9). Si está, se dibuja en vez de `icon`.
+    pub picture: Option<Picture>,
 }
 
 impl Program {
@@ -57,7 +62,7 @@ fn icon_named(s: &str) -> Icon {
 
 /// Lee un `app.txt`. `None` si falta `nombre`. Lo demás tiene valores por defecto.
 pub fn parse_manifest(dir: &str, text: &str) -> Option<Program> {
-    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360) };
+    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None };
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let Some((k, v)) = line.split_once('=') else { continue };
@@ -88,6 +93,11 @@ pub fn installed(sys: &mut dyn Platform) -> Vec<Program> {
         let Ok(txt) = fs.read(&files::join(&dir, MANIFEST)) else { continue };
         let Some(p) = parse_manifest(&dir, &String::from_utf8_lossy(&txt)) else { continue };
         if fs.stat(&p.binary()).is_ok_and(|s| !s.dir) {
+            let mut p = p;
+            let pic = files::join(&p.dir, ICON);
+            if fs.stat(&pic).is_ok_and(|s| s.size <= 1 << 20) {
+                p.picture = fs.read(&pic).ok().and_then(|b| bmp::decode(&b));
+            }
             v.push(p);
         }
     }
@@ -105,7 +115,7 @@ pub fn for_binary(sys: &mut dyn Platform, path: &str) -> Option<Program> {
         return Some(p);
     }
     let name = file.rsplit_once('.').map_or(file, |(n, _)| n);
-    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360) })
+    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None })
 }
 
 /// Carga el `.nfx` de `path` y lo arranca. `Err` con el motivo para enseñarlo al usuario.
@@ -116,8 +126,8 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
         return Err(String::from("El programa es demasiado grande"));
     }
     let data = fs.read(path).map_err(fs_msg)?;
-    let (proc, fixed) = sys.spawn(&data)?;
-    Ok(ProcApp::new(proc, fixed, &p.name, Some(p.icon)))
+    let proc = sys.spawn(&data, &p.name)?;
+    Ok(ProcApp::new(proc, &p.name, Some(p.icon)))
 }
 
 fn fs_msg(e: FsError) -> String {

@@ -54,12 +54,19 @@ pub const SYS_DATETIME: u64 = 7;
 pub const SYS_SET_TIMER: u64 = 8;
 /// `SET_MIN_SIZE(w, h)`: tamaño mínimo del contenido.
 pub const SYS_SET_MIN_SIZE: u64 = 9;
+/// `SAVE_AS(ptr, len, name_ptr, name_len)` (v0.9): el sistema pregunta al usuario dónde guardar esos
+/// `len` bytes (máx. `SAVE_MAX`) proponiendo el nombre dado (UTF-8, sin `\`, `/` ni `:`) y los
+/// escribe con sus permisos. El programa nunca ve la ruta. La respuesta llega como `EV_SAVED`.
+pub const SYS_SAVE_AS: u64 = 10;
+pub const SAVE_MAX: u64 = 32 << 20;
 
 pub const E_INVAL: i64 = -1;
 /// Puntero fuera de la zona del programa o sin mapear.
 pub const E_FAULT: i64 = -2;
 pub const E_NOMEM: i64 = -3;
 pub const E_NOSYS: i64 = -4;
+/// Ya hay una petición igual en curso (p. ej. otro `SAVE_AS` sin responder).
+pub const E_BUSY: i64 = -5;
 
 pub const LOG_MAX: usize = 1024;
 pub const TITLE_MAX: usize = 256;
@@ -86,6 +93,8 @@ pub const EV_THEME: u32 = 10;
 pub const EV_TIMER: u32 = 11;
 /// El usuario quiere cerrar la ventana.
 pub const EV_CLOSE: u32 = 12;
+/// Resultado de `SAVE_AS`: `a` = 1 guardado, 0 cancelado, -1 error.
+pub const EV_SAVED: u32 = 13;
 
 pub const F_SHIFT: u32 = 1;
 pub const F_CTRL: u32 = 2;

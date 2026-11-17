@@ -4,9 +4,10 @@
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;
 use crate::keys::Pool;
-use crate::proc::Process;
+use crate::proc::{ProcInfo, Process};
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct DateTime {
@@ -43,11 +44,17 @@ pub trait Platform {
     /// Acumulador de aleatoriedad del sistema. El escritorio le echa cada movimiento del ratón
     /// y cada tecla; de él salen las llaves de cifrado.
     fn pool(&mut self) -> &mut Pool;
-    /// Carga un programa `.nfx` en modo usuario (v0.8). `Err` con el motivo, en español.
-    /// Devuelve el proceso y la memoria fija que ocupa (imagen + pila), para `ProcApp::new`.
-    fn spawn(&mut self, _nfx: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
+    /// Carga un programa `.nfx` en modo usuario y lo pone en marcha (v0.9). `name` es para el
+    /// Administrador de tareas. `Err` con el motivo, en español.
+    fn spawn(&mut self, _nfx: &[u8], _name: &str) -> Result<Box<dyn Process>, String> {
         Err(String::from("Este equipo no puede ejecutar programas"))
     }
+    /// Programas en marcha (v0.9), para el Administrador de tareas.
+    fn processes(&mut self) -> Vec<ProcInfo> {
+        Vec::new()
+    }
+    /// Finaliza el programa `id` (queda `Killed(Kill::Ended)`; su ventana se cierra sola).
+    fn kill_process(&mut self, _id: u64) {}
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
