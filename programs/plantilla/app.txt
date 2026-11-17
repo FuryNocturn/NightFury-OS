@@ -1,0 +1,6 @@
+nombre=Plantilla
+version=1.0
+autor=NightFury
+icono=app
+ancho=360
+alto=200

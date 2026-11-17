@@ -3,7 +3,22 @@
 version = 4
 
 [[package]]
+name = "calculadora"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
 name = "kernel"
+version = "0.7.2"
+dependencies = [
+ "nf-core",
+]
+
+[[package]]
+name = "nf-app"
 version = "0.7.2"
 dependencies = [
  "nf-core",
@@ -17,5 +32,20 @@ version = "0.7.2"
 name = "nfdisk"
 version = "0.7.2"
 dependencies = [
+ "nf-core",
+]
+
+[[package]]
+name = "nfpack"
+version = "0.7.2"
+dependencies = [
+ "nf-core",
+]
+
+[[package]]
+name = "plantilla"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
  "nf-core",
 ]

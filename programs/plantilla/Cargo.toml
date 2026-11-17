@@ -1,0 +1,9 @@
+[package]
+name = "plantilla"
+version = "1.0.0"
+edition.workspace = true
+description = "NightFury: programa de ejemplo para hacer los tuyos"
+
+[dependencies]
+nf-core = { path = "../../nf-core" }
+nf-app = { path = "../../nf-app" }
