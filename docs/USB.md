@@ -55,3 +55,27 @@ nfdisk comprobar disco.img                      # revisa la coherencia del volum
 - `formatear disco.img` solo funciona con una imagen en blanco; con datos exige `--forzar` (borra todo).
 - Solo trabaja con archivos normales: rechaza `\\.\PhysicalDrive0`, `\\?\...`, `D:\` y similares.
 - Una imagen creada con `nfdisk crear` arranca en NightFury sin preguntar por formato.
+- Las imágenes nuevas (`crear`, `formatear`) dejan **sin usar los dos últimos bloques** del archivo: son el sitio de la cabecera
+  del cifrado total. Las imágenes antiguas siguen funcionando con todos sus bloques.
+
+### Discos con cifrado total
+Si el disco se cifró desde NightFury (Configuración › Disco), `nfdisk` lo detecta por su cabecera:
+- **Sin clave**, `info` y `comprobar` solo dicen «Disco cifrado de NightFury»; no muestran tamaños, nombres ni nada del contenido.
+  Las demás órdenes piden la clave y se niegan sin ella.
+- **La clave del disco nunca va por la línea de órdenes** (quedaría en el historial). Se da con la variable de entorno
+  `NFDISK_CLAVE` (para scripts y pruebas) o, si no existe, `nfdisk` la pregunta por teclado (sin mostrarla en Windows; en otros
+  sistemas avisa de que se verá).
+  ```powershell
+  $env:NFDISK_CLAVE = "mi clave del disco"
+  nfdisk listar disco.img C:\Usuarios -r
+  Remove-Item Env:NFDISK_CLAVE
+  ```
+- `--recuperacion`: la clave que se da es el **código de recuperación** del disco (8 grupos de 5 caracteres) en vez de la clave.
+- `--clave`: hace que `info` y `comprobar` pregunten la clave por teclado (por defecto solo usan `NFDISK_CLAVE`, para no
+  interrumpir scripts).
+- Con la clave, todas las órdenes funcionan como en un disco normal, **también sobre un disco a medio convertir** (cifrando o
+  descifrando): lo que se escribe va cifrado o en claro según el punto en que esté la conversión. Si la conversión se cortó con
+  un bloque a medias, `nfdisk` lo rehace al abrir (por eso entonces abre la imagen también para escribir).
+- `formatear --forzar` en un disco cifrado exige además la clave y deja un NFFS normal sin cifrar.
+- `nfdisk` **no activa ni quita** el cifrado: eso lo hace NightFury, con barra de progreso y reanudable.
+- Cierra QEMU antes de usarlo, igual que siempre, y haz copia de seguridad de la imagen antes de convertirla desde NightFury.

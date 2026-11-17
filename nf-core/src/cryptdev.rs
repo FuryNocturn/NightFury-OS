@@ -451,6 +451,12 @@ pub fn open(
     }
 }
 
+/// ¿Hay que escribir para abrir este disco (bloque a medias o conversión sin rematar)? Sirve a
+/// las herramientas que abren en solo lectura para saber si necesitan permiso de escritura.
+pub fn needs_repair(h: &Header, dev_blocks: u64) -> bool {
+    h.pending || (h.state != State::Encrypted && h.next >= dev_blocks.saturating_sub(RESERVED))
+}
+
 /// Convierte un error de disco en el de claves.
 pub fn disk_err(e: DiskError) -> KeyError {
     ke(e)

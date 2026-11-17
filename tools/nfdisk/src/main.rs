@@ -1,12 +1,15 @@
 //! nfdisk: lee y escribe imágenes de disco NFFS (el `disco.img` de QEMU) desde Windows.
 //! Solo escribe en archivos regulares; nunca en dispositivos ni unidades.
 use nf_core::block::{BlockDev, DiskError, BLOCK};
+use nf_core::cryptdev::{self, CryptDev, Header};
 use nf_core::files::{is_protected, Files};
 use nf_core::fs::{Entry, FsError, Nffs};
 use nf_core::platform::DateTime;
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::rc::Rc;
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +25,10 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
   nfdisk ayuda\n\
+Discos con cifrado total: sin clave, «info» y «comprobar» solo dicen «disco cifrado de NightFury». Las demás órdenes piden la clave\n\
+del disco (variable de entorno NFDISK_CLAVE, o se pregunta por teclado; nunca por argumento) y con ella trabajan como siempre, también\n\
+sobre un disco a medio convertir. --recuperacion: la clave es el código de recuperación del disco. --clave: pregunta la clave en «info» y\n\
+«comprobar». nfdisk no activa ni quita el cifrado: eso se hace desde NightFury (Configuración › Disco).\n\
 Rutas de la imagen: C:\\Usuarios\\Ana\\Documentos\\nota.txt, \\Usuarios\\Ana\\Documentos\\nota.txt o Usuarios/Ana/Documentos/nota.txt.\n\
 Estructura: Usuarios\\<nombre>\\{Escritorio,Documentos,Descargas,Imágenes,Música,Vídeos,.config,.papelera} y Sistema\\{config,temp,lib,drivers,logs}.\n\
 nfdisk trabaja directamente sobre el volumen, sin cuentas ni permisos (como administrador): no crea cuentas ni migra discos antiguos; eso lo hace NightFury al arrancar.";
@@ -109,12 +116,121 @@ fn dev_from(f: File, path: &str) -> R<FileDev> {
     Ok(FileDev { f, blocks: m.len() / BLOCK as u64 })
 }
 
-fn mount(path: &str, write: bool) -> R<Nffs> {
-    let mut dev = open(path, write)?;
+/// Cabecera de cifrado total del dispositivo, si la tiene (y su último bloque no es del NFFS).
+fn crypt_header(dev: &mut FileDev) -> Option<Header> {
+    let h = cryptdev::detect(dev)?;
+    (Nffs::volume_blocks_of(dev) != Some(dev.blocks)).then_some(h)
+}
+
+const CIFRADO: &str = "Disco cifrado de NightFury. Sin la clave no se puede ver nada más.";
+
+/// De dónde sale la clave: el argumento dice si se puede preguntar por teclado.
+type Secret<'a> = &'a dyn Fn(bool) -> Option<String>;
+
+/// Cómo se consigue la clave de un disco cifrado.
+#[derive(Clone, Copy)]
+struct Opts<'a> {
+    secret: Secret<'a>,
+    /// La clave es el código de recuperación.
+    recovery: bool,
+    /// Se puede preguntar por teclado si no está en el entorno.
+    ask: bool,
+}
+
+/// Abre el volumen de un disco cifrado con la clave. Un bloque a medias de una conversión se
+/// rehace al abrir (escribe), y entonces la imagen se abre también para escritura.
+fn mount_crypt(path: &str, blocks: u64, h: Header, write: bool, o: Opts) -> R<Nffs> {
+    let secret = (o.secret)(o.ask).ok_or("Este disco está cifrado: hace falta la clave (variable NFDISK_CLAVE o por teclado).")?;
+    let dev = open(path, write || cryptdev::needs_repair(&h, blocks))?;
+    let mut core = match cryptdev::open(Box::new(dev), h, &secret, o.recovery) {
+        Ok(c) => c,
+        Err((_, _, e)) => return Err(e.text().to_string()),
+    };
+    core.recover().map_err(|_| "Error de disco.".to_string())?;
+    Nffs::mount(Box::new(CryptDev::new(Rc::new(RefCell::new(core))))).map_err(fs_err)
+}
+
+/// `Ok(None)` si el disco es cifrado y no se ha dado la clave (para «info» y «comprobar»).
+fn mount_opt(path: &str, write: bool, o: Opts) -> R<Option<Nffs>> {
+    let mut dev = open(path, false)?;
+    if let Some(h) = crypt_header(&mut dev) {
+        if !o.ask && (o.secret)(false).is_none() {
+            return Ok(None);
+        }
+        return mount_crypt(path, dev.blocks, h, write, o).map(Some);
+    }
     if !Nffs::is_formatted(&mut dev) {
         return Err(format!("«{path}» no contiene un disco NFFS."));
     }
-    Nffs::mount(Box::new(dev)).map_err(fs_err)
+    drop(dev);
+    let dev = open(path, write)?;
+    Nffs::mount(Box::new(dev)).map(Some).map_err(fs_err)
+}
+
+fn mount(path: &str, write: bool, o: Opts) -> R<Nffs> {
+    mount_opt(path, write, o)?.ok_or_else(|| CIFRADO.to_string())
+}
+
+/// Apaga el eco de la consola mientras se escribe la clave (solo Windows; sin consola no hace nada).
+#[cfg(windows)]
+mod noecho {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+    }
+    const ECHO_INPUT: u32 = 0x0004;
+
+    pub struct Guard(*mut c_void, u32);
+
+    pub fn off() -> Option<Guard> {
+        let h = std::io::stdin().as_raw_handle();
+        let mut mode = 0u32;
+        // SAFETY: llamadas a la API de consola con el manejador de la entrada estándar y un puntero válido.
+        unsafe {
+            (GetConsoleMode(h, &mut mode) != 0 && SetConsoleMode(h, mode & !ECHO_INPUT) != 0).then_some(Guard(h, mode))
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: restaura el modo que tenía la consola.
+            unsafe {
+                SetConsoleMode(self.0, self.1);
+            }
+        }
+    }
+}
+
+/// Clave de `NFDISK_CLAVE` o, si `ask`, preguntada por teclado (sin eco si se puede).
+fn read_secret(ask: bool) -> Option<String> {
+    if let Some(v) = std::env::var_os("NFDISK_CLAVE") {
+        return v.into_string().ok().filter(|s| !s.is_empty());
+    }
+    if !ask {
+        return None;
+    }
+    let tty = std::io::stdin().is_terminal();
+    #[cfg(windows)]
+    let _guard = if tty { noecho::off() } else { None };
+    #[cfg(windows)]
+    let hidden = _guard.is_some();
+    #[cfg(not(windows))]
+    let hidden = false;
+    if tty {
+        eprint!("Clave del disco{}: ", if hidden { "" } else { " (se verá lo que escribes)" });
+        let _ = std::io::stderr().flush();
+    }
+    let mut line = String::new();
+    let r = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        eprintln!();
+    }
+    let line = line.trim_end_matches(['\r', '\n']).to_string();
+    (r.is_ok() && !line.is_empty()).then_some(line)
 }
 
 /// Fecha UTC de ahora (días desde 1970 → calendario civil, a mano).
@@ -159,7 +275,8 @@ fn format_dev(dev: FileDev) -> R<()> {
     let f = dev.f.try_clone().map_err(|e| e.to_string())?;
     let blocks = dev.blocks;
     let t = now();
-    Nffs::format(Box::new(dev), t).map_err(fs_err)?;
+    // Se dejan sin usar los dos últimos bloques: sitio para el cifrado total.
+    Nffs::format_with(Box::new(dev), blocks.saturating_sub(cryptdev::RESERVED), t).map_err(fs_err)?;
     let files = Files::probe(Some(Box::new(FileDev { f, blocks })), t);
     if !files.persistent() {
         return Err("No se pudieron crear las carpetas iniciales.".into());
@@ -194,7 +311,14 @@ fn list(fs: &mut Nffs, dir: &str, recurse: bool, depth: usize) -> R<()> {
 }
 
 fn run(args: &[String]) -> R<()> {
+    run_with(args, &read_secret)
+}
+
+fn run_with(args: &[String], secret: Secret) -> R<()> {
     let flag = |f: &str| args.iter().any(|a| a == f);
+    let opts = |ask: bool| Opts { secret, recovery: flag("--recuperacion"), ask };
+    let all = opts(true);
+    let quiet = opts(flag("--clave"));
     let pos: Vec<&str> = args.iter().skip(1).filter(|a| !a.starts_with("--") && a.as_str() != "-r").map(|s| s.as_str()).collect();
     let need = |n: usize| if pos.len() == n { Ok(()) } else { Err("Número de argumentos incorrecto. Prueba «nfdisk ayuda».".to_string()) };
     let cmd = args.first().map(|s| s.as_str()).unwrap_or("ayuda");
@@ -218,6 +342,12 @@ fn run(args: &[String]) -> R<()> {
         "formatear" => {
             need(1)?;
             let mut dev = open(pos[0], true)?;
+            if crypt_header(&mut dev).is_some() {
+                // Formatear un disco cifrado destruye lo que contiene: antes hay que demostrar que se tiene la clave.
+                drop(dev);
+                mount(pos[0], false, all)?;
+                dev = open(pos[0], true)?;
+            }
             if !Nffs::is_blank(&mut dev) && !flag("--forzar") {
                 return Err("La imagen no está en blanco (tiene datos). Para borrarlo todo y formatear usa --forzar.".into());
             }
@@ -234,19 +364,21 @@ fn run(args: &[String]) -> R<()> {
         }
         "info" => {
             need(1)?;
-            let (total, free) = mount(pos[0], false)?.space();
+            let Some(mut fs) = mount_opt(pos[0], false, quiet)? else { return Ok(println!("{CIFRADO}")) };
+            let (total, free) = fs.space();
             println!("Tamaño: {}\nLibre:  {}\nUsado:  {}", fmt_size(total), fmt_size(free), fmt_size(total - free));
         }
         "comprobar" => {
             need(1)?;
-            mount(pos[0], false)?.check().map_err(|e| format!("La imagen tiene errores: {}", e.message()))?;
+            let Some(mut fs) = mount_opt(pos[0], false, quiet)? else { return Ok(println!("{CIFRADO}")) };
+            fs.check().map_err(|e| format!("La imagen tiene errores: {}", e.message()))?;
             println!("La imagen está bien.");
         }
         "listar" => {
             if pos.len() != 1 && pos.len() != 2 {
                 return need(1);
             }
-            let mut fs = mount(pos[0], false)?;
+            let mut fs = mount(pos[0], false, all)?;
             let dir = rel(pos.get(1).copied().unwrap_or(""))?;
             list(&mut fs, &dir, flag("-r"), 0)?;
         }
@@ -254,7 +386,7 @@ fn run(args: &[String]) -> R<()> {
             need(3)?;
             let data = std::fs::read(pos[1]).map_err(|e| format!("No se puede leer «{}»: {e}", pos[1]))?;
             let dest = rel_item(pos[2])?;
-            let mut fs = mount(pos[0], true)?;
+            let mut fs = mount(pos[0], true, all)?;
             match fs.stat(&dest) {
                 Ok(e) if e.dir => return Err(fs_err(FsError::IsDir)),
                 Ok(_) if !flag("--reemplazar") => return Err("Ya existe en la imagen. Usa --reemplazar para sustituirlo.".into()),
@@ -266,7 +398,7 @@ fn run(args: &[String]) -> R<()> {
         "sacar" => {
             need(3)?;
             let src = rel_item(pos[1])?;
-            let data = mount(pos[0], false)?.read(&src).map_err(fs_err)?;
+            let data = mount(pos[0], false, all)?.read(&src).map_err(fs_err)?;
             check_regular(pos[2])?;
             if Path::new(pos[2]).exists() && !flag("--reemplazar") {
                 return Err(format!("«{}» ya existe. Usa --reemplazar para sustituirlo.", pos[2]));
@@ -277,7 +409,7 @@ fn run(args: &[String]) -> R<()> {
         "carpeta" => {
             need(2)?;
             let p = rel_item(pos[1])?;
-            mount(pos[0], true)?.mkdir(&p, now()).map_err(fs_err)?;
+            mount(pos[0], true, all)?.mkdir(&p, now()).map_err(fs_err)?;
             println!("Carpeta creada.");
         }
         "borrar" => {
@@ -286,13 +418,13 @@ fn run(args: &[String]) -> R<()> {
             if is_protected(&p) {
                 return Err(format!("«{p}» es una carpeta del sistema o de una cuenta y no se puede borrar."));
             }
-            mount(pos[0], true)?.remove(&p).map_err(fs_err)?;
+            mount(pos[0], true, all)?.remove(&p).map_err(fs_err)?;
             println!("Borrado.");
         }
         "ver" => {
             need(2)?;
             let p = rel_item(pos[1])?;
-            let data = mount(pos[0], false)?.read(&p).map_err(fs_err)?;
+            let data = mount(pos[0], false, all)?.read(&p).map_err(fs_err)?;
             let mut o = std::io::stdout();
             let _ = o.write_all(String::from_utf8_lossy(&data).as_bytes());
             let _ = o.flush();
@@ -335,8 +467,19 @@ mod tests {
         }
     }
 
+    /// Sin clave disponible (para discos sin cifrar).
+    fn plain() -> Opts<'static> {
+        Opts { secret: &|_| None, recovery: false, ask: false }
+    }
+
+    /// Las pruebas no tocan la variable de entorno (es de todo el proceso): la clave se da a mano.
     fn go(a: &[&str]) -> R<()> {
-        run(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        go_key(a, None)
+    }
+
+    fn go_key(a: &[&str], key: Option<&str>) -> R<()> {
+        let key = key.map(String::from);
+        run_with(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &move |_| key.clone())
     }
 
     #[test]
@@ -348,7 +491,7 @@ mod tests {
         assert!(go(&["crear", &img.0, "2"]).is_err());
         go(&["info", &img.0]).unwrap();
         go(&["comprobar", &img.0]).unwrap();
-        let mut fs = mount(&img.0, false).unwrap();
+        let mut fs = mount(&img.0, false, plain()).unwrap();
         for c in ["Usuarios", "Sistema\\config", "Sistema\\temp", "Sistema\\lib", "Sistema\\drivers", "Sistema\\logs"] {
             assert!(fs.stat(c).unwrap().dir, "{c}");
         }
@@ -390,7 +533,7 @@ mod tests {
         go(&["carpeta", &img.0, "Usuarios\\x"]).unwrap();
         assert!(go(&["formatear", &img.0]).is_err());
         go(&["formatear", &img.0, "--forzar"]).unwrap();
-        let mut fs = mount(&img.0, false).unwrap();
+        let mut fs = mount(&img.0, false, plain()).unwrap();
         assert!(fs.stat("Usuarios\\x").is_err());
         assert!(fs.stat("Sistema\\logs").is_ok());
         drop(fs);
@@ -430,5 +573,159 @@ mod tests {
     fn fecha_razonable() {
         let t = now();
         assert!(t.year >= 2026 && (1..=12).contains(&t.month) && (1..=31).contains(&t.day));
+    }
+
+    // ---- Discos con cifrado total ----
+
+    const CLAVE: &str = "clave-de-prueba";
+    const SECRETO: &str = "TEXTO-SECRETO-DE-PRUEBA-PARA-NFDISK";
+    const RUTA: &str = "C:\\Usuarios\\Ana\\Documentos\\secreto.txt";
+
+    /// Imagen de 2 MiB con una cuenta y un archivo, cifrada (entera o a medias) desde el sistema.
+    /// Devuelve el código de recuperación.
+    fn imagen_cifrada(img: &Tmp, terminar: bool) -> String {
+        go(&["crear", &img.0, "2"]).unwrap();
+        let t = now();
+        let mut f = Files::probe(Some(Box::new(open(&img.0, true).unwrap())), t);
+        f.create_account("Ana", None, true, [3; 16], t).unwrap();
+        f.login("Ana", "").unwrap();
+        f.write(RUTA, SECRETO.repeat(50).as_bytes(), t).unwrap();
+        let mut pool = nf_core::keys::Pool::new();
+        for i in 0..nf_core::keys::POOL_EVENTS_NEEDED as i32 {
+            pool.add_event(i, i * 7, i as u64, i as u64 * 13);
+        }
+        let code = f.encrypt_disk(CLAVE, &mut pool, t).unwrap();
+        if terminar {
+            while !f.convert_step(64, t).unwrap() {}
+        } else {
+            assert!(!f.convert_step(100, t).unwrap());
+        }
+        code
+    }
+
+    fn hay(bytes: &[u8], aguja: &str) -> bool {
+        bytes.windows(aguja.len()).any(|w| w == aguja.as_bytes())
+    }
+
+    #[test]
+    fn imagen_nueva_deja_dos_bloques_sin_usar() {
+        let img = Tmp::new("img");
+        go(&["crear", &img.0, "1"]).unwrap();
+        let fs = mount(&img.0, false, plain()).unwrap();
+        assert_eq!(fs.volume_blocks(), 254);
+        assert_eq!(fs.dev_blocks(), 256);
+    }
+
+    #[test]
+    fn disco_cifrado_sin_clave_no_ensena_nada_ni_se_toca() {
+        let img = Tmp::new("img");
+        imagen_cifrada(&img, true);
+        let antes = std::fs::read(&img.0).unwrap();
+        assert!(!hay(&antes, SECRETO) && !hay(&antes, "secreto.txt") && !hay(&antes, "Usuarios"));
+        go(&["info", &img.0]).unwrap();
+        go(&["comprobar", &img.0]).unwrap();
+        for orden in [
+            vec!["listar", &img.0],
+            vec!["ver", &img.0, RUTA],
+            vec!["carpeta", &img.0, "Usuarios\\Ana\\x"],
+            vec!["borrar", &img.0, RUTA],
+            vec!["formatear", &img.0, "--forzar"],
+            vec!["sacar", &img.0, RUTA, "no-debe-existir.bin"],
+        ] {
+            assert!(go(&orden).is_err(), "{orden:?}");
+        }
+        // Clave mala o código que no es: se rechaza y la imagen queda igual.
+        assert!(go_key(&["listar", &img.0], Some("clave-mala")).is_err());
+        assert!(go_key(&["info", &img.0], Some("clave-mala")).is_err());
+        assert!(go_key(&["listar", &img.0, "--recuperacion"], Some(CLAVE)).is_err());
+        assert_eq!(std::fs::read(&img.0).unwrap(), antes);
+        assert!(!Path::new("no-debe-existir.bin").exists());
+    }
+
+    #[test]
+    fn disco_cifrado_con_clave_funciona_como_siempre() {
+        let (img, src, out) = (Tmp::new("img"), Tmp::new("bin"), Tmp::new("out"));
+        let codigo = imagen_cifrada(&img, true);
+        let k = Some(CLAVE);
+        go_key(&["info", &img.0], k).unwrap();
+        go_key(&["comprobar", &img.0], k).unwrap();
+        go_key(&["listar", &img.0, "C:\\Usuarios", "-r"], k).unwrap();
+        go_key(&["sacar", &img.0, RUTA, &out.0], k).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), SECRETO.repeat(50).as_bytes());
+        std::fs::write(&src.0, "nuevo-contenido-largo-para-buscar").unwrap();
+        go_key(&["carpeta", &img.0, "Usuarios\\Ana\\Documentos\\Nueva"], k).unwrap();
+        go_key(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/Nueva/n.txt"], k).unwrap();
+        go_key(&["sacar", &img.0, "Usuarios/Ana/Documentos/Nueva/n.txt", &out.0, "--reemplazar"], k).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), b"nuevo-contenido-largo-para-buscar");
+        go_key(&["borrar", &img.0, "Usuarios/Ana/Documentos/Nueva/n.txt"], k).unwrap();
+        go_key(&["comprobar", &img.0], k).unwrap();
+        // Lo escrito con nfdisk tampoco queda en claro.
+        let crudo = std::fs::read(&img.0).unwrap();
+        assert!(!hay(&crudo, "nuevo-contenido") && !hay(&crudo, SECRETO) && !hay(&crudo, "Nueva"));
+        // Con el código de recuperación (con y sin guiones).
+        go_key(&["listar", &img.0, "--recuperacion"], Some(&codigo)).unwrap();
+        go_key(&["listar", &img.0, "--recuperacion"], Some(&codigo.replace('-', ""))).unwrap();
+        assert!(go_key(&["listar", &img.0, "--recuperacion"], Some(CLAVE)).is_err());
+        // Y el sistema sigue pudiendo abrirlo con la clave.
+        let t = now();
+        let mut f = Files::probe(Some(Box::new(open(&img.0, true).unwrap())), t);
+        assert!(f.disk_locked());
+        f.unlock_disk(CLAVE, false, t).unwrap();
+        f.login("Ana", "").unwrap();
+        assert_eq!(f.read(RUTA).unwrap(), SECRETO.repeat(50).as_bytes());
+    }
+
+    #[test]
+    fn disco_a_medio_convertir_se_abre_con_clave() {
+        let (img, src, out) = (Tmp::new("img"), Tmp::new("bin"), Tmp::new("out"));
+        imagen_cifrada(&img, false);
+        let k = Some(CLAVE);
+        // Sin clave no se ve nada; con ella se lee y se escribe a ambos lados del progreso.
+        go(&["info", &img.0]).unwrap();
+        go_key(&["comprobar", &img.0], k).unwrap();
+        go_key(&["sacar", &img.0, RUTA, &out.0], k).unwrap();
+        assert_eq!(std::fs::read(&out.0).unwrap(), SECRETO.repeat(50).as_bytes());
+        std::fs::write(&src.0, "escrito-con-nfdisk-a-medias").unwrap();
+        go_key(&["meter", &img.0, &src.0, "Usuarios/Ana/Documentos/m.txt"], k).unwrap();
+        go_key(&["listar", &img.0, "Usuarios/Ana/Documentos"], k).unwrap();
+        // El sistema termina la conversión y todo está.
+        let t = now();
+        let mut f = Files::probe(Some(Box::new(open(&img.0, true).unwrap())), t);
+        f.unlock_disk(CLAVE, false, t).unwrap();
+        f.login("Ana", "").unwrap();
+        while !f.convert_step(64, t).unwrap() {}
+        assert_eq!(f.read("C:\\Usuarios\\Ana\\Documentos\\m.txt").unwrap(), b"escrito-con-nfdisk-a-medias");
+        assert_eq!(f.read(RUTA).unwrap(), SECRETO.repeat(50).as_bytes());
+    }
+
+    #[test]
+    fn formatear_un_disco_cifrado_pide_clave_y_forzar() {
+        let img = Tmp::new("img");
+        imagen_cifrada(&img, true);
+        let k = Some(CLAVE);
+        assert!(go_key(&["formatear", &img.0], k).is_err());
+        assert!(go_key(&["formatear", &img.0, "--forzar"], Some("mala")).is_err());
+        go_key(&["formatear", &img.0, "--forzar"], k).unwrap();
+        // Ahora es un NFFS normal, sin cabecera y sin lo de antes.
+        go(&["comprobar", &img.0]).unwrap();
+        assert!(go(&["ver", &img.0, RUTA]).is_err());
+        let mut dev = open(&img.0, false).unwrap();
+        assert!(crypt_header(&mut dev).is_none());
+    }
+
+    #[test]
+    fn clave_por_variable_de_entorno() {
+        let img = Tmp::new("img");
+        imagen_cifrada(&img, true);
+        // Es la única prueba que toca la variable (es de todo el proceso).
+        std::env::set_var("NFDISK_CLAVE", CLAVE);
+        let ok = run(&["listar".to_string(), img.0.clone(), "C:\\Usuarios".to_string()]);
+        let info = run(&["info".to_string(), img.0.clone()]);
+        std::env::set_var("NFDISK_CLAVE", "otra");
+        let mala = run(&["listar".to_string(), img.0.clone()]);
+        std::env::remove_var("NFDISK_CLAVE");
+        ok.unwrap();
+        info.unwrap();
+        assert!(mala.is_err());
     }
 }
