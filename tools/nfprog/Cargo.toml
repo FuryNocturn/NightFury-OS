@@ -1,0 +1,13 @@
+[package]
+name = "nfprog"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NightFury: genera los iconos (icono.bmp) de los programas y saca capturas de sus ventanas en el PC"
+
+[dependencies]
+nf-core = { path = "../../nf-core" }
+reloj = { path = "../../programs/reloj" }
+paint = { path = "../../programs/paint" }

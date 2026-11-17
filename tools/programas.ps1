@@ -1,5 +1,5 @@
 # Compila todos los programas de programs\* para NightFury y los empaqueta como .nfx.
-# Resultado: target\programas\<nombre>\programa.nfx + app.txt  (<nombre> = el valor de nombre= en app.txt).
+# Resultado: target\programas\<nombre>\programa.nfx + app.txt (+ icono.bmp si existe)  (<nombre> = el valor de nombre= en app.txt).
 # Uso: .\tools\programas.ps1    (sale con código distinto de 0 si algo falla)
 $ErrorActionPreference = 'Stop'
 Set-Location (Split-Path $PSScriptRoot -Parent)
@@ -25,5 +25,7 @@ foreach ($p in $progs) {
     & $nfpack "target\x86_64-unknown-none\release\$($p.Name)" "$dest\programa.nfx"
     if ($LASTEXITCODE -ne 0) { Falla "$($p.Name): nfpack ha fallado" }
     Copy-Item $app "$dest\app.txt" -Force
+    # Icono propio opcional (BMP de 24 o 32 bits); lo genera `cargo run -p nfprog -- iconos` o lo pones tú.
+    if (Test-Path "$($p.FullName)\icono.bmp") { Copy-Item "$($p.FullName)\icono.bmp" "$dest\icono.bmp" -Force }
 }
 Write-Host "OK: programas en target\programas\" -ForegroundColor Green

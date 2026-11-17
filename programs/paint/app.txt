@@ -1,0 +1,6 @@
+nombre=Paint
+version=1.0
+autor=NightFury
+icono=app
+ancho=920
+alto=620
