@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Explorador de archivos: navegación, lista (detalles, lista o iconos), Papelera, menú contextual
 //! y operaciones sobre `Files`.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.

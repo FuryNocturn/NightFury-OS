@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Tipografía propia de trazos. CONTRATO: estas firmas públicas no cambian.
 //! `size` es la altura de las mayúsculas en píxeles (9 = texto normal de interfaz).
 //!

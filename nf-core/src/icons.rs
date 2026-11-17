@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Iconos propios dibujados por código. CONTRATO: `Icon` y la firma de `draw` no cambian.
 //! Rejilla lógica de 16 unidades; `k = size / 16`. Los rectángulos se ajustan a píxeles enteros.
 use crate::geom::Rect;

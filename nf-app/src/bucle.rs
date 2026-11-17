@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Bucle de eventos de un programa: traduce `WireEvent` a llamadas de `App` y decide cuándo
 //! redibujar. No toca hardware: todo lo del núcleo entra por `Llamadas` (la real está en `rt`, la
 //! falsa en las pruebas).

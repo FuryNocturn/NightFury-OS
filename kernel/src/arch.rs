@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! x86_64: puertos, GDT, IDT, PIC 8259, temporizador PIT 8254 y rutinas de entrada.
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicU64, Ordering::Relaxed};

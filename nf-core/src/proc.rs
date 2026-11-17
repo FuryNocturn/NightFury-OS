@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Programas en modo usuario vistos desde el escritorio (F3, v0.8). CONTRATO: `Regions`,
 //! `UserMem`, `SysState`, `Outbox`, `Sys`, `dispatch`, `Process`, `RunEnd`, `Kill` y `ProcApp`.
 //!

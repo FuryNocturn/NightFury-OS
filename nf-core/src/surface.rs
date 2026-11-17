@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Superficie de píxeles 0x00RRGGBB con recorte y primitivas de dibujo suavizadas.
 //! Convención de coordenadas reales: el píxel (i, j) cubre [i, i+1) x [j, j+1); su centro es (i+0.5, j+0.5).
 use crate::geom::Rect;

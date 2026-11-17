@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Programas instalados en `C:\Programas` (F3, v0.8): cada uno en su carpeta con `app.txt` y
 //! `programa.nfx`. CONTRATO: `Program`, `parse_manifest`, `installed`, `open`.
 //!

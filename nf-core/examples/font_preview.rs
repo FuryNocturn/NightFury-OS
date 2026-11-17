@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa de la tipografía: `cargo run -p nf-core --example font_preview -- salida.bmp`
 //! Dibuja sobre fondo blanco y oscuro y amplía x3 para ver el detalle a tamaño 9.
 use nf_core::font::{draw, line_h};

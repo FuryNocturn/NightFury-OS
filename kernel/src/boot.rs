@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Entrada UEFI: elige el modo de vídeo, reserva la memoria, sale de los servicios de
 //! arranque y salta al núcleo con pila propia.
 use crate::uefi::*;

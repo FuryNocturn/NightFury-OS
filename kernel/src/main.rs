@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! NightFury: núcleo. Solo aporta hardware (vídeo, interrupciones, PS/2, reloj, memoria);
 //! todo lo demás vive en `nf-core`.
 #![no_std]

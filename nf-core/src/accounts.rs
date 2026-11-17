@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cuentas de usuario: formato del archivo de cuentas y comprobación de claves. Lógica pura;
 //! quién puede hacer qué y dónde se guarda lo decide `files.rs`.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cinta con pestañas del Explorador (v0.4.0). Ver docs/PLAN-cinta.md.
 //! Widget reutilizable: fila de pestañas (con botón de archivo opcional) y, debajo, la cinta de la
 //! pestaña activa con grupos de botones. No guarda nada del Explorador: solo emite `RibbonAct`.

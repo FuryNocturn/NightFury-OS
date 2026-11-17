@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Pantallas de cuentas a pantalla completa: asistente inicial, inicio de sesión y bloqueo.
 //! `Desktop` les pasa el teclado y el ratón mientras `covers()` y las pinta encima de un fondo
 //! oscurecido; aquí no hay nada del escritorio (ventanas, barra, menús).

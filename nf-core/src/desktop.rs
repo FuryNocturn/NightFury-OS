@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Escritorio y gestor de ventanas. CONTRATO: las firmas de `new`, `event`, `render` y `back`
 //! no cambian (las usa el núcleo).
 //!

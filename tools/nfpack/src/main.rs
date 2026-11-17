@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! nfpack: convierte el ELF de un programa (x86_64-unknown-none, enlazado con programs/link.ld a
 //! su dirección fija) en un `.nfx` que carga el núcleo. Uso: `nfpack <elf> <salida.nfx>`.
 //!

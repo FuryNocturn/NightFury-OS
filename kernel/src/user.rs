@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Programas en modo usuario (ring 3): espacio de direcciones propio, entrada y salida con
 //! `syscall`/`iretq`, y el `Process` que usa el escritorio.
 //!

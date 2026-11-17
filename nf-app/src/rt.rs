@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Parte del runtime que habla con el núcleo de verdad: `syscall`, asignador, panic y arranque.
 //! Solo se compila para `x86_64-unknown-none`; lo demás (el bucle) se prueba en el PC.
 use crate::bucle::{cortar, ejecutar, Llamadas};

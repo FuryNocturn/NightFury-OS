@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Contrato entre el núcleo y los programas en modo usuario (F3, v0.8). CONTRATO: los números de
 //! llamada, `WireEvent`, sus `kind` y las constantes de memoria no cambian sin subir `ABI_VERSION`.
 //!

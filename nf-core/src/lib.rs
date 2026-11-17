@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! NightFury: todo lo que no toca hardware. Se prueba en el PC con `cargo test -p nf-core`.
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
@@ -38,3 +40,7 @@ pub mod theme;
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).
 pub const NAME: &str = "NightFury";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Crédito obligatorio (GPL-3.0 §7(b), ver NOTICE): los derivados lo conservan visible en "Acerca de".
+pub const CREDIT: &str = "Basado en NightFury-OS de FuryNocturn";
+pub const CREDIT_URL: &str = "https://github.com/FuryNocturn/NightFury-OS";
+pub const LICENSE_LINE: &str = "Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn). Licencia GPL-3.0.";

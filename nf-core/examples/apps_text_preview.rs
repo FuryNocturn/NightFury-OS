@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa del Bloc de notas y el Terminal:
 //! `cargo run --release -p nf-core --example apps_text_preview -- carpeta`
 //! Escribe un BMP por app y tamaño (por defecto y mínimo) en la carpeta indicada.

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa de la cinta del Explorador: `cargo run -p nf-core --example ribbon_preview -- carpeta`
 //! Guarda BMP de las pestañas Inicio y Vista (760 px), con hover y con botones desactivados.
 use nf_core::apps::MouseEv;

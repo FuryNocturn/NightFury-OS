@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Formato de programa `.nfx` (F3, v0.8). CONTRATO: el formato en disco, `Kind`, `Section`,
 //! `Image`, `parse` y `encode`.
 //!

@@ -2,6 +2,9 @@
 name = "nfpack"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "NightFury: empaqueta un ELF de x86_64-unknown-none como programa .nfx"
 
 [dependencies]

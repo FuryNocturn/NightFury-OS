@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cifrado simétrico propio (clean room), escrito a partir de las normas públicas:
 //! - AES-256: FIPS 197.
 //! - Modo CTR: NIST SP 800-38A.

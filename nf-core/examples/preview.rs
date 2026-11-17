@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Vista previa del escritorio: simula escenas y guarda BMP en la carpeta indicada.
 //! Uso: cargo run --release -p nf-core --example preview -- carpeta
 use nf_core::apps::{App, AppKind, Ctx, MouseEv};

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Cuadros de diálogo modales. CONTRATO: los tipos `Buttons`, `Answer`, `DialogRequest` y
 //! `DialogResult` no cambian. Una app pide un diálogo con `cx.dialog = Some(..)` y recibe la
 //! respuesta en `App::dialog_result`. `tag` lo elige la app para saber a qué petición corresponde

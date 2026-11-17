@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Menú contextual (clic derecho). CONTRATO: estos tipos no cambian.
 //! Lo pide una app con `cx.menu = Some(MenuRequest { .. })` y la elección llega por
 //! `App::menu_result(tag, id, cx)`. Lo dibuja el escritorio, que también lo usa para sus menús.
