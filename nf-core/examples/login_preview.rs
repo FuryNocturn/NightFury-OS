@@ -1,5 +1,6 @@
 //! Vista previa de las pantallas de cuentas: `cargo run -p nf-core --example login_preview -- carpeta`
-//! Guarda BMP (1280x800) del asistente, de su segunda tarjeta, del inicio de sesión y del bloqueo.
+//! Guarda BMP (1280x800) del asistente, de su segunda tarjeta, del inicio de sesión, del bloqueo y de las
+//! pantallas del cifrado: disco cifrado (clave y código), recuperar cuenta, aleatoriedad y aviso de progreso.
 use nf_core::apps::AppKind;
 use nf_core::block::RamDisk;
 use nf_core::desktop::Desktop;
@@ -76,4 +77,55 @@ fn main() {
     d.launch(AppKind::Files, &mut sys2);
     d.lock(&mut sys2);
     guarda(&dir, "5_bloqueo", &mut d, &mut sys2);
+    // Cifrado: disco cifrado en modo clave y en modo código de recuperación.
+    let mut sys3 = TestPlatform { ms: 1000, size: (1280, 800), ..Default::default() };
+    sys3.files = Files::probe(Some(Box::new(RamDisk::new(4096))), now);
+    sys3.files.format_pending(now).unwrap();
+    sys3.files.create_account("Ana", Some("secreto1"), true, [1; 16], now).unwrap();
+    sys3.files.logout();
+    let mut d = Desktop::new(1280, 800, &mut sys3);
+    d.event(Event::Tick(10), &mut sys3);
+    d.preview_disk_screen();
+    typ(&mut d, &mut sys3, "clavedisco");
+    guarda(&dir, "6_disco_cifrado_clave", &mut d, &mut sys3);
+    for _ in 0..2 {
+        press(&mut d, &mut sys3, Key::Tab, None);
+    }
+    press(&mut d, &mut sys3, Key::Enter, None);
+    typ(&mut d, &mut sys3, "abcde-fghjk-mnpqr");
+    press(&mut d, &mut sys3, Key::Enter, None);
+    guarda(&dir, "7_disco_cifrado_codigo", &mut d, &mut sys3);
+    // Seguir sin disco: la confirmación.
+    for _ in 0..3 {
+        press(&mut d, &mut sys3, Key::Tab, None);
+    }
+    press(&mut d, &mut sys3, Key::Enter, None);
+    guarda(&dir, "7b_seguir_sin_disco", &mut d, &mut sys3);
+    // Asistente con el indicador de fortaleza.
+    let mut sys4 = TestPlatform { ms: 1000, size: (1280, 800), ..Default::default() };
+    sys4.files = Files::probe(Some(Box::new(RamDisk::new(4096))), now);
+    sys4.files.format_pending(now).unwrap();
+    sys4.files.logout();
+    let mut d = Desktop::new(1280, 800, &mut sys4);
+    d.event(Event::Tick(10), &mut sys4);
+    typ(&mut d, &mut sys4, "Ana");
+    press(&mut d, &mut sys4, Key::Tab, None);
+    typ(&mut d, &mut sys4, "Abc12345xyz");
+    guarda(&dir, "8_asistente_fortaleza", &mut d, &mut sys4);
+    // Aleatoriedad a medio llenar y aviso de progreso, sobre el escritorio.
+    let mut d = Desktop::new(1280, 800, &mut sys2);
+    d.event(Event::Tick(10), &mut sys2);
+    press(&mut d, &mut sys2, Key::Right, None);
+    typ(&mut d, &mut sys2, "secreto1");
+    press(&mut d, &mut sys2, Key::Enter, None);
+    d.launch(AppKind::Files, &mut sys2);
+    d.preview_entropy(&mut sys2);
+    d.render(&mut sys2);
+    for i in 0..170 {
+        d.mouse_to(380 + (i * 37) % 520, 300 + (i * 53) % 170, &mut sys2);
+    }
+    guarda(&dir, "9_aleatoriedad", &mut d, &mut sys2);
+    d.mouse_to(900, 500, &mut sys2);
+    d.preview_conversion(true, true, 37);
+    guarda(&dir, "10_progreso_disco", &mut d, &mut sys2);
 }
