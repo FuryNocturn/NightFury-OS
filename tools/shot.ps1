@@ -17,9 +17,9 @@ Set-Location $root
 New-Item -ItemType Directory -Force shots | Out-Null
 if (-not $NoBuild) {
     # Los programas del sistema van dentro del núcleo (se instalan en C:\Programas al arrancar).
-& "$PSScriptRoot\programas.ps1" | Out-Null
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-cargo build -p kernel --release --target x86_64-unknown-uefi
+    & "$PSScriptRoot\programas.ps1" | Out-Null
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    cargo build -p kernel --release --target x86_64-unknown-uefi
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 New-Item -ItemType Directory -Force esp\EFI\BOOT | Out-Null
