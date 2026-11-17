@@ -446,6 +446,60 @@ impl Files {
         let dev = self.pending.take().ok_or(FsError::Invalid)?;
         // Se dejan sin usar los dos últimos bloques: sitio para el cifrado total.
         let total = dev.blocks().saturating_sub(cryptdev::RESERVED);
+        self.format_on(dev, total, now)
+    }
+
+    /// Como `format_pending`, pero el disco nace con el cifrado total ya puesto (sin conversión):
+    /// se escribe la cabecera y el sistema de archivos se crea ya cifrado. Devuelve el código de
+    /// recuperación del disco. Para el asistente del primer arranque.
+    pub fn format_pending_encrypted(&mut self, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError> {
+        if password.chars().count() < accounts::MIN_PASSWORD {
+            return Err(KeyError::Weak);
+        }
+        if !pool.ready() {
+            return Err(KeyError::NotReady);
+        }
+        let mut dev = self.pending.take().ok_or(KeyError::Unavailable)?;
+        if dev.blocks() < 66 {
+            self.pending = Some(dev);
+            return Err(KeyError::NoRoom);
+        }
+        let mut master = pool.master();
+        let (mut s1, mut i1, mut s2, mut i2) = ([0u8; 16], [0u8; 16], [0u8; 16], [0u8; 16]);
+        pool.take(&mut s1);
+        pool.take(&mut i1);
+        pool.take(&mut s2);
+        pool.take(&mut i2);
+        let code = keys::recovery_code(pool);
+        let mut rsecret = keys::normalize_recovery(&code).unwrap_or_default().into_bytes();
+        let hdr = Header {
+            state: State::Encrypted,
+            next: 0,
+            pending: false,
+            disk: keys::Slot::wrap(&master, password.as_bytes(), s1, i1),
+            recovery: keys::Slot::wrap(&master, &rsecret, s2, i2),
+        };
+        wipe(&mut rsecret);
+        for b in [&mut s1, &mut i1, &mut s2, &mut i2] {
+            wipe(b);
+        }
+        if let Err(e) = cryptdev::write_header(&mut *dev, &hdr) {
+            wipe(&mut master);
+            self.pending = Some(dev);
+            return Err(cryptdev::disk_err(e));
+        }
+        let core = Rc::new(RefCell::new(Core::new(dev, hdr, &master)));
+        wipe(&mut master);
+        let crypt: Box<dyn BlockDev> = Box::new(CryptDev::new(core.clone()));
+        let total = crypt.blocks();
+        self.format_on(crypt, total, now)?;
+        self.disk.core = Some(core);
+        self.log("Disco formateado con cifrado total", now);
+        Ok(code)
+    }
+
+    /// Crea el sistema de archivos en `dev` y pasa a usarlo (ver `format_pending`).
+    fn format_on(&mut self, dev: Box<dyn BlockDev>, total: u64, now: DateTime) -> Result<(), FsError> {
         let mut fs = Nffs::format_with(dev, total, now)?;
         ensure_structure(&mut fs, now);
         fs.write(rel(VERSION_FILE), b"2\n", now)?;
@@ -1786,6 +1840,59 @@ impl Files {
         Ok(code)
     }
 
+    /// Cifra la carpeta de la cuenta `name` recién creada y termina la conversión en el acto
+    /// (una carpeta nueva casi no tiene nada). Funciona sin sesión o con sesión de administrador;
+    /// `password` es la clave de esa cuenta. Devuelve su código de recuperación. Para el asistente.
+    pub fn encrypt_new_home(&mut self, name: &str, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError> {
+        if !self.persistent {
+            return Err(KeyError::Unavailable);
+        }
+        if self.user.is_some() && !self.is_admin() {
+            return Err(KeyError::NotAdmin);
+        }
+        let acc = self.accounts().into_iter().find(|a| same(&a.name, name)).ok_or(KeyError::Unavailable)?;
+        let own = self.user().is_some_and(|u| same(u, &acc.name));
+        let prev_user = self.user.take();
+        let prev_hc = core::mem::take(&mut self.hc);
+        self.user = Some((acc.name.clone(), acc.admin));
+        let private = self.has_private_data(&acc.name);
+        let r = self.encrypt_home(password, pool, now).and_then(|code| {
+            self.hc.fresh = !private;
+            while !self.home_convert_step(64, now)? {}
+            self.hc.fresh = false;
+            Ok(code)
+        });
+        // Si la sesión era la de esa misma cuenta, se queda con sus llaves; si no, vuelve a la de antes.
+        if !own {
+            self.hc = prev_hc;
+        }
+        self.user = prev_user;
+        self.generation += 1;
+        r
+    }
+
+    /// ¿Hay en la carpeta de `name` algún archivo con contenido, fuera de `.config`? (lectura en
+    /// bruto, antes de cifrar).
+    fn has_private_data(&mut self, name: &str) -> bool {
+        let home = join_rel(USERS, name);
+        let mut work = vec![home.clone()];
+        while let Some(d) = work.pop() {
+            let Ok(list) = self.fs.list(&d) else { continue };
+            for e in list {
+                if d == home && same(&e.name, HOME_CONFIG) {
+                    continue;
+                }
+                let p = join_rel(&d, &e.name);
+                if e.dir {
+                    work.push(p);
+                } else if e.size > 0 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Quita el cifrado de la carpeta de la sesión abierta. Deja una conversión en curso.
     pub fn decrypt_home(&mut self, password: &str, now: DateTime) -> Result<(), KeyError> {
         let name = self.user().map(String::from).ok_or(KeyError::Unavailable)?;
@@ -2035,6 +2142,9 @@ struct Home {
     total: u64,
     /// Limpieza del espacio libre al terminar de cifrar: siguiente bloque por mirar.
     scrub: Option<u64>,
+    /// Carpeta recién creada sin datos propios: al terminar de cifrar no hace falta limpiar el
+    /// espacio libre (no hubo nada suyo en claro en el disco).
+    fresh: bool,
     counter: u32,
     /// Entradas de carpetas ya listadas (por ruta en disco, en minúsculas); se vacía al modificar.
     cache: BTreeMap<String, Vec<Item>>,
@@ -2385,7 +2495,7 @@ impl Files {
             self.hc.conv = Some(stack);
         }
         // Todo convertido: lo claro que quedó en bloques ya libres (datos y metadatos viejos) se borra.
-        if res == Ok(true) && to_enc {
+        if res == Ok(true) && to_enc && !self.hc.fresh {
             return self.scrub_phase(budget.max(1) as u64 * SCRUB_CHUNK);
         }
         res
@@ -2543,6 +2653,57 @@ mod tests {
     use crate::block::{DiskError, BLOCK};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn primer_arranque_cifrado_sin_conversion() {
+        let n = DateTime::default();
+        let mut pool = crate::keys::Pool::new();
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED {
+            pool.add_event(i as i32 * 7, 3, i as u64, i as u64 * 7919);
+        }
+        let disk = Disk::new(4096);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), n);
+        assert!(f.pending_format());
+        assert_eq!(f.format_pending_encrypted("corta", &mut pool, n), Err(KeyError::Weak));
+        assert!(f.pending_format(), "si falla, el disco sigue pendiente");
+        let code = f.format_pending_encrypted("clave-del-disco", &mut pool, n).unwrap();
+        assert!(f.disk_encrypted() && f.disk_conversion().is_none(), "nace cifrado, sin conversión");
+        assert!(f.needs_setup() && f.user().is_none());
+        // Primera cuenta con carpeta cifrada, sin sesión (como en el asistente).
+        f.create_account("Ana", Some("clave-de-ana"), true, [1; 16], n).unwrap();
+        assert_eq!(f.encrypt_new_home("Ana", "mala-clave", &mut pool, n), Err(KeyError::WrongSecret));
+        let ana = f.encrypt_new_home("Ana", "clave-de-ana", &mut pool, n).unwrap();
+        assert!(f.user().is_none() && f.account_encrypted("Ana") && f.home_conversion().is_none());
+        // Con la sesión de Ana (administradora), otra cuenta y su carpeta.
+        f.login("Ana", "clave-de-ana").unwrap();
+        f.create_account("Luis", Some("clave-de-luis"), false, [2; 16], n).unwrap();
+        let luis = f.encrypt_new_home("Luis", "clave-de-luis", &mut pool, n).unwrap();
+        assert_eq!(f.user(), Some("Ana"), "la sesión no cambia");
+        assert!(f.home_encrypted() && f.account_encrypted("Luis"));
+        let doc = format!("{}\\nota-secreta-de-ana.txt", f.std_dir(Std::Documents));
+        f.write(&doc, b"CONTENIDO-PRIVADO-DE-ANA-0123456789", n).unwrap();
+        assert_ne!([&code, &ana, &luis][0], &ana);
+        drop(f);
+        let raw = disk.0.borrow().clone();
+        for s in [&b"CONTENIDO-PRIVADO-DE-ANA"[..], b"nota-secreta", b"Usuarios", b"Documentos", b"Luis|"] {
+            assert!(!raw.windows(s.len()).any(|w| w == s), "en claro: {}", String::from_utf8_lossy(s));
+        }
+        // Al volver a arrancar: disco bloqueado; con su clave abre y cada cuenta ve lo suyo.
+        let mut f = Files::probe(Some(Box::new(disk.clone())), n);
+        assert!(f.disk_locked());
+        f.unlock_disk(&code, true, n).unwrap();
+        f.login("Ana", "clave-de-ana").unwrap();
+        assert_eq!(f.read(&doc).unwrap(), b"CONTENIDO-PRIVADO-DE-ANA-0123456789");
+        f.logout();
+        f.login("Luis", "clave-de-luis").unwrap();
+        assert_eq!(f.read(&doc), Err(FsError::Denied));
+        // El código de recuperación de Luis le pone una clave nueva.
+        f.logout();
+        f.recover_account("Luis", &luis, "otra-clave-luis", &mut pool, n).unwrap();
+        f.login("Luis", "otra-clave-luis").unwrap();
+        // Un usuario normal no cifra la carpeta de otro desde su sesión.
+        assert_eq!(f.encrypt_new_home("Ana", "clave-de-ana", &mut pool, n), Err(KeyError::NotAdmin));
+    }
 
     #[test]
     fn cuenta_nueva_no_hereda_carpeta_conservada() {
