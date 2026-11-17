@@ -1,7 +1,7 @@
 //! Explorador de archivos: navegación, lista (detalles, lista o iconos), Papelera, menú contextual
 //! y operaciones sobre `Files`.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
-use super::{App, AppKind, Ctx, MouseEv};
+use super::{App, AppKind, Ctx, DragRequest, MouseEv};
 use crate::dialogs::{self, Answer, Buttons, DialogRequest, DialogResult};
 use crate::files::{self, file_name, join, parent, valid_name, Files, Std};
 use crate::font::{self, Align};
@@ -35,6 +35,10 @@ const LCOL_W: i32 = 190;
 /// Filas que mueve la rueda por muesca en Detalles (en Iconos, una fila de la rejilla; en Lista, una columna).
 const WHEEL_ROWS: i32 = 3;
 const DOUBLE_MS: u64 = 500;
+/// Píxeles que hay que mover con el botón pulsado para que sea un arrastre.
+const DRAG_PX: i32 = 5;
+/// Milisegundos entre línea y línea del desplazamiento automático del recuadro.
+const AUTOSCROLL_MS: u64 = 60;
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
 const DISABLED: u32 = 0xA6A6A6;
@@ -260,6 +264,40 @@ struct Row {
     id: String,
 }
 
+/// Pulsación sobre un elemento: puede acabar en arrastre de archivos.
+struct Press {
+    x: i32,
+    y: i32,
+    i: usize,
+    /// Estaba dentro de una selección múltiple: si no hay arrastre, al soltar queda solo él.
+    defer: bool,
+    /// Ya se movió y no se pudo arrastrar (Papelera, protegidas): al soltar no cambia la selección.
+    dead: bool,
+}
+
+/// Recuadro de selección. El ancla está en coordenadas del contenido (se desplaza con él); el
+/// puntero en coordenadas de la ventana.
+struct Mq {
+    ax: i32,
+    ay: i32,
+    px: i32,
+    py: i32,
+    /// Selección de partida (la de antes si se empezó con Ctrl, vacía si no).
+    base: Vec<usize>,
+    add: bool,
+    /// Ya se ha movido lo bastante para considerarlo un recuadro y no un clic.
+    on: bool,
+    last: u64,
+}
+
+/// Destino resaltado de un arrastre (`Area` no se resalta).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tgt {
+    Row(usize),
+    Place(usize),
+    Area,
+}
+
 struct Explorer {
     /// Carpeta actual o `files::TRASH`.
     cwd: String,
@@ -309,6 +347,9 @@ struct Explorer {
     /// avisa con un `KeyEvent` de `Key::Other` cada vez que cambia.
     ctrl: bool,
     shift: bool,
+    press: Option<Press>,
+    mq: Option<Mq>,
+    drop_tgt: Option<Tgt>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -398,6 +439,9 @@ fn make() -> Explorer {
         has_clip: false,
         ctrl: false,
         shift: false,
+        press: None,
+        mq: None,
+        drop_tgt: None,
     }
 }
 
@@ -770,6 +814,71 @@ impl Explorer {
         self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| h.clone())
     }
 
+    // ---- recuadro de selección y arrastre ----
+
+    /// Desplazamiento del contenido: coordenada de contenido = de ventana + esto.
+    fn off(&self) -> (i32, i32) {
+        let t = self.top as i32;
+        match (self.view, self.view.grid()) {
+            (_, Some((_, ch, _, _))) => (0, t * ch),
+            (View::List, _) => (t * LCOL_W, 0),
+            _ => (0, t * ROW_H),
+        }
+    }
+
+    /// Selección = lo que toca el recuadro (respecto a la selección de partida).
+    fn mq_apply(&mut self) {
+        let Some(m) = &self.mq else { return };
+        let (ox, oy) = self.off();
+        let (px, py) = (m.px + ox, m.py + oy);
+        let r = Rect::new(m.ax.min(px), m.ay.min(py), (m.ax - px).abs() + 1, (m.ay - py).abs() + 1);
+        let mut v = Vec::new();
+        for i in 0..self.rows.len() {
+            let ir = self.item_rect(i);
+            let hit = r.intersects(Rect::new(ir.x + ox, ir.y + oy, ir.w, ir.h));
+            let was = m.base.binary_search(&i).is_ok();
+            if if m.add { hit != was } else { hit || was } {
+                v.push(i);
+            }
+        }
+        self.sel = v.last().copied();
+        self.anchor = self.sel.unwrap_or(0);
+        self.marked = v;
+    }
+
+    /// Rectángulo del recuadro en la ventana, si hay uno dibujándose.
+    fn mq_rect(&self) -> Option<Rect> {
+        let m = self.mq.as_ref().filter(|m| m.on)?;
+        let (ox, oy) = self.off();
+        let (x0, y0) = (m.ax - ox, m.ay - oy);
+        Some(Rect::new(x0.min(m.px), y0.min(m.py), (x0 - m.px).abs() + 1, (y0 - m.py).abs() + 1))
+    }
+
+    /// Destino de soltar `paths` en (x, y): carpeta y qué resaltar. `None` si ahí no se puede soltar.
+    fn target(&self, x: i32, y: i32, paths: &[String], f: &Files) -> Option<(String, Tgt)> {
+        let (dest, tgt) = if x < PANEL_W {
+            let y0 = self.body_y() + 8;
+            if y < y0 || y >= self.h - STATUS_H {
+                return None;
+            }
+            let i = ((y - y0) / PLACE_H) as usize;
+            (PLACES.get(i)?.path(f), Tgt::Place(i))
+        } else if let Some(i) = self.item_at(x, y).filter(|&i| self.rows[i].dir && !self.trash()) {
+            (join(&self.cwd, &self.rows[i].name), Tgt::Row(i))
+        } else if self.area().contains(x, y) && !self.trash() {
+            (self.cwd.clone(), Tgt::Area)
+        } else {
+            return None;
+        };
+        let inside = |p: &String| same(&dest, p) || (dest.len() > p.len() && same(&dest[..p.len()], p) && dest.as_bytes()[p.len()] == b'\\');
+        let there = |p: &String| parent(p).is_some_and(|q| same(&q, &dest));
+        let ok = !paths.is_empty()
+            && !paths.iter().any(inside)
+            && !paths.iter().all(there)
+            && (dest == files::TRASH || can_create_in(f, &dest));
+        ok.then_some((dest, tgt))
+    }
+
     // ---- carga y operaciones ----
 
     fn reload(&mut self, sys: &mut dyn Platform) {
@@ -788,6 +897,7 @@ impl Explorer {
         };
         let f = sys.files();
         self.gen = f.generation();
+        (self.press, self.mq) = (None, None);
         let prefs = f.explorer_prefs();
         self.show_ext = f.read(&prefs).map_or(true, |d| !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"));
         self.rows.clear();
@@ -1415,6 +1525,10 @@ impl Explorer {
             } else if self.hover == Some(Hit::Place(i)) {
                 s.fill_rect(r, 0xE9E9E9);
             }
+            if self.drop_tgt == Some(Tgt::Place(i)) {
+                s.blend_rect(r, theme.accent, 70);
+                s.frame(r, theme.accent);
+            }
             icons::draw(s, place.icon(), 14, r.y + (PLACE_H - 16) / 2, 16, 0x444444);
             clipped(s, Rect::new(38, r.y, PANEL_W - 42, r.h), place.name(), TEXT, Align::Left);
             self.hits.push((r, Hit::Place(i)));
@@ -1528,6 +1642,15 @@ impl Explorer {
                     }
                 }
             }
+        }
+        if let Some(Tgt::Row(i)) = self.drop_tgt.filter(|_| !trash) {
+            let r = self.item_rect(i);
+            s.blend_rect(r, theme.accent, 60);
+            s.frame(r, theme.accent);
+        }
+        if let Some(r) = self.mq_rect() {
+            s.blend_rect(r, theme.accent, 50);
+            s.frame(r, theme.accent);
         }
         s.set_clip(old);
         let m = self.metrics();
@@ -1710,7 +1833,17 @@ impl App for Explorer {
                     }
                 }
             }
-            MouseEv::Up { .. } => {}
+            MouseEv::Up { .. } => {
+                if self.mq.take().is_some_and(|m| m.on) {
+                    cx.redraw = true;
+                }
+                // Pulsó un elemento de una selección múltiple y no hubo arrastre: queda solo ese.
+                if let Some(p) = self.press.take().filter(|p| p.defer && !p.dead && p.i < self.rows.len()) {
+                    self.set_one(p.i);
+                    self.last_click = Some((p.i, cx.now_ms));
+                    cx.redraw = true;
+                }
+            }
             MouseEv::Leave => {
                 if self.hover.take().is_some() {
                     cx.redraw = true;
@@ -1722,9 +1855,32 @@ impl App for Explorer {
                     self.hover = h;
                     cx.redraw = true;
                 }
+                if let Some(p) = self.press.as_ref().filter(|p| !p.dead && (x - p.x).abs().max((y - p.y).abs()) > DRAG_PX) {
+                    let paths = self.paths();
+                    if p.i >= self.rows.len() || self.trash() || paths.iter().any(|q| files::is_protected(q)) {
+                        if let Some(p) = &mut self.press {
+                            p.dead = true;
+                        }
+                    } else {
+                        self.press = None;
+                        self.hover = None;
+                        cx.drag = Some(DragRequest { paths });
+                        cx.redraw = true;
+                    }
+                }
+                let (ox, oy) = self.off();
+                if let Some(m) = &mut self.mq {
+                    (m.px, m.py) = (x, y);
+                    m.on |= (m.ax - (x + ox)).abs().max((m.ay - (y + oy)).abs()) > 3;
+                    if m.on {
+                        self.mq_apply();
+                        cx.redraw = true;
+                    }
+                }
             }
             MouseEv::Down { x, y } => {
                 cx.redraw = true;
+                (self.press, self.mq) = (None, None);
                 if let Some(h) = self.hit_at(x, y) {
                     match h {
                         Hit::Back => self.go_back(cx),
@@ -1754,6 +1910,11 @@ impl App for Explorer {
                         self.toggle(i);
                         self.last_click = None;
                     }
+                    Some(i) if self.is_sel(i) && self.marked.len() > 1 => {
+                        // No deshace la selección: se decide al soltar (o se arrastra todo).
+                        self.press = Some(Press { x, y, i, defer: true, dead: false });
+                        self.last_click = None;
+                    }
                     Some(i) => {
                         self.set_one(i);
                         if self.last_click.is_some_and(|(j, t)| j == i && cx.now_ms.saturating_sub(t) < DOUBLE_MS) {
@@ -1761,11 +1922,16 @@ impl App for Explorer {
                             self.open_sel(cx);
                         } else {
                             self.last_click = Some((i, cx.now_ms));
+                            self.press = Some(Press { x, y, i, defer: false, dead: false });
                         }
                     }
                     None => {
-                        if self.area().contains(x, y) && !self.ctrl && !self.shift {
-                            self.clear_sel();
+                        if self.area().contains(x, y) {
+                            if !self.ctrl && !self.shift {
+                                self.clear_sel();
+                            }
+                            let (ox, oy) = self.off();
+                            self.mq = Some(Mq { ax: x + ox, ay: y + oy, px: x, py: y, base: self.marked.clone(), add: self.ctrl, on: false, last: cx.now_ms });
                         }
                     }
                 }
@@ -1783,6 +1949,44 @@ impl App for Explorer {
         if let Some(p) = p {
             self.top = (p.max(0) as usize).min(self.max_top());
             cx.redraw = true;
+        }
+        // Recuadro de selección contra un borde de la zona: el contenido avanza solo.
+        if let Some(m) = self.mq.as_ref().filter(|m| m.on && cx.now_ms.saturating_sub(m.last) >= AUTOSCROLL_MS) {
+            let a = self.area();
+            let (lo, hi, v) = if self.horiz() { (a.x, a.right(), m.px) } else { (a.y, a.bottom(), m.py) };
+            let top = if v < lo { self.top.saturating_sub(1) } else if v >= hi { (self.top + 1).min(self.max_top()) } else { self.top };
+            if top != self.top {
+                self.top = top;
+                if let Some(m) = &mut self.mq {
+                    m.last = cx.now_ms;
+                }
+                self.mq_apply();
+                cx.redraw = true;
+            }
+        }
+    }
+
+    fn drag_over(&mut self, pos: Option<(i32, i32)>, paths: &[String], cx: &mut Ctx) -> bool {
+        let t = pos.and_then(|(x, y)| self.target(x, y, paths, cx.sys.files()));
+        let tgt = t.as_ref().map(|(_, g)| *g).filter(|g| *g != Tgt::Area);
+        if tgt != self.drop_tgt {
+            self.drop_tgt = tgt;
+            cx.redraw = true;
+        }
+        t.is_some()
+    }
+
+    fn drop_files(&mut self, x: i32, y: i32, paths: &[String], copy: bool, cx: &mut Ctx) {
+        let t = self.target(x, y, paths, cx.sys.files());
+        if self.drop_tgt.take().is_some() {
+            cx.redraw = true;
+        }
+        let Some((dest, _)) = t else { return };
+        let paths = paths.to_vec();
+        if dest == files::TRASH {
+            self.act(Act::Trash(paths), cx);
+        } else {
+            self.act(Act::Transfer { paths, dir: dest, mv: !copy }, cx);
         }
     }
 
