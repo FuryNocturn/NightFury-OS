@@ -11,6 +11,7 @@ use crate::font::{self, Align};
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
+use crate::keys::KeyError;
 use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::platform::{DateTime, Platform};
@@ -53,6 +54,23 @@ const CURSOR: [&str; 19] = [
     "............",
 ];
 /// Zona que puede ocupar el puntero en (x, y), sea la flecha o una flecha doble de redimensionado.
+/// Número que identifica la tecla para el acumulador de aleatoriedad.
+fn key_code(k: Key) -> i32 {
+    match k {
+        Key::Char(c) => c as i32,
+        Key::F(n) => 0x1000 + n as i32,
+        Key::Escape => 0x2001,
+        Key::Backspace => 0x2002,
+        Key::Tab => 0x2003,
+        Key::Enter => 0x2004,
+        Key::Left => 0x2005,
+        Key::Right => 0x2006,
+        Key::Up => 0x2007,
+        Key::Down => 0x2008,
+        _ => 0x2000,
+    }
+}
+
 fn cursor_rect(x: i32, y: i32) -> Rect {
     Rect::new(x - 11, y - 11, 24, 30)
 }
@@ -317,6 +335,45 @@ pub struct Desktop {
     /// Cerrando sesión: se pide cerrar cada ventana, una a una; espera la respuesta de esta.
     logging_out: bool,
     logout_wait: Option<u32>,
+    /// Conversión de cifrado en curso (la que muestra el aviso), aviso final y si falló.
+    conv: Option<Conv>,
+    conv_note: Option<(&'static str, u64)>,
+    conv_failed: bool,
+}
+
+/// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
+const CONV_DISK_BLOCKS: u32 = 16;
+/// Archivos de la carpeta que se convierten en cada tick.
+const CONV_HOME_FILES: u32 = 1;
+/// Cuánto se ve "Cifrado completado".
+const CONV_NOTE_MS: u64 = 4000;
+/// Confirmaciones de apagar (0), reiniciar (1) y cerrar sesión (3) con un cifrado en curso.
+const TAG_POWER: u32 = 0xFFFF_FF20;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ConvWhat {
+    Disk,
+    Home,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Conv {
+    what: ConvWhat,
+    /// `true` = cifrando, `false` = descifrando.
+    enc: bool,
+    pct: u32,
+}
+
+impl Conv {
+    fn text(&self) -> String {
+        let (verb, what) = match (self.enc, self.what) {
+            (true, ConvWhat::Disk) => ("Cifrando", "el disco"),
+            (false, ConvWhat::Disk) => ("Descifrando", "el disco"),
+            (true, ConvWhat::Home) => ("Cifrando", "tu carpeta"),
+            (false, ConvWhat::Home) => ("Descifrando", "tu carpeta"),
+        };
+        format!("{verb} {what}… {} %", self.pct)
+    }
 }
 
 fn shadow(s: &mut Surface, r: Rect) {
@@ -556,9 +613,12 @@ impl Desktop {
             can_session: sys.files().persistent(),
             logging_out: false,
             logout_wait: None,
+            conv: None,
+            conv_note: None,
+            conv_failed: false,
         };
         d.login.set_clock(d.clock);
-        if sys.files().user().is_some() {
+        if sys.files().user().is_some() && !sys.files().disk_locked() {
             d.load_session(sys);
         } else {
             // Disco con cuentas: hasta el primer tick (`boot_flow`) solo se ve el fondo oscuro.
@@ -617,6 +677,12 @@ impl Desktop {
 
     /// Orden del arranque: aviso/diálogo de disco, asistente si hace falta, inicio de sesión, escritorio.
     fn enter_flow(&mut self, sys: &mut dyn Platform) {
+        // Disco cifrado: primero su clave, antes del asistente y del inicio de sesión.
+        if sys.files().disk_locked() {
+            self.login.start_disk();
+            self.screen_on();
+            return;
+        }
         if sys.files().user().is_some() {
             if self.login.mode != Mode::Off {
                 self.open_session(sys);
@@ -641,6 +707,8 @@ impl Desktop {
     fn show_pick(&mut self, sys: &mut dyn Platform) {
         let users = sys.files().accounts().iter().map(|a| (a.name.clone(), a.has_password())).collect();
         self.login.start_pick(users);
+        let enc = self.login.user_names().into_iter().map(|n| sys.files().account_encrypted(&n)).collect();
+        self.login.set_recoverable(enc);
         self.screen_on();
     }
 
@@ -656,17 +724,153 @@ impl Desktop {
                 self.files_gen = 0;
                 self.dmg_all();
             }
-            Out::SetupDone => self.enter_flow(sys),
+            Out::SetupDone | Out::DiskDone => self.enter_flow(sys),
             Out::Shutdown => sys.shutdown(),
             Out::Reboot => sys.reboot(),
         }
         self.flush_login();
     }
 
+    /// Apagar (0), reiniciar (1) o cerrar sesión (3). Con un cifrado en curso, antes pide confirmación.
+    fn power(&mut self, act: u32, sys: &mut dyn Platform) {
+        if self.converting(sys) {
+            let (title, what) = match act {
+                0 => ("Apagar", "apagar: continuará al volver a arrancar"),
+                1 => ("Reiniciar", "reiniciar: continuará al volver a arrancar"),
+                _ => ("Cerrar sesión", "cerrar la sesión: continuará al volver a entrar"),
+            };
+            let text = format!("Hay un cifrado en curso. Puedes {what}.");
+            let req = DialogRequest::Message { tag: TAG_POWER + act, title: String::from(title), text, buttons: Buttons::YesNo };
+            self.open_dialog(None, req, sys);
+            return;
+        }
+        self.do_power(act, sys);
+    }
+
+    fn do_power(&mut self, act: u32, sys: &mut dyn Platform) {
+        match act {
+            0 => sys.shutdown(),
+            1 => sys.reboot(),
+            _ => self.begin_logout(sys),
+        }
+    }
+
+    /// ¿Hay una conversión de cifrado en marcha?
+    fn converting(&self, sys: &mut dyn Platform) -> bool {
+        self.conv.is_some() || sys.files().disk_conversion().is_some() || sys.files().home_conversion().is_some()
+    }
+
+    fn conv_rect(&self) -> Rect {
+        Rect::new(self.w - 292, self.bar_y() - 60, 280, 52)
+    }
+
+    /// Un paso de la conversión en curso (si la hay) y actualización del aviso. Si falla, no se
+    /// reintenta: un diálogo lo cuenta una sola vez.
+    fn convert_tick(&mut self, sys: &mut dyn Platform) {
+        if let Some((_, until)) = self.conv_note {
+            if self.now_ms >= until {
+                self.conv_note = None;
+                self.dmg(self.conv_rect());
+            }
+        }
+        if self.conv_failed || !self.booted || sys.files().disk_locked() {
+            return;
+        }
+        let now = sys.now();
+        let (what, res) = if sys.files().disk_conversion().is_some() {
+            (ConvWhat::Disk, sys.files().convert_step(CONV_DISK_BLOCKS, now))
+        } else if sys.files().home_conversion().is_some() {
+            (ConvWhat::Home, sys.files().home_convert_step(CONV_HOME_FILES, now))
+        } else {
+            self.set_conv(ConvWhat::Disk, None);
+            return;
+        };
+        match res {
+            Ok(_) => {
+                let state = if what == ConvWhat::Disk { sys.files().disk_conversion() } else { sys.files().home_conversion() };
+                self.set_conv(what, state);
+            }
+            Err(e) => self.conv_error(e, sys),
+        }
+    }
+
+    /// Anota el estado de la conversión: (hechos, total, cifrando) o `None` si ya terminó.
+    fn set_conv(&mut self, what: ConvWhat, state: Option<(u64, u64, bool)>) {
+        let old = self.conv;
+        match state {
+            Some((done, total, enc)) => {
+                let pct = if total == 0 { 100 } else { (done.min(total) * 100 / total) as u32 };
+                self.conv = Some(Conv { what, enc, pct });
+                self.conv_note = None;
+            }
+            None => {
+                if let Some(c) = self.conv.take() {
+                    self.conv_note = Some((if c.enc { "Cifrado completado" } else { "Descifrado completado" }, self.now_ms + CONV_NOTE_MS));
+                }
+            }
+        }
+        if self.conv != old || (old.is_some() && self.conv.is_none()) {
+            self.dmg(self.conv_rect());
+        }
+    }
+
+    fn conv_error(&mut self, e: KeyError, sys: &mut dyn Platform) {
+        self.conv_failed = true;
+        self.conv = None;
+        self.dmg(self.conv_rect());
+        let now = sys.now();
+        sys.files().log(&format!("Conversión de cifrado detenida: {e:?}"), now);
+        let text = format!("El cifrado se ha detenido. {}", e.text());
+        let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Cifrado"), text, buttons: Buttons::Ok };
+        self.open_dialog(None, req, sys);
+    }
+
+    fn paint_conv(&self, s: &mut Surface) {
+        let r = self.conv_rect();
+        if !r.intersects(s.clip()) {
+            return;
+        }
+        let (text, pct) = match (&self.conv, self.conv_note) {
+            (Some(c), _) => (c.text(), Some(c.pct)),
+            (None, Some((t, _))) => (String::from(t), None),
+            _ => return,
+        };
+        s.fill_rect(r, 0x2B2B2B);
+        s.frame(r, blend(0x2B2B2B, 0xFFFFFF, 40));
+        text_in(s, Rect::new(r.x + 14, r.y + 6, r.w - 28, 26), &text, 9, 0xFFFFFF, Align::Left);
+        if let Some(p) = pct {
+            let track = Rect::new(r.x + 14, r.bottom() - 14, r.w - 28, 4);
+            s.fill_rect(track, 0x555555);
+            s.fill_rect(Rect::new(track.x, track.y, track.w * p as i32 / 100, track.h), self.theme.accent);
+        }
+    }
+
+    /// Solo para vistas previas: pinta el aviso de conversión sin tocar el disco.
+    #[doc(hidden)]
+    pub fn preview_conversion(&mut self, disk: bool, enc: bool, pct: u32) {
+        self.set_conv(if disk { ConvWhat::Disk } else { ConvWhat::Home }, Some((pct as u64, 100, enc)));
+    }
+
+    /// Solo para vistas previas y pruebas: muestra la pantalla "Disco cifrado".
+    #[doc(hidden)]
+    pub fn preview_disk_screen(&mut self) {
+        self.login.start_disk();
+        self.screen_on();
+    }
+
+    /// Solo para vistas previas: abre el diálogo de aleatoriedad como diálogo del sistema.
+    #[doc(hidden)]
+    pub fn preview_entropy(&mut self, sys: &mut dyn Platform) {
+        let req = DialogRequest::Entropy { tag: TAG_SYS, title: String::from("Generar la llave") };
+        self.open_dialog(None, req, sys);
+    }
+
     /// Bloquea: las ventanas siguen abiertas pero no se ven ni reciben nada.
     pub fn lock(&mut self, sys: &mut dyn Platform) {
         let Some(name) = sys.files().user().map(String::from) else { return };
         let has = sys.files().has_password();
+        // La llave de la carpeta se borra de la memoria hasta que se desbloquee con la clave.
+        sys.files().lock_keys();
         self.login.start_lock(&name, has);
         self.screen_on();
         self.flush_login();
@@ -763,6 +967,9 @@ impl Desktop {
         if (x, y) == (self.mx, self.my) {
             return;
         }
+        // Cada movimiento alimenta el acumulador de aleatoriedad (también en las pantallas de inicio).
+        let fine = sys.entropy();
+        sys.pool().add_event(x, y, self.now_ms, fine);
         self.dmg(cursor_rect(self.mx, self.my));
         self.mx = x;
         self.my = y;
@@ -1477,6 +1684,7 @@ impl Desktop {
                 self.show_notice(sys);
             }
             DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            DialogResult::Answer { tag: t @ TAG_POWER..=0xFFFF_FF23, answer: Answer::Yes } => self.do_power(t - TAG_POWER, sys),
             DialogResult::Answer { tag: u32::MAX, .. } => self.enter_flow(sys),
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {
                 if let Err(e) = sys.files().empty_trash() {
@@ -1936,10 +2144,8 @@ impl Desktop {
             Hit::Shut(i) => {
                 self.set_shut(false);
                 match i {
-                    0 => sys.shutdown(),
-                    1 => sys.reboot(),
                     2 => self.lock(sys),
-                    _ => self.begin_logout(sys),
+                    _ => self.power(i as u32, sys),
                 }
             }
             Hit::MPower => self.set_shut(!shut_was),
@@ -2084,6 +2290,8 @@ impl Desktop {
         if !k.down {
             return;
         }
+        let fine = sys.entropy();
+        sys.pool().add_event(key_code(k.key), 0, self.now_ms, fine);
         if self.login.covers() {
             let out = self.login.key(&k, sys);
             self.login_out(out, sys);
@@ -2126,12 +2334,13 @@ impl Desktop {
 
     fn tick(&mut self, ms: u64, sys: &mut dyn Platform) {
         self.now_ms = ms;
-        self.login.tick(ms);
-        self.flush_login();
+        let out = self.login.tick(ms, sys);
+        self.login_out(out, sys);
         if !self.booted {
             self.booted = true;
             self.boot_flow(sys);
         }
+        self.convert_tick(sys);
         self.refresh_icons(sys);
         self.sync_mods(sys);
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
@@ -2177,6 +2386,7 @@ impl Desktop {
             }
             if self.login.mode == Mode::Off {
                 self.paint_bar(s, active);
+                self.paint_conv(s);
                 if self.start_open {
                     self.paint_menu(s);
                 }
@@ -4374,5 +4584,270 @@ mod login_tests {
         same_as_full(&mut d, &mut sys);
         click(&mut d, &mut sys, (1180, 672));
         assert!(sys.halted);
+    }
+
+    #[test]
+    fn el_escritorio_alimenta_el_acumulador_con_raton_y_teclado() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        let base = sys.pool.events();
+        d.mouse_to(100, 100, &mut sys);
+        d.mouse_to(100, 100, &mut sys); // misma posición: no cuenta
+        d.mouse_to(120, 90, &mut sys);
+        assert_eq!(sys.pool.events(), base + 2);
+        let before = sys.pool.preview();
+        typ(&mut d, &mut sys, "a");
+        assert_eq!(sys.pool.events(), base + 3);
+        assert_ne!(sys.pool.preview(), before);
+    }
+
+    // ---- Cifrado (v0.6.0): pantallas
+
+    fn sesion() -> (Desktop, TestPlatform) {
+        let mut sys = with_accounts(&[("Ana", None)]);
+        let mut d = boot(&mut sys);
+        d.render(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Off);
+        (d, sys)
+    }
+
+    fn texto(d: &Desktop) -> String {
+        d.conv.map(|c| c.text()).unwrap_or_default()
+    }
+
+    #[test]
+    fn el_aviso_de_conversion_aparece_avanza_y_se_va() {
+        let (mut d, mut sys) = sesion();
+        let r = d.conv_rect();
+        d.set_conv(ConvWhat::Disk, Some((37, 100, true)));
+        assert_eq!(texto(&d), "Cifrando el disco… 37 %");
+        // Solo se repinta su rectángulo.
+        let zonas = d.render(&mut sys);
+        assert!(!zonas.is_empty() && zonas.iter().all(|z| z.intersect(r) == *z), "{zonas:?}");
+        same_as_full(&mut d, &mut sys);
+        let (track_x, y) = (r.x + 14, r.bottom() - 12);
+        assert_eq!(d.back().px[(y * 1280 + track_x + 10) as usize], d.theme.accent);
+        assert_eq!(d.back().px[(y * 1280 + track_x + 200) as usize], 0x555555);
+        // El mismo porcentaje no ensucia nada; uno nuevo, sí.
+        d.set_conv(ConvWhat::Disk, Some((37, 100, true)));
+        assert!(d.render(&mut sys).is_empty());
+        d.set_conv(ConvWhat::Disk, Some((38, 100, true)));
+        assert!(!d.render(&mut sys).is_empty());
+        // Cada tipo de conversión con su texto.
+        for (disk, enc, t) in [(true, false, "Descifrando el disco… 5 %"), (false, true, "Cifrando tu carpeta… 5 %"), (false, false, "Descifrando tu carpeta… 5 %")] {
+            d.preview_conversion(disk, enc, 5);
+            assert_eq!(texto(&d), t);
+        }
+        // Al terminar: aviso de 4 s y luego nada.
+        d.set_conv(ConvWhat::Home, Some((100, 100, true)));
+        d.set_conv(ConvWhat::Home, None);
+        assert_eq!((d.conv, d.conv_note.map(|n| n.0)), (None, Some("Cifrado completado")));
+        same_as_full(&mut d, &mut sys);
+        d.event(Event::Tick(d.now_ms + 1000), &mut sys);
+        assert!(d.conv_note.is_some());
+        d.event(Event::Tick(d.now_ms + CONV_NOTE_MS), &mut sys);
+        assert!(d.conv_note.is_none());
+        same_as_full(&mut d, &mut sys);
+        d.set_conv(ConvWhat::Disk, Some((9, 10, false)));
+        d.set_conv(ConvWhat::Disk, None);
+        assert_eq!(d.conv_note.map(|n| n.0), Some("Descifrado completado"));
+    }
+
+    #[test]
+    fn sin_conversion_el_tick_no_pinta_nada() {
+        let (mut d, mut sys) = sesion();
+        d.event(Event::Tick(d.now_ms + 10), &mut sys);
+        assert!(d.conv.is_none() && d.conv_note.is_none());
+    }
+
+    #[test]
+    fn apagar_con_un_cifrado_en_curso_pide_confirmacion() {
+        let (mut d, mut sys) = sesion();
+        d.power(0, &mut sys);
+        assert!(sys.halted);
+        sys.halted = false;
+        d.set_conv(ConvWhat::Disk, Some((1, 100, true)));
+        d.power(0, &mut sys);
+        assert!(!sys.halted);
+        assert_eq!(d.window_count(), 1);
+        // Escape = No.
+        press(&mut d, &mut sys, Key::Escape, None);
+        assert!(!sys.halted && d.window_count() == 0);
+        d.power(0, &mut sys);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert!(sys.halted);
+        // Reiniciar y cerrar sesión, igual.
+        d.power(1, &mut sys);
+        assert!(!sys.rebooted);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert!(sys.rebooted);
+        d.power(3, &mut sys);
+        assert_eq!(d.login_mode(), Mode::Off);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login_mode(), Mode::Pick);
+    }
+
+    #[test]
+    fn un_error_de_conversion_se_cuenta_una_sola_vez() {
+        let (mut d, mut sys) = sesion();
+        d.set_conv(ConvWhat::Disk, Some((1, 100, true)));
+        d.conv_error(KeyError::Fs(FsError::Invalid), &mut sys);
+        assert!(d.conv.is_none() && d.conv_failed);
+        assert_eq!(d.window_count(), 1);
+        for i in 1..5 {
+            d.event(Event::Tick(d.now_ms + 10 * i), &mut sys);
+        }
+        assert_eq!(d.window_count(), 1);
+    }
+
+    #[test]
+    fn la_pantalla_de_disco_cifrado_sigue_el_arranque_normal() {
+        // Con cuentas: tras abrir (o seguir sin disco) viene el inicio de sesión.
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        d.preview_disk_screen();
+        assert_eq!(d.login_mode(), Mode::Disk);
+        same_as_full(&mut d, &mut sys);
+        // Escribir una clave, enviarla y esperar el tick: aquí el disco no está cifrado y lo dice.
+        typ(&mut d, &mut sys, "clavedisco");
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login_mode(), Mode::Disk);
+        d.event(Event::Tick(d.now_ms + 200), &mut sys);
+        same_as_full(&mut d, &mut sys);
+        // Seguir sin disco: Tab hasta el enlace, Enter, Mayús+Tab a "Seguir sin disco" y Enter.
+        for _ in 0..3 {
+            press(&mut d, &mut sys, Key::Tab, None);
+        }
+        press(&mut d, &mut sys, Key::Enter, None);
+        same_as_full(&mut d, &mut sys);
+        assert_eq!(d.login_mode(), Mode::Disk);
+        d.event(Event::Key(KeyEvent { key: Key::Tab, ch: None, down: true, shift: true, ctrl: false, alt: false }), &mut sys);
+        press(&mut d, &mut sys, Key::Enter, None);
+        assert_eq!(d.login_mode(), Mode::Pick);
+        // Sin cuentas: el asistente.
+        let mut sys = disk();
+        let mut d = boot(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Setup);
+        d.preview_disk_screen();
+        d.login_out(Out::DiskDone, &mut sys);
+        assert_eq!(d.login_mode(), Mode::Setup);
+    }
+
+    #[test]
+    fn apagar_desde_la_pantalla_de_disco_cifrado() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        d.preview_disk_screen();
+        click(&mut d, &mut sys, (1240, 760));
+        same_as_full(&mut d, &mut sys);
+        click(&mut d, &mut sys, (1180, 672));
+        assert!(sys.halted);
+    }
+
+    #[test]
+    fn el_dialogo_de_aleatoriedad_cuenta_cada_movimiento_una_sola_vez() {
+        let (mut d, mut sys) = sesion();
+        d.preview_entropy(&mut sys);
+        d.render(&mut sys);
+        let (c, (w, h)) = {
+            let win = d.wins.last().unwrap();
+            (win.content_rect(), win.dlg.as_ref().unwrap().size())
+        };
+        let base = sys.pool.events();
+        for i in 0..20 {
+            d.mouse_to(c.x + 10 + i * 3, c.y + 60, &mut sys);
+        }
+        // El escritorio alimenta el acumulador y el diálogo solo cuenta: ni dobles ni pérdidas.
+        assert_eq!(sys.pool.events(), base + 20);
+        // "Continuar" no responde hasta completar los movimientos.
+        let boton = |d: &mut Desktop, sys: &mut TestPlatform| {
+            d.mouse_to(c.x + w - 150, c.y + h - 30, sys);
+            d.left_button(true, sys);
+            d.left_button(false, sys);
+        };
+        boton(&mut d, &mut sys);
+        assert_eq!(d.window_count(), 1);
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED as i32 {
+            d.mouse_to(c.x + 5 + i % 450, c.y + 60 + i / 450, &mut sys);
+        }
+        d.render(&mut sys);
+        boton(&mut d, &mut sys);
+        assert_eq!(d.window_count(), 0);
+    }
+
+    /// Disco en memoria que sigue vivo tras entregárselo a `Files` (para "reiniciar" y montarlo otra vez).
+    #[derive(Clone)]
+    struct Shared(Rc<core::cell::RefCell<Vec<u8>>>);
+    impl crate::block::BlockDev for Shared {
+        fn blocks(&self) -> u64 {
+            (self.0.borrow().len() / crate::block::BLOCK) as u64
+        }
+        fn read(&mut self, n: u64, buf: &mut [u8]) -> Result<(), crate::block::DiskError> {
+            if n >= self.blocks() || buf.len() != crate::block::BLOCK {
+                return Err(crate::block::DiskError::Range);
+            }
+            buf.copy_from_slice(&self.0.borrow()[n as usize * crate::block::BLOCK..][..crate::block::BLOCK]);
+            Ok(())
+        }
+        fn write(&mut self, n: u64, buf: &[u8]) -> Result<(), crate::block::DiskError> {
+            if n >= self.blocks() || buf.len() != crate::block::BLOCK {
+                return Err(crate::block::DiskError::Range);
+            }
+            self.0.borrow_mut()[n as usize * crate::block::BLOCK..][..crate::block::BLOCK].copy_from_slice(buf);
+            Ok(())
+        }
+    }
+
+    /// Integración con el cifrado de disco real de `files.rs` (el integrador la activa cuando exista):
+    /// un disco cifrado arranca en la pantalla "Disco cifrado", rechaza una clave mala, se abre con la
+    /// buena o con el código de recuperación, y sigue con el inicio de sesión.
+    #[test]
+    #[ignore = "necesita el cifrado de disco de files.rs"]
+    fn disco_cifrado_real_pide_su_clave_antes_del_inicio_de_sesion() {
+        let ram = Shared(Rc::new(core::cell::RefCell::new(vec![0; 4096 * crate::block::BLOCK])));
+        let now = DateTime { year: 2026, month: 11, day: 15, hour: 21, minute: 37, second: 5 };
+        let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+        sys.files = Files::probe(Some(Box::new(ram.clone())), now);
+        sys.files.format_pending(now).unwrap();
+        sys.files.create_account("Ana", Some("secreto1"), true, [1; 16], now).unwrap();
+        sys.files.login("Ana", "secreto1").unwrap();
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED {
+            sys.pool.add_event(i as i32, 3, 1, i as u64 * 7919);
+        }
+        let mut pool = core::mem::take(&mut sys.pool);
+        let code = sys.files.encrypt_disk("clavedisco", &mut pool, now).unwrap();
+        while !sys.files.convert_step(64, now).unwrap() {}
+        sys.files.logout();
+        drop(sys);
+
+        let remount = |ram: &Shared| {
+            let mut sys = TestPlatform { size: (1280, 800), ..Default::default() };
+            sys.files = Files::probe(Some(Box::new(ram.clone())), now);
+            assert!(sys.files.disk_locked());
+            sys
+        };
+        // Clave mala, y luego la buena.
+        let mut sys = remount(&ram);
+        let mut d = boot(&mut sys);
+        assert_eq!(d.login_mode(), Mode::Disk);
+        typ(&mut d, &mut sys, "mala");
+        press(&mut d, &mut sys, Key::Enter, None);
+        d.event(Event::Tick(d.now_ms + 200), &mut sys);
+        assert_eq!(d.login_mode(), Mode::Disk);
+        typ(&mut d, &mut sys, "clavedisco");
+        press(&mut d, &mut sys, Key::Enter, None);
+        d.event(Event::Tick(d.now_ms + 200), &mut sys);
+        assert_eq!(d.login_mode(), Mode::Pick);
+        // Con el código de recuperación (tecleado en minúsculas y con guiones).
+        let mut sys = remount(&ram);
+        let mut d = boot(&mut sys);
+        for _ in 0..2 {
+            press(&mut d, &mut sys, Key::Tab, None);
+        }
+        press(&mut d, &mut sys, Key::Enter, None);
+        typ(&mut d, &mut sys, &code.to_lowercase());
+        press(&mut d, &mut sys, Key::Enter, None);
+        d.event(Event::Tick(d.now_ms + 200), &mut sys);
+        assert_eq!(d.login_mode(), Mode::Pick);
     }
 }

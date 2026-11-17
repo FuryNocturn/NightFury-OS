@@ -2,15 +2,22 @@
 //! `Desktop` les pasa el teclado y el ratón mientras `covers()` y las pinta encima de un fondo
 //! oscurecido; aquí no hay nada del escritorio (ventanas, barra, menús).
 //!
-//! Las claves viven solo en los búferes `pw` y `pw2` (reservados de una vez, sin crecer, y
-//! borrados con `crypto::wipe`); no se copian a ningún registro, título ni archivo.
+//! Las claves y códigos viven solo en los búferes `pw`, `pw2` y `code` (reservados de una vez, sin
+//! crecer, y borrados con `crypto::wipe`); no se copian a ningún registro, título ni archivo.
+//!
+//! Cifrado (v0.6.0): la pantalla "Disco cifrado" (`Mode::Disk`, antes del asistente y del inicio
+//! de sesión) y la recuperación de una cuenta (`Mode::Recover`, desde el inicio de sesión). Derivar
+//! una llave tarda (PBKDF2): se avisa con "Comprobando…" y el trabajo se hace en un tick posterior
+//! (`job`), para que ese aviso llegue a la pantalla antes.
 use crate::accounts::{self, AccountError};
 use crate::crypto::wipe;
 use crate::dialogs::{fit, wrap};
 use crate::font::{self, Align};
 use crate::geom::Rect;
+use crate::files::Files;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
+use crate::keys::{self, KeyError, Pool};
 use crate::platform::{DateTime, Platform};
 use crate::surface::{blend, lighten, Surface};
 use alloc::format;
@@ -26,6 +33,10 @@ pub enum Mode {
     Setup,
     Pick,
     Lock,
+    /// Disco cifrado esperando su clave (o su código de recuperación).
+    Disk,
+    /// Recuperar una cuenta cifrada con su código: código, clave nueva y repetirla.
+    Recover,
 }
 
 /// Lo que el escritorio debe hacer tras un evento.
@@ -38,6 +49,8 @@ pub enum Out {
     Unlocked,
     /// El asistente terminó (la sesión del asistente ya está cerrada).
     SetupDone,
+    /// El disco cifrado se abrió, o se eligió seguir sin él: continúa el arranque normal.
+    DiskDone,
     Shutdown,
     Reboot,
 }
@@ -54,6 +67,21 @@ enum Item {
     Msg,
     Power,
     Shut(usize),
+    /// Código de recuperación (campo siempre visible).
+    Code,
+    /// Enlace de texto: cambiar de clave a código, o "He olvidado mi clave".
+    Link,
+    /// Enlace "Seguir sin disco".
+    Skip,
+    /// "Volver" de la confirmación de seguir sin disco.
+    Back,
+}
+
+/// Trabajo lento aplazado un tick (derivar llaves).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Job {
+    Disk,
+    Recover,
 }
 
 const FIELD_H: i32 = 30;
@@ -70,6 +98,17 @@ const GREY: u32 = 0xB5B5B5;
 const RED: u32 = 0xFF8A80;
 const AVATARS: [u32; 6] = [0x3B7DD8, 0x2E8B57, 0xC98A0B, 0xB5446E, 0x7A55C9, 0x0E8A8A];
 const SHUT_ROWS: [&str; 2] = ["Apagar", "Reiniciar"];
+const STRENGTH_W: i32 = 170;
+const LOCK_W: i32 = 64;
+const LOCK_H: i32 = 72;
+/// Espera mínima entre pintar "Comprobando…" y empezar a derivar la llave.
+const JOB_DELAY_MS: u64 = 30;
+const GREEN: u32 = 0xA5D6A7;
+const DISK_SUB_KEY: &str = "Escribe la clave del disco para abrirlo.";
+const DISK_SUB_CODE: &str = "Escribe el código de recuperación del disco (8 grupos de 5 caracteres).";
+const SKIP_TEXT: &str = "Los archivos se guardarán solo en la memoria y se perderán al apagar.";
+const RECOVER_SUB: &str = "Escribe el código de recuperación de esta cuenta y elige una clave nueva.";
+const STRENGTH: [(&str, u32); 5] = [("Muy débil", 0xFF6B5E), ("Débil", 0xFF9A4D), ("Aceptable", 0xF2C94C), ("Buena", 0x9BDB6B), ("Fuerte", 0x4CCB6A)];
 const SUB: &str = "La primera cuenta es la del administrador: podrá crear y quitar otras cuentas.";
 
 struct Layout {
@@ -95,6 +134,8 @@ pub struct Login {
     name: String,
     pw: String,
     pw2: String,
+    /// Código de recuperación (se ve al teclearlo).
+    code: String,
     admin: bool,
     focus: Item,
     err: Option<(Item, String)>,
@@ -109,6 +150,16 @@ pub struct Login {
     last_secs: u64,
     clock: DateTime,
     damage: Vec<Rect>,
+    /// Por cada cuenta de `users`: su carpeta está cifrada (ofrece "He olvidado mi clave").
+    recoverable: Vec<bool>,
+    /// Disco: se escribe el código de recuperación en vez de la clave.
+    recovery_mode: bool,
+    /// Disco: pregunta "¿seguir sin disco?" abierta.
+    confirm_skip: bool,
+    /// Trabajo lento pendiente y el instante a partir del cual se hace.
+    job: Option<(Job, u64)>,
+    /// El mensaje de `err` es una buena noticia (se pinta en verde).
+    good: bool,
 }
 
 fn secret() -> String {
@@ -119,6 +170,24 @@ fn secret() -> String {
 fn wipe_str(s: &mut String) {
     let mut b = core::mem::replace(s, secret()).into_bytes();
     wipe(&mut b);
+}
+
+/// Comprueba el código de recuperación tecleado sin derivar nada (acepta minúsculas, espacios y guiones).
+fn check_code(input: &str) -> Result<(), &'static str> {
+    let n = input.chars().filter(|c| !c.is_whitespace() && *c != '-').count();
+    if n != 40 {
+        return Err("El código debe tener 40 caracteres.");
+    }
+    keys::normalize_recovery(input).map(|_| ()).ok_or("El código tiene caracteres que no son válidos.")
+}
+
+/// Da a una operación de `Files` el acumulador de la plataforma (son dos préstamos de `sys`: el
+/// acumulador se saca un momento y se devuelve con sus movimientos).
+fn with_pool<R>(sys: &mut dyn Platform, f: impl FnOnce(&mut Files, &mut Pool) -> R) -> R {
+    let mut pool = core::mem::take(sys.pool());
+    let r = f(sys.files(), &mut pool);
+    *sys.pool() = pool;
+    r
 }
 
 fn text_in(s: &mut Surface, r: Rect, text: &str, size: u32, bold: bool, color: u32, align: Align) {
@@ -141,6 +210,7 @@ impl Login {
             name: String::new(),
             pw: secret(),
             pw2: secret(),
+            code: secret(),
             admin: false,
             focus: Item::Name,
             err: None,
@@ -154,12 +224,17 @@ impl Login {
             last_secs: 0,
             clock: DateTime::default(),
             damage: Vec::new(),
+            recoverable: Vec::new(),
+            recovery_mode: false,
+            confirm_skip: false,
+            job: None,
+            good: false,
         }
     }
 
     /// Las pantallas que tapan todo el escritorio.
     pub fn covers(&self) -> bool {
-        matches!(self.mode, Mode::Setup | Mode::Pick | Mode::Lock)
+        matches!(self.mode, Mode::Setup | Mode::Pick | Mode::Lock | Mode::Disk | Mode::Recover)
     }
 
     pub fn take_damage(&mut self) -> Vec<Rect> {
@@ -185,11 +260,15 @@ impl Login {
     fn wipe_all(&mut self) {
         wipe_str(&mut self.pw);
         wipe_str(&mut self.pw2);
+        wipe_str(&mut self.code);
     }
 
     fn enter(&mut self, mode: Mode) {
         self.wipe_all();
         self.mode = mode;
+        self.job = None;
+        self.good = false;
+        self.confirm_skip = false;
         self.shut = false;
         self.hot = None;
         self.err = None;
@@ -202,6 +281,7 @@ impl Login {
     pub fn off(&mut self) {
         self.enter(Mode::Off);
         self.users.clear();
+        self.recoverable.clear();
         self.created.clear();
         self.name.clear();
     }
@@ -220,12 +300,28 @@ impl Login {
         self.focus = Item::Name;
     }
 
-    /// Lista de cuentas (nombre, tiene clave) para elegir.
+    /// Pantalla "Disco cifrado": clave del disco (o su código de recuperación).
+    pub fn start_disk(&mut self) {
+        self.enter(Mode::Disk);
+        self.recovery_mode = false;
+        self.focus = Item::Pw;
+    }
+
+    /// Lista de cuentas (nombre, tiene clave) para elegir. Después, `set_recoverable`.
     pub fn start_pick(&mut self, users: Vec<(String, bool)>) {
         self.enter(Mode::Pick);
+        self.recoverable = alloc::vec![false; users.len()];
         self.users = users;
         self.sel = 0;
         self.focus = self.order().first().copied().unwrap_or(Item::Ok);
+    }
+
+    /// Qué cuentas de la lista tienen la carpeta cifrada (una por cuenta, en el mismo orden).
+    pub fn set_recoverable(&mut self, v: Vec<bool>) {
+        if v.len() == self.users.len() && v != self.recoverable {
+            self.recoverable = v;
+            self.dmg_panel();
+        }
     }
 
     pub fn start_lock(&mut self, name: &str, has_password: bool) {
@@ -233,6 +329,11 @@ impl Login {
         self.users = alloc::vec![(String::from(name), has_password)];
         self.sel = 0;
         self.focus = self.order().first().copied().unwrap_or(Item::Ok);
+    }
+
+    /// Nombres de las cuentas de la lista.
+    pub fn user_names(&self) -> Vec<String> {
+        self.users.iter().map(|u| u.0.clone()).collect()
     }
 
     pub fn set_clock(&mut self, t: DateTime) {
@@ -284,6 +385,9 @@ impl Login {
     }
 
     fn msg_text(&self) -> Option<String> {
+        if self.job.is_some() {
+            return Some(String::from("Comprobando…"));
+        }
         if self.waiting() {
             return Some(format!("Demasiados intentos. Espera {} s para volver a probar.", self.secs_left()));
         }
@@ -291,10 +395,10 @@ impl Login {
     }
 
     /// Reloj del escritorio (unas 100 veces por segundo): parpadeo del cursor y cuenta atrás.
-    pub fn tick(&mut self, ms: u64) {
+    pub fn tick(&mut self, ms: u64, sys: &mut dyn Platform) -> Out {
         self.now = ms;
         if !self.covers() {
-            return;
+            return Out::None;
         }
         if self.until.is_some() {
             if self.waiting() {
@@ -311,10 +415,18 @@ impl Login {
         if ms >= self.next_blink {
             self.next_blink = ms + 530;
             self.caret = !self.caret;
-            if matches!(self.focus, Item::Name | Item::Pw | Item::Pw2) {
+            if matches!(self.focus, Item::Name | Item::Pw | Item::Pw2 | Item::Code) {
                 self.dmg_item(self.focus);
             }
         }
+        if let Some((job, at)) = self.job {
+            if ms >= at {
+                self.job = None;
+                self.dmg_item(Item::Msg);
+                return self.run_job(job, sys);
+            }
+        }
+        Out::None
     }
 
     fn dmg_item(&mut self, it: Item) {
@@ -326,6 +438,10 @@ impl Login {
 
     // ---------------------------------------------------------------- disposición
 
+    fn can_recover(&self) -> bool {
+        self.mode == Mode::Pick && self.recoverable.get(self.sel).copied().unwrap_or(false)
+    }
+
     fn has_pw(&self) -> bool {
         self.users.get(self.sel).is_some_and(|u| u.1)
     }
@@ -334,6 +450,10 @@ impl Login {
         match self.mode {
             Mode::Setup if !self.second => alloc::vec![Item::Name, Item::Pw, Item::Pw2, Item::Ok],
             Mode::Setup => alloc::vec![Item::Name, Item::Pw, Item::Pw2, Item::Admin, Item::Ok, Item::Done],
+            Mode::Recover => alloc::vec![Item::Code, Item::Pw, Item::Pw2, Item::Ok, Item::Done],
+            Mode::Disk if self.confirm_skip => alloc::vec![Item::Done, Item::Back],
+            Mode::Disk => alloc::vec![Item::Pw, Item::Ok, Item::Link, Item::Skip],
+            Mode::Pick if self.has_pw() && self.can_recover() => alloc::vec![Item::Pw, Item::Link, Item::Ok],
             Mode::Pick | Mode::Lock if self.has_pw() => alloc::vec![Item::Pw, Item::Ok],
             Mode::Pick | Mode::Lock => alloc::vec![Item::Ok],
             _ => Vec::new(),
@@ -343,7 +463,11 @@ impl Login {
     fn layout(&self) -> Layout {
         let lh = font::line_h(8);
         let mut items: Vec<(Item, Rect)> = Vec::new();
-        if self.mode == Mode::Setup {
+        if self.mode == Mode::Disk {
+            return self.layout_disk();
+        }
+        if matches!(self.mode, Mode::Setup | Mode::Recover) {
+            let rec = self.mode == Mode::Recover;
             let w = CARD_W.min(self.w - 16).max(240);
             let inner = w - 2 * PAD;
             let block = lh + 2 + FIELD_H + 2 + lh + 4;
@@ -351,29 +475,36 @@ impl Login {
             let title = Rect::new(PAD, y, inner, 24);
             y += 30;
             let body = y;
-            if self.second {
+            if rec {
+                y += wrap(RECOVER_SUB, 8, inner).len() as i32 * lh + 14;
+            } else if self.second {
                 let n = self.created.len().min(MAX_LIST) as i32 + (self.created.len() > MAX_LIST) as i32;
                 y += lh + 2 + n * (font::line_h(9) + 2) + 12;
             } else {
                 y += wrap(SUB, 8, inner).len() as i32 * lh + 14;
             }
-            for it in [Item::Name, Item::Pw, Item::Pw2] {
+            for it in [if rec { Item::Code } else { Item::Name }, Item::Pw, Item::Pw2] {
                 items.push((it, Rect::new(PAD, y + lh + 2, inner, FIELD_H)));
                 y += block;
             }
-            if self.second {
+            if self.second && !rec {
                 items.push((Item::Admin, Rect::new(PAD, y, inner, 22)));
                 y += 30;
             }
             y += 6;
-            if self.second {
+            if self.second || rec {
                 let bw = (inner - 12) / 2;
                 items.push((Item::Ok, Rect::new(PAD, y, bw, BTN_H)));
                 items.push((Item::Done, Rect::new(PAD + bw + 12, y, bw, BTN_H)));
             } else {
                 items.push((Item::Ok, Rect::new(PAD, y, inner, BTN_H)));
             }
-            y += BTN_H + PAD;
+            y += BTN_H;
+            if rec {
+                items.push((Item::Msg, Rect::new(PAD, y + 8, inner, lh + 4)));
+                y += lh + 12;
+            }
+            y += PAD;
             let (ox, oy) = ((self.w - w) / 2, ((self.h - y) / 2).max(8));
             for it in items.iter_mut() {
                 it.1.x += ox;
@@ -391,6 +522,9 @@ impl Login {
         let mut total = 50 + rows * SLOT_H + 12 + BTN_H + 10 + lh + 4;
         if self.has_pw() {
             total += FIELD_H + 10;
+            if self.can_recover() {
+                total += 22;
+            }
         }
         let y0 = ((self.h - total) / 2 - 20).max(16);
         let title = Rect::new(0, y0, self.w, 26);
@@ -405,6 +539,10 @@ impl Login {
         if self.has_pw() {
             items.push((Item::Pw, Rect::new((self.w - 280) / 2, yb, 280, FIELD_H)));
             yb += FIELD_H + 10;
+            if self.can_recover() {
+                items.push((Item::Link, Rect::new((self.w - 280) / 2, yb - 4, 280, 18)));
+                yb += 22;
+            }
         }
         items.push((Item::Ok, Rect::new((self.w - 150) / 2, yb, 150, BTN_H)));
         yb += BTN_H + 10;
@@ -412,6 +550,48 @@ impl Login {
         let bounds = items.iter().fold(title, |u, i| u.union(i.1));
         items.push((Item::Power, self.power_rect()));
         Layout { items, bounds, card: Rect::default(), title, body_y: 0 }
+    }
+
+    fn disk_sub(&self) -> &'static str {
+        if self.recovery_mode {
+            DISK_SUB_CODE
+        } else {
+            DISK_SUB_KEY
+        }
+    }
+
+    /// Pantalla "Disco cifrado": candado, título, texto y debajo el campo, los botones y los enlaces.
+    /// `card` es aquí el rectángulo del candado y `body_y` donde empieza el texto.
+    fn layout_disk(&self) -> Layout {
+        let lh = font::line_h(8);
+        let mut items: Vec<(Item, Rect)> = Vec::new();
+        let text = if self.confirm_skip { SKIP_TEXT } else { self.disk_sub() };
+        let body = wrap(text, 9, 440).len() as i32 * font::line_h(9);
+        let mut total = LOCK_H + 12 + 26 + 8 + body + 14;
+        total += if self.confirm_skip { BTN_H } else { FIELD_H + 10 + BTN_H + 12 + 20 + 4 + 20 + 8 + lh + 4 };
+        let y0 = ((self.h - total) / 2 - 10).max(16);
+        let lock = Rect::new(self.w / 2 - LOCK_W / 2, y0, LOCK_W, LOCK_H);
+        let title = Rect::new(0, y0 + LOCK_H + 12, self.w, 26);
+        let body_y = title.y + 34;
+        let mut y = body_y + body + 14;
+        if self.confirm_skip {
+            let x0 = (self.w - 332) / 2;
+            items.push((Item::Done, Rect::new(x0, y, 200, BTN_H)));
+            items.push((Item::Back, Rect::new(x0 + 212, y, 120, BTN_H)));
+        } else {
+            items.push((Item::Pw, Rect::new((self.w - 360) / 2, y, 360, FIELD_H)));
+            y += FIELD_H + 10;
+            items.push((Item::Ok, Rect::new((self.w - 150) / 2, y, 150, BTN_H)));
+            y += BTN_H + 12;
+            items.push((Item::Link, Rect::new((self.w - 360) / 2, y, 360, 20)));
+            y += 24;
+            items.push((Item::Skip, Rect::new((self.w - 360) / 2, y, 360, 20)));
+            y += 28;
+            items.push((Item::Msg, Rect::new((self.w - 440) / 2, y, 440, lh + 4)));
+        }
+        let bounds = items.iter().fold(title.union(lock), |u, i| u.union(i.1));
+        items.push((Item::Power, self.power_rect()));
+        Layout { items, bounds, card: lock, title, body_y }
     }
 
     fn item_at(&self, x: i32, y: i32) -> Option<Item> {
@@ -427,7 +607,7 @@ impl Login {
         if !self.covers() {
             return;
         }
-        let hot = self.item_at(x, y).filter(|i| !matches!(i, Item::Name | Item::Pw | Item::Pw2));
+        let hot = self.item_at(x, y).filter(|i| !matches!(i, Item::Name | Item::Pw | Item::Pw2 | Item::Code));
         if hot != self.hot {
             let l = self.layout();
             for it in [self.hot, hot].into_iter().flatten() {
@@ -470,12 +650,15 @@ impl Login {
     }
 
     fn click_item(&mut self, item: Option<Item>, sys: &mut dyn Platform) -> Out {
+        if self.job.is_some() && item != Some(Item::Power) {
+            return Out::None;
+        }
         match item {
             Some(Item::Power) => {
                 self.set_shut(true);
                 Out::None
             }
-            Some(it @ (Item::Name | Item::Pw | Item::Pw2 | Item::Admin)) => {
+            Some(it @ (Item::Name | Item::Pw | Item::Pw2 | Item::Code | Item::Admin)) => {
                 if it == Item::Admin {
                     self.admin = !self.admin;
                 }
@@ -483,7 +666,7 @@ impl Login {
                 Out::None
             }
             Some(Item::Ok) => self.activate(Item::Ok, sys),
-            Some(Item::Done) => self.activate(Item::Done, sys),
+            Some(it @ (Item::Done | Item::Link | Item::Skip | Item::Back)) => self.activate(it, sys),
             Some(Item::Avatar(i)) => {
                 self.select(i);
                 if self.has_pw() {
@@ -513,6 +696,7 @@ impl Login {
             self.sel = i;
             self.wipe_all();
             self.err = None;
+            self.good = false;
             self.focus = self.order().first().copied().unwrap_or(Item::Ok);
             self.dmg_panel();
         }
@@ -533,6 +717,7 @@ impl Login {
             Item::Name => Some(&mut self.name),
             Item::Pw => Some(&mut self.pw),
             Item::Pw2 => Some(&mut self.pw2),
+            Item::Code => Some(&mut self.code),
             _ => None,
         }
     }
@@ -547,16 +732,24 @@ impl Login {
             }
             return Out::None;
         }
-        let multi = self.mode != Mode::Setup && self.users.len() > 1;
+        if self.job.is_some() {
+            return Out::None;
+        }
+        let multi = self.mode == Mode::Pick && self.users.len() > 1;
         match k.key {
             Key::Tab => self.move_focus(!k.shift),
             Key::Enter => return self.activate(self.focus, sys),
-            Key::Escape => {
-                if self.mode != Mode::Setup && !self.pw.is_empty() {
-                    wipe_str(&mut self.pw);
-                    self.dmg_item(Item::Pw);
+            Key::Escape => match self.mode {
+                Mode::Recover => self.cancel_recover(),
+                Mode::Disk if self.confirm_skip => self.set_confirm(false),
+                Mode::Setup => {}
+                _ => {
+                    if !self.pw.is_empty() {
+                        wipe_str(&mut self.pw);
+                        self.dmg_item(Item::Pw);
+                    }
                 }
-            }
+            },
             Key::Left if multi => self.select((self.sel + self.users.len() - 1) % self.users.len()),
             Key::Right if multi => self.select((self.sel + 1) % self.users.len()),
             Key::Backspace => {
@@ -573,7 +766,7 @@ impl Login {
             _ => {
                 let f = self.focus;
                 let typed = k.ch.filter(|c| !c.is_control() && !k.ctrl && !k.alt);
-                if matches!(f, Item::Name | Item::Pw | Item::Pw2) {
+                if matches!(f, Item::Name | Item::Pw | Item::Pw2 | Item::Code) {
                     if let Some(c) = typed {
                         if self.waiting() && f == Item::Pw {
                             return Out::None;
@@ -603,12 +796,24 @@ impl Login {
             Some(_) => self.dmg_panel(),
             None => self.dmg_item(f),
         }
+        if f == Item::Pw && matches!(self.mode, Mode::Setup | Mode::Recover) {
+            self.dmg_strength();
+        }
+    }
+
+    /// Repinta el indicador de fortaleza (a la derecha de la etiqueta del campo de clave).
+    fn dmg_strength(&mut self) {
+        let lh = font::line_h(8);
+        let r = self.layout().items.iter().find(|i| i.0 == Item::Pw).map(|i| i.1);
+        if let Some(r) = r {
+            self.dmg(Rect::new(r.right() - STRENGTH_W, r.y - lh - 2, STRENGTH_W, lh).inflate(1));
+        }
     }
 
     /// Enter, espacio o clic sobre `it`.
     fn activate(&mut self, it: Item, sys: &mut dyn Platform) -> Out {
-        if self.mode == Mode::Setup {
-            match it {
+        match self.mode {
+            Mode::Setup => match it {
                 Item::Admin => {
                     self.admin = !self.admin;
                     self.dmg_item(Item::Admin);
@@ -616,10 +821,181 @@ impl Login {
                 }
                 Item::Done => self.finish(sys),
                 _ => self.submit(sys),
+            },
+            Mode::Recover => {
+                if it == Item::Done {
+                    self.cancel_recover();
+                    Out::None
+                } else {
+                    self.recover_submit()
+                }
             }
-        } else {
-            self.attempt(sys)
+            Mode::Disk => match it {
+                Item::Link => {
+                    self.toggle_recovery();
+                    Out::None
+                }
+                Item::Skip => {
+                    self.set_confirm(true);
+                    Out::None
+                }
+                Item::Back => {
+                    self.set_confirm(false);
+                    Out::None
+                }
+                Item::Done => {
+                    sys.files().skip_locked_disk();
+                    self.wipe_all();
+                    Out::DiskDone
+                }
+                _ => self.disk_submit(),
+            },
+            _ if it == Item::Link => {
+                self.start_recover();
+                Out::None
+            }
+            _ => self.attempt(sys),
         }
+    }
+
+    // ---------------------------------------------------------------- disco cifrado y recuperación
+
+    /// Muestra un mensaje bajo los botones (rojo, o verde si es una buena noticia).
+    fn say(&mut self, text: &str, good: bool) {
+        self.err = Some((Item::Msg, String::from(text)));
+        self.good = good;
+        self.dmg_panel();
+    }
+
+    fn set_confirm(&mut self, on: bool) {
+        self.dmg_panel();
+        wipe_str(&mut self.pw);
+        self.confirm_skip = on;
+        self.err = None;
+        self.focus = if on { Item::Back } else { Item::Pw };
+        self.dmg_panel();
+    }
+
+    fn toggle_recovery(&mut self) {
+        self.dmg_panel();
+        wipe_str(&mut self.pw);
+        self.recovery_mode = !self.recovery_mode;
+        self.err = None;
+        self.focus = Item::Pw;
+        self.dmg_panel();
+    }
+
+    /// Lo escrito en el campo del disco, ya comprobado (sin derivar nada): el texto de error si no vale.
+    fn check_disk_input(&self) -> Result<(), &'static str> {
+        if !self.recovery_mode {
+            return if self.pw.is_empty() { Err("Escribe la clave del disco.") } else { Ok(()) };
+        }
+        check_code(&self.pw)
+    }
+
+    fn disk_submit(&mut self) -> Out {
+        if self.waiting() || self.job.is_some() {
+            return Out::None;
+        }
+        if let Err(e) = self.check_disk_input() {
+            self.say(e, false);
+            return Out::None;
+        }
+        self.err = None;
+        self.good = false;
+        self.job = Some((Job::Disk, self.now + JOB_DELAY_MS));
+        self.dmg_item(Item::Msg);
+        Out::None
+    }
+
+    /// Resultado de abrir el disco. Solo una clave equivocada cuenta para la espera creciente.
+    fn disk_result(&mut self, res: Result<(), KeyError>) -> Out {
+        match res {
+            Ok(()) => {
+                self.fails = 0;
+                self.until = None;
+                self.err = None;
+                self.dmg_all();
+                Out::DiskDone
+            }
+            Err(e) => {
+                if e == KeyError::WrongSecret {
+                    self.fail();
+                }
+                self.say(e.text(), false);
+                Out::None
+            }
+        }
+    }
+
+    fn run_job(&mut self, job: Job, sys: &mut dyn Platform) -> Out {
+        let now = sys.now();
+        match job {
+            Job::Disk => {
+                let recovery = self.recovery_mode;
+                let mut typed = core::mem::replace(&mut self.pw, secret());
+                let mut norm = if recovery { keys::normalize_recovery(&typed).unwrap_or_default() } else { String::new() };
+                let res = sys.files().unlock_disk(if recovery { &norm } else { &typed }, recovery, now);
+                wipe_str(&mut typed);
+                wipe_str(&mut norm);
+                self.disk_result(res)
+            }
+            Job::Recover => {
+                let name = self.users.get(self.sel).map(|u| u.0.clone()).unwrap_or_default();
+                let mut norm = keys::normalize_recovery(&self.code).unwrap_or_default();
+                let mut newpw = core::mem::replace(&mut self.pw, secret());
+                let res = with_pool(sys, |f, pool| f.recover_account(&name, &norm, &newpw, pool, now));
+                wipe_str(&mut norm);
+                wipe_str(&mut newpw);
+                self.wipe_all();
+                self.recover_result(res);
+                Out::None
+            }
+        }
+    }
+
+    /// Resultado de recuperar la cuenta: vuelve al inicio de sesión con un aviso, o muestra el error.
+    fn recover_result(&mut self, res: Result<(), KeyError>) {
+        match res {
+            Ok(()) => {
+                self.enter(Mode::Pick);
+                self.focus = self.order().first().copied().unwrap_or(Item::Ok);
+                self.say("Clave cambiada. Ya puedes iniciar sesión.", true);
+            }
+            Err(e) => {
+                self.focus = if e == KeyError::Weak { Item::Pw } else { Item::Code };
+                self.say(e.text(), false);
+            }
+        }
+    }
+
+    fn start_recover(&mut self) {
+        if self.can_recover() {
+            self.enter(Mode::Recover);
+            self.focus = Item::Code;
+        }
+    }
+
+    fn cancel_recover(&mut self) {
+        self.enter(Mode::Pick);
+        self.focus = self.order().first().copied().unwrap_or(Item::Ok);
+    }
+
+    fn recover_submit(&mut self) -> Out {
+        if self.job.is_some() {
+            return Out::None;
+        }
+        if let Err(e) = check_code(&self.code) {
+            return self.fail_at(Item::Code, e);
+        }
+        if self.pw != self.pw2 {
+            return self.fail_at(Item::Pw2, "Las claves no coinciden.");
+        }
+        self.err = None;
+        self.good = false;
+        self.job = Some((Job::Recover, self.now + JOB_DELAY_MS));
+        self.dmg_item(Item::Msg);
+        Out::None
     }
 
     // ---------------------------------------------------------------- asistente
@@ -702,8 +1078,7 @@ impl Login {
                 if e == AccountError::WrongPassword {
                     self.fail();
                 }
-                self.err = Some((Item::Msg, String::from(if e == AccountError::WrongPassword { "La clave no es correcta." } else { e.text() })));
-                self.dmg_panel();
+                self.say(if e == AccountError::WrongPassword { "La clave no es correcta." } else { e.text() }, false);
                 Out::None
             }
         }
@@ -716,10 +1091,10 @@ impl Login {
             return;
         }
         let l = self.layout();
-        if self.mode == Mode::Setup {
-            self.paint_setup(s, &l, accent);
-        } else {
-            self.paint_pick(s, &l, accent);
+        match self.mode {
+            Mode::Setup | Mode::Recover => self.paint_setup(s, &l, accent),
+            Mode::Disk => self.paint_disk(s, &l, accent),
+            _ => self.paint_pick(s, &l, accent),
         }
         let c = self.clock_rect();
         if c.intersects(s.clip()) {
@@ -748,6 +1123,28 @@ impl Login {
         }
     }
 
+    /// El campo muestra su texto (nombre, código de recuperación) en vez de puntos.
+    fn plain(&self, it: Item) -> bool {
+        it == Item::Name || it == Item::Code || (it == Item::Pw && self.mode == Mode::Disk && self.recovery_mode)
+    }
+
+    fn buf(&self, it: Item) -> &str {
+        match it {
+            Item::Name => &self.name,
+            Item::Code => &self.code,
+            Item::Pw => &self.pw,
+            _ => &self.pw2,
+        }
+    }
+
+    fn placeholder(&self, it: Item) -> Option<&'static str> {
+        match (self.mode, it) {
+            (Mode::Disk, Item::Pw) => Some(if self.recovery_mode { "Código de recuperación" } else { "Clave del disco" }),
+            (Mode::Pick | Mode::Lock, Item::Pw) => Some("Clave"),
+            _ => None,
+        }
+    }
+
     fn field(&self, s: &mut Surface, r: Rect, it: Item, accent: u32) {
         if !r.intersects(s.clip()) {
             return;
@@ -757,26 +1154,63 @@ impl Login {
         s.frame(r, if focused { accent } else { 0x8A8A8A });
         let inner = Rect::new(r.x + 8, r.y, r.w - 16, r.h);
         let end;
-        if it == Item::Name {
-            let w = font::width(&self.name, 9, false);
-            text_in(s, inner, &self.name, 9, false, 0x000000, if w > inner.w { Align::Right } else { Align::Left });
+        let text = self.buf(it);
+        if self.plain(it) {
+            let w = font::width(text, 9, false);
+            text_in(s, inner, text, 9, false, 0x000000, if w > inner.w { Align::Right } else { Align::Left });
             end = inner.x + w.min(inner.w);
         } else {
             // Puntos: la clave nunca se muestra.
-            let n = if it == Item::Pw { self.pw.chars().count() } else { self.pw2.chars().count() };
+            let n = text.chars().count();
             let fit_n = ((inner.w - 8) / 11).max(1) as usize;
             let shown = n.min(fit_n);
             for i in 0..shown {
                 s.fill_circle((inner.x + 5 + i as i32 * 11) as f32, (r.y + r.h / 2) as f32, 3.2, 0x000000, 255);
             }
             end = inner.x + shown as i32 * 11;
-            if n == 0 && !focused && self.mode != Mode::Setup {
-                text_in(s, inner, "Clave", 9, false, 0x8A8A8A, Align::Left);
+        }
+        if text.is_empty() && !focused {
+            if let Some(p) = self.placeholder(it) {
+                text_in(s, inner, p, 9, false, 0x8A8A8A, Align::Left);
             }
         }
         if focused && self.caret {
             s.fill_rect(Rect::new(end + 1, r.y + 6, 1, r.h - 12), 0x000000);
         }
+    }
+
+    /// Enlace de texto centrado en `r`, subrayado al pasar el ratón o con el foco.
+    fn link(&self, s: &mut Surface, r: Rect, it: Item, text: &str) {
+        if !r.intersects(s.clip()) {
+            return;
+        }
+        let lit = self.hot == Some(it) || self.focus == it;
+        let color = if lit { 0xFFFFFF } else { 0xCFCFCF };
+        text_in(s, Rect::new(r.x + 1, r.y + 1, r.w, r.h), text, 9, false, 0x000000, Align::Center);
+        text_in(s, r, text, 9, false, color, Align::Center);
+        if lit {
+            let w = font::width(text, 9, false).min(r.w);
+            s.fill_rect(Rect::new(r.x + (r.w - w) / 2, r.y + r.h - 3, w, 1), color);
+        }
+    }
+
+    /// Indicador de fortaleza: cuatro tramos y la palabra, a la derecha de la etiqueta del campo `r`.
+    fn paint_strength(&self, s: &mut Surface, r: Rect) {
+        if self.pw.is_empty() {
+            return;
+        }
+        let lh = font::line_h(8);
+        let area = Rect::new(r.right() - STRENGTH_W, r.y - lh - 2, STRENGTH_W, lh);
+        if !area.intersects(s.clip()) {
+            return;
+        }
+        let lv = (keys::strength(&self.pw) as usize).min(4);
+        let (name, color) = STRENGTH[lv];
+        for i in 0..4 {
+            let seg = Rect::new(area.x + i * 22, area.y + lh / 2 - 3, 18, 6);
+            s.fill_rect(seg, if (i as usize) < lv.max(1) { color } else { 0x4A4A4A });
+        }
+        text_in(s, Rect::new(area.x + 96, area.y, STRENGTH_W - 96, lh), name, 8, false, color, Align::Right);
     }
 
     fn button(&self, s: &mut Surface, r: Rect, it: Item, text: &str, accent: u32, primary: bool) {
@@ -804,9 +1238,22 @@ impl Login {
         s.frame(c, 0x383838);
         let lh = font::line_h(8);
         let inner = c.w - 2 * PAD;
-        text_in(s, l.title, if self.second { "¿Añadir otra cuenta?" } else { "Crea tu cuenta" }, 14, true, 0xFFFFFF, Align::Left);
+        let rec = self.mode == Mode::Recover;
+        let title = if rec {
+            let who = self.users.get(self.sel).map(|u| u.0.as_str()).unwrap_or("");
+            fit(&format!("Recuperar la cuenta de {who}"), 14, inner)
+        } else if self.second {
+            String::from("¿Añadir otra cuenta?")
+        } else {
+            String::from("Crea tu cuenta")
+        };
+        text_in(s, l.title, &title, 14, true, 0xFFFFFF, Align::Left);
         let bx = c.x + PAD;
-        if self.second {
+        if rec {
+            for (i, line) in wrap(RECOVER_SUB, 8, inner).iter().enumerate() {
+                text_in(s, Rect::new(bx, l.body_y + i as i32 * lh, inner, lh), line, 8, false, GREY, Align::Left);
+            }
+        } else if self.second {
             text_in(s, Rect::new(bx, l.body_y, inner, lh), "Cuentas creadas", 8, false, GREY, Align::Left);
             let rh = font::line_h(9) + 2;
             for (i, (n, admin)) in self.created.iter().take(MAX_LIST).enumerate() {
@@ -824,14 +1271,20 @@ impl Login {
         }
         for &(it, r) in &l.items {
             match it {
-                Item::Name | Item::Pw | Item::Pw2 => {
-                    let label = match it {
-                        Item::Name => "Nombre de usuario",
-                        Item::Pw => "Clave (opcional, mínimo 6 caracteres)",
+                Item::Name | Item::Code | Item::Pw | Item::Pw2 => {
+                    let label = match (it, rec) {
+                        (Item::Name, _) => "Nombre de usuario",
+                        (Item::Code, _) => "Código de recuperación",
+                        (Item::Pw, true) => "Clave nueva (mínimo 6 caracteres)",
+                        (Item::Pw, false) => "Clave (opcional, mínimo 6 caracteres)",
+                        (_, true) => "Repite la clave nueva",
                         _ => "Repite la clave",
                     };
-                    text_in(s, Rect::new(r.x, r.y - lh - 2, r.w, lh), label, 8, false, GREY, Align::Left);
+                    text_in(s, Rect::new(r.x, r.y - lh - 2, r.w - if it == Item::Pw { STRENGTH_W } else { 0 }, lh), label, 8, false, GREY, Align::Left);
                     self.field(s, r, it, accent);
+                    if it == Item::Pw {
+                        self.paint_strength(s, r);
+                    }
                     if let Some((_, e)) = self.err.as_ref().filter(|e| e.0 == it) {
                         text_in(s, Rect::new(r.x, r.bottom() + 2, r.w, lh), e, 8, false, RED, Align::Left);
                     }
@@ -845,8 +1298,69 @@ impl Login {
                     }
                     text_in(s, Rect::new(r.x + 26, r.y, r.w - 26, r.h), "Administrador", 9, false, 0xFFFFFF, Align::Left);
                 }
-                Item::Ok => self.button(s, r, it, if self.second { "Añadir" } else { "Crear cuenta" }, accent, true),
-                Item::Done => self.button(s, r, it, "Terminar", accent, false),
+                Item::Ok => self.button(s, r, it, if rec { "Cambiar clave" } else if self.second { "Añadir" } else { "Crear cuenta" }, accent, true),
+                Item::Done => self.button(s, r, it, if rec { "Cancelar" } else { "Terminar" }, accent, false),
+                Item::Msg => {
+                    if let Some(t) = self.msg_text() {
+                        text_in(s, r, &t, 8, false, if self.good { GREEN } else { RED }, Align::Left);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Candado dibujado por código (arco, cuerpo y ojo de la cerradura).
+    fn draw_lock(&self, s: &mut Surface, r: Rect, accent: u32) {
+        let (cx, top) = ((r.x + r.w / 2) as f32, r.y as f32);
+        let c = top + 26.0;
+        let arc = [(-15.0, 0.0), (-13.86, -5.74), (-10.61, -10.61), (-5.74, -13.86), (0.0, -15.0), (5.74, -13.86), (10.61, -10.61), (13.86, -5.74), (15.0, 0.0)];
+        let mut pts: Vec<(f32, f32)> = alloc::vec![(cx - 15.0, c + 14.0)];
+        pts.extend(arc.iter().map(|&(dx, dy)| (cx + dx, c + dy)));
+        pts.push((cx + 15.0, c + 14.0));
+        s.stroke(&pts, 6.0, 0xE4E4E4);
+        let body = Rect::new(r.x + 6, r.y + 32, r.w - 12, 40);
+        s.fill_rect(body, accent);
+        s.frame(body, lighten(accent, 60));
+        s.fill_circle(cx, top + 48.0, 5.5, 0x1C1C1C, 255);
+        s.fill_rect(Rect::new(r.x + r.w / 2 - 2, r.y + 50, 4, 12), 0x1C1C1C);
+    }
+
+    fn paint_disk(&self, s: &mut Surface, l: &Layout, accent: u32) {
+        if l.card.intersects(s.clip()) {
+            self.draw_lock(s, l.card, accent);
+        }
+        let title = if self.confirm_skip { "¿Seguir sin disco?" } else { "Este disco está cifrado" };
+        if l.title.intersects(s.clip()) {
+            text_in(s, Rect::new(l.title.x + 1, l.title.y + 1, l.title.w, l.title.h), title, 14, true, 0x000000, Align::Center);
+            text_in(s, l.title, title, 14, true, 0xFFFFFF, Align::Center);
+        }
+        let text = if self.confirm_skip { SKIP_TEXT } else { self.disk_sub() };
+        let lh = font::line_h(9);
+        for (i, line) in wrap(text, 9, 440).iter().enumerate() {
+            let r = Rect::new(0, l.body_y + i as i32 * lh, self.w, lh);
+            if r.intersects(s.clip()) {
+                text_in(s, Rect::new(r.x + 1, r.y + 1, r.w, r.h), line, 9, false, 0x000000, Align::Center);
+                text_in(s, r, line, 9, false, 0xE0E0E0, Align::Center);
+            }
+        }
+        for &(it, r) in &l.items {
+            if !r.intersects(s.clip()) {
+                continue;
+            }
+            match it {
+                Item::Pw => self.field(s, r, it, accent),
+                Item::Ok => self.button(s, r, it, "Abrir", accent, true),
+                Item::Link => self.link(s, r, it, if self.recovery_mode { "Usar la clave del disco" } else { "Usar el código de recuperación" }),
+                Item::Skip => self.link(s, r, it, "Seguir sin disco"),
+                Item::Done => self.button(s, r, it, "Seguir sin disco", accent, false),
+                Item::Back => self.button(s, r, it, "Volver", accent, true),
+                Item::Msg => {
+                    if let Some(t) = self.msg_text() {
+                        text_in(s, Rect::new(r.x + 1, r.y + 1, r.w, r.h), &t, 8, false, 0x000000, Align::Center);
+                        text_in(s, r, &t, 8, false, if self.good { GREEN } else { RED }, Align::Center);
+                    }
+                }
                 _ => {}
             }
         }
@@ -882,15 +1396,304 @@ impl Login {
                     text_in(s, t, &label, 9, on, if on { 0xFFFFFF } else { 0xD0D0D0 }, Align::Center);
                 }
                 Item::Pw => self.field(s, r, it, accent),
+                Item::Link => self.link(s, r, it, "He olvidado mi clave"),
                 Item::Ok => self.button(s, r, it, if self.mode == Mode::Lock { "Desbloquear" } else { "Entrar" }, accent, true),
                 Item::Msg => {
                     if let Some(t) = self.msg_text() {
                         text_in(s, Rect::new(r.x + 1, r.y + 1, r.w, r.h), &t, 8, false, 0x000000, Align::Center);
-                        text_in(s, r, &t, 8, false, RED, Align::Center);
+                        text_in(s, r, &t, 8, false, if self.good && !self.waiting() { GREEN } else { RED }, Align::Center);
                     }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::POOL_EVENTS_NEEDED;
+    use crate::platform::TestPlatform;
+
+    const CODE: &str = "ABCDEFGHJKMNPQRSTUVWXYZ023456789ABCDEFGH";
+
+    fn sys() -> TestPlatform {
+        TestPlatform { size: (1280, 800), ..Default::default() }
+    }
+
+    fn disk() -> (Login, TestPlatform) {
+        let mut l = Login::new(1280, 800);
+        l.start_disk();
+        (l, sys())
+    }
+
+    fn press(l: &mut Login, sys: &mut TestPlatform, key: Key, ch: Option<char>) -> Out {
+        l.key(&KeyEvent { key, ch, down: true, shift: false, ctrl: false, alt: false }, sys)
+    }
+
+    fn typ(l: &mut Login, sys: &mut TestPlatform, text: &str) {
+        for c in text.chars() {
+            press(l, sys, Key::Char(c.to_ascii_lowercase()), Some(c));
+        }
+    }
+
+    fn rect(l: &Login, it: Item) -> Rect {
+        l.layout().items.iter().find(|i| i.0 == it).unwrap().1
+    }
+
+    fn click(l: &mut Login, sys: &mut TestPlatform, it: Item) -> Out {
+        let r = rect(l, it);
+        l.click(r.x + r.w / 2, r.y + r.h / 2, sys)
+    }
+
+    fn msg(l: &Login) -> String {
+        l.msg_text().unwrap_or_default()
+    }
+
+    #[test]
+    fn disco_sin_clave_avisa_y_no_deriva_nada() {
+        let (mut l, mut sys) = disk();
+        assert!(l.covers());
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert_eq!(msg(&l), "Escribe la clave del disco.");
+        assert!(l.job.is_none());
+    }
+
+    #[test]
+    fn disco_dice_comprobando_y_deriva_un_tick_despues() {
+        let (mut l, mut sys) = disk();
+        l.tick(100, &mut sys);
+        typ(&mut l, &mut sys, "clavedisco");
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert_eq!(msg(&l), "Comprobando…");
+        // Mientras tanto no se acepta nada más.
+        typ(&mut l, &mut sys, "x");
+        assert_eq!(l.pw.chars().count(), 10);
+        assert_eq!(l.tick(110, &mut sys), Out::None);
+        assert!(l.job.is_some());
+        // El disco de la plataforma de pruebas no está cifrado: error normal, que no cuenta como fallo.
+        assert_eq!(l.tick(100 + JOB_DELAY_MS, &mut sys), Out::None);
+        assert_eq!(msg(&l), KeyError::NotEncrypted.text());
+        assert_eq!((l.fails, l.pw.len()), (0, 0));
+    }
+
+    #[test]
+    fn disco_en_modo_codigo_valida_antes_de_derivar() {
+        let (mut l, mut sys) = disk();
+        assert!(!l.plain(Item::Pw));
+        click(&mut l, &mut sys, Item::Link);
+        assert!(l.recovery_mode && l.plain(Item::Pw));
+        typ(&mut l, &mut sys, "abcd-efgh");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(msg(&l), "El código debe tener 40 caracteres.");
+        assert!(l.job.is_none());
+        // Con 40 caracteres válidos (minúsculas, espacios y guiones incluidos) sí se pone en marcha.
+        for _ in 0..9 {
+            press(&mut l, &mut sys, Key::Backspace, None);
+        }
+        let spaced: String = CODE.to_lowercase().as_bytes().chunks(5).map(|c| core::str::from_utf8(c).unwrap()).collect::<Vec<_>>().join("-");
+        typ(&mut l, &mut sys, &spaced);
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert!(l.job.is_some());
+        // Un carácter fuera del alfabeto se avisa aparte.
+        assert!(check_code(&CODE.replace('A', "I")).is_err());
+        assert_eq!(check_code(&CODE.replace('A', "I")), Err("El código tiene caracteres que no son válidos."));
+        // Volver a la clave borra lo escrito.
+        l.job = None;
+        click(&mut l, &mut sys, Item::Link);
+        assert!(!l.recovery_mode && l.pw.is_empty());
+    }
+
+    #[test]
+    fn disco_espera_creciente_tras_tres_fallos() {
+        let (mut l, mut sys) = disk();
+        l.tick(1000, &mut sys);
+        for _ in 0..2 {
+            assert_eq!(l.disk_result(Err(KeyError::WrongSecret)), Out::None);
+            assert!(!l.waiting());
+        }
+        // Otros errores no cuentan.
+        l.disk_result(Err(KeyError::NotEncrypted));
+        assert!(!l.waiting());
+        l.disk_result(Err(KeyError::WrongSecret));
+        assert!(l.waiting());
+        assert!(msg(&l).starts_with("Demasiados intentos. Espera 5 s"));
+        typ(&mut l, &mut sys, "x");
+        assert!(l.pw.is_empty());
+        assert_eq!(press(&mut l, &mut sys, Key::Enter, None), Out::None);
+        assert!(l.job.is_none());
+        l.tick(1000 + 5000, &mut sys);
+        assert!(!l.waiting());
+        typ(&mut l, &mut sys, "x");
+        assert_eq!(l.pw.len(), 1);
+        // Siguientes esperas: 15 s a los 6 fallos.
+        for _ in 0..3 {
+            l.disk_result(Err(KeyError::WrongSecret));
+        }
+        assert_eq!(l.last_secs, 15);
+        // Acertar lo reinicia todo.
+        l.until = None;
+        assert_eq!(l.disk_result(Ok(())), Out::DiskDone);
+        assert_eq!((l.fails, l.until), (0, None));
+    }
+
+    #[test]
+    fn disco_seguir_sin_disco_pide_confirmacion() {
+        let (mut l, mut sys) = disk();
+        typ(&mut l, &mut sys, "algo");
+        assert_eq!(click(&mut l, &mut sys, Item::Skip), Out::None);
+        assert!(l.confirm_skip && l.pw.is_empty());
+        assert_eq!(l.layout().items.iter().filter(|i| matches!(i.0, Item::Done | Item::Back)).count(), 2);
+        // Volver (o Escape) no hace nada más.
+        assert_eq!(click(&mut l, &mut sys, Item::Back), Out::None);
+        assert!(!l.confirm_skip);
+        click(&mut l, &mut sys, Item::Skip);
+        press(&mut l, &mut sys, Key::Escape, None);
+        assert!(!l.confirm_skip);
+        // Confirmar sigue el arranque.
+        click(&mut l, &mut sys, Item::Skip);
+        assert_eq!(click(&mut l, &mut sys, Item::Done), Out::DiskDone);
+    }
+
+    #[test]
+    fn disco_se_dibuja_en_los_dos_modos_y_con_confirmacion() {
+        let (mut l, mut sys) = disk();
+        let mut s = Surface::new(1280, 800, 0x101010);
+        l.paint(&mut s, 0x3B7DD8);
+        let antes = s.px.clone();
+        click(&mut l, &mut sys, Item::Link);
+        typ(&mut l, &mut sys, "abcde");
+        l.paint(&mut s, 0x3B7DD8);
+        assert!(s.px != antes);
+        click(&mut l, &mut sys, Item::Skip);
+        l.paint(&mut s, 0x3B7DD8);
+        // La clave no se ve nunca: en modo clave el campo solo lleva puntos.
+        assert!(!l.plain(Item::Pw2) && l.users.is_empty());
+    }
+
+    #[test]
+    fn fortaleza_se_pinta_en_el_asistente() {
+        let mut l = Login::new(1280, 800);
+        let mut sys = sys();
+        l.start_setup();
+        l.focus = Item::Pw;
+        let lh = font::line_h(8);
+        let probe = |l: &Login| {
+            let r = rect(l, Item::Pw);
+            let mut s = Surface::new(1280, 800, 0x101010);
+            l.paint(&mut s, 0x3B7DD8);
+            (s.px[((r.y - lh - 2 + lh / 2) * 1280 + r.right() - STRENGTH_W + 2) as usize], s)
+        };
+        let vacio = probe(&l).0;
+        for (pw, nivel) in [("abc123", 1u8), ("Abc12345", 2), ("abcdefgh1234", 3), ("Abc12345xyz!qwertyz", 4)] {
+            wipe_str(&mut l.pw);
+            typ(&mut l, &mut sys, pw);
+            assert_eq!(keys::strength(pw), nivel, "{pw}");
+            let (px, _) = probe(&l);
+            assert_eq!(px, STRENGTH[nivel as usize].1);
+            assert_ne!(px, vacio);
+        }
+        // También en "Añadir otra cuenta" (misma tarjeta con la segunda cuenta).
+        l.second = true;
+        assert_eq!(probe(&l).0, STRENGTH[4].1);
+    }
+
+    #[test]
+    fn fortaleza_ensucia_su_zona_al_teclear() {
+        let mut l = Login::new(1280, 800);
+        let mut sys = sys();
+        l.start_setup();
+        l.focus = Item::Pw;
+        l.take_damage();
+        typ(&mut l, &mut sys, "a");
+        let lh = font::line_h(8);
+        let r = rect(&l, Item::Pw);
+        let zona = Rect::new(r.right() - STRENGTH_W, r.y - lh - 2, STRENGTH_W, lh);
+        assert!(l.take_damage().iter().any(|d| d.x <= zona.x && d.right() >= zona.right() && d.y <= zona.y && d.bottom() >= zona.bottom()));
+    }
+
+    fn pick_recuperable() -> (Login, TestPlatform) {
+        let mut l = Login::new(1280, 800);
+        l.start_pick(alloc::vec![(String::from("Ana"), true), (String::from("Luis"), true)]);
+        l.set_recoverable(alloc::vec![true, false]);
+        (l, sys())
+    }
+
+    #[test]
+    fn recuperar_cuenta_solo_se_ofrece_si_esta_cifrada() {
+        let (mut l, mut sys) = pick_recuperable();
+        assert!(l.layout().items.iter().any(|i| i.0 == Item::Link));
+        press(&mut l, &mut sys, Key::Right, None);
+        assert!(l.layout().items.iter().all(|i| i.0 != Item::Link));
+        press(&mut l, &mut sys, Key::Left, None);
+        assert_eq!(l.order(), [Item::Pw, Item::Link, Item::Ok]);
+    }
+
+    #[test]
+    fn recuperar_cuenta_valida_el_formulario_y_borra_los_buffers() {
+        let (mut l, mut sys) = pick_recuperable();
+        click(&mut l, &mut sys, Item::Link);
+        assert_eq!(l.mode, Mode::Recover);
+        // Código corto.
+        typ(&mut l, &mut sys, "abc");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Code, "El código debe tener 40 caracteres.")));
+        // Claves distintas.
+        for _ in 0..3 {
+            press(&mut l, &mut sys, Key::Backspace, None);
+        }
+        typ(&mut l, &mut sys, CODE);
+        press(&mut l, &mut sys, Key::Tab, None);
+        typ(&mut l, &mut sys, "nueva123");
+        press(&mut l, &mut sys, Key::Tab, None);
+        typ(&mut l, &mut sys, "nueva124");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(l.err.as_ref().map(|e| (e.0, e.1.as_str())), Some((Item::Pw2, "Las claves no coinciden.")));
+        // Iguales: "Comprobando…" y, un tick después, el resultado (el disco de pruebas no está cifrado).
+        press(&mut l, &mut sys, Key::Backspace, None);
+        typ(&mut l, &mut sys, "3");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert_eq!(msg(&l), "Comprobando…");
+        l.tick(500, &mut sys);
+        assert_eq!(msg(&l), KeyError::NotEncrypted.text());
+        assert_eq!((l.code.len(), l.pw.len(), l.pw2.len()), (0, 0, 0));
+        assert_eq!(l.mode, Mode::Recover);
+        // Cancelar vuelve al inicio de sesión.
+        click(&mut l, &mut sys, Item::Done);
+        assert_eq!(l.mode, Mode::Pick);
+        assert_eq!(l.users.len(), 2);
+    }
+
+    #[test]
+    fn recuperar_cuenta_con_exito_vuelve_con_un_aviso_verde() {
+        let (mut l, mut sys) = pick_recuperable();
+        click(&mut l, &mut sys, Item::Link);
+        l.recover_result(Ok(()));
+        assert_eq!(l.mode, Mode::Pick);
+        assert_eq!(msg(&l), "Clave cambiada. Ya puedes iniciar sesión.");
+        assert!(l.good);
+        // Un intento posterior con clave mala vuelve a ser rojo.
+        typ(&mut l, &mut sys, "mala");
+        press(&mut l, &mut sys, Key::Enter, None);
+        assert!(!l.good);
+        // Y un error de clave floja apunta al campo de la clave nueva.
+        click(&mut l, &mut sys, Item::Link);
+        l.recover_result(Err(KeyError::Weak));
+        assert_eq!((l.focus, msg(&l).as_str()), (Item::Pw, KeyError::Weak.text()));
+    }
+
+    #[test]
+    fn el_acumulador_vuelve_con_sus_eventos_tras_prestarse() {
+        let mut sys = sys();
+        for i in 0..POOL_EVENTS_NEEDED {
+            sys.pool.add_event(i as i32, 1, 1, i as u64);
+        }
+        let r = with_pool(&mut sys, |_, pool| {
+            assert!(pool.ready());
+            7
+        });
+        assert_eq!(r, 7);
+        assert!(sys.pool.ready());
     }
 }
