@@ -4013,5 +4013,23 @@ mod tests {
         t.tab(0);
         t.open(files::TRASH);
         guarda(&t.draw(), "papelera");
+        // v0.7.0: recuadro a medio dibujar y carpeta resaltada como destino.
+        t.open(dd(Std::Documents).as_str());
+        t.e.view = View::Icons;
+        t.e.clear_sel();
+        t.draw();
+        let (x3, y3) = t.pt(3);
+        t.down(x3 + 20, 440);
+        t.mv(x3 - 150, y3);
+        guarda(&t.draw(), "recuadro");
+        t.up_(0, 0);
+        t.e.view = View::Details;
+        t.e.clear_sel();
+        t.draw();
+        let p = pth(Std::Documents, "f01");
+        t.over(Some(t.pt(0)), &[p.clone()]);
+        guarda(&t.draw(), "destino_carpeta");
+        t.over(Some(T::place_pt(3)), &[p]);
+        guarda(&t.draw(), "destino_panel");
     }
 }
