@@ -3676,6 +3676,55 @@ mod tests {
         assert!(t.answer(text("Libre")).is_none() && t.sys.files.exists(pth(Std::Documents, "Libre").as_str()));
     }
 
+    // ---- v0.7.2: arrastre con el botón derecho ----
+
+    impl T {
+        fn source(&mut self, p: (i32, i32)) -> Option<Vec<String>> {
+            let (r, ..) = self.cx(|e, cx| e.drag_source(p.0, p.1, cx));
+            self.draw();
+            r
+        }
+    }
+
+    #[test]
+    fn drag_source_selecciona_como_el_menu_y_conserva_la_multiple() {
+        let mut t = T::new();
+        let (nota, sub) = (pth(Std::Documents, "nota.txt"), pth(Std::Documents, "Sub"));
+        let i = t.rows().iter().position(|n| n == "nota.txt").unwrap();
+        // Elemento sin seleccionar: se selecciona solo y se devuelve.
+        assert_eq!(t.source(t.pt(i)), Some(vec![nota.clone()]));
+        assert_eq!(t.sel_name().as_deref(), Some("nota.txt"));
+        // Con los dos seleccionados, arrastrar uno conserva la selección múltiple.
+        t.mods(false, true);
+        t.click_item(0);
+        t.mods(false, false);
+        assert_eq!(t.e.marked.len(), 2);
+        let got = t.source(t.pt(i)).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&nota) && got.contains(&sub));
+        assert_eq!(t.e.marked.len(), 2);
+        // Zona vacía, cabecera y panel: nada.
+        assert_eq!(t.source(EMPTY), None);
+        assert_eq!(t.source((300, RIB_H + NAV_H + 5)), None);
+        assert_eq!(t.source((30, RIB_H + NAV_H + 20)), None);
+    }
+
+    #[test]
+    fn drag_source_no_da_nada_en_papelera_ni_con_protegidas() {
+        let mut t = T::new();
+        // Carpeta personal: «Documentos» y compañía están protegidas.
+        let home = parent(dd(Std::Documents).as_str()).unwrap();
+        t.open(&home);
+        let i = t.rows().iter().position(|n| n == "Documentos").unwrap();
+        assert_eq!(t.source(t.pt(i)), None);
+        // Papelera.
+        let now = t.now_dt();
+        t.sys.files.user_trash_many(&[pth(Std::Documents, "nota.txt")], now).unwrap();
+        t.open(files::TRASH);
+        assert!(!t.rows().is_empty());
+        assert_eq!(t.source(t.pt(0)), None);
+    }
+
     // ---- v0.7.0: recuadro de selección y arrastre ----
 
     impl T {
