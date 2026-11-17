@@ -27,6 +27,9 @@ const RIB_H: i32 = 116;
 const NAV_H: i32 = 34;
 const HEAD_H: i32 = 22;
 const ROW_H: i32 = 22;
+/// Vista Detalles: franja libre a la izquierda de las filas, para empezar el recuadro de selección
+/// aunque la lista llene la ventana.
+const GUTTER: i32 = 16;
 const STATUS_H: i32 = 22;
 const PANEL_W: i32 = 140;
 const COL_W: [i32; 3] = [152, 152, 76];
@@ -107,6 +110,8 @@ const TAG_NEWDOC: u32 = 6;
 const TAG_MOVETO: u32 = 7;
 const TAG_COPYTO: u32 = 8;
 const TAG_SYS: u32 = 9;
+/// Confirmación de enviar a la Papelera.
+const TAG_DEL: u32 = 10;
 /// Menús: sobre un elemento / sobre la zona vacía / de la cinta (Archivo y Ordenar por).
 const TAG_MENU_ITEM: u32 = 1;
 const TAG_MENU_BG: u32 = 2;
@@ -776,7 +781,7 @@ impl Explorer {
         let size = PANEL_W + lw - COL_W[2];
         let b = size - COL_W[1];
         let a = b - COL_W[0];
-        [PANEL_W, a, b, size]
+        [PANEL_W + GUTTER, a, b, size]
     }
 
     /// Rectángulo del elemento `i` (puede quedar fuera de la zona si no está visible).
@@ -787,7 +792,7 @@ impl Explorer {
         match (self.view, self.view.grid()) {
             (_, Some((cw, ch, _, _))) => Rect::new(a.x + slot * cw, a.y + line * ch, cw, ch),
             (View::List, _) => Rect::new(a.x + line * LCOL_W, a.y + slot * ROW_H, LCOL_W, ROW_H),
-            _ => Rect::new(a.x, a.y + line * ROW_H, a.w, ROW_H),
+            _ => Rect::new(a.x + GUTTER, a.y + line * ROW_H, a.w - GUTTER, ROW_H),
         }
     }
 
@@ -800,6 +805,7 @@ impl Explorer {
         let (line, slot) = match (self.view, self.view.grid()) {
             (_, Some((cw, ch, _, _))) => (dy / ch, dx / cw),
             (View::List, _) => (dx / LCOL_W, dy / ROW_H),
+            _ if dx < GUTTER => return None,
             _ => (dy / ROW_H, 0),
         };
         let (pl, page, _) = self.dims();
@@ -1061,7 +1067,14 @@ impl Explorer {
                 let dir = self.cwd.clone();
                 self.paste_into(&dir, cx);
             }
-            Cmd::Delete => self.act(Act::Trash(paths), cx),
+            Cmd::Delete => {
+                let text = match paths.as_slice() {
+                    [one] => format!("¿Quieres enviar «{}» a la Papelera?", files::file_name(one)),
+                    many => format!("¿Quieres enviar estos {} elementos a la Papelera?", many.len()),
+                };
+                self.pending_sys = Some(Act::Trash(paths));
+                cx.dialog = Some(DialogRequest::Message { tag: TAG_DEL, title: String::from("Eliminar"), text, buttons: Buttons::YesNo });
+            }
             Cmd::MoveTo | Cmd::CopyTo => {
                 let mv = c == Cmd::MoveTo;
                 self.pending = paths;
@@ -1627,8 +1640,8 @@ impl Explorer {
                         s.fill_rect(r, hl);
                     }
                     let y = r.y;
-                    icons::draw(s, icon, PANEL_W + 6, y + 3, 16, 0x444444);
-                    clipped(s, Rect::new(PANEL_W + 28, y, cx[1] - PANEL_W - 32, ROW_H), name, TEXT, Align::Left);
+                    icons::draw(s, icon, cx[0] + 6, y + 3, 16, 0x444444);
+                    clipped(s, Rect::new(cx[0] + 28, y, cx[1] - cx[0] - 32, ROW_H), name, TEXT, Align::Left);
                     let (c1, c2) = if trash {
                         (row.loc.clone(), fmt_date(row.date))
                     } else {
@@ -2030,6 +2043,12 @@ impl App for Explorer {
                 self.act(Act::Transfer { paths, dir, mv }, cx);
             }
             DialogResult::Path { path: None, .. } => self.pending.clear(),
+            DialogResult::Answer { tag: TAG_DEL, answer } => {
+                // Sí: se elimina (si toca Sistema, `act` pregunta además por eso).
+                if let (Answer::Yes, Some(a)) = (answer, self.pending_sys.take()) {
+                    self.act(a, cx);
+                }
+            }
             DialogResult::Answer { tag: TAG_SYS, answer } => {
                 if let (Answer::Yes, Some(a)) = (answer, self.pending_sys.take()) {
                     self.apply(a, cx);
@@ -2139,6 +2158,8 @@ mod tests {
         closed: bool,
         drag: Option<DragRequest>,
         redraw: bool,
+        /// Contesta Sí solo a "¿enviar a la Papelera?" (las pruebas antiguas eliminan sin preguntar).
+        auto_del: bool,
     }
 
     impl T {
@@ -2150,7 +2171,7 @@ mod tests {
             T::with(sys)
         }
         fn with(sys: TestPlatform) -> T {
-            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None, term: None, closed: false, drag: None, redraw: false };
+            let mut t = T { e: make(), sys, th: Theme::default(), now: 1000, menu: None, open_new: None, term: None, closed: false, drag: None, redraw: false, auto_del: true };
             t.draw();
             t
         }
@@ -2168,7 +2189,13 @@ mod tests {
             self.closed |= cx.close;
             self.drag = cx.drag.take().or(self.drag.take());
             self.redraw = cx.redraw;
-            (r, cx.dialog.take(), cx.open.take())
+            let (d, o) = (cx.dialog.take(), cx.open.take());
+            if self.auto_del && matches!(d, Some(DialogRequest::Message { tag: TAG_DEL, .. })) {
+                let mut cx = Ctx::new(&mut self.sys, &mut self.th, self.now);
+                self.e.dialog_result(DialogResult::Answer { tag: TAG_DEL, answer: Answer::Yes }, &mut cx);
+                return (r, cx.dialog.take(), o);
+            }
+            (r, d, o)
         }
         fn key(&mut self, key: Key, ctrl: bool) -> (Option<DialogRequest>, Option<String>) {
             let ev = KeyEvent { key, ch: None, down: true, shift: false, ctrl, alt: false };
@@ -3673,6 +3700,44 @@ mod tests {
         fn exists_in(&mut self, d: Std, n: &str) -> bool {
             self.sys.files.exists(pth(d, n).as_str())
         }
+    }
+
+    #[test]
+    fn suprimir_pide_confirmacion() {
+        let mut t = T::new();
+        t.auto_del = false;
+        t.many(2); // Sub, f00, f01, nota.txt
+        t.select("nota.txt");
+        let (d, _) = t.key(Key::Delete, false);
+        let Some(DialogRequest::Message { tag: TAG_DEL, text, buttons: Buttons::YesNo, .. }) = d else { panic!("{d:?}") };
+        assert_eq!(text, "¿Quieres enviar «nota.txt» a la Papelera?");
+        t.answer(DialogResult::Answer { tag: TAG_DEL, answer: Answer::No });
+        assert!(t.exists_in(Std::Documents, "nota.txt"), "con No no se elimina");
+        t.answer(DialogResult::Answer { tag: TAG_DEL, answer: Answer::Yes });
+        assert!(t.exists_in(Std::Documents, "nota.txt"), "un Sí suelto, sin pregunta pendiente, no hace nada");
+        t.key(Key::Char('a'), true);
+        let (d, _) = t.key(Key::Delete, false);
+        let Some(DialogRequest::Message { text, .. }) = d else { panic!() };
+        assert_eq!(text, "¿Quieres enviar estos 4 elementos a la Papelera?");
+        t.answer(DialogResult::Answer { tag: TAG_DEL, answer: Answer::Yes });
+        assert!(t.names().is_empty());
+        t.key(Key::Char('z'), true);
+        assert_eq!(t.names().len(), 4);
+    }
+
+    #[test]
+    fn recuadro_desde_el_margen_izquierdo_con_la_lista_llena() {
+        let mut t = T::new();
+        t.many(40); // más filas de las que caben: no queda zona vacía debajo
+        let (_, y0) = t.pt(0);
+        let (_, y3) = t.pt(3);
+        let gx = PANEL_W + GUTTER / 2;
+        assert_eq!(t.e.item_at(gx, y0), None, "el margen no es una fila");
+        t.down(gx, y3);
+        t.mv(gx + 300, y0);
+        assert_eq!(t.marked(), [0, 1, 2, 3]);
+        t.up_(gx + 300, y0);
+        assert_eq!(t.marked(), [0, 1, 2, 3]);
     }
 
     #[test]

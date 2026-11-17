@@ -231,6 +231,8 @@ const TAG_EMPTY: u32 = 0xFFFF_FF13;
 const TAG_INFO: u32 = 0xFFFF_FF14;
 /// Confirmación de soltar archivos sobre o desde `C:\Sistema`.
 const TAG_DROP: u32 = 0xFFFF_FF15;
+/// "¿Enviar a la Papelera?" (Supr y Eliminar sobre iconos).
+const TAG_DEL: u32 = 0xFFFF_FF16;
 
 /// Etiquetas e identificadores de los menús contextuales del escritorio.
 const MENU_ICON: u32 = 1;
@@ -400,6 +402,8 @@ pub struct Desktop {
     band_base: Vec<usize>,
     /// Soltar pendiente de confirmar (toca `C:\Sistema`): destino, rutas y si es copiar.
     pending_drop: Option<(Dest, Vec<String>, bool)>,
+    /// Lo que se enviará a la Papelera si se responde Sí a `TAG_DEL`.
+    pending_del: Option<Vec<String>>,
 }
 
 /// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
@@ -685,6 +689,7 @@ impl Desktop {
             band: None,
             band_base: Vec::new(),
             pending_drop: None,
+            pending_del: None,
         };
         d.login.set_clock(d.clock);
         if sys.files().user().is_some() && !sys.files().disk_locked() {
@@ -725,6 +730,7 @@ impl Desktop {
         self.dnd_hl = None;
         self.dnd_lbl = Rect::default();
         self.pending_drop = None;
+        self.pending_del = None;
         let mut dim = Surface::new(self.w, self.h, 0);
         dim.blit(&self.wall, 0, 0);
         dim.blend_rect(Rect::new(0, 0, self.w, self.h), 0x000000, 150);
@@ -1322,15 +1328,10 @@ impl Desktop {
 
     /// Órdenes del menú con varios iconos seleccionados (los de apps y la Papelera se ignoran).
     fn multi_action(&mut self, id: u32, sys: &mut dyn Platform) {
-        let now = sys.now();
         let paths = self.sel_paths();
         match id {
             M_CUT | M_COPY if !paths.is_empty() => sys.files().set_clip_many(&paths, id == M_CUT),
-            M_DELETE if !paths.is_empty() => {
-                if let Err(e) = sys.files().user_trash_many(&paths, now) {
-                    self.info("No se puede eliminar", e.message(), sys);
-                }
-            }
+            M_DELETE if !paths.is_empty() => self.ask_trash(paths, sys),
             M_PROPS => {
                 let text = format!("{} elementos seleccionados.", self.sel.len());
                 self.info("Propiedades", &text, sys);
@@ -1428,10 +1429,19 @@ impl Desktop {
     }
 
     fn trash_path(&mut self, path: &str, sys: &mut dyn Platform) {
-        let now = sys.now();
-        if let Err(e) = sys.files().user_trash(path, now) {
-            self.info("No se puede eliminar", e.message(), sys);
-        }
+        self.ask_trash(vec![String::from(path)], sys);
+    }
+
+    /// Pregunta antes de enviar a la Papelera; con Sí sigue como soltar en la Papelera (que avisa
+    /// además si toca `C:\Sistema`).
+    fn ask_trash(&mut self, paths: Vec<String>, sys: &mut dyn Platform) {
+        let text = match paths.as_slice() {
+            [one] => format!("¿Quieres enviar «{}» a la Papelera?", files::file_name(one)),
+            many => format!("¿Quieres enviar estos {} elementos a la Papelera?", many.len()),
+        };
+        self.pending_del = Some(paths);
+        let req = DialogRequest::Message { tag: TAG_DEL, title: String::from("Eliminar"), text, buttons: Buttons::YesNo };
+        self.open_dialog(None, req, sys);
     }
 
     fn start_rename(&mut self, path: &str, sys: &mut dyn Platform) {
@@ -1458,13 +1468,7 @@ impl Desktop {
                 self.set_sel((0..self.icons.len()).collect());
                 self.anchor = 0;
             }
-            Key::Delete if !paths.is_empty() => {
-                let now = sys.now();
-                if let Err(e) = sys.files().user_trash_many(&paths, now) {
-                    self.info("No se puede eliminar", e.message(), sys);
-                }
-                self.refresh_icons(sys);
-            }
+            Key::Delete if !paths.is_empty() => self.ask_trash(paths, sys),
             Key::F(2) if self.sel.len() == 1 && paths.len() == 1 => self.start_rename(&paths[0], sys),
             _ => {}
         }
@@ -1852,6 +1856,12 @@ impl Desktop {
                     self.info("No se puede vaciar la Papelera", e.message(), sys);
                 }
                 self.refresh_icons(sys);
+            }
+            DialogResult::Answer { tag: TAG_DEL, answer } => {
+                if let (Answer::Yes, Some(paths)) = (answer, self.pending_del.take()) {
+                    self.desk_drop(Dest::Trash, paths, false, sys);
+                }
+                self.pending_del = None;
             }
             DialogResult::Answer { tag: TAG_DROP, answer } => {
                 if let Some((dest, paths, copy)) = self.pending_drop.take() {
@@ -4300,6 +4310,8 @@ mod menu_tests {
         let n = d.icons.len();
         let i = d.icons.iter().position(|x| x.name == "nota.txt").unwrap();
         pick(&mut d, &mut sys, Some(i), M_DELETE);
+        assert_eq!(d.dialog_count(), 1, "pregunta antes de eliminar");
+        key(&mut d, &mut sys, Key::Enter, None, false); // Sí
         assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         assert_eq!(d.icons.len(), n - 1);
         assert_eq!(sys.files.trash_list().unwrap().len(), 2);
@@ -4506,6 +4518,11 @@ mod menu_tests {
         // Supr sobre el icono seleccionado: a la Papelera.
         click_icon(&mut d, &mut sys, 7);
         key(&mut d, &mut sys, Key::Delete, None, false);
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")), "aún no: pregunta");
+        key(&mut d, &mut sys, Key::Escape, None, false); // No
+        assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")), "con No se queda");
+        key(&mut d, &mut sys, Key::Delete, None, false);
+        key(&mut d, &mut sys, Key::Enter, None, false); // Sí
         assert!(!sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         assert_eq!(sys.files.trash_list().unwrap().len(), 1);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
@@ -6157,6 +6174,7 @@ mod dnd_tests {
         // Ctrl+A y Supr: solo se eliminan archivos y carpetas; las apps y la Papelera se quedan.
         key(&mut d, &mut sys, Key::Char('a'), Some('a'), true);
         key(&mut d, &mut sys, Key::Delete, None, false);
+        key(&mut d, &mut sys, Key::Enter, None, false); // Sí
         assert_eq!(d.icons.len(), 6);
         assert_eq!(d.dialog_count(), 0);
         // Deshacer lo devuelve como un solo lote.
