@@ -1923,6 +1923,66 @@ impl Files {
     }
 }
 
+/// Bloques que cuenta como una unidad de progreso la limpieza del espacio libre.
+const SCRUB_CHUNK: u64 = 256;
+
+/// Pone a cero los bloques LIBRES del volumen NFFS de `dev` desde `*cursor`, mirando como mucho
+/// `max`. Al cifrar una carpeta, lo viejo en claro queda en bloques liberados (datos y metadatos);
+/// esto los borra de verdad. Lee el mapa de bloques confirmado en cada llamada (el superbloque
+/// válido de mayor generación, con su suma comprobada), así que solo toca lo que nadie usa y cada
+/// llamada es válida aunque entre dos de ellas se haya escrito algo. `Ok(true)` al llegar al final.
+/// shortcut: formato de NFFS leído aquí a mano (fs.rs no ofrece el mapa); si cambia el formato, mover esto a fs.rs.
+fn scrub_free(dev: &mut dyn BlockDev, cursor: &mut u64, max: u64) -> Result<bool, FsError> {
+    use crate::block::BLOCK;
+    fn fnv(data: &[u8]) -> u64 {
+        data.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+    }
+    let le64 = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let le32 = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+    let mut best: Option<(u64, [u8; BLOCK])> = None;
+    for slot in 0..2u64 {
+        let mut b = [0u8; BLOCK];
+        dev.read(slot, &mut b)?;
+        if &b[..4] == b"NFFS" && le32(&b, 4) == 1 && le64(&b, 56) == fnv(&b[..56]) && best.as_ref().is_none_or(|x| le64(&b, 8) > x.0) {
+            best = Some((le64(&b, 8), b));
+        }
+    }
+    let (_, sb) = best.ok_or(FsError::Corrupt)?;
+    let (total, count, first, len, sum) = (le64(&sb, 16), le32(&sb, 28) as usize, le64(&sb, 32), le32(&sb, 40) as usize, le64(&sb, 48));
+    let bm = total.div_ceil(8) as usize;
+    if total > dev.blocks() || count == 0 || len < bm || len > count * (BLOCK - 8) {
+        return Err(FsError::Corrupt);
+    }
+    let mut meta = Vec::with_capacity(len);
+    let (mut b, mut buf) = (first, [0u8; BLOCK]);
+    for _ in 0..count {
+        if b < 2 || b >= total {
+            return Err(FsError::Corrupt);
+        }
+        dev.read(b, &mut buf)?;
+        meta.extend_from_slice(&buf[8..]);
+        b = le64(&buf, 0);
+    }
+    meta.truncate(len);
+    if b != 0 || fnv(&meta) != sum {
+        return Err(FsError::Corrupt);
+    }
+    let end = (*cursor).saturating_add(max).min(total);
+    while *cursor < end {
+        let n = *cursor;
+        *cursor += 1;
+        if n < 2 || meta[(n / 8) as usize] >> (n % 8) & 1 == 1 {
+            continue;
+        }
+        dev.read(n, &mut buf)?;
+        if buf.iter().any(|&x| x != 0) {
+            dev.write(n, &[0u8; BLOCK])?;
+        }
+    }
+    dev.flush()?;
+    Ok(*cursor >= total)
+}
+
 /// Archivo de llaves de una cuenta (ruta relativa a la raíz).
 fn keys_path(name: &str) -> String {
     join_rel(KEYS_DIR, name)
@@ -1967,6 +2027,8 @@ struct Home {
     conv: Option<Vec<Frame>>,
     done: u64,
     total: u64,
+    /// Limpieza del espacio libre al terminar de cifrar: siguiente bloque por mirar.
+    scrub: Option<u64>,
     counter: u32,
     /// Entradas de carpetas ya listadas (por ruta en disco, en minúsculas); se vacía al modificar.
     cache: BTreeMap<String, Vec<Item>>,
@@ -2300,6 +2362,9 @@ impl Files {
     }
 
     fn conv_run(&mut self, name: &str, to_enc: bool, mut budget: u32, now: DateTime) -> Result<bool, FsError> {
+        if to_enc && self.hc.scrub.is_some() && self.hc.conv.is_none() {
+            return self.scrub_phase(budget as u64 * SCRUB_CHUNK); // ya está todo convertido
+        }
         let mut stack = match self.hc.conv.take() {
             Some(s) => s,
             None => {
@@ -2313,6 +2378,31 @@ impl Files {
         if res == Ok(false) {
             self.hc.conv = Some(stack);
         }
+        // Todo convertido: lo claro que quedó en bloques ya libres (datos y metadatos viejos) se borra.
+        if res == Ok(true) && to_enc {
+            return self.scrub_phase(budget.max(1) as u64 * SCRUB_CHUNK);
+        }
+        res
+    }
+
+    /// Una pasada de limpieza de como mucho `blocks` bloques. `Ok(true)` al terminar el volumen.
+    fn scrub_phase(&mut self, blocks: u64) -> Result<bool, FsError> {
+        let vol = self.fs.volume_blocks();
+        let mut cur = match self.hc.scrub {
+            Some(c) => c,
+            None => {
+                self.hc.total += vol.div_ceil(SCRUB_CHUNK);
+                0
+            }
+        };
+        let from = cur;
+        let mut res = Ok(false);
+        self.fs.swap_dev(|mut dev| {
+            res = scrub_free(&mut *dev, &mut cur, blocks);
+            dev
+        });
+        self.hc.scrub = Some(cur);
+        self.hc.done += (cur - from).div_ceil(SCRUB_CHUNK);
         res
     }
 
@@ -4099,5 +4189,242 @@ mod tests {
         assert_eq!((dk.writes(), dk.bytes()), (0, v));
         let g = Files::probe(Some(Box::new(Cdisk::new(300))), d(4));
         assert!(g.pending_format());
+    }
+
+    // ---- Cifrado de la carpeta de usuario ----
+
+    const PW: &str = "secreta1";
+    const H: &str = "C:\\Usuarios\\Ana";
+    const NEEDLES: [&str; 9] = [
+        SECRET_TEXT,
+        SECRET_NAME,
+        "carpeta-reservada-secreta",
+        "segundo.txt",
+        "nota-del-escritorio-privada",
+        "CUERPO-ESCRITORIO-PRIVADO",
+        "CONFIG-PRIVADA-XYZ",
+        "para-la-papelera-secreta",
+        "nombre-largo-subcarpeta",
+    ];
+
+    /// Disco con Ana (administradora, con clave) y la sesión abierta, sin archivos.
+    fn hdisk(blocks: usize) -> (Cdisk, Files) {
+        let disk = Cdisk::new(blocks);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
+        f.format_pending(d(1)).unwrap();
+        f.create_account("Ana", Some(PW), true, [1; 16], d(1)).unwrap();
+        f.login("Ana", PW).unwrap();
+        (disk, f)
+    }
+
+    /// Ana con archivos, subcarpetas, configuración y algo en la Papelera.
+    fn fill(f: &mut Files) {
+        f.write(&format!("{H}\\Documentos\\{SECRET_NAME}"), &secret_body(0), d(2)).unwrap();
+        f.mkdir(&format!("{H}\\Documentos\\carpeta-reservada-secreta"), d(2)).unwrap();
+        f.write(&format!("{H}\\Documentos\\carpeta-reservada-secreta\\segundo.txt"), &secret_body(1), d(3)).unwrap();
+        f.mkdir(&format!("{H}\\Documentos\\carpeta-reservada-secreta\\nombre-largo-subcarpeta"), d(3)).unwrap();
+        f.write(&format!("{H}\\Escritorio\\nota-del-escritorio-privada.txt"), b"CUERPO-ESCRITORIO-PRIVADO", d(4)).unwrap();
+        let cfg = f.config_file();
+        f.write(&cfg, b"fondo=CONFIG-PRIVADA-XYZ\n", d(5)).unwrap();
+        f.write(&format!("{H}\\Documentos\\para-la-papelera-secreta.txt"), &secret_body(2), d(6)).unwrap();
+        f.trash(&format!("{H}\\Documentos\\para-la-papelera-secreta.txt"), d(6)).unwrap();
+        f.write(&format!("{H}\\Documentos\\vacio.txt"), b"", d(6)).unwrap();
+    }
+
+    /// Foto lógica de todo lo de Ana (nombres, tipos, tamaños, fechas y contenido), incluidas
+    /// `.config` y `.papelera`.
+    fn snap(f: &mut Files) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![String::from("Usuarios\\Ana")];
+        while let Some(p) = stack.pop() {
+            let mut es = f.r_list(&p).unwrap();
+            es.sort_by_key(|e| lower(&e.name));
+            for e in es {
+                let q = join_rel(&p, &e.name);
+                let body = if e.dir {
+                    stack.push(q.clone());
+                    String::new()
+                } else {
+                    crate::crypto::to_hex(&crate::crypto::sha256(&f.r_read(&q).unwrap()))
+                };
+                out.push(format!("{q}|{}|{}|{:?}|{body}", e.dir, e.size, e.modified));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn finish_home(f: &mut Files, step: u32) {
+        let mut guard = 0;
+        while !f.home_convert_step(step, d(8)).unwrap() {
+            guard += 1;
+            assert!(guard < 20_000);
+        }
+    }
+
+    fn raw_has(disk: &Cdisk, needles: &[&str]) -> Option<String> {
+        let raw = disk.bytes();
+        needles.iter().find(|n| contains(&raw, n)).map(|n| n.to_string())
+    }
+
+    #[test]
+    fn home_roundtrip_nothing_in_clear_and_same_after_relogin() {
+        let (disk, mut f) = hdisk(400);
+        fill(&mut f);
+        let before = snap(&mut f);
+        assert!(raw_has(&disk, &NEEDLES).is_some());
+        let mut pool = ready_pool();
+        assert!(!f.home_encrypted() && !f.account_encrypted("Ana"));
+        let code = f.encrypt_home(PW, &mut pool, d(7)).unwrap();
+        assert!(f.home_encrypted() && f.account_encrypted("ana"));
+        let (done, total, enc) = f.home_conversion().unwrap();
+        assert!(done == 0 && total >= 10 && enc);
+        // A medias: todo se sigue viendo igual y el progreso solo sube.
+        let mut last = 0;
+        for _ in 0..6 {
+            assert!(!f.home_convert_step(2, d(8)).unwrap());
+            assert_eq!(snap(&mut f), before);
+            let (dn, tot, _) = f.home_conversion().unwrap();
+            assert!(dn >= last && tot >= dn);
+            last = dn;
+        }
+        finish_home(&mut f, 3);
+        assert_eq!(f.home_conversion(), None);
+        assert_eq!(snap(&mut f), before);
+        assert_eq!(f.stat(&format!("{H}\\Documentos\\vacio.txt")).unwrap().size, 0);
+        assert_eq!(f.stat(&format!("{H}\\Documentos\\{SECRET_NAME}")).unwrap().size, secret_body(0).len() as u64);
+        // En la imagen en bruto no hay ni contenido ni nombres, ni en `.config` ni en la Papelera.
+        assert_eq!(raw_has(&disk, &NEEDLES), None);
+        assert_eq!(raw_has(&disk, &["Documentos", "Escritorio", ".papelera", ".config", "Descargas"]), None);
+        // El archivo de llaves no tiene ni la clave ni el código; el registro tampoco.
+        let kf = String::from_utf8(f.fs.read("Sistema\\config\\llaves\\Ana").unwrap()).unwrap();
+        assert!(kf.starts_with("estado=cifrado\n") && !kf.contains(PW) && !kf.contains(&code));
+        let log = String::from_utf8(f.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
+        assert!(log.contains("Cifrado de la carpeta de Ana activado") && !log.contains(PW) && !log.contains(&code.replace('-', "")));
+        // Papelera dentro de la carpeta cifrada.
+        let items = f.trash_list().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "para-la-papelera-secreta.txt");
+        // Cierra la sesión y vuelve: mismas cosas; con la clave mala no hay sesión.
+        f.logout();
+        assert!(f.hc.keys.is_none());
+        assert_eq!(f.login("Ana", "mala-clave"), Err(AccountError::WrongPassword));
+        assert!(f.user().is_none());
+        f.login("Ana", PW).unwrap();
+        assert_eq!(snap(&mut f), before);
+        // Reinicio completo.
+        let (after, mut g) = reboot(&disk);
+        assert!(g.account_encrypted("Ana"));
+        // Ni el arranque crea carpetas en claro dentro de la carpeta cifrada.
+        let names: Vec<String> = g.fs.list("Usuarios\\Ana").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.len() == 8 && names.iter().all(|n| n.starts_with("$E") || n.starts_with("$e")), "{names:?}");
+        assert_eq!(g.read(&format!("{H}\\Documentos\\{SECRET_NAME}")), Err(FsError::Denied));
+        g.login("Ana", PW).unwrap();
+        assert_eq!(snap(&mut g), before);
+        assert_eq!(raw_has(&after, &NEEDLES), None);
+        let id = g.trash_list().unwrap()[0].id.clone();
+        let back = g.restore(&id).unwrap();
+        assert_eq!(g.read(&back).unwrap(), secret_body(2));
+    }
+
+    /// Operaciones que se aplican igual a una carpeta normal y a otra cifrada (o a medias).
+    fn script(f: &mut Files, i: usize) {
+        let docs = format!("{H}\\Documentos");
+        let desk = format!("{H}\\Escritorio");
+        match i {
+            0 => f.write(&format!("{docs}\\nuevo.txt"), b"nuevo contenido", d(10)).unwrap(),
+            1 => f.write(&format!("{docs}\\{SECRET_NAME}"), b"reescrito", d(11)).unwrap(),
+            2 => f.mkdir(&format!("{docs}\\otra"), d(12)).unwrap(),
+            3 => f.rename(&format!("{docs}\\nuevo.txt"), &format!("{docs}\\otra\\Movido.TXT")).unwrap(),
+            4 => f.rename(&format!("{docs}\\carpeta-reservada-secreta"), &format!("{desk}\\carpeta-renombrada")).unwrap(),
+            5 => f.copy(&format!("{desk}\\carpeta-renombrada"), &format!("{docs}\\copia"), d(13)).unwrap(),
+            6 => f.delete(&format!("{docs}\\copia\\segundo.txt")).unwrap(),
+            7 => f.user_trash(&format!("{docs}\\otra\\movido.txt"), d(14)).unwrap(),
+            8 => f.undo(d(15)).unwrap(),
+            9 => {
+                f.set_clip(&format!("{desk}\\nota-del-escritorio-privada.txt"), false);
+                f.paste(&docs, d(16)).unwrap();
+            }
+            10 => assert_eq!(f.free_name(&docs, "nota-del-escritorio-privada.txt"), "nota-del-escritorio-privada (2).txt"),
+            11 => {
+                f.transfer(&[format!("{docs}\\copia")], &desk, true, d(17)).unwrap();
+            }
+            12 => f.user_rename(&format!("{desk}\\copia"), &format!("{desk}\\COPIA2")).unwrap(),
+            13 => f.user_create(&format!("{docs}\\creado.txt"), false, d(18)).unwrap(),
+            14 => {
+                let t = f.trash_list().unwrap();
+                f.restore(&t[0].id).unwrap();
+            }
+            15 => f.write(&format!("{docs}\\final.txt"), &secret_body(4), d(19)).unwrap(),
+            16 => f.empty_trash().unwrap(),
+            _ => unreachable!(),
+        }
+    }
+    const SCRIPT_LEN: usize = 17;
+
+    #[test]
+    fn every_operation_works_inside_an_encrypted_home_same_as_outside() {
+        // Gemelo sin cifrar para comparar.
+        let (_, mut plain) = hdisk(400);
+        fill(&mut plain);
+        let (disk, mut enc) = hdisk(400);
+        fill(&mut enc);
+        let mut pool = ready_pool();
+        enc.encrypt_home(PW, &mut pool, d(7)).unwrap();
+        finish_home(&mut enc, 5);
+        assert_eq!(snap(&mut enc), snap(&mut plain));
+        for i in 0..SCRIPT_LEN {
+            script(&mut plain, i);
+            script(&mut enc, i);
+            assert_eq!(snap(&mut enc), snap(&mut plain), "paso {i}");
+            assert_eq!(enc.list(&format!("{H}\\Escritorio")).unwrap(), plain.list(&format!("{H}\\Escritorio")).unwrap());
+            assert_eq!(enc.undo_label(), plain.undo_label());
+        }
+        // Mayúsculas y minúsculas da igual en las rutas.
+        assert!(enc.exists(&format!("{}\\DOCUMENTOS\\FINAL.TXT", H.to_uppercase())));
+        assert_eq!(enc.read("c:/usuarios/ana/documentos/final.txt").unwrap(), secret_body(4));
+        // Cosas inexistentes y errores iguales.
+        for p in ["Documentos\\no-existe.txt", "Documentos\\final.txt\\x", "NoExiste\\a.txt"] {
+            assert_eq!(enc.read(&format!("{H}\\{p}")), plain.read(&format!("{H}\\{p}")), "{p}");
+        }
+        assert_eq!(enc.list(&format!("{H}\\Documentos\\final.txt")).err(), Some(FsError::NotDir));
+        assert_eq!(enc.read(&format!("{H}\\Documentos")), Err(FsError::IsDir));
+        assert_eq!(enc.mkdir(&format!("{H}\\Documentos"), d(1)), Err(FsError::Exists));
+        assert_eq!(enc.write(&format!("{H}\\Documentos"), b"x", d(1)), Err(FsError::IsDir));
+        assert_eq!(enc.rename(&format!("{H}\\Documentos\\final.txt"), &format!("{H}\\Escritorio\\COPIA2")), Err(FsError::Exists));
+        assert_eq!(enc.rename(&format!("{H}\\Escritorio\\COPIA2"), &format!("{H}\\Escritorio\\copia2\\dentro")), Err(FsError::Invalid));
+        // Las carpetas protegidas siguen protegidas.
+        assert_eq!(enc.rename(&format!("{H}\\Documentos"), &format!("{H}\\Docs")), Err(FsError::Invalid));
+        assert_eq!(enc.delete(&format!("{H}\\.papelera")), Err(FsError::Invalid));
+        // El nombre de lo escrito no se ve en la imagen.
+        assert_eq!(raw_has(&disk, &["final.txt", "creado.txt", "COPIA2", "Movido", "carpeta-renombrada"]), None);
+    }
+
+    #[test]
+    fn mixed_state_works_while_encrypting_and_while_decrypting() {
+        for decrypting in [false, true] {
+            let (_, mut plain) = hdisk(400);
+            fill(&mut plain);
+            let (_, mut enc) = hdisk(400);
+            fill(&mut enc);
+            let mut pool = ready_pool();
+            enc.encrypt_home(PW, &mut pool, d(7)).unwrap();
+            if decrypting {
+                finish_home(&mut enc, 50);
+                enc.decrypt_home(PW, d(8)).unwrap();
+            }
+            for i in 0..SCRIPT_LEN {
+                // Un paso de conversión (de dos en dos) entre operación y operación.
+                if !enc.home_convert_step(2, d(9)).unwrap() {
+                    assert!(enc.home_conversion().is_some());
+                }
+                script(&mut plain, i);
+                script(&mut enc, i);
+                assert_eq!(snap(&mut enc), snap(&mut plain), "decrypting={decrypting} paso {i}");
+            }
+            finish_home(&mut enc, 4);
+            assert_eq!(snap(&mut enc), snap(&mut plain));
+            assert_eq!(enc.home_encrypted(), !decrypting);
+        }
     }
 }
