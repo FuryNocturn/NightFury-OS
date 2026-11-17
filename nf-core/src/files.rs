@@ -2854,4 +2854,493 @@ mod tests {
         let log = String::from_utf8(f.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
         assert!(log.contains("Cuenta creada: Ana") && !log.contains("secreta1") && !log.contains("otraclave"));
     }
+
+    // ---- Cifrado total del disco ----
+
+    /// Disco en memoria compartido con cuenta de escrituras y corte de luz simulado: a partir de
+    /// la escritura `limit` las escrituras se descartan (sin error, como un corte real).
+    #[derive(Clone)]
+    struct Cdisk {
+        data: Rc<RefCell<Vec<u8>>>,
+        writes: Rc<std::cell::Cell<usize>>,
+        limit: Rc<std::cell::Cell<usize>>,
+    }
+    impl Cdisk {
+        fn new(blocks: usize) -> Cdisk {
+            Cdisk::from_bytes(vec![0; blocks * BLOCK])
+        }
+        fn from_bytes(v: Vec<u8>) -> Cdisk {
+            Cdisk { data: Rc::new(RefCell::new(v)), writes: Rc::new(std::cell::Cell::new(0)), limit: Rc::new(std::cell::Cell::new(usize::MAX)) }
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.data.borrow().clone()
+        }
+        fn writes(&self) -> usize {
+            self.writes.get()
+        }
+    }
+    impl BlockDev for Cdisk {
+        fn blocks(&self) -> u64 {
+            (self.data.borrow().len() / BLOCK) as u64
+        }
+        fn read(&mut self, n: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+            if n >= self.blocks() || buf.len() != BLOCK {
+                return Err(DiskError::Range);
+            }
+            buf.copy_from_slice(&self.data.borrow()[n as usize * BLOCK..][..BLOCK]);
+            Ok(())
+        }
+        fn write(&mut self, n: u64, buf: &[u8]) -> Result<(), DiskError> {
+            if n >= self.blocks() || buf.len() != BLOCK {
+                return Err(DiskError::Range);
+            }
+            let w = self.writes.get();
+            self.writes.set(w + 1);
+            if w < self.limit.get() {
+                self.data.borrow_mut()[n as usize * BLOCK..][..BLOCK].copy_from_slice(buf);
+            }
+            Ok(())
+        }
+    }
+
+    fn ready_pool() -> Pool {
+        let mut p = Pool::new();
+        for i in 0..crate::keys::POOL_EVENTS_NEEDED as i32 {
+            p.add_event(i, i * 5, i as u64, i as u64 * 11);
+        }
+        p
+    }
+
+    const KEY: &str = "clave-del-disco";
+    const SECRET_NAME: &str = "informe-secreto-confidencial.txt";
+    const SECRET_TEXT: &str = "CONTENIDO-CONFIDENCIAL-DE-PRUEBA-0123456789";
+    const DOCS: &str = "C:\\Usuarios\\Ana\\Documentos\\";
+
+    fn secret_body(i: usize) -> Vec<u8> {
+        SECRET_TEXT.repeat(30 + i * 40).into_bytes()
+    }
+
+    /// Disco nuevo de `blocks` bloques, formateado, con la cuenta Ana y unos archivos.
+    fn populated_disk(blocks: usize) -> (Cdisk, Files) {
+        let disk = Cdisk::new(blocks);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(1));
+        f.format_pending(d(1)).unwrap();
+        enter(&mut f, "Ana");
+        f.write(&format!("{DOCS}{SECRET_NAME}"), &secret_body(0), d(2)).unwrap();
+        f.mkdir(&format!("{DOCS}carpeta-reservada-secreta"), d(2)).unwrap();
+        f.write(&format!("{DOCS}carpeta-reservada-secreta\\segundo.txt"), &secret_body(1), d(2)).unwrap();
+        (disk, f)
+    }
+
+    fn check_files(f: &mut Files) {
+        assert_eq!(f.read(&format!("{DOCS}{SECRET_NAME}")).unwrap(), secret_body(0));
+        assert_eq!(f.read(&format!("{DOCS}carpeta-reservada-secreta\\segundo.txt")).unwrap(), secret_body(1));
+    }
+
+    fn contains(hay: &[u8], needle: &str) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    fn finish_conversion(f: &mut Files, step: u32) {
+        let mut guard = 0;
+        while !f.convert_step(step, d(3)).unwrap() {
+            guard += 1;
+            assert!(guard < 10_000);
+        }
+    }
+
+    /// Reinicio: un `Files` nuevo sobre los bytes que hay en el disco.
+    fn reboot(disk: &Cdisk) -> (Cdisk, Files) {
+        let after = Cdisk::from_bytes(disk.bytes());
+        let f = Files::probe(Some(Box::new(after.clone())), d(4));
+        (after, f)
+    }
+
+    #[test]
+    fn new_disks_reserve_two_blocks_and_old_ones_still_mount() {
+        let (disk, mut f) = populated_disk(300);
+        assert_eq!(f.fs.volume_blocks(), 298);
+        assert_eq!(f.fs.dev_blocks(), 300);
+        assert!(disk.bytes()[298 * BLOCK..].iter().all(|&b| b == 0));
+        // Disco antiguo: NFFS en todos los bloques.
+        let old = Cdisk::new(300);
+        drop(Nffs::format(Box::new(old.clone()), d(1)).unwrap());
+        let mut g = Files::probe(Some(Box::new(old.clone())), d(2));
+        assert!(g.persistent() && !g.disk_locked());
+        assert_eq!(g.fs.volume_blocks(), 300);
+        enter(&mut g, "Ana");
+        check_files(&mut f);
+    }
+
+    #[test]
+    fn encrypt_roundtrip_with_key_and_recovery_and_nothing_in_clear() {
+        let (disk, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        let code = f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        assert!(f.disk_encrypted());
+        assert_eq!(f.disk_conversion().map(|c| (c.0, c.1, c.2)), Some((0, 298, true)));
+        // Uso durante la conversión, por debajo y por encima del progreso.
+        assert!(!f.convert_step(100, d(3)).unwrap());
+        check_files(&mut f);
+        let during = format!("{DOCS}durante-la-conversion-secreta.txt");
+        f.write(&during, &secret_body(2), d(3)).unwrap();
+        assert!(!f.convert_step(60, d(3)).unwrap());
+        assert_eq!(f.read(&during).unwrap(), secret_body(2));
+        // Mientras convierte no deja cambiar nada más ni activarlo otra vez.
+        assert_eq!(f.encrypt_disk(KEY, &mut pool, d(3)), Err(KeyError::Busy));
+        assert_eq!(f.decrypt_disk(KEY, d(3)), Err(KeyError::Busy));
+        finish_conversion(&mut f, 50);
+        assert_eq!(f.disk_conversion(), None);
+        assert!(f.disk_encrypted());
+        check_files(&mut f);
+        assert_eq!(f.encrypt_disk(KEY, &mut pool, d(3)), Err(KeyError::AlreadyEncrypted));
+        // En la imagen en bruto no hay nada en claro, ni en el bloque de trabajo.
+        let raw = disk.bytes();
+        for needle in [SECRET_TEXT, SECRET_NAME, "carpeta-reservada-secreta", "durante-la-conversion", "Usuarios", "Documentos", "NFFS"] {
+            assert!(!contains(&raw, needle), "en claro: {needle}");
+        }
+        assert!(raw[298 * BLOCK..299 * BLOCK].iter().all(|&b| b == 0));
+        let log = String::from_utf8(f.fs.read("Sistema\\logs\\sistema.log").unwrap()).unwrap();
+        assert!(log.contains("Cifrado total activado"));
+        assert!(!log.contains(KEY) && !log.contains(&code) && !log.contains(&code.replace('-', "")));
+
+        // Reinicio: bloqueado, sin tocar el disco, clave mala deja el disco intacto byte a byte.
+        let (after, mut g) = reboot(&disk);
+        assert!(g.disk_locked() && !g.persistent() && g.notice().is_some());
+        assert!(!g.pending_format());
+        let snapshot = after.bytes();
+        let w = after.writes();
+        assert_eq!(g.unlock_disk("clave-mala", false, d(5)), Err(KeyError::WrongSecret));
+        assert_eq!(g.unlock_disk(KEY, true, d(5)), Err(KeyError::WrongSecret));
+        assert_eq!(g.unlock_disk("ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCDE-ABCDE", true, d(5)), Err(KeyError::WrongSecret));
+        assert_eq!(after.bytes(), snapshot);
+        assert_eq!(after.writes(), w);
+        assert!(g.disk_locked());
+        // Clave buena.
+        g.unlock_disk(KEY, false, d(5)).unwrap();
+        assert!(!g.disk_locked() && g.persistent() && g.disk_encrypted() && g.user().is_none());
+        g.login("Ana", "").unwrap();
+        check_files(&mut g);
+        assert_eq!(g.read(&during).unwrap(), secret_body(2));
+        // Con el código de recuperación (también escrito en minúsculas y sin guiones).
+        for variant in [code.clone(), code.to_lowercase().replace('-', " ")] {
+            let (_, mut h) = reboot(&disk);
+            assert!(h.disk_locked());
+            h.unlock_disk(&variant, true, d(5)).unwrap();
+            h.login("Ana", "").unwrap();
+            check_files(&mut h);
+        }
+        // Y la clave del disco no sirve como código de recuperación ni al revés.
+        let (_, mut h) = reboot(&disk);
+        assert_eq!(h.unlock_disk(&code, false, d(5)), Err(KeyError::WrongSecret));
+    }
+
+    #[test]
+    fn use_during_decrypt_and_decrypt_leaves_a_normal_nffs() {
+        let (disk, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        finish_conversion(&mut f, 80);
+        assert_eq!(f.decrypt_disk("otra-clave", d(3)), Err(KeyError::WrongSecret));
+        f.decrypt_disk(KEY, d(3)).unwrap();
+        assert_eq!(f.disk_conversion().map(|c| (c.0, c.2)), Some((0, false)));
+        assert!(!f.convert_step(120, d(3)).unwrap());
+        check_files(&mut f);
+        let mid = format!("{DOCS}a-mitad-de-descifrado.txt");
+        f.write(&mid, &secret_body(3), d(3)).unwrap();
+        assert!(!f.convert_step(60, d(3)).unwrap());
+        assert_eq!(f.read(&mid).unwrap(), secret_body(3));
+        // Cortado a mitad y reiniciado: sigue pidiendo la clave y se puede terminar.
+        let (after, mut g) = reboot(&disk);
+        assert!(g.disk_locked());
+        g.unlock_disk(KEY, false, d(5)).unwrap();
+        assert!(g.disk_conversion().is_some_and(|c| !c.2 && c.0 > 0));
+        g.login("Ana", "").unwrap();
+        check_files(&mut g);
+        finish_conversion(&mut g, 70);
+        assert!(!g.disk_encrypted() && g.disk_conversion().is_none());
+        assert_eq!(g.read(&mid).unwrap(), secret_body(3));
+        // La imagen vuelve a ser un NFFS normal: monta sin clave y no queda cabecera.
+        let raw = Cdisk::from_bytes(after.bytes());
+        assert!(cryptdev::detect(&mut raw.clone()).is_none());
+        assert!(raw.bytes()[298 * BLOCK..].iter().all(|&b| b == 0));
+        let (_, mut h) = reboot(&after);
+        assert!(!h.disk_locked() && h.persistent() && !h.disk_encrypted());
+        h.login("Ana", "").unwrap();
+        check_files(&mut h);
+        assert_eq!(h.read(&mid).unwrap(), secret_body(3));
+        // Y se puede volver a cifrar.
+        h.encrypt_disk(KEY, &mut pool, d(6)).unwrap();
+    }
+
+    /// Corta la luz en CADA escritura (desde `limit0` hasta que acaba la conversión), reinicia, abre
+    /// con la clave, termina la conversión y comprueba que todo está íntegro.
+    fn cut_everywhere(decrypting: bool) {
+        let (disk, mut f) = populated_disk(70);
+        let mut pool = ready_pool();
+        if decrypting {
+            f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+            finish_conversion(&mut f, 100);
+        }
+        let base = disk.bytes();
+        // Una ejecución de toda la operación; con `limit` la luz se va tras esa escritura.
+        let run = |limit: Option<usize>| -> (Cdisk, usize) {
+            let dk = Cdisk::from_bytes(base.clone());
+            let mut g = Files::probe(Some(Box::new(dk.clone())), d(4));
+            let mut pool = ready_pool();
+            if decrypting {
+                g.unlock_disk(KEY, false, d(4)).unwrap();
+            }
+            g.login("Ana", "").unwrap();
+            let start = dk.writes();
+            if let Some(k) = limit {
+                dk.limit.set(start + k);
+            }
+            if decrypting {
+                g.decrypt_disk(KEY, d(5)).unwrap();
+            } else {
+                g.encrypt_disk(KEY, &mut pool, d(5)).unwrap();
+            }
+            finish_conversion(&mut g, 1);
+            let n = dk.writes() - start;
+            (dk, n)
+        };
+        let (_, total) = run(None);
+        assert!(total > 2 * 68, "{total}");
+        for k in 0..=total {
+            let (dk, _) = run(Some(k));
+            let (after, mut g) = reboot(&dk);
+            if g.disk_locked() {
+                // Cifrado (o a medias): se abre con la clave y se termina lo que falte.
+                g.unlock_disk(KEY, false, d(6)).unwrap();
+                g.login("Ana", "").unwrap();
+                check_files(&mut g);
+                let mut guard = 0;
+                while !g.convert_step(7, d(6)).unwrap() {
+                    guard += 1;
+                    assert!(guard < 1000);
+                }
+                check_files(&mut g);
+                if !decrypting {
+                    assert!(g.disk_encrypted(), "k={k}");
+                    let raw = after.bytes();
+                    for needle in [SECRET_TEXT, SECRET_NAME] {
+                        assert!(!contains(&raw, needle), "k={k}: {needle}");
+                    }
+                    assert!(raw[68 * BLOCK..69 * BLOCK].iter().all(|&b| b == 0), "k={k}");
+                } else if !g.disk_encrypted() {
+                    // Descifrado del todo: la imagen es un NFFS normal, sin cabecera, que monta sin clave.
+                    let (_, mut fin) = reboot(&after);
+                    assert!(!fin.disk_locked() && fin.persistent(), "k={k}");
+                    fin.login("Ana", "").unwrap();
+                    check_files(&mut fin);
+                    assert!(cryptdev::detect(&mut after.clone()).is_none(), "k={k}");
+                } else {
+                    // Solo si se perdió la escritura que empezaba a descifrar: sigue cifrado del todo.
+                    assert!(g.disk_conversion().is_none(), "k={k}");
+                }
+            } else {
+                // Plano (antes de empezar o ya descifrado): monta sin clave.
+                assert!(g.persistent(), "k={k}");
+                g.login("Ana", "").unwrap();
+                check_files(&mut g);
+            }
+        }
+    }
+
+    #[test]
+    fn power_cut_at_every_write_while_encrypting_the_disk() {
+        cut_everywhere(false);
+    }
+
+    #[test]
+    fn power_cut_at_every_write_while_decrypting_the_disk() {
+        cut_everywhere(true);
+    }
+
+    #[test]
+    fn permissions_and_errors_of_disk_encryption() {
+        let (_, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        assert_eq!(f.encrypt_disk("abc", &mut pool, d(2)), Err(KeyError::Weak));
+        assert_eq!(f.encrypt_disk(KEY, &mut Pool::new(), d(2)), Err(KeyError::NotReady));
+        assert_eq!(f.decrypt_disk(KEY, d(2)), Err(KeyError::NotEncrypted));
+        assert_eq!(f.change_disk_password(KEY, "nueva-clave", &mut pool, d(2)), Err(KeyError::NotEncrypted));
+        assert_eq!(f.new_disk_recovery(KEY, &mut pool, d(2)), Err(KeyError::NotEncrypted));
+        assert_eq!(f.unlock_disk(KEY, false, d(2)), Err(KeyError::NotEncrypted));
+        assert!(f.convert_step(5, d(2)).unwrap());
+        // Un usuario normal no puede.
+        f.create_account("Beto", None, false, [9; 16], d(2)).unwrap();
+        f.logout();
+        f.login("Beto", "").unwrap();
+        assert_eq!(f.encrypt_disk(KEY, &mut pool, d(2)), Err(KeyError::NotAdmin));
+        assert!(!f.disk_encrypted());
+        f.logout();
+        f.login("Ana", "").unwrap();
+        f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        finish_conversion(&mut f, 100);
+        f.logout();
+        f.login("Beto", "").unwrap();
+        assert_eq!(f.decrypt_disk(KEY, d(2)), Err(KeyError::NotAdmin));
+        assert_eq!(f.change_disk_password(KEY, "nueva-clave", &mut pool, d(2)), Err(KeyError::NotAdmin));
+        assert_eq!(f.new_disk_recovery(KEY, &mut pool, d(2)), Err(KeyError::NotAdmin));
+        // Sin disco persistente.
+        let mut m = Files::default();
+        assert_eq!(m.encrypt_disk(KEY, &mut pool, d(2)), Err(KeyError::Unavailable));
+        // Sin sesión tampoco.
+        let (_, mut g) = populated_disk(300);
+        g.logout();
+        assert_eq!(g.encrypt_disk(KEY, &mut pool, d(2)), Err(KeyError::NotAdmin));
+    }
+
+    #[test]
+    fn change_password_and_new_recovery_invalidate_the_old_ones() {
+        let (disk, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        let code = f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        finish_conversion(&mut f, 100);
+        let body_before: Vec<u8> = disk.bytes()[..298 * BLOCK].to_vec();
+        assert_eq!(f.change_disk_password("incorrecta", "otra-nueva", &mut pool, d(3)), Err(KeyError::WrongSecret));
+        assert_eq!(f.change_disk_password(KEY, "corta", &mut pool, d(3)), Err(KeyError::Weak));
+        assert_eq!(f.change_disk_password(KEY, "otra-nueva", &mut Pool::new(), d(3)), Err(KeyError::NotReady));
+        f.change_disk_password(KEY, "otra-nueva", &mut pool, d(3)).unwrap();
+        // Los datos cifrados no cambian (salvo el registro), solo la cabecera.
+        let raw = disk.bytes();
+        let changed = (0..298).filter(|&i| raw[i * BLOCK..(i + 1) * BLOCK] != body_before[i * BLOCK..(i + 1) * BLOCK]).count();
+        assert!(changed < 20, "{changed}");
+        let (ga, mut g) = reboot(&disk);
+        assert_eq!(g.unlock_disk(KEY, false, d(5)), Err(KeyError::WrongSecret));
+        g.unlock_disk("otra-nueva", false, d(5)).unwrap();
+        g.login("Ana", "").unwrap();
+        check_files(&mut g);
+        // El código de recuperación sigue valiendo tras cambiar la clave.
+        let (_, mut h) = reboot(&disk);
+        h.unlock_disk(&code, true, d(5)).unwrap();
+        // Código nuevo: el viejo deja de valer.
+        let new_code = g.new_disk_recovery("otra-nueva", &mut pool, d(6)).unwrap();
+        assert_ne!(new_code, code);
+        assert_eq!(g.new_disk_recovery(KEY, &mut pool, d(6)), Err(KeyError::WrongSecret));
+        let (_, mut h) = reboot(&ga);
+        assert_eq!(h.unlock_disk(&code, true, d(7)), Err(KeyError::WrongSecret));
+        h.unlock_disk(&new_code, true, d(7)).unwrap();
+        h.login("Ana", "").unwrap();
+        check_files(&mut h);
+        // Cambiar la clave a mitad de una conversión también vale.
+        let (_, mut c) = populated_disk(300);
+        c.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        assert!(!c.convert_step(50, d(2)).unwrap());
+        c.change_disk_password(KEY, "otra-nueva", &mut pool, d(3)).unwrap();
+        finish_conversion(&mut c, 40);
+        check_files(&mut c);
+    }
+
+    #[test]
+    fn old_disk_needs_free_last_blocks() {
+        // Disco antiguo con todo el espacio: con los dos últimos bloques libres se activa.
+        let old = Cdisk::new(200);
+        drop(Nffs::format(Box::new(old.clone()), d(1)).unwrap());
+        let mut f = Files::probe(Some(Box::new(old.clone())), d(2));
+        assert_eq!(f.fs.volume_blocks(), 200);
+        enter(&mut f, "Ana");
+        f.write(&format!("{DOCS}{SECRET_NAME}"), &secret_body(0), d(2)).unwrap();
+        f.mkdir(&format!("{DOCS}carpeta-reservada-secreta"), d(2)).unwrap();
+        f.write(&format!("{DOCS}carpeta-reservada-secreta\\segundo.txt"), &secret_body(1), d(2)).unwrap();
+        let before = old.bytes();
+        let mut pool = ready_pool();
+        // Con el último bloque ocupado: NoRoom y el disco no cambia.
+        f.fs.mark_used_for_test(199);
+        assert_eq!(f.encrypt_disk(KEY, &mut pool, d(3)), Err(KeyError::NoRoom));
+        assert_eq!(old.bytes(), before);
+        assert!(!f.disk_encrypted());
+        // Con el penúltimo también.
+        let mut f = Files::probe(Some(Box::new(Cdisk::from_bytes(before.clone()))), d(2));
+        f.login("Ana", "").unwrap();
+        f.fs.mark_used_for_test(198);
+        assert_eq!(f.encrypt_disk(KEY, &mut pool, d(3)), Err(KeyError::NoRoom));
+        // Libres: se reduce el volumen y se cifra.
+        let disk = Cdisk::from_bytes(before);
+        let mut f = Files::probe(Some(Box::new(disk.clone())), d(2));
+        f.login("Ana", "").unwrap();
+        f.encrypt_disk(KEY, &mut pool, d(3)).unwrap();
+        assert_eq!(f.fs.volume_blocks(), 198);
+        finish_conversion(&mut f, 64);
+        check_files(&mut f);
+        let (_, mut g) = reboot(&disk);
+        assert!(g.disk_locked());
+        g.unlock_disk(KEY, false, d(5)).unwrap();
+        g.login("Ana", "").unwrap();
+        check_files(&mut g);
+        assert!(!contains(&disk.bytes(), SECRET_TEXT));
+    }
+
+    #[test]
+    fn skip_locked_disk_writes_nothing() {
+        let (disk, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        finish_conversion(&mut f, 100);
+        let (after, mut g) = reboot(&disk);
+        let (snap, w) = (after.bytes(), after.writes());
+        assert!(g.disk_locked());
+        g.skip_locked_disk();
+        assert!(!g.disk_locked() && !g.persistent() && g.notice().is_some());
+        // C: sigue en memoria y se puede usar sin tocar el disco.
+        g.write("C:\\Usuarios\\Usuario\\Documentos\\a.txt", b"mem", d(5)).unwrap();
+        assert_eq!(g.unlock_disk(KEY, false, d(5)), Err(KeyError::NotEncrypted));
+        assert_eq!(after.bytes(), snap);
+        assert_eq!(after.writes(), w);
+        // Inspeccionar sin clave tampoco escribe.
+        let (a2, g2) = reboot(&disk);
+        assert!(g2.disk_locked());
+        assert_eq!(a2.writes(), 0);
+    }
+
+    #[test]
+    fn altered_header_or_garbage_is_not_an_encrypted_disk_and_is_not_written() {
+        let (disk, mut f) = populated_disk(300);
+        let mut pool = ready_pool();
+        f.encrypt_disk(KEY, &mut pool, d(2)).unwrap();
+        finish_conversion(&mut f, 100);
+        let good = disk.bytes();
+        let last = 299 * BLOCK;
+        let used = good[last..last + BLOCK].iter().position(|&b| b == 0).unwrap();
+        // Cualquier byte alterado de la cabecera: ya no es un disco cifrado y se ignora sin escribir.
+        for i in (0..used).step_by(37).chain([0, 1, 8, used - 1]) {
+            let mut bad = good.clone();
+            bad[last + i] ^= 0x40;
+            let dk = Cdisk::from_bytes(bad.clone());
+            let g = Files::probe(Some(Box::new(dk.clone())), d(4));
+            assert!(!g.disk_locked() && !g.persistent() && !g.pending_format(), "byte {i}");
+            assert_eq!(dk.writes(), 0);
+            assert_eq!(dk.bytes(), bad);
+        }
+        // Basura en el último bloque de un disco por lo demás en blanco: no está en blanco ni es cifrado.
+        let mut junk = vec![0u8; 300 * BLOCK];
+        junk[last..last + 64].copy_from_slice(&[0xa5; 64]);
+        let dk = Cdisk::from_bytes(junk.clone());
+        let g = Files::probe(Some(Box::new(dk.clone())), d(4));
+        assert!(!g.disk_locked() && !g.pending_format() && !g.persistent());
+        assert_eq!((dk.writes(), dk.bytes()), (0, junk));
+        // Una cabecera válida con otro contenido delante sigue siendo de un disco cifrado (se abre
+        // con clave); y un NFFS antiguo cuyo último bloque es suyo no se toma por cifrado.
+        let mut text = vec![0u8; 100 * BLOCK];
+        let old = Cdisk::from_bytes(std::mem::take(&mut text));
+        drop(Nffs::format(Box::new(old.clone()), d(1)).unwrap());
+        let mut bytes = old.bytes();
+        bytes[99 * BLOCK..].copy_from_slice(&good[last..last + BLOCK]);
+        let g = Files::probe(Some(Box::new(Cdisk::from_bytes(bytes))), d(4));
+        assert!(!g.disk_locked() && g.persistent());
+    }
+
+    #[test]
+    fn blank_means_all_zeros_even_at_the_very_end() {
+        let mut v = vec![0u8; 300 * BLOCK];
+        v[300 * BLOCK - 1] = 1;
+        let dk = Cdisk::from_bytes(v.clone());
+        let g = Files::probe(Some(Box::new(dk.clone())), d(4));
+        assert!(!g.pending_format() && !g.persistent());
+        assert_eq!((dk.writes(), dk.bytes()), (0, v));
+        let g = Files::probe(Some(Box::new(Cdisk::new(300))), d(4));
+        assert!(g.pending_format());
+    }
 }

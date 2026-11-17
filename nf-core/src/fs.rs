@@ -914,6 +914,12 @@ impl Nffs {
         a.into_iter().chain(b).map(|sb| sb.total).max()
     }
 
+    /// Solo pruebas: marca un bloque como usado (para simular un disco con el final ocupado).
+    #[cfg(test)]
+    pub(crate) fn mark_used_for_test(&mut self, b: u64) {
+        set_bit(&mut self.free, b, true);
+    }
+
     /// Bloques del dispositivo que hay debajo.
     pub fn dev_blocks(&self) -> u64 {
         self.dev.blocks()
