@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), no_std)]
 extern crate alloc;
 
+pub mod abi;
 pub mod accounts;
 pub mod apps;
 pub mod block;
@@ -24,7 +25,9 @@ pub mod keys;
 pub mod login;
 pub mod math;
 pub mod menu;
+pub mod nfx;
 pub mod platform;
+pub mod proc;
 pub mod ribbon;
 pub mod scrollbar;
 pub mod surface;

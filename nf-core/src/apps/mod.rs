@@ -25,6 +25,8 @@ pub enum AppKind {
     /// Explorador de archivos.
     Files,
     Terminal,
+    /// Programa en modo usuario (`proc::ProcApp`). Nunca está en `APPS` ni se crea con `create`.
+    Program,
 }
 
 /// Apps instaladas, en orden alfabético: (tipo, nombre visible, icono).
@@ -94,6 +96,10 @@ impl<'a> Ctx<'a> {
 pub trait App {
     fn kind(&self) -> AppKind;
     fn title(&self) -> String;
+    /// Icono de la ventana si no es el de su `AppKind` en `APPS` (los programas, v0.8).
+    fn icon(&self) -> Option<Icon> {
+        None
+    }
     /// Tamaño mínimo del área de contenido.
     fn min_size(&self) -> (i32, i32);
     /// Dibuja TODO el contenido en `s` (s.w x s.h es el área de contenido actual).
@@ -140,6 +146,7 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
         AppKind::Settings => (780, 520),
         AppKind::Files => (1040, 540),
         AppKind::Terminal => (680, 400),
+        AppKind::Program => (480, 360),
     }
 }
 
@@ -150,5 +157,7 @@ pub fn create(kind: AppKind) -> Box<dyn App> {
         AppKind::Settings => settings::new(),
         AppKind::Files => explorer::new(),
         AppKind::Terminal => terminal::new(),
+        // Los programas los abre el escritorio con `Platform::spawn`; no hay nada que crear aquí.
+        AppKind::Program => unreachable!("los programas no se crean con apps::create"),
     }
 }

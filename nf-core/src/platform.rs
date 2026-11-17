@@ -2,6 +2,8 @@
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;
 use crate::keys::Pool;
+use crate::proc::Process;
+use alloc::boxed::Box;
 use alloc::string::String;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -39,6 +41,11 @@ pub trait Platform {
     /// Acumulador de aleatoriedad del sistema. El escritorio le echa cada movimiento del ratón
     /// y cada tecla; de él salen las llaves de cifrado.
     fn pool(&mut self) -> &mut Pool;
+    /// Carga un programa `.nfx` en modo usuario (v0.8). `Err` con el motivo, en español.
+    /// Devuelve el proceso y la memoria fija que ocupa (imagen + pila), para `ProcApp::new`.
+    fn spawn(&mut self, _nfx: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
+        Err(String::from("Este equipo no puede ejecutar programas"))
+    }
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
