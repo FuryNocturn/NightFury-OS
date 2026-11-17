@@ -26,6 +26,7 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk carpeta <imagen> <ruta>\n\
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
+  nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
   nfdisk ayuda\n\
 Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
 y la clave de esa cuenta en la variable NFDISK_CLAVE_USUARIO (o por teclado; nunca por argumento), «listar», «ver», «sacar», «meter»,\n\
@@ -37,6 +38,7 @@ sobre un disco a medio convertir. --recuperacion: la clave es el código de recu
 «comprobar». nfdisk no activa ni quita el cifrado: eso se hace desde NightFury (Configuración › Disco).\n\
 Rutas de la imagen: C:\\Usuarios\\Ana\\Documentos\\nota.txt, \\Usuarios\\Ana\\Documentos\\nota.txt o Usuarios/Ana/Documentos/nota.txt.\n\
 Estructura: Usuarios\\<nombre>\\{Escritorio,Documentos,Descargas,Imágenes,Música,Vídeos,.config,.papelera} y Sistema\\{config,temp,lib,drivers,logs}.\n\
+«instalar» copia el programa (app.txt, programa.nfx e icono.bmp si lo hay) a C:\\Programas\\<nombre>; no reemplaza los del sistema.\n\
 nfdisk trabaja directamente sobre el volumen, sin cuentas ni permisos (como administrador): no crea cuentas ni migra discos antiguos; eso lo hace NightFury al arrancar.";
 
 type R<T> = Result<T, String>;
@@ -582,9 +584,58 @@ fn run_with(args: &[String], secret: Secret, usecret: UserSecret) -> R<()> {
             let _ = o.write_all(String::from_utf8_lossy(&data).as_bytes());
             let _ = o.flush();
         }
+        "instalar" => {
+            need(2)?;
+            let mut fs = mount(pos[0], true, all)?;
+            let name = install(&mut fs, Path::new(pos[1]), flag("--reemplazar"))?;
+            println!("Instalado en C:\\Programas\\{name}.");
+        }
         _ => return Err(format!("Orden desconocida: «{cmd}». Prueba «nfdisk ayuda».")),
     }
     Ok(())
+}
+
+/// Copia un programa de una carpeta de Windows a `Programas\<nombre>` de la imagen (ver `nf_core::programs`).
+fn install(fs: &mut Nffs, src: &Path, replace: bool) -> R<String> {
+    use nf_core::programs::{parse_manifest, BINARY, ICON, MANIFEST, SYSTEM_MARK};
+    let read = |n: &str| std::fs::read(src.join(n));
+    let txt = read(MANIFEST).map_err(|_| format!("«{}» no tiene app.txt: no es un programa de NightFury.", src.display()))?;
+    let p = parse_manifest("", &String::from_utf8_lossy(&txt)).ok_or("El app.txt no tiene la línea nombre=.")?;
+    if !nf_core::files::valid_name(&p.name) {
+        return Err(format!("«{}» no vale como nombre de carpeta.", p.name));
+    }
+    let bin = read(BINARY).map_err(|_| "Falta programa.nfx.".to_string())?;
+    if bin.len() as u64 > nf_core::programs::MAX_NFX {
+        return Err("programa.nfx es demasiado grande.".into());
+    }
+    nf_core::nfx::parse(&bin).map_err(|e| format!("programa.nfx no es válido ({e:?})."))?;
+    let icon = read(ICON).ok();
+    let dir = format!("Programas\\{}", p.name);
+    if fs.stat(&format!("{dir}\\{SYSTEM_MARK}")).is_ok() {
+        return Err(format!("«{}» es un programa del sistema y no se puede reemplazar.", p.name));
+    }
+    match fs.stat(&dir) {
+        Ok(e) if !e.dir => return Err(format!("Programas\\{} existe y no es una carpeta.", p.name)),
+        Ok(_) if !replace => return Err(format!("«{}» ya está instalado. Usa --reemplazar para sustituirlo.", p.name)),
+        Ok(_) => {}
+        Err(_) => {
+            // Discos de antes de la v0.8 no tienen la carpeta Programas.
+            if fs.stat("Programas").is_err() {
+                fs.mkdir("Programas", now()).map_err(fs_err)?;
+            }
+            fs.mkdir(&dir, now()).map_err(fs_err)?;
+        }
+    }
+    fs.write(&format!("{dir}\\{MANIFEST}"), &txt, now()).map_err(fs_err)?;
+    fs.write(&format!("{dir}\\{BINARY}"), &bin, now()).map_err(fs_err)?;
+    let icon_path = format!("{dir}\\{ICON}");
+    match icon {
+        Some(i) => fs.write(&icon_path, &i, now()).map_err(fs_err)?,
+        None => {
+            let _ = fs.remove(&icon_path);
+        }
+    }
+    Ok(p.name)
 }
 
 fn main() -> ExitCode {
@@ -638,6 +689,40 @@ mod tests {
     fn go_user(a: &[&str], ukey: Option<&str>) -> R<()> {
         let ukey = ukey.map(String::from);
         run_with(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), &|_| None, &move |_, _| ukey.clone())
+    }
+
+    #[test]
+    fn instalar_programa() {
+        use nf_core::nfx::{encode, Kind, Section};
+        let img = Tmp::new("img");
+        let dir = std::env::temp_dir().join(format!("nfdisk-prog-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().into_owned();
+        go(&["crear", &img.0, "2"]).unwrap();
+        assert!(go(&["instalar", &img.0, &d]).unwrap_err().contains("app.txt"));
+        std::fs::write(dir.join("app.txt"), "nombre=Juego\nversion=1.0\n").unwrap();
+        assert!(go(&["instalar", &img.0, &d]).unwrap_err().contains("programa.nfx"));
+        std::fs::write(dir.join("programa.nfx"), b"NFX1 roto").unwrap();
+        assert!(go(&["instalar", &img.0, &d]).unwrap_err().contains("no es válido"));
+        let b = nf_core::abi::USER_BASE + 0x40_0000;
+        std::fs::write(dir.join("programa.nfx"), encode(b, &[Section { kind: Kind::Code, vaddr: b, memsz: 4, data: &[0x90; 4] }])).unwrap();
+        std::fs::write(dir.join("icono.bmp"), b"BM").unwrap();
+        go(&["instalar", &img.0, &d]).unwrap();
+        assert!(go(&["instalar", &img.0, &d]).unwrap_err().contains("--reemplazar"));
+        std::fs::remove_file(dir.join("icono.bmp")).unwrap();
+        go(&["instalar", &img.0, &d, "--reemplazar"]).unwrap();
+        let mut fs = mount(&img.0, false, plain()).unwrap();
+        assert!(fs.stat("Programas\\Juego\\programa.nfx").is_ok());
+        assert!(fs.stat("Programas\\Juego\\icono.bmp").is_err(), "el icono viejo se quita");
+        drop(fs);
+        // Los del sistema no se tocan.
+        go(&["carpeta", &img.0, "Programas\\Calc"]).unwrap();
+        let mark = Tmp::new("mark");
+        std::fs::write(&mark.0, b"").unwrap();
+        go(&["meter", &img.0, &mark.0, "Programas\\Calc\\.sistema"]).unwrap();
+        std::fs::write(dir.join("app.txt"), "nombre=Calc\n").unwrap();
+        assert!(go(&["instalar", &img.0, &d, "--reemplazar"]).unwrap_err().contains("del sistema"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
