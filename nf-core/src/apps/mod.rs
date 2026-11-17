@@ -114,6 +114,13 @@ pub trait App {
     fn drag_over(&mut self, _pos: Option<(i32, i32)>, _paths: &[String], _cx: &mut Ctx) -> bool {
         false
     }
+    /// Arrastre con el botón DERECHO (v0.7.2): el escritorio pregunta qué se arrastraría desde ese
+    /// punto (relativo al contenido). La app lo selecciona como haría un clic (si ya estaba en una
+    /// selección múltiple, la conserva) y devuelve las rutas; `None` si ahí no hay nada arrastrable.
+    /// Si el botón se suelta sin arrastrar, la app recibe `MouseEv::RightDown` como siempre.
+    fn drag_source(&mut self, _x: i32, _y: i32, _cx: &mut Ctx) -> Option<Vec<String>> {
+        None
+    }
     /// Se han soltado archivos en ese punto de la ventana. `copy` = Ctrl pulsado (copiar en vez de mover).
     fn drop_files(&mut self, _x: i32, _y: i32, _paths: &[String], _copy: bool, _cx: &mut Ctx) {}
     /// Abre una ruta absoluta ("C:\\..." o `files::TRASH`) en esta ventana.
