@@ -594,7 +594,7 @@ impl Settings {
 
     /// Pantalla del ratón; al terminar se ejecuta la operación.
     fn entropy(&mut self, job: Job, cx: &mut Ctx) {
-        cx.dialog = Some(DialogRequest::Entropy { tag: T_ENT, title: String::from(TITLE) });
+        cx.dialog = Some(DialogRequest::Entropy { tag: T_ENT, title: String::from("Generar la llave") });
         self.job = Some(job);
     }
 
@@ -1867,17 +1867,7 @@ mod tests {
         b.texto(T_SEC, "mala-clave");
         assert_eq!(b.mensaje(), AccountError::WrongPassword.text());
         assert!(b.app.job.is_none());
-        // Clave buena: pantalla del ratón y la llamada; la pantalla muestra lo que ella devuelva.
-        b.pulsa(Act::HomeEnc);
-        b.respuesta(T_CONF, Answer::Yes);
-        b.texto(T_SEC, "clave-luis");
-        b.entropia();
-        b.respuesta(T_ENT, Answer::Ok);
-        resultado_de_la_llamada(&mut b);
-        assert!(b.app.job.as_ref().map_or(true, |j| j.old.0.is_empty() && j.new.0.is_empty()));
-        assert_eq!(b.eventos(), 300, "el acumulador vuelve al sistema también si la llamada falla");
         // Cancelar en cada paso no cambia nada.
-        b.app.job = None;
         b.pulsa(Act::HomeEnc);
         b.respuesta(T_CONF, Answer::Cancel);
         b.pulsa(Act::HomeEnc);
@@ -1888,6 +1878,15 @@ mod tests {
         b.texto(T_SEC, "clave-luis");
         b.respuesta(T_ENT, Answer::Cancel);
         assert!(b.dialog.is_none() && b.app.job.is_none());
+        // Clave buena: pantalla del ratón y la llamada; la pantalla muestra lo que ella devuelva.
+        b.pulsa(Act::HomeEnc);
+        b.respuesta(T_CONF, Answer::Yes);
+        b.texto(T_SEC, "clave-luis");
+        b.entropia();
+        b.respuesta(T_ENT, Answer::Ok);
+        resultado_de_la_llamada(&mut b);
+        assert!(b.app.job.as_ref().map_or(true, |j| j.old.0.is_empty() && j.new.0.is_empty()));
+        assert_eq!(b.eventos(), 300, "el acumulador vuelve al sistema también si la llamada falla");
     }
 
     #[test]
@@ -1950,7 +1949,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "necesita el cifrado de carpeta de files.rs"]
     fn integracion_real_cifrar_la_carpeta_desde_mi_cuenta() {
         let mut b = Banco::con_disco("Ana");
         b.pool_listo();
