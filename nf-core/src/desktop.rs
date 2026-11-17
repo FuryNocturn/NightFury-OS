@@ -3300,7 +3300,7 @@ mod tests {
         let (mut d, mut sys) = setup(1280, 800);
         let p = center(d.icon_cell(0));
         click!(d, sys, p);
-        assert_eq!((d.window_count(), d.sel), (0, Some(0)));
+        assert_eq!((d.window_count(), d.sel.clone()), (0, vec![0]));
         click!(d, sys, p);
         assert_eq!(kinds(&d), [AppKind::Notepad]);
         // Dos clics demasiado separados en el tiempo no abren.
@@ -4162,7 +4162,7 @@ mod menu_tests {
     fn pick(d: &mut Desktop, sys: &mut TestPlatform, icon: Option<usize>, id: u32) {
         match icon {
             Some(i) => {
-                d.sel = Some(i);
+                d.sel = vec![i];
                 d.desktop_menu_result(MENU_ICON, id, sys);
             }
             None => d.desktop_menu_result(MENU_DESK, id, sys),
@@ -4175,40 +4175,45 @@ mod menu_tests {
         click_at(d, sys, center(d.icon_cell(i)));
     }
 
+    fn items_of(d: &mut Desktop, i: usize, sys: &mut TestPlatform) -> Vec<MenuItem> {
+        d.sel = vec![i];
+        d.icon_items(sys)
+    }
+
     fn answer_text(d: &mut Desktop, sys: &mut TestPlatform, tag: u32, v: &str) {
         d.system_result(DialogResult::Text { tag, value: Some(String::from(v)) }, sys);
     }
 
     #[test]
     fn icon_menus_have_the_right_items() {
-        let (d, mut sys) = setup();
+        let (mut d, mut sys) = setup();
         assert_eq!(d.icons[6].name, "Carpeta");
         assert_eq!(d.icons[7].name, "nota.txt");
         // App: solo Abrir, en negrita.
-        let it = d.icon_items(0, &mut sys);
+        let it = items_of(&mut d, 0, &mut sys);
         assert_eq!(texts(&it), ["Abrir"]);
         assert!(it[0].bold);
         // Papelera vacía: Vaciar desactivado; con algo dentro, activo.
-        let it = d.icon_items(5, &mut sys);
+        let it = items_of(&mut d, 5, &mut sys);
         assert_eq!(texts(&it), ["Abrir", "Vaciar Papelera"]);
         assert!(it[1].disabled);
         let now = sys.now();
         sys.files.write(&sp(&sys.files, Std::Desktop, "viejo.txt"), b"x", now).unwrap();
         sys.files.trash(&sp(&sys.files, Std::Desktop, "viejo.txt"), now).unwrap();
-        assert!(!d.icon_items(5, &mut sys)[1].disabled);
+        assert!(!items_of(&mut d, 5, &mut sys)[1].disabled);
         // Archivo.
-        let it = d.icon_items(7, &mut sys);
+        let it = items_of(&mut d, 7, &mut sys);
         let want = ["Abrir", "Abrir con >", "-", "Cortar", "Copiar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
         assert_eq!(texts(&it), want);
         assert!(it[0].bold && it.iter().all(|i| !i.disabled));
         assert_eq!(it[1].sub[0].text, "Bloc de notas");
         // Carpeta: Pegar desactivado hasta que haya portapapeles.
-        let it = d.icon_items(6, &mut sys);
+        let it = items_of(&mut d, 6, &mut sys);
         let want = ["Abrir", "Abrir en ventana nueva", "-", "Cortar", "Copiar", "Pegar", "-", "Eliminar", "Cambiar nombre", "-", "Propiedades"];
         assert_eq!(texts(&it), want);
         assert!(it[5].disabled);
         sys.files.set_clip(&sp(&sys.files, Std::Desktop, "nota.txt"), false);
-        assert!(!d.icon_items(6, &mut sys)[5].disabled);
+        assert!(!items_of(&mut d, 6, &mut sys)[5].disabled);
     }
 
     #[test]
@@ -4243,7 +4248,7 @@ mod menu_tests {
     fn right_click_selects_icon_opens_menu_and_open_works() {
         let (mut d, mut sys) = setup();
         { let p = center(d.icon_cell(7)); right_click(&mut d, &mut sys, p); }
-        assert_eq!(d.sel, Some(7));
+        assert_eq!(d.sel, vec![7]);
         let m = d.menu().expect("menú del icono");
         let r = m.item_rect(0);
         click_at(&mut d, &mut sys, center(r));
@@ -4252,7 +4257,7 @@ mod menu_tests {
         // Sobre el fondo: menú del fondo y sin selección.
         d.close(d.wins[0].id);
         right_click(&mut d, &mut sys, (900, 500));
-        assert!(d.menu().is_some() && d.sel.is_none());
+        assert!(d.menu().is_some() && d.sel.is_empty());
         d.close_menu();
         // Sobre una ventana no se abre el menú del escritorio.
         d.launch(AppKind::Calc, &mut sys);
@@ -4458,9 +4463,9 @@ mod menu_tests {
         assert_eq!(d.icons[5].name, "Papelera");
         assert_eq!(d.icons[0].name, "Bloc de notas");
         // La selección sigue al icono al reordenar.
-        d.sel = Some(7);
+        d.sel = vec![7];
         pick(&mut d, &mut sys, None, M_SORT + 1);
-        assert_eq!(d.icons[d.sel.unwrap()].name, "a.txt");
+        assert_eq!(d.icons[d.sel[0]].name, "a.txt");
     }
 
     #[test]
