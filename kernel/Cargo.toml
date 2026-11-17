@@ -12,3 +12,7 @@ bench = false
 
 [dependencies]
 nf-core = { path = "../nf-core" }
+
+[features]
+# Programas de prueba en modo usuario al llegar al escritorio (solo para verificar el núcleo).
+demo = []

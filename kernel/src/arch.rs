@@ -54,6 +54,7 @@ macro_rules! irq_stub {
             "sub rsp, 544\n",
             "fxsave64 [rsp+32]\n",
             "cld\n",
+            "lea rdi, [rsp+616]\n", // marco de la CPU (rip, cs, ...): solo lo mira el temporizador
             "call ", $handler, "\n",
             "fxrstor64 [rsp+32]\n",
             "add rsp, 544\n",
@@ -103,9 +104,14 @@ extern "C" {
 // ---------- Manejadores (los llaman las rutinas de arriba) ----------
 
 #[no_mangle]
-extern "C" fn timer_handler() {
+extern "sysv64" fn timer_handler(frame: *const u64) {
     TICKS.fetch_add(1, Relaxed);
     eoi(0);
+    // frame[1] = CS interrumpido: si era un programa (ring 3), mira si lleva demasiado sin esperar.
+    // La rutina de entrada nos pasa un marco válido (5 qwords de la CPU).
+    if unsafe { *frame.add(1) } & 3 == 3 {
+        crate::user::tick_en_usuario();
+    }
 }
 
 #[no_mangle]
@@ -138,10 +144,44 @@ struct Ptr {
     base: u64,
 }
 
-static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00CF_9200_0000_FFFF];
+/// Nula, código y datos del núcleo (0x08, 0x10), datos y código de usuario (0x18, 0x20; con
+/// `sysret` salen como 0x1B y 0x23) y el TSS (0x28, ocupa dos entradas).
+static mut GDT: [u64; 7] = [0, 0x00AF_9A00_0000_FFFF, 0x00CF_9200_0000_FFFF, 0x00CF_F200_0000_FFFF, 0x00AF_FA00_0000_FFFF, 0, 0];
+
+#[repr(C, align(16))]
+struct Tss([u32; 26]);
+static mut TSS: Tss = Tss([0; 26]);
+
+/// Pila aparte para el fallo doble (IST1), por si la pila del núcleo está rota.
+#[repr(C, align(16))]
+struct PilaFd([u8; 16384]);
+static mut PILA_FD: PilaFd = PilaFd([0; 16384]);
+
+/// Pila del núcleo para cuando un programa entra por una interrupción o excepción (TSS.RSP0).
+pub fn set_rsp0(v: u64) {
+    // Un solo núcleo; solo se llama antes de entrar al programa (interrupciones cerradas).
+    unsafe {
+        let t = &mut (*core::ptr::addr_of_mut!(TSS)).0;
+        t[1] = v as u32;
+        t[2] = (v >> 32) as u32;
+    }
+}
 
 pub fn init_gdt() {
-    let p = Ptr { limit: (core::mem::size_of_val(&GDT) - 1) as u16, base: GDT.as_ptr() as u64 };
+    // Arranque, un solo núcleo: nadie más toca la GDT ni el TSS.
+    unsafe {
+        let tss = core::ptr::addr_of_mut!(TSS) as u64;
+        let t = &mut (*core::ptr::addr_of_mut!(TSS)).0;
+        let top = core::ptr::addr_of_mut!(PILA_FD) as u64 + 16384;
+        t[9] = top as u32;
+        t[10] = (top >> 32) as u32;
+        t[25] = 104 << 16; // sin mapa de E/S
+        let g = &mut *core::ptr::addr_of_mut!(GDT);
+        // TSS de 64 bits libre (tipo 0x89), límite 103.
+        g[5] = 103 | (tss & 0xFFFF) << 16 | (tss >> 16 & 0xFF) << 32 | 0x89 << 40 | (tss >> 24 & 0xFF) << 56;
+        g[6] = tss >> 32;
+    }
+    let p = Ptr { limit: (7 * 8 - 1) as u16, base: core::ptr::addr_of!(GDT) as u64 };
     unsafe {
         asm!(
             "lgdt [{p}]",
@@ -159,6 +199,7 @@ pub fn init_gdt() {
             p = in(reg) &p,
             out("rax") _,
         );
+        asm!("ltr ax", in("ax") 0x28u16, options(nomem, nostack));
     }
 }
 
@@ -200,6 +241,7 @@ pub fn init_idt() {
         for (i, e) in idt.iter_mut().enumerate().take(32) {
             *e = entry(exc_stub_table[i]);
         }
+        idt[8].ist = 1; // fallo doble
         idt[VEC_TIMER] = entry(irq_timer_stub as *const () as u64);
         idt[VEC_TECLADO] = entry(irq_teclado_stub as *const () as u64);
         idt[VEC_RATON] = entry(irq_raton_stub as *const () as u64);

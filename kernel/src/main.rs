@@ -7,13 +7,17 @@ extern crate alloc;
 
 mod ahci;
 mod arch;
+#[cfg(feature = "demo")]
+mod demo;
 mod boot;
 mod fb;
+mod paging;
 mod pci;
 mod ps2;
 mod rtc;
 mod serial;
 mod uefi;
+mod user;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -31,6 +35,7 @@ use nf_core::heap::Heap;
 use nf_core::icons::{self, Icon};
 use nf_core::input::{Event, Keyboard, Ps2Mouse};
 use nf_core::platform::{DateTime, MemInfo, Platform};
+use nf_core::proc::Process;
 use nf_core::surface::Surface;
 use nf_core::{font, NAME};
 use serial::traza;
@@ -138,6 +143,9 @@ impl Platform for Plat {
     fn pool(&mut self) -> &mut nf_core::keys::Pool {
         &mut self.pool
     }
+    fn spawn(&mut self, nfx: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
+        user::spawn(nfx)
+    }
     fn entropy(&mut self) -> u64 {
         use core::arch::x86_64::{__cpuid, _rdtsc};
         // Contador de ciclos del procesador y reloj del sistema: siempre disponibles.
@@ -212,10 +220,12 @@ extern "C" fn kmain() -> ! {
     }
     unsafe { (*HEAP.0.get()).init(info.heap_base as *mut u8, info.heap_size as usize) };
     HEAP_LISTO.store(true, Release);
+    paging::init(info.ram_end, info.fb_base + info.stride as u64 * info.height as u64 * 4);
     arch::init_gdt();
     arch::init_idt();
     arch::init_pic();
     arch::init_pit();
+    user::init_syscall();
 
     pantalla_de_arranque(&fb);
     let con_rueda = ps2::init();
@@ -248,6 +258,8 @@ extern "C" fn kmain() -> ! {
             t.second
         );
     }
+    #[cfg(feature = "demo")]
+    demo::lanzar(&mut desk, &mut plat);
     unsafe { core::arch::asm!("sti") };
 
     let mut teclado = Keyboard::new();
@@ -359,6 +371,10 @@ extern "C" fn fault_handler(vector: u64, frame: *const u64) -> ! {
     // Con código de error la pila empieza por él y el RIP está una posición más allá.
     let con_codigo = matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30);
     let rip = unsafe { *frame.add(con_codigo as usize) };
+    // CS del marco: si era un programa (ring 3) solo se mata al programa; el sistema sigue.
+    if unsafe { *frame.add(con_codigo as usize + 1) } & 3 == 3 {
+        user::fallo(vector, rip);
+    }
     let mut b = Buf { b: [0; 512], n: 0 };
     let _ = write!(b, "Excepcion {} en la direccion {:#018x}", vector, rip);
     if TRAZA {
