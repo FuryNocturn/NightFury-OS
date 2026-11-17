@@ -53,6 +53,23 @@ const CURSOR: [&str; 19] = [
     "............",
 ];
 /// Zona que puede ocupar el puntero en (x, y), sea la flecha o una flecha doble de redimensionado.
+/// Número que identifica la tecla para el acumulador de aleatoriedad.
+fn key_code(k: Key) -> i32 {
+    match k {
+        Key::Char(c) => c as i32,
+        Key::F(n) => 0x1000 + n as i32,
+        Key::Escape => 0x2001,
+        Key::Backspace => 0x2002,
+        Key::Tab => 0x2003,
+        Key::Enter => 0x2004,
+        Key::Left => 0x2005,
+        Key::Right => 0x2006,
+        Key::Up => 0x2007,
+        Key::Down => 0x2008,
+        _ => 0x2000,
+    }
+}
+
 fn cursor_rect(x: i32, y: i32) -> Rect {
     Rect::new(x - 11, y - 11, 24, 30)
 }
@@ -763,6 +780,9 @@ impl Desktop {
         if (x, y) == (self.mx, self.my) {
             return;
         }
+        // Cada movimiento alimenta el acumulador de aleatoriedad (también en las pantallas de inicio).
+        let fine = sys.entropy();
+        sys.pool().add_event(x, y, self.now_ms, fine);
         self.dmg(cursor_rect(self.mx, self.my));
         self.mx = x;
         self.my = y;
@@ -2084,6 +2104,8 @@ impl Desktop {
         if !k.down {
             return;
         }
+        let fine = sys.entropy();
+        sys.pool().add_event(key_code(k.key), 0, self.now_ms, fine);
         if self.login.covers() {
             let out = self.login.key(&k, sys);
             self.login_out(out, sys);
@@ -4374,5 +4396,20 @@ mod login_tests {
         same_as_full(&mut d, &mut sys);
         click(&mut d, &mut sys, (1180, 672));
         assert!(sys.halted);
+    }
+
+    #[test]
+    fn el_escritorio_alimenta_el_acumulador_con_raton_y_teclado() {
+        let mut sys = with_accounts(&[("Ana", Some("secreto1"))]);
+        let mut d = boot(&mut sys);
+        let base = sys.pool.events();
+        d.mouse_to(100, 100, &mut sys);
+        d.mouse_to(100, 100, &mut sys); // misma posición: no cuenta
+        d.mouse_to(120, 90, &mut sys);
+        assert_eq!(sys.pool.events(), base + 2);
+        let before = sys.pool.preview();
+        typ(&mut d, &mut sys, "a");
+        assert_eq!(sys.pool.events(), base + 3);
+        assert_ne!(sys.pool.preview(), before);
     }
 }
