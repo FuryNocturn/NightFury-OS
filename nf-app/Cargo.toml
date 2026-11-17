@@ -1,0 +1,8 @@
+[package]
+name = "nf-app"
+version.workspace = true
+edition.workspace = true
+description = "NightFury: runtime de los programas en modo usuario (arranque, llamadas, bucle de eventos)"
+
+[dependencies]
+nf-core = { path = "../nf-core" }

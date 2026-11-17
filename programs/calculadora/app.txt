@@ -1,0 +1,6 @@
+nombre=Calculadora
+version=1.0
+autor=NightFury
+icono=calc
+ancho=320
+alto=470

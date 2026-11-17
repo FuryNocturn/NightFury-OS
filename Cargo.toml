@@ -1,5 +1,5 @@
 ﻿[workspace]
-members = ["nf-core", "kernel", "tools/nfdisk"]
+members = ["nf-core", "kernel", "tools/nfdisk", "nf-app", "tools/nfpack", "programs/calculadora", "programs/plantilla"]
 default-members = ["nf-core"]
 resolver = "2"
 
