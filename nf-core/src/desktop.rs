@@ -4190,8 +4190,10 @@ mod modal_tests {
         // Botón derecho por evento de ratón: enfoca la de atrás y le llega.
         d.mouse_to(c0.x + 10, c0.y + 10, &mut sys);
         d.event(Event::Mouse(crate::input::MousePacket { dx: 0, dy: 0, buttons: 2, dz: 0 }), &mut sys);
-        assert_eq!(log1.borrow()[1], "derecho 10,10");
+        assert_eq!(log1.borrow().len(), 1); // el menú sale al soltar, no al pulsar
         assert_eq!(d.active_id(), Some(d.wins[1].id));
+        d.event(Event::Mouse(crate::input::MousePacket { dx: 0, dy: 0, buttons: 0, dz: 0 }), &mut sys);
+        assert_eq!(log1.borrow()[1], "derecho 10,10");
         assert!(d.menu().is_some());
         // La rueda no llega a nadie con el menú abierto.
         d.wheel(1, &mut sys);
