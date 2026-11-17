@@ -220,6 +220,8 @@ struct DIcon {
 /// Etiquetas de los diálogos del sistema (sin dueña).
 const TAG_FORMAT: u32 = 0xFFFF_FF01;
 const TAG_SYS: u32 = 0xFFFF_FF02;
+/// Ventana del ratón del asistente de disco nuevo (llaves y códigos de recuperación).
+const TAG_SETUP: u32 = 0xFFFF_FF03;
 /// Diálogos de los menús del escritorio; la ruta afectada va en `Desktop::pending`.
 const TAG_RENAME: u32 = 0xFFFF_FF10;
 const TAG_NEWDIR: u32 = 0xFFFF_FF11;
@@ -799,6 +801,10 @@ impl Desktop {
             Out::SetupDone | Out::DiskDone => self.enter_flow(sys),
             Out::Shutdown => sys.shutdown(),
             Out::Reboot => sys.reboot(),
+            Out::NeedEntropy => {
+                let req = DialogRequest::Entropy { tag: TAG_SETUP, title: String::from("Generar las llaves") };
+                self.open_dialog(None, req, sys);
+            }
         }
         self.flush_login();
     }
@@ -1813,26 +1819,16 @@ impl Desktop {
         match res {
             DialogResult::Answer { tag: TAG_FORMAT, answer } => {
                 if answer == Answer::Yes {
-                    let now = sys.now();
-                    match sys.files().format_pending(now) {
-                        Ok(()) => {
-                            // El disco nuevo no tiene cuentas: se descarta la sesión de la unidad en
-                            // memoria y se pasa al asistente (tras los avisos).
-                            let ids: Vec<u32> = self.wins.iter().map(|w| w.id).collect();
-                            for id in ids {
-                                self.close(id);
-                            }
-                            sys.files().logout();
-                            self.login.start_boot();
-                            self.screen_on();
-                        }
-                        Err(e) => {
-                            let text = format!("No se ha podido preparar el disco: {}", e.message());
-                            let req = DialogRequest::Message { tag: TAG_SYS, title: String::from("Disco nuevo"), text, buttons: Buttons::Ok };
-                            self.open_dialog(None, req, sys);
-                            return;
-                        }
+                    // El disco todavía no se toca: el asistente pregunta el cifrado y las cuentas y lo
+                    // formatea al final. Se descarta ya la sesión de la unidad en memoria.
+                    let ids: Vec<u32> = self.wins.iter().map(|w| w.id).collect();
+                    for id in ids {
+                        self.close(id);
                     }
+                    self.login.start_new_disk();
+                    self.screen_on();
+                    self.flush_login();
+                    return;
                 } else {
                     // Solo el Sí formatea: cualquier otra respuesta descarta el disco.
                     sys.files().decline_format();
@@ -1840,6 +1836,15 @@ impl Desktop {
                 self.show_notice(sys);
             }
             DialogResult::Answer { tag: TAG_SYS, .. } => self.show_notice(sys),
+            DialogResult::Answer { tag: TAG_SETUP, answer } => {
+                if answer == Answer::Ok {
+                    self.login.begin_provision();
+                } else {
+                    self.login.cancel_entropy();
+                }
+                self.screen_on();
+                self.flush_login();
+            }
             DialogResult::Answer { tag: t @ TAG_POWER..=0xFFFF_FF23, answer: Answer::Yes } => self.do_power(t - TAG_POWER, sys),
             DialogResult::Answer { tag: u32::MAX, .. } => self.enter_flow(sys),
             DialogResult::Answer { tag: TAG_EMPTY, answer: Answer::Yes } => {

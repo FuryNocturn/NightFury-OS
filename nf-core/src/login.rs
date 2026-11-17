@@ -51,6 +51,9 @@ pub enum Out {
     SetupDone,
     /// El disco cifrado se abrió, o se eligió seguir sin él: continúa el arranque normal.
     DiskDone,
+    /// Asistente de disco nuevo: hace falta la ventana del ratón (el escritorio la abre y
+    /// responde con `begin_provision` o `cancel_entropy`).
+    NeedEntropy,
     Shutdown,
     Reboot,
 }
@@ -75,6 +78,49 @@ enum Item {
     Skip,
     /// "Volver" de la confirmación de seguir sin disco.
     Back,
+    /// Opción de cifrado del asistente (0 Ninguno, 1 Mi carpeta, 2 Disco entero, 3 Ambos).
+    Opt(usize),
+}
+
+/// Qué se cifra en un disco nuevo (v0.7.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Enc {
+    Nothing,
+    Home,
+    Disk,
+    Both,
+}
+
+impl Enc {
+    const ALL: [Enc; 4] = [Enc::Nothing, Enc::Home, Enc::Disk, Enc::Both];
+
+    fn disk(self) -> bool {
+        matches!(self, Enc::Disk | Enc::Both)
+    }
+
+    fn home(self) -> bool {
+        matches!(self, Enc::Home | Enc::Both)
+    }
+}
+
+/// Pantalla del asistente. Con disco ya formateado solo se usa `Account`; con disco nuevo el orden
+/// es Choice, DiskKey (si hay cifrado de disco), Account, Preparing y Codes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Account,
+    Choice,
+    DiskKey,
+    Preparing,
+    Codes,
+}
+
+/// Cuenta tecleada en el asistente de disco nuevo: se crea al final, cuando el disco ya está formateado.
+struct PendAcc {
+    name: String,
+    pw: String,
+    admin: bool,
+    created: bool,
+    coded: bool,
 }
 
 /// Trabajo lento aplazado un tick (derivar llaves).
@@ -82,6 +128,7 @@ enum Item {
 enum Job {
     Disk,
     Recover,
+    Provision,
 }
 
 const FIELD_H: i32 = 30;
@@ -109,7 +156,27 @@ const DISK_SUB_CODE: &str = "Escribe el código de recuperación del disco (8 gr
 const SKIP_TEXT: &str = "Los archivos se guardarán solo en la memoria y se perderán al apagar.";
 const RECOVER_SUB: &str = "Escribe el código de recuperación de esta cuenta y elige una clave nueva.";
 const STRENGTH: [(&str, u32); 5] = [("Muy débil", 0xFF6B5E), ("Débil", 0xFF9A4D), ("Aceptable", 0xF2C94C), ("Buena", 0x9BDB6B), ("Fuerte", 0x4CCB6A)];
+const OPT_H: i32 = 46;
+const OPTS: [(&str, &str); 4] = [
+    ("Ninguno", "Los datos se guardan sin cifrar."),
+    ("Mi carpeta", "Tus archivos solo se abren con tu clave."),
+    ("Disco entero", "Todo el disco pide una clave en cada arranque."),
+    ("Ambos", "Clave del disco al arrancar y tu carpeta con su clave."),
+];
+const CHOICE_SUB: &str = "Elige qué quieres proteger con una clave.";
+const CHOICE_WARN: &str = "Si olvidas la clave y pierdes el código de recuperación, no se podrán recuperar los datos.";
+const DISKKEY_SUB: &str = "Se pedirá en cada arranque del equipo. Mínimo 6 caracteres.";
+const CODE_WARN: &str = "Apúntalo en papel y guárdalo en un lugar seguro. Es la única forma de recuperar tus datos si olvidas la clave. No se volverá a mostrar.";
+const AMBER: u32 = 0xF2C94C;
 const SUB: &str = "La primera cuenta es la del administrador: podrá crear y quitar otras cuentas.";
+
+impl Layout {
+    /// Rectángulo del código de recuperación en una tarjeta de ancho `w` cuyo cuerpo empieza en `body_y`
+    /// (relativo a la tarjeta).
+    fn code_rect_in(w: i32, body_y: i32) -> Rect {
+        Login::code_box(Rect::new(0, 0, w, 0), body_y)
+    }
+}
 
 struct Layout {
     items: Vec<(Item, Rect)>,
@@ -160,6 +227,21 @@ pub struct Login {
     job: Option<(Job, u64)>,
     /// El mensaje de `err` es una buena noticia (se pinta en verde).
     good: bool,
+    /// Asistente de disco nuevo (el disco aún no está formateado): pantalla, cifrado elegido y lo tecleado.
+    fresh: bool,
+    step: Step,
+    enc: Enc,
+    /// Clave del disco ya confirmada (solo vive hasta formatear).
+    disk_pw: String,
+    pend: Vec<PendAcc>,
+    /// Aviso ya mostrado: la siguiente pulsación sigue igualmente (clave débil o cuenta sin clave).
+    weak_ok: bool,
+    warned: bool,
+    /// El disco ya se formateó (no se repite si hay que reintentar).
+    disk_done: bool,
+    /// Códigos de recuperación (a quién pertenece, código) y cuál se muestra.
+    codes: Vec<(String, String)>,
+    code_i: usize,
 }
 
 fn secret() -> String {
@@ -188,6 +270,14 @@ fn with_pool<R>(sys: &mut dyn Platform, f: impl FnOnce(&mut Files, &mut Pool) ->
     let r = f(sys.files(), &mut pool);
     *sys.pool() = pool;
     r
+}
+
+/// Texto pequeño en hasta dos líneas dentro de `r`.
+fn text_wrapped(s: &mut Surface, r: Rect, text: &str, color: u32) {
+    let lh = font::line_h(8);
+    for (i, line) in wrap(text, 8, r.w).iter().take(2).enumerate() {
+        text_in(s, Rect::new(r.x, r.y + i as i32 * lh, r.w, lh), line, 8, false, color, Align::Left);
+    }
 }
 
 fn text_in(s: &mut Surface, r: Rect, text: &str, size: u32, bold: bool, color: u32, align: Align) {
@@ -229,6 +319,16 @@ impl Login {
             confirm_skip: false,
             job: None,
             good: false,
+            fresh: false,
+            step: Step::Account,
+            enc: Enc::Home,
+            disk_pw: secret(),
+            pend: Vec::new(),
+            weak_ok: false,
+            warned: false,
+            disk_done: false,
+            codes: Vec::new(),
+            code_i: 0,
         }
     }
 
@@ -263,8 +363,28 @@ impl Login {
         wipe_str(&mut self.code);
     }
 
+    /// Borra todo lo secreto del asistente de disco nuevo (claves, cuentas tecleadas y códigos).
+    fn wipe_setup(&mut self) {
+        wipe_str(&mut self.disk_pw);
+        for p in self.pend.iter_mut() {
+            wipe_str(&mut p.pw);
+        }
+        self.pend.clear();
+        for c in self.codes.iter_mut() {
+            wipe_str(&mut c.1);
+        }
+        self.codes.clear();
+        self.code_i = 0;
+        self.disk_done = false;
+        self.weak_ok = false;
+        self.warned = false;
+    }
+
     fn enter(&mut self, mode: Mode) {
         self.wipe_all();
+        self.wipe_setup();
+        self.fresh = false;
+        self.step = Step::Account;
         self.mode = mode;
         self.job = None;
         self.good = false;
@@ -298,6 +418,34 @@ impl Login {
         self.name.clear();
         self.admin = false;
         self.focus = Item::Name;
+    }
+
+    /// Asistente de un disco recién preparado: primero el cifrado, y el disco se formatea al final.
+    pub fn start_new_disk(&mut self) {
+        self.start_setup();
+        self.fresh = true;
+        self.step = Step::Choice;
+        self.enc = Enc::Home;
+        self.focus = Item::Ok;
+    }
+
+    /// La ventana del ratón respondió Ok: a preparar el disco y las cuentas.
+    pub fn begin_provision(&mut self) {
+        self.mode = Mode::Setup;
+        self.step = Step::Preparing;
+        self.err = None;
+        self.good = false;
+        self.focus = Item::Ok;
+        self.job = Some((Job::Provision, self.now + JOB_DELAY_MS));
+        self.dmg_all();
+    }
+
+    /// La ventana del ratón se canceló: vuelve a "¿Añadir otra cuenta?" sin haber tocado el disco.
+    pub fn cancel_entropy(&mut self) {
+        self.mode = Mode::Setup;
+        self.step = Step::Account;
+        self.focus = Item::Name;
+        self.dmg_all();
     }
 
     /// Pantalla "Disco cifrado": clave del disco (o su código de recuperación).
@@ -448,6 +596,11 @@ impl Login {
 
     fn order(&self) -> Vec<Item> {
         match self.mode {
+            Mode::Setup if self.fresh && self.step != Step::Account => match self.step {
+                Step::Choice | Step::Codes => alloc::vec![Item::Ok],
+                Step::DiskKey => alloc::vec![Item::Pw, Item::Pw2, Item::Ok, Item::Done],
+                _ => Vec::new(),
+            },
             Mode::Setup if !self.second => alloc::vec![Item::Name, Item::Pw, Item::Pw2, Item::Ok],
             Mode::Setup => alloc::vec![Item::Name, Item::Pw, Item::Pw2, Item::Admin, Item::Ok, Item::Done],
             Mode::Recover => alloc::vec![Item::Code, Item::Pw, Item::Pw2, Item::Ok, Item::Done],
@@ -465,6 +618,9 @@ impl Login {
         let mut items: Vec<(Item, Rect)> = Vec::new();
         if self.mode == Mode::Disk {
             return self.layout_disk();
+        }
+        if self.mode == Mode::Setup && self.fresh && self.step != Step::Account {
+            return self.layout_step();
         }
         if matches!(self.mode, Mode::Setup | Mode::Recover) {
             let rec = self.mode == Mode::Recover;
@@ -503,6 +659,9 @@ impl Login {
             if rec {
                 items.push((Item::Msg, Rect::new(PAD, y + 8, inner, lh + 4)));
                 y += lh + 12;
+            } else if self.fresh {
+                items.push((Item::Msg, Rect::new(PAD, y + 8, inner, 2 * lh + 4)));
+                y += 2 * lh + 12;
             }
             y += PAD;
             let (ox, oy) = ((self.w - w) / 2, ((self.h - y) / 2).max(8));
@@ -550,6 +709,77 @@ impl Login {
         let bounds = items.iter().fold(title, |u, i| u.union(i.1));
         items.push((Item::Power, self.power_rect()));
         Layout { items, bounds, card: Rect::default(), title, body_y: 0 }
+    }
+
+    /// A quién pertenece el código que se muestra ("del disco", "de la cuenta Ana").
+    fn code_owner(&self) -> String {
+        self.codes.get(self.code_i).map(|c| c.0.clone()).unwrap_or_default()
+    }
+
+    /// Rectángulo del código de recuperación dentro de su tarjeta.
+    fn code_box(card: Rect, body_y: i32) -> Rect {
+        Rect::new(card.x + PAD, body_y + font::line_h(9) + 10, card.w - 2 * PAD, 52)
+    }
+
+    /// Tarjetas del asistente de disco nuevo que no son la de cuentas: cifrado, clave del disco,
+    /// preparando y códigos de recuperación.
+    fn layout_step(&self) -> Layout {
+        let lh = font::line_h(8);
+        let mut items: Vec<(Item, Rect)> = Vec::new();
+        let w = CARD_W.min(self.w - 16).max(240);
+        let inner = w - 2 * PAD;
+        let block = lh + 2 + FIELD_H + 2 + lh + 4;
+        let mut y = PAD;
+        let title = Rect::new(PAD, y, inner, 24);
+        y += 30;
+        let body = y;
+        match self.step {
+            Step::Choice => {
+                y += wrap(CHOICE_SUB, 8, inner).len() as i32 * lh + 12;
+                for i in 0..OPTS.len() {
+                    items.push((Item::Opt(i), Rect::new(PAD, y, inner, OPT_H)));
+                    y += OPT_H + 4;
+                }
+                y += 6 + wrap(CHOICE_WARN, 8, inner).len() as i32 * lh + 12;
+                items.push((Item::Ok, Rect::new(PAD, y, inner, BTN_H)));
+                y += BTN_H;
+                items.push((Item::Msg, Rect::new(PAD, y + 8, inner, 2 * lh + 4)));
+                y += 2 * lh + 12;
+            }
+            Step::DiskKey => {
+                y += wrap(DISKKEY_SUB, 8, inner).len() as i32 * lh + 14;
+                for it in [Item::Pw, Item::Pw2] {
+                    items.push((it, Rect::new(PAD, y + lh + 2, inner, FIELD_H)));
+                    y += block;
+                }
+                y += 6;
+                let bw = (inner - 12) / 2;
+                items.push((Item::Ok, Rect::new(PAD, y, bw, BTN_H)));
+                items.push((Item::Done, Rect::new(PAD + bw + 12, y, bw, BTN_H)));
+                y += BTN_H;
+                items.push((Item::Msg, Rect::new(PAD, y + 8, inner, 2 * lh + 4)));
+                y += 2 * lh + 12;
+            }
+            Step::Preparing => {
+                y += font::line_h(9) + 6 + lh + 6;
+            }
+            _ => {
+                let b = Layout::code_rect_in(w, body);
+                y = b.bottom() + 14 + wrap(CODE_WARN, 8, inner).len() as i32 * lh + 14;
+                items.push((Item::Ok, Rect::new(PAD, y, inner, BTN_H)));
+                y += BTN_H;
+            }
+        }
+        y += PAD;
+        let (ox, oy) = ((self.w - w) / 2, ((self.h - y) / 2).max(8));
+        for it in items.iter_mut() {
+            it.1.x += ox;
+            it.1.y += oy;
+        }
+        let card = Rect::new(ox, oy, w, y);
+        let title = Rect::new(title.x + ox, title.y + oy, title.w, title.h);
+        items.push((Item::Power, self.power_rect()));
+        Layout { items, bounds: card, card, title, body_y: body + oy }
     }
 
     fn disk_sub(&self) -> &'static str {
@@ -666,7 +896,7 @@ impl Login {
                 Out::None
             }
             Some(Item::Ok) => self.activate(Item::Ok, sys),
-            Some(it @ (Item::Done | Item::Link | Item::Skip | Item::Back)) => self.activate(it, sys),
+            Some(it @ (Item::Done | Item::Link | Item::Skip | Item::Back | Item::Opt(_))) => self.activate(it, sys),
             Some(Item::Avatar(i)) => {
                 self.select(i);
                 if self.has_pw() {
@@ -739,8 +969,11 @@ impl Login {
         match k.key {
             Key::Tab => self.move_focus(!k.shift),
             Key::Enter => return self.activate(self.focus, sys),
+            Key::Up | Key::Left if self.choosing() => self.move_opt(false),
+            Key::Down | Key::Right if self.choosing() => self.move_opt(true),
             Key::Escape => match self.mode {
                 Mode::Recover => self.cancel_recover(),
+                Mode::Setup if self.fresh && self.step == Step::DiskKey => self.to_choice(),
                 Mode::Disk if self.confirm_skip => self.set_confirm(false),
                 Mode::Setup => {}
                 _ => {
@@ -796,6 +1029,8 @@ impl Login {
             Some(_) => self.dmg_panel(),
             None => self.dmg_item(f),
         }
+        self.weak_ok = false;
+        self.warned = false;
         if f == Item::Pw && matches!(self.mode, Mode::Setup | Mode::Recover) {
             self.dmg_strength();
         }
@@ -813,6 +1048,20 @@ impl Login {
     /// Enter, espacio o clic sobre `it`.
     fn activate(&mut self, it: Item, sys: &mut dyn Platform) -> Out {
         match self.mode {
+            Mode::Setup if self.fresh && self.step != Step::Account => match (self.step, it) {
+                (Step::Choice, Item::Opt(i)) => {
+                    self.set_opt(i);
+                    Out::None
+                }
+                (Step::Choice, _) => self.choice_next(),
+                (Step::DiskKey, Item::Done) => {
+                    self.to_choice();
+                    Out::None
+                }
+                (Step::DiskKey, _) => self.diskkey_next(),
+                (Step::Codes, _) => self.code_next(),
+                _ => Out::None,
+            },
             Mode::Setup => match it {
                 Item::Admin => {
                     self.admin = !self.admin;
@@ -940,6 +1189,20 @@ impl Login {
                 wipe_str(&mut norm);
                 self.disk_result(res)
             }
+            Job::Provision => match self.provision(sys) {
+                Ok(()) if self.codes.is_empty() => Out::SetupDone,
+                Ok(()) => {
+                    self.step = Step::Codes;
+                    self.code_i = 0;
+                    self.focus = Item::Ok;
+                    self.dmg_all();
+                    Out::None
+                }
+                Err(e) => {
+                    self.fail_provision(e);
+                    Out::None
+                }
+            },
             Job::Recover => {
                 let name = self.users.get(self.sel).map(|u| u.0.clone()).unwrap_or_default();
                 let mut norm = keys::normalize_recovery(&self.code).unwrap_or_default();
@@ -1008,6 +1271,9 @@ impl Login {
     }
 
     fn submit(&mut self, sys: &mut dyn Platform) -> Out {
+        if self.fresh {
+            return self.submit_fresh();
+        }
         self.err = None;
         if !accounts::valid_user_name(&self.name) {
             return self.fail_at(Item::Name, AccountError::BadName.text());
@@ -1041,9 +1307,224 @@ impl Login {
     }
 
     fn finish(&mut self, sys: &mut dyn Platform) -> Out {
+        if self.fresh {
+            return self.finish_fresh();
+        }
         sys.files().logout();
         self.wipe_all();
         Out::SetupDone
+    }
+
+    // ---------------------------------------------------------------- asistente de disco nuevo
+
+    fn choosing(&self) -> bool {
+        self.mode == Mode::Setup && self.fresh && self.step == Step::Choice && self.job.is_none()
+    }
+
+    fn opt_index(&self) -> usize {
+        Enc::ALL.iter().position(|&e| e == self.enc).unwrap_or(0)
+    }
+
+    fn set_opt(&mut self, i: usize) {
+        if let Some(&e) = Enc::ALL.get(i) {
+            if e != self.enc {
+                self.enc = e;
+                self.dmg_panel();
+            }
+        }
+    }
+
+    fn move_opt(&mut self, fwd: bool) {
+        let n = Enc::ALL.len();
+        let i = self.opt_index();
+        self.set_opt(if fwd { (i + 1) % n } else { (i + n - 1) % n });
+    }
+
+    /// Vuelve a la elección de cifrado (borra la clave del disco).
+    fn to_choice(&mut self) {
+        self.dmg_panel();
+        self.wipe_all();
+        wipe_str(&mut self.disk_pw);
+        self.step = Step::Choice;
+        self.err = None;
+        self.weak_ok = false;
+        self.focus = Item::Ok;
+        self.dmg_all();
+    }
+
+    /// "Siguiente" en la elección: clave del disco si hace falta, o directamente las cuentas.
+    fn choice_next(&mut self) -> Out {
+        self.dmg_panel();
+        self.wipe_all();
+        wipe_str(&mut self.disk_pw);
+        self.err = None;
+        self.weak_ok = false;
+        if self.enc.disk() {
+            self.step = Step::DiskKey;
+            self.focus = Item::Pw;
+        } else {
+            self.step = Step::Account;
+            self.focus = Item::Name;
+        }
+        self.dmg_all();
+        Out::None
+    }
+
+    /// "Siguiente" en la clave del disco: longitud, coincidencia y, si es débil, un aviso antes de seguir.
+    fn diskkey_next(&mut self) -> Out {
+        self.err = None;
+        if self.pw.chars().count() < accounts::MIN_PASSWORD {
+            return self.fail_at(Item::Pw, KeyError::Weak.text());
+        }
+        if self.pw != self.pw2 {
+            return self.fail_at(Item::Pw2, "Las claves no coinciden.");
+        }
+        if keys::strength(&self.pw) < 2 && !self.weak_ok {
+            self.weak_ok = true;
+            self.say("La clave es débil. Púlsalo otra vez para usarla igualmente.", false);
+            return Out::None;
+        }
+        self.disk_pw = core::mem::replace(&mut self.pw, secret());
+        self.wipe_all();
+        self.weak_ok = false;
+        self.step = Step::Account;
+        self.focus = Item::Name;
+        self.dmg_all();
+        Out::None
+    }
+
+    /// Una cuenta del asistente de disco nuevo: se valida ahora y se guarda en memoria hasta el final.
+    fn submit_fresh(&mut self) -> Out {
+        self.err = None;
+        if !accounts::valid_user_name(&self.name) {
+            return self.fail_at(Item::Name, AccountError::BadName.text());
+        }
+        if self.pend.iter().any(|p| crate::fs::same(&p.name, &self.name)) {
+            return self.fail_at(Item::Name, AccountError::Exists.text());
+        }
+        if self.pw != self.pw2 {
+            return self.fail_at(Item::Pw2, "Las claves no coinciden.");
+        }
+        let n = self.pw.chars().count();
+        if n > 0 && n < accounts::MIN_PASSWORD {
+            return self.fail_at(Item::Pw, AccountError::WeakPassword.text());
+        }
+        if n == 0 && self.enc.home() {
+            if !self.second {
+                return self.fail_at(Item::Pw, "Hace falta una clave para cifrar tu carpeta.");
+            }
+            if !self.warned {
+                self.warned = true;
+                return self.fail_at(Item::Pw, "Su carpeta quedará sin cifrar. Pulsa otra vez para añadirla igualmente.");
+            }
+        }
+        let admin = self.admin || !self.second;
+        let name = core::mem::take(&mut self.name);
+        let pw = core::mem::replace(&mut self.pw, secret());
+        self.created.push((name.clone(), admin));
+        self.pend.push(PendAcc { name, pw, admin, created: false, coded: false });
+        self.second = true;
+        self.admin = false;
+        self.warned = false;
+        self.wipe_all();
+        self.focus = Item::Name;
+        self.dmg_all();
+        Out::None
+    }
+
+    /// "Terminar": con cifrado pide la ventana del ratón (una vez); sin él, prepara directamente.
+    fn finish_fresh(&mut self) -> Out {
+        if self.enc == Enc::Nothing {
+            self.begin_provision();
+            return Out::None;
+        }
+        // La ventana del ratón es un diálogo del escritorio: esta pantalla se aparta mientras tanto.
+        self.mode = Mode::Boot;
+        self.job = None;
+        self.dmg_all();
+        Out::NeedEntropy
+    }
+
+    /// Hace todo el trabajo: formatea (cifrado o no), crea las cuentas y cifra sus carpetas. Se puede
+    /// repetir tras un fallo: lo ya hecho (`disk_done`, `created`, `coded`) no se vuelve a hacer.
+    fn provision(&mut self, sys: &mut dyn Platform) -> Result<(), String> {
+        let now = sys.now();
+        if !self.disk_done {
+            if self.enc.disk() {
+                let pw = &self.disk_pw;
+                let code = with_pool(sys, |f, pool| f.format_pending_encrypted(pw, pool, now)).map_err(|e| String::from(e.text()))?;
+                self.codes.push((String::from("del disco"), code));
+            } else {
+                sys.files().format_pending(now).map_err(|e| String::from(e.message()))?;
+            }
+            self.disk_done = true;
+        }
+        for i in 0..self.pend.len() {
+            if !self.pend[i].created {
+                let salt = accounts::salt_from(sys.entropy(), sys.entropy());
+                let p = &self.pend[i];
+                let pw = if p.pw.is_empty() { None } else { Some(p.pw.as_str()) };
+                sys.files().create_account(&p.name, pw, p.admin, salt, now).map_err(|e| String::from(e.text()))?;
+                self.pend[i].created = true;
+            }
+            if self.enc.home() && !self.pend[i].coded && !self.pend[i].pw.is_empty() {
+                let p = &self.pend[i];
+                let code = with_pool(sys, |f, pool| f.encrypt_new_home(&p.name, &p.pw, pool, now)).map_err(|e| String::from(e.text()))?;
+                self.pend[i].coded = true;
+                let owner = format!("de la cuenta {}", self.pend[i].name);
+                self.codes.push((owner, code));
+            }
+            // La sesión de la primera cuenta (administradora) permite crear las demás.
+            if i == 0 && self.pend.len() > 1 && sys.files().user().is_none() {
+                let p = &self.pend[0];
+                sys.files().login(&p.name, &p.pw).map_err(|e| String::from(e.text()))?;
+            }
+        }
+        sys.files().logout();
+        wipe_str(&mut self.disk_pw);
+        for p in self.pend.iter_mut() {
+            wipe_str(&mut p.pw);
+        }
+        Ok(())
+    }
+
+    /// Un fallo al preparar: sin nada hecho vuelve a la elección de cifrado; si el disco ya se formateó o
+    /// hay cuentas creadas, a la tarjeta de cuentas (para reintentar con "Terminar", que retoma lo que falta).
+    fn fail_provision(&mut self, e: String) {
+        let done = self.disk_done || self.pend.iter().any(|p| p.created);
+        self.mode = Mode::Setup;
+        if done {
+            self.step = Step::Account;
+            self.focus = Item::Name;
+        } else {
+            for p in self.pend.iter_mut() {
+                wipe_str(&mut p.pw);
+            }
+            self.pend.clear();
+            self.created.clear();
+            self.second = false;
+            self.step = Step::Choice;
+            self.focus = Item::Ok;
+        }
+        self.err = Some((Item::Msg, e));
+        self.good = false;
+        self.dmg_all();
+    }
+
+    /// "Lo he apuntado": siguiente código; tras el último sigue el arranque normal.
+    fn code_next(&mut self) -> Out {
+        if let Some(c) = self.codes.get_mut(self.code_i) {
+            wipe_str(&mut c.1);
+        }
+        self.code_i += 1;
+        if self.code_i >= self.codes.len() {
+            self.codes.clear();
+            self.code_i = 0;
+            self.dmg_all();
+            return Out::SetupDone;
+        }
+        self.dmg_all();
+        Out::None
     }
 
     // ---------------------------------------------------------------- inicio de sesión y bloqueo
@@ -1092,6 +1573,7 @@ impl Login {
         }
         let l = self.layout();
         match self.mode {
+            Mode::Setup if self.fresh && self.step != Step::Account => self.paint_step(s, &l, accent),
             Mode::Setup | Mode::Recover => self.paint_setup(s, &l, accent),
             Mode::Disk => self.paint_disk(s, &l, accent),
             _ => self.paint_pick(s, &l, accent),
@@ -1276,6 +1758,8 @@ impl Login {
                         (Item::Name, _) => "Nombre de usuario",
                         (Item::Code, _) => "Código de recuperación",
                         (Item::Pw, true) => "Clave nueva (mínimo 6 caracteres)",
+                        (Item::Pw, false) if self.fresh && self.enc.home() && !self.second => "Clave (obligatoria, mínimo 6 caracteres)",
+                        (Item::Pw, false) if self.fresh && self.enc.home() => "Clave (opcional: sin clave no se cifra su carpeta)",
                         (Item::Pw, false) => "Clave (opcional, mínimo 6 caracteres)",
                         (_, true) => "Repite la clave nueva",
                         _ => "Repite la clave",
@@ -1302,7 +1786,109 @@ impl Login {
                 Item::Done => self.button(s, r, it, if rec { "Cancelar" } else { "Terminar" }, accent, false),
                 Item::Msg => {
                     if let Some(t) = self.msg_text() {
-                        text_in(s, r, &t, 8, false, if self.good { GREEN } else { RED }, Align::Left);
+                        text_wrapped(s, r, &t, if self.good { GREEN } else { RED });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Botón de opción: círculo vacío o con punto.
+    fn radio(s: &mut Surface, cx: f32, cy: f32, on: bool, accent: u32) {
+        s.fill_circle(cx, cy, 8.0, if on { accent } else { 0x8A8A8A }, 255);
+        s.fill_circle(cx, cy, 6.3, CARD_BG, 255);
+        if on {
+            s.fill_circle(cx, cy, 3.8, accent, 255);
+        }
+    }
+
+    /// Tarjetas del asistente de disco nuevo: cifrado, clave del disco, preparando y código de recuperación.
+    fn paint_step(&self, s: &mut Surface, l: &Layout, accent: u32) {
+        let c = l.card;
+        s.fill_rect(c, CARD_BG);
+        s.frame(c, 0x383838);
+        let lh = font::line_h(8);
+        let inner = c.w - 2 * PAD;
+        let bx = c.x + PAD;
+        let title = match self.step {
+            Step::Choice => "¿Quieres cifrar tus datos?",
+            Step::DiskKey => "Clave del disco",
+            Step::Preparing => "Preparando tu equipo",
+            _ => "Código de recuperación",
+        };
+        text_in(s, l.title, title, 14, true, 0xFFFFFF, Align::Left);
+        let lines = |s: &mut Surface, text: &str, y: i32, color: u32| {
+            for (i, line) in wrap(text, 8, inner).iter().enumerate() {
+                text_in(s, Rect::new(bx, y + i as i32 * lh, inner, lh), line, 8, false, color, Align::Left);
+            }
+        };
+        match self.step {
+            Step::Choice => {
+                lines(s, CHOICE_SUB, l.body_y, GREY);
+                let last = l.items.iter().filter(|i| matches!(i.0, Item::Opt(_))).map(|i| i.1.bottom()).max().unwrap_or(l.body_y);
+                lines(s, CHOICE_WARN, last + 6, AMBER);
+            }
+            Step::DiskKey => lines(s, DISKKEY_SUB, l.body_y, GREY),
+            Step::Preparing => {
+                text_in(s, Rect::new(bx, l.body_y, inner, font::line_h(9)), "Preparando…", 9, true, 0xFFFFFF, Align::Left);
+                let t = if self.enc == Enc::Nothing { "Un momento." } else { "Generar las llaves tarda un poco. No apagues el equipo." };
+                text_in(s, Rect::new(bx, l.body_y + font::line_h(9) + 6, inner, lh), t, 8, false, GREY, Align::Left);
+            }
+            _ => {
+                let t = format!("Código {} de {} · {}", self.code_i + 1, self.codes.len(), self.code_owner());
+                text_in(s, Rect::new(bx, l.body_y, inner, font::line_h(9)), &fit(&t, 9, inner), 9, true, 0xFFFFFF, Align::Left);
+                let b = Self::code_box(c, l.body_y);
+                s.fill_rect(b, 0x121212);
+                s.frame(b, 0x4A4A4A);
+                let code = self.codes.get(self.code_i).map(|x| x.1.as_str()).unwrap_or("");
+                let size = (8..=14u32).rev().find(|&z| font::width(code, z, true) <= b.w - 16).unwrap_or(8);
+                text_in(s, b, code, size, true, 0xFFFFFF, Align::Center);
+                lines(s, CODE_WARN, b.bottom() + 14, AMBER);
+            }
+        }
+        for &(it, r) in &l.items {
+            match it {
+                Item::Opt(i) => {
+                    if !r.intersects(s.clip()) {
+                        continue;
+                    }
+                    let on = self.opt_index() == i;
+                    if on {
+                        s.fill_rect(r, 0x2B2B2B);
+                        s.frame(r, accent);
+                    } else if self.hot == Some(it) {
+                        s.fill_rect(r, 0x262626);
+                    }
+                    Self::radio(s, (r.x + 20) as f32, (r.y + r.h / 2) as f32, on, accent);
+                    let lab = OPTS[i].0;
+                    text_in(s, Rect::new(r.x + 40, r.y + 6, r.w - 48, font::line_h(9)), lab, 9, true, 0xFFFFFF, Align::Left);
+                    text_in(s, Rect::new(r.x + 40, r.y + 8 + font::line_h(9), r.w - 48, lh), &fit(OPTS[i].1, 8, r.w - 48), 8, false, GREY, Align::Left);
+                }
+                Item::Pw | Item::Pw2 => {
+                    let label = if it == Item::Pw { "Clave del disco (mínimo 6 caracteres)" } else { "Repite la clave del disco" };
+                    text_in(s, Rect::new(r.x, r.y - lh - 2, r.w - if it == Item::Pw { STRENGTH_W } else { 0 }, lh), label, 8, false, GREY, Align::Left);
+                    self.field(s, r, it, accent);
+                    if it == Item::Pw {
+                        self.paint_strength(s, r);
+                    }
+                    if let Some((_, e)) = self.err.as_ref().filter(|e| e.0 == it) {
+                        text_in(s, Rect::new(r.x, r.bottom() + 2, r.w, lh), e, 8, false, RED, Align::Left);
+                    }
+                }
+                Item::Ok => {
+                    let t = match self.step {
+                        Step::Codes => "Lo he apuntado",
+                        Step::DiskKey if self.weak_ok => "Usar igualmente",
+                        Step::Preparing => "Preparando…",
+                        _ => "Siguiente",
+                    };
+                    self.button(s, r, it, t, accent, true);
+                }
+                Item::Done => self.button(s, r, it, "Atrás", accent, false),
+                Item::Msg => {
+                    if let Some(t) = self.msg_text() {
+                        text_wrapped(s, r, &t, if self.good { GREEN } else if self.weak_ok { AMBER } else { RED });
                     }
                 }
                 _ => {}
