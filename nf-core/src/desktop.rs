@@ -277,6 +277,8 @@ struct DIcon {
 }
 
 /// Etiquetas de los diálogos del sistema (sin dueña).
+/// Mosaicos del menú Inicio (4 filas de 2).
+const START_TILES: usize = 8;
 const TAG_FORMAT: u32 = 0xFFFF_FF01;
 const TAG_SYS: u32 = 0xFFFF_FF02;
 /// Ventana del ratón del asistente de disco nuevo (llaves y códigos de recuperación).
@@ -1688,8 +1690,10 @@ impl Desktop {
     fn toggle_start(&mut self, sys: &mut dyn Platform) {
         if !self.start_open {
             self.start_items = launchers(sys);
-            // shortcut: el menú no se desplaza; caben 8 mosaicos. Con más programas, lista con barra.
-            self.start_items.truncate(8);
+            // shortcut: el menú no se desplaza: la lista llega hasta donde cabe (12 filas en 500 px) y los
+            // mosaicos son los `START_TILES` primeros. Con muchos programas, lista con barra.
+            let rows = ((self.menu_rect().h - 8) / 40).max(1) as usize;
+            self.start_items.truncate(rows);
         }
         self.set_start(!self.start_open);
     }
@@ -2423,7 +2427,7 @@ impl Desktop {
                 if self.row_rect(i).contains(x, y) {
                     return Hit::Row(i);
                 }
-                if self.tile_rect(i).contains(x, y) {
+                if i < START_TILES && self.tile_rect(i).contains(x, y) {
                     return Hit::Tile(i);
                 }
             }
@@ -3287,7 +3291,7 @@ impl Desktop {
             text_in(s, Rect::new(r.x + 50, r.y, r.w - 50, r.h), name, 9, 0xFFFFFF, Align::Left);
         }
         text_in(s, Rect::new(m.x + 300, m.y + 10, 200, 24), "Aplicaciones", 8, 0xB5B5B5, Align::Left);
-        for (i, Launcher { name, icon, pic, .. }) in self.start_items.iter().enumerate() {
+        for (i, Launcher { name, icon, pic, .. }) in self.start_items.iter().enumerate().take(START_TILES) {
             let r = self.tile_rect(i);
             let bg = if self.hot == Hit::Tile(i) { lighten(self.theme.accent, 45) } else { self.theme.accent };
             s.fill_rect(r, bg);

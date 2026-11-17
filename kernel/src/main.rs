@@ -68,13 +68,31 @@ unsafe impl GlobalAlloc for Asignador {
 }
 
 /// Programas que trae el sistema (los compila `tools\programas.ps1` antes que el núcleo).
-const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[(
-    "Calculadora",
-    &[
-        ("app.txt", include_bytes!("../../programs/calculadora/app.txt")),
-        ("programa.nfx", include_bytes!("../../target/programas/Calculadora/programa.nfx")),
-    ],
-)];
+const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[
+    (
+        "Calculadora",
+        &[
+            ("app.txt", include_bytes!("../../programs/calculadora/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Calculadora/programa.nfx")),
+        ],
+    ),
+    (
+        "Reloj",
+        &[
+            ("app.txt", include_bytes!("../../programs/reloj/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Reloj/programa.nfx")),
+            ("icono.bmp", include_bytes!("../../programs/reloj/icono.bmp")),
+        ],
+    ),
+    (
+        "Paint",
+        &[
+            ("app.txt", include_bytes!("../../programs/paint/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Paint/programa.nfx")),
+            ("icono.bmp", include_bytes!("../../programs/paint/icono.bmp")),
+        ],
+    ),
+];
 
 #[global_allocator]
 static ASIGNADOR: Asignador = Asignador;
