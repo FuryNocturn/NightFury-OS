@@ -92,3 +92,10 @@ error). Se pierden `rcx` y `r11`. Contrato completo en `nf-core\src\abi.rs`.
 - El programa se compila **sin SSE** (así es el destino `x86_64-unknown-none`): los `f32`/`f64` van por
   software, algo más lentos pero correctos.
 - Un programa solo ve su propia memoria; si falla o se cuelga, el sistema lo termina sin caerse.
+
+## Licencia
+
+Los programas se enlazan con `nf-app` y `nf-core`, que son GPL-3.0. Si repartes a otros un programa hecho
+con este kit, también tiene que publicarse con la GPL-3.0 y con su código fuente, conservando el fichero
+`NOTICE` y el crédito "Basado en NightFury-OS de FuryNocturn" (ver `LICENSE` y `NOTICE`). Para uso
+propio, sin repartirlo, no hace falta nada.
