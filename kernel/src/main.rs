@@ -174,6 +174,9 @@ fn elegir_disco() -> Option<Box<dyn BlockDev>> {
         let mib = d.blocks() * BLOCK as u64 >> 20;
         let motivo = if Nffs::is_formatted(&mut *d) {
             "NightFury"
+        } else if nf_core::cryptdev::detect(&mut *d).is_some() {
+            // Cifrado total: el NFFS no se ve, pero la cabecera del último bloque es la nuestra.
+            "NightFury cifrado"
         } else if Nffs::is_blank(&mut *d) {
             "en blanco"
         } else {
