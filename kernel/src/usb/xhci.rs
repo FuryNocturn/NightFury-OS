@@ -492,6 +492,12 @@ impl Xhci {
         let _ = self.comando(trb_cmd(10, 0, slot, 0));
         unsafe { write_volatile(self.dcbaa.ptr::<u64>().add(slot as usize), 0) };
         super::masivo::quitado(self.id, slot);
+        for e in d.eps.iter().flatten() {
+            if let Uso::Mando(m) = &e.uso {
+                super::evento_mando(nf_core::gamepad::PadEvent::Removed(m.id));
+                traza!("NF usb: mando {} quitado", m.id);
+            }
+        }
         if d.padre.is_none() && self.puerto_slot[d.raiz as usize] == slot {
             self.puerto_slot[d.raiz as usize] = 0;
         }

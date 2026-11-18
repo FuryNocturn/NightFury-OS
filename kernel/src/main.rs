@@ -349,6 +349,7 @@ extern "C" fn kmain() -> ! {
     raton.set_wheel(con_rueda);
     let mut usb_teclado: Vec<u8> = Vec::new();
     let mut usb_raton: Vec<nf_core::input::MousePacket> = Vec::new();
+    let mut usb_mandos: Vec<nf_core::gamepad::PadEvent> = Vec::new();
     let mut unidades = unidades::Unidades::default();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
@@ -380,7 +381,7 @@ extern "C" fn kmain() -> ! {
             }
         }
         // USB: sondeo del xHCI; el teclado entra por el mismo decodificador que el PS/2.
-        usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton);
+        usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton, &mut usb_mandos);
         unidades.sondear(&mut plat.files, &mut plat.pool);
         for b in usb_teclado.drain(..) {
             if let Some(k) = teclado.feed(b) {
@@ -389,6 +390,9 @@ extern "C" fn kmain() -> ! {
         }
         for p in usb_raton.drain(..) {
             desk.event(Event::Mouse(p), &mut plat);
+        }
+        for e in usb_mandos.drain(..) {
+            desk.gamepad(e, &mut plat);
         }
         let t = arch::TICKS.load(Relaxed);
         if t != ultimo {

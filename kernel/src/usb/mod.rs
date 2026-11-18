@@ -22,6 +22,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use nf_core::gamepad::{Pad, PadEvent};
 use nf_core::input::MousePacket;
 use nf_core::usbhid::BootKeyboard;
 use nf_core::vol::SectorDev;
@@ -61,6 +62,30 @@ pub enum Uso {
     Hub,
     /// Almacenamiento masivo BOT (`masivo.rs`): solo reclama la interfaz; sus endpoints bulk llevan `Nada`.
     Masivo,
+    /// Mando de juego (HID o Xbox): el endpoint de interrupción IN lleva el controlador `Pad`.
+    Mando(Box<Mando>),
+}
+
+pub struct Mando {
+    pub pad: Pad,
+    /// Único mientras el sistema esté encendido.
+    pub id: u32,
+    pub iface: u8,
+    /// dci del endpoint de interrupción OUT, si la interfaz lo tiene (si no, SET_REPORT).
+    pub out: Option<u8>,
+}
+
+/// Siguiente id de mando: nunca se reutiliza.
+static ID_MANDO: AtomicU32 = AtomicU32::new(1);
+
+struct ColaMandos(UnsafeCell<Vec<PadEvent>>);
+// Un solo núcleo; solo el sondeo (bucle principal) la toca.
+unsafe impl Sync for ColaMandos {}
+static MANDOS: ColaMandos = ColaMandos(UnsafeCell::new(Vec::new()));
+
+/// Deja un evento de mando para `poll`.
+fn evento_mando(e: PadEvent) {
+    unsafe { &mut *MANDOS.0.get() }.push(e);
 }
 
 impl Uso {
@@ -177,10 +202,11 @@ pub fn init() -> usize {
 
 /// Procesa eventos, reencola transferencias y deja bytes set 1 del teclado y paquetes del ratón.
 // shortcut: sondeo sin MSI, pasar a MSI/APIC cuando llegue la red
-pub fn poll(now_ms: u64, teclado: &mut Vec<u8>, raton: &mut Vec<MousePacket>) {
+pub fn poll(now_ms: u64, teclado: &mut Vec<u8>, raton: &mut Vec<MousePacket>, mandos: &mut Vec<PadEvent>) {
     for x in unsafe { &mut *USB.0.get() }.iter_mut() {
         dev::servir(x, now_ms, teclado, raton);
     }
+    mandos.append(unsafe { &mut *MANDOS.0.get() });
 }
 
 // ---------- Discos (almacenamiento masivo) ----------

@@ -4,13 +4,19 @@
 //! Las clases se enchufan en `Uso::de` (qué interfaz reclaman), en `preparar` (qué piden al dispositivo
 //! antes de configurar) y en `atender` (qué hacen con cada transferencia terminada).
 use super::xhci::{intervalo, CfgEp, Error, Origen, Xhci, CCS, CSC};
-use super::{espera_ms, Plazo, Uso};
+use super::{espera_ms, evento_mando, Dma, Mando, Plazo, Uso, ID_MANDO};
 use crate::serial::traza;
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use nf_core::gamepad::{self, Detect, Pad, PadEvent, PadIface, PadInfo};
 use nf_core::input::MousePacket;
 use nf_core::usbhid::boot_mouse;
 
 type R<T> = Result<T, Error>;
+
+/// Hora (ms) del último `servir`: la usan los mandos que se configuran en medio de un sondeo.
+static AHORA: AtomicU64 = AtomicU64::new(0);
 
 struct EpD {
     addr: u8,
@@ -25,6 +31,8 @@ struct Iface {
     clase: u8,
     sub: u8,
     proto: u8,
+    /// Longitud del descriptor de informes HID (descriptor 0x21), 0 si no lo hay.
+    hid_len: u16,
     eps: Vec<EpD>,
 }
 
@@ -43,12 +51,17 @@ fn interfaces(cfg: &[u8]) -> Vec<Iface> {
             4 if l >= 9 => {
                 activa = d[3] == 0;
                 if activa {
-                    v.push(Iface { num: d[2], clase: d[5], sub: d[6], proto: d[7], eps: Vec::new() });
+                    v.push(Iface { num: d[2], clase: d[5], sub: d[6], proto: d[7], hid_len: 0, eps: Vec::new() });
                 }
             }
             5 if l >= 7 && activa => {
                 if let Some(f) = v.last_mut() {
                     f.eps.push(EpD { addr: d[2], attr: d[3], mps: u16::from_le_bytes([d[4], d[5]]), intervalo: d[6], rafaga: 0 });
+                }
+            }
+            0x21 if l >= 9 && activa => {
+                if let Some(f) = v.last_mut() {
+                    f.hid_len = u16::from_le_bytes([d[7], d[8]]);
                 }
             }
             // Companion de endpoint SuperSpeed: ráfaga máxima del endpoint anterior.
@@ -71,6 +84,7 @@ fn nombre(u: &Uso) -> &'static str {
         Uso::Raton => "raton",
         Uso::Hub => "hub",
         Uso::Masivo => "almacenamiento",
+        Uso::Mando(_) => "mando",
     }
 }
 
@@ -161,22 +175,39 @@ fn identificar(x: &mut Xhci, slot: u8) -> R<()> {
     let mut cfg = alloc::vec![0u8; total];
     let n = x.control(slot, 0x80, 6, 0x0200, 0, &mut cfg)?;
     cfg.truncate(n);
-    preparar(x, slot, c9[5], &cfg)
+    preparar(x, slot, c9[5], &cfg, vid, pid, d[15])
 }
 
 /// Reclama las interfaces conocidas: SET_CONFIGURATION, órdenes propias de cada clase, Configure Endpoint
 /// y primera lectura. Un dispositivo sin interfaces conocidas se deja direccionado, sin configurar.
-fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
+fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8], vid: u16, pid: u16, i_prod: u8) -> R<()> {
     let vel = x.dev(slot).ok_or(Error::Ausente)?.vel;
     let mut planes: Vec<(u8, CfgEp, Uso)> = Vec::new();
     // Interfaces de almacenamiento: (interfaz, dci bulk IN, dci bulk OUT, direcciones de los endpoints).
     let mut masivos: Vec<(u8, u8, u8, u8, u8)> = Vec::new();
+    let mut configurado = false;
     for f in interfaces(cfg) {
         if f.clase == 8 && f.proto == 0x62 {
             // UAS sin alternativa BOT en el ajuste 0 (con ella, `interfaces` ya ve la BOT): no se soporta.
             traza!("NF usb: ranura {}: interfaz {} es UAS sin alternativa BOT, se ignora", slot, f.num);
         }
-        let Some(uso) = Uso::de(f.clase, f.sub, f.proto) else { continue };
+        let mut out_plan = None;
+        let uso = match mando_de(x, slot, &f, vid, pid, valor_cfg, &mut configurado) {
+            Some(pad) => {
+                let out = f.eps.iter().find(|e| e.attr & 3 == 3 && e.addr & 0x80 == 0);
+                let out_dci = out.map(|e| (e.addr & 0xF) * 2).filter(|d| *d > 1);
+                if let (Some(e), Some(d)) = (out, out_dci) {
+                    let rafaga = if vel >= 4 { e.rafaga } else { (e.mps >> 11 & 3) as u8 };
+                    out_plan = Some(CfgEp { dci: d, tipo: 3, mps: e.mps & 0x7FF, intervalo: intervalo(vel, e.intervalo), rafaga });
+                }
+                let id = ID_MANDO.fetch_add(1, Relaxed);
+                Uso::Mando(alloc::boxed::Box::new(Mando { pad, id, iface: f.num, out: out_dci }))
+            }
+            None => match Uso::de(f.clase, f.sub, f.proto) {
+                Some(u) => u,
+                None => continue,
+            },
+        };
         if let Uso::Masivo = uso {
             let bulk = |dir_in: bool| f.eps.iter().find(|e| e.attr & 3 == 2 && (e.addr & 0x80 != 0) == dir_in);
             let (Some(ei), Some(eo)) = (bulk(true), bulk(false)) else {
@@ -201,12 +232,17 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
         }
         let rafaga = if vel >= 4 { e.rafaga } else { (e.mps >> 11 & 3) as u8 };
         planes.push((f.num, CfgEp { dci, tipo: 7, mps: e.mps & 0x7FF, intervalo: intervalo(vel, e.intervalo), rafaga }, uso));
+        if let Some(c) = out_plan.filter(|c| !planes.iter().any(|p| p.1.dci == c.dci)) {
+            planes.push((f.num, c, Uso::Nada));
+        }
     }
     if planes.is_empty() {
         traza!("NF usb: ranura {}: ninguna interfaz conocida", slot);
         return Ok(());
     }
-    x.control(slot, 0, 9, valor_cfg as u16, 0, &mut [])?;
+    if !configurado {
+        x.control(slot, 0, 9, valor_cfg as u16, 0, &mut [])?;
+    }
     let mut hub = None;
     let mut espera_hub = 0;
     for (num, _, uso) in &planes {
@@ -229,12 +265,17 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
                 hub = Some((h[2], if vel >= 4 { 0 } else { h[3] >> 5 & 3 }));
                 espera_hub = h[5] as u64 * 2;
             }
+            Uso::Mando(_) => {
+                // Sin protocolo de arranque (el mando usa su descriptor); solo sin repeticiones por silencio.
+                let _ = x.control(slot, 0x21, 0x0A, 0, *num as u16, &mut []);
+            }
             Uso::Nada | Uso::Masivo => {}
         }
     }
     // Solo los endpoints de interrupción se arman: los bulk los usa `masivo` bajo demanda.
     let dcis: Vec<(u8, bool)> = planes.iter().filter(|p| p.1.tipo == 7).map(|p| (p.1.dci, matches!(p.2, Uso::Hub))).collect();
     let nombres: Vec<&str> = planes.iter().map(|p| nombre(&p.2)).collect();
+    let mandos: Vec<u8> = planes.iter().filter(|p| matches!(p.2, Uso::Mando(_))).map(|p| p.1.dci).collect();
     x.configurar(slot, planes.into_iter().map(|(_, c, u)| (c, u)).collect(), hub)?;
     traza!("NF usb: ranura {} configurada: {:?}{}", slot, nombres, hub.map_or(alloc::string::String::new(), |h| alloc::format!(" ({} puertos)", h.0)));
     for (dci, es_hub) in dcis {
@@ -246,7 +287,89 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
     for (num, di, d_o, ai, ao) in masivos {
         super::masivo::alta(x, slot, num, (di, ai), (d_o, ao));
     }
+    for dci in mandos {
+        mando_alta(x, slot, dci, i_prod);
+    }
     Ok(())
+}
+
+/// ¿Esta interfaz es un mando? Teclados/ratones de arranque, hubs y almacenamiento ni se consultan.
+/// Para un HID desconocido se lee su descriptor de informes (con el dispositivo ya configurado).
+fn mando_de(x: &mut Xhci, slot: u8, f: &Iface, vid: u16, pid: u16, valor_cfg: u8, configurado: &mut bool) -> Option<Pad> {
+    if matches!((f.clase, f.sub, f.proto), (3, 1, 1 | 2) | (9, ..) | (8, ..)) {
+        return None;
+    }
+    match gamepad::detect(&PadIface { vid, pid, class: f.clase, sub: f.sub, proto: f.proto }) {
+        Detect::No => None,
+        Detect::Pad(p) => Some(p),
+        Detect::NeedsDescriptor => {
+            if !*configurado {
+                x.control(slot, 0, 9, valor_cfg as u16, 0, &mut []).ok()?;
+                *configurado = true;
+            }
+            let mut d = alloc::vec![0u8; if f.hid_len > 0 { (f.hid_len as usize).min(4096) } else { 1024 }];
+            let n = x.control(slot, 0x81, 6, 0x2200, f.num as u16, &mut d).ok()?;
+            d.truncate(n);
+            Pad::from_descriptor(&d)
+        }
+    }
+}
+
+/// Cadena de producto del dispositivo (inglés de EE. UU.), recortada a 64 caracteres.
+fn cadena(x: &mut Xhci, slot: u8, idx: u8) -> Option<String> {
+    if idx == 0 {
+        return None;
+    }
+    let mut b = [0u8; 255];
+    let n = x.control(slot, 0x80, 6, 0x0300 | idx as u16, 0x0409, &mut b).ok()?.min(255);
+    let l = (b[0] as usize).min(n);
+    if l < 4 || b[1] != 3 {
+        return None;
+    }
+    let u = b[2..l].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+    let s: String = char::decode_utf16(u).map(|c| c.unwrap_or('?')).take(64).collect();
+    (!s.trim().is_empty()).then_some(s)
+}
+
+/// Mando recién configurado: nombre, saludo inicial y aviso al escritorio.
+fn mando_alta(x: &mut Xhci, slot: u8, dci: u8, i_prod: u8) {
+    let nombre = cadena(x, slot, i_prod);
+    let now = AHORA.load(Relaxed);
+    let Some(Uso::Mando(m)) = x.ep_mut(slot, dci).map(|e| &mut e.uso) else { return };
+    let nombre = nombre.unwrap_or_else(|| String::from(m.pad.default_name()));
+    let kind = m.pad.kind();
+    let (id, iface, out) = (m.id, m.iface, m.out);
+    let salidas = m.pad.start(now);
+    traza!("NF usb: mando {} «{}» ({:?})", id, nombre, kind);
+    evento_mando(PadEvent::Connected(PadInfo { id, kind, name: nombre }));
+    enviar(x, slot, iface, out, salidas);
+}
+
+/// Manda informes de salida a un mando: por su endpoint de interrupción OUT o, si no tiene, por SET_REPORT.
+/// Espera poco (el sondeo no puede quedarse parado); si falla, traza y sigue.
+fn enviar(x: &mut Xhci, slot: u8, iface: u8, out: Option<u8>, salidas: Vec<Vec<u8>>) {
+    for mut s in salidas.into_iter().filter(|s| !s.is_empty()) {
+        let r = match out {
+            Some(dci) => match Dma::nuevo(s.len(), 64) {
+                Some(b) => {
+                    unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), b.ptr::<u8>(), s.len()) };
+                    let r = x.normal(slot, dci, b.dir(), s.len(), false).and_then(|_| x.esperar(slot, dci, 20));
+                    if matches!(r, Err(Error::Tiempo)) {
+                        x.abortar(slot, dci);
+                    }
+                    r.map(|_| ())
+                }
+                None => Err(Error::Datos),
+            },
+            None => {
+                let v = 0x0200 | s[0] as u16;
+                x.control(slot, 0x21, 9, v, iface as u16, &mut s).map(|_| ())
+            }
+        };
+        if let Err(e) = r {
+            traza!("NF usb: ranura {}: no se pudo enviar al mando ({:?})", slot, e);
+        }
+    }
 }
 
 // ---------- Hubs ----------
@@ -352,11 +475,22 @@ fn atender(x: &mut Xhci, slot: u8, dci: u8, ahora: u64, tec: &mut Vec<u8>, rat: 
         None => {}
         Some(Ok(datos)) => {
             let mut hub = false;
+            let mut salida = None;
             match x.ep_mut(slot, dci).map(|e| &mut e.uso) {
                 Some(Uso::Teclado(kb)) => kb.feed(&datos, ahora, tec),
                 Some(Uso::Raton) => rat.extend(boot_mouse(&datos)),
                 Some(Uso::Hub) => hub = true,
+                Some(Uso::Mando(m)) => {
+                    let (st, sal) = m.pad.feed(&datos, ahora);
+                    if let Some(s) = st {
+                        evento_mando(PadEvent::State(m.id, s));
+                    }
+                    salida = Some((m.iface, m.out, sal));
+                }
                 _ => {}
+            }
+            if let Some((iface, out, sal)) = salida {
+                enviar(x, slot, iface, out, sal);
             }
             if hub {
                 // Mapa de bits: bit n = el puerto n ha cambiado.
@@ -384,6 +518,7 @@ fn atender(x: &mut Xhci, slot: u8, dci: u8, ahora: u64, tec: &mut Vec<u8>, rat: 
 
 /// Un paso de sondeo de un controlador.
 pub fn servir(x: &mut Xhci, ahora: u64, tec: &mut Vec<u8>, rat: &mut Vec<MousePacket>) {
+    AHORA.store(ahora, Relaxed);
     x.eventos();
     while let Some(p) = x.psc.pop() {
         if (1..=x.npuertos).contains(&p) {
@@ -393,11 +528,22 @@ pub fn servir(x: &mut Xhci, ahora: u64, tec: &mut Vec<u8>, rat: &mut Vec<MousePa
     for (slot, dci) in x.completados() {
         atender(x, slot, dci, ahora, tec, rat);
     }
+    let mut salidas = Vec::new();
     for d in x.devs.iter_mut().flatten() {
         for e in d.eps.iter_mut().flatten() {
-            if let Uso::Teclado(kb) = &mut e.uso {
-                kb.tick(ahora, tec);
+            match &mut e.uso {
+                Uso::Teclado(kb) => kb.tick(ahora, tec),
+                Uso::Mando(m) => {
+                    let s = m.pad.tick(ahora);
+                    if !s.is_empty() {
+                        salidas.push((d.slot, m.iface, m.out, s));
+                    }
+                }
+                _ => {}
             }
         }
+    }
+    for (slot, iface, out, s) in salidas {
+        enviar(x, slot, iface, out, s);
     }
 }
