@@ -3,7 +3,31 @@
 version = 4
 
 [[package]]
+name = "bloc-notas"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
 name = "calculadora"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
+name = "configuracion"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
+name = "explorador"
 version = "1.0.0"
 dependencies = [
  "nf-app",
@@ -69,6 +93,14 @@ dependencies = [
 
 [[package]]
 name = "reloj"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
+name = "terminal"
 version = "1.0.0"
 dependencies = [
  "nf-app",

@@ -92,6 +92,35 @@ const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[
             ("icono.bmp", include_bytes!("../../programs/paint/icono.bmp")),
         ],
     ),
+    // v0.10: las apps que antes iban dentro del núcleo.
+    (
+        "Bloc de notas",
+        &[
+            ("app.txt", include_bytes!("../../programs/bloc-notas/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Bloc de notas/programa.nfx")),
+        ],
+    ),
+    (
+        "Terminal",
+        &[
+            ("app.txt", include_bytes!("../../programs/terminal/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Terminal/programa.nfx")),
+        ],
+    ),
+    (
+        "Configuración",
+        &[
+            ("app.txt", include_bytes!("../../programs/configuracion/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Configuración/programa.nfx")),
+        ],
+    ),
+    (
+        "Explorador de archivos",
+        &[
+            ("app.txt", include_bytes!("../../programs/explorador/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Explorador de archivos/programa.nfx")),
+        ],
+    ),
 ];
 
 #[global_allocator]

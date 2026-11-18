@@ -1,0 +1,6 @@
+nombre=Configuración
+version=1.0
+autor=NightFury
+icono=ajustes
+ancho=780
+alto=520
