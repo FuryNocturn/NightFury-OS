@@ -62,6 +62,12 @@ pub enum Icon {
     DiscoSeguro,
     /// Administrador de tareas: panel con barras de uso.
     Tareas,
+    /// Pendrive (unidad extraíble).
+    Usb,
+    /// Pendrive con candado (unidad extraíble cifrada).
+    UsbSeguro,
+    /// Este equipo: pantalla sobre una base.
+    Equipo,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -440,6 +446,30 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             cell(s, o, k, (12.0, 9.0, 13.0, 12.0), ROJO);
             cell(s, o, k, (3.0, 12.4, 13.0, 12.8), GRIS);
         }
+        Icon::Usb | Icon::UsbSeguro => {
+            // Pendrive: conector metálico con dos agujeros y cuerpo azul con una ranura de anilla.
+            cell(s, o, k, (6.0, 1.0, 10.0, 6.0), rgb(0xB9, 0xBE, 0xC5));
+            cell(s, o, k, (6.8, 2.0, 7.6, 3.4), OSCURO);
+            cell(s, o, k, (8.4, 2.0, 9.2, 3.4), OSCURO);
+            cell(s, o, k, (5.0, 6.0, 11.0, 15.0), AZUL);
+            cell(s, o, k, (5.0, 6.0, 11.0, 7.0), rgb(0x5B, 0x98, 0xEA));
+            cell(s, o, k, (7.4, 12.6, 8.6, 13.6), CLARO);
+            if icon == Icon::UsbSeguro {
+                cell(s, o, k, (8.0, 9.0, 15.0, 15.5), rgb(0xE0, 0x9F, 0x1E));
+                cell(s, o, k, (9.0, 7.0, 10.0, 9.0), OSCURO);
+                cell(s, o, k, (13.0, 7.0, 14.0, 9.0), OSCURO);
+                cell(s, o, k, (9.0, 6.2, 14.0, 7.2), OSCURO);
+                cell(s, o, k, (11.0, 11.4, 12.0, 13.4), OSCURO);
+            }
+        }
+        Icon::Equipo => {
+            // Pantalla con marco oscuro sobre un pie y una base.
+            cell(s, o, k, (1.0, 2.0, 15.0, 11.0), OSCURO);
+            cell(s, o, k, (2.0, 3.0, 14.0, 10.0), rgb(0x8F, 0xBE, 0xF0));
+            cell(s, o, k, (2.0, 3.0, 14.0, 5.0), rgb(0xB5, 0xD3, 0xF6));
+            cell(s, o, k, (7.0, 11.0, 9.0, 13.0), GRIS);
+            cell(s, o, k, (4.0, 13.0, 12.0, 14.5), GRIS);
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -456,7 +486,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 44] = [
+    const ALL: [Icon; 47] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -501,6 +531,9 @@ mod tests {
         Icon::Cuentas,
         Icon::DiscoSeguro,
         Icon::Tareas,
+        Icon::Usb,
+        Icon::UsbSeguro,
+        Icon::Equipo,
     ];
     const SENT: u32 = 0x123456;
 

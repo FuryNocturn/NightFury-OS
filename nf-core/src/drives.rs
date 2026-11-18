@@ -53,6 +53,32 @@ pub enum DriveAction {
     Encrypt { disk: u32, label: String, password: String },
 }
 
+impl DriveInfo {
+    /// Nombre que ven los usuarios: «Disco local (C:)», «Etiqueta (D:)» o «Unidad USB (D:)».
+    pub fn name(&self) -> String {
+        let l = self.letter;
+        match (self.removable, self.label.is_empty()) {
+            (false, _) => alloc::format!("Disco local ({l}:)"),
+            (true, true) => alloc::format!("Unidad USB ({l}:)"),
+            (true, false) => alloc::format!("{} ({l}:)", self.label),
+        }
+    }
+}
+
+/// Nombre del sistema de archivos para mostrar.
+pub fn kind_name(k: FsKind) -> &'static str {
+    match k {
+        FsKind::Fat12 => "FAT12",
+        FsKind::Fat16 => "FAT16",
+        FsKind::Fat32 => "FAT32",
+        FsKind::ExFat => "exFAT",
+        FsKind::Iso9660 => "ISO 9660",
+        FsKind::Udf => "UDF",
+        FsKind::NightFury => "NightFury",
+        FsKind::Unknown => "Formato no compatible",
+    }
+}
+
 /// Unidad cifrada esperando contraseña (la guarda `Files`).
 pub struct Locked {
     pub disk: u32,

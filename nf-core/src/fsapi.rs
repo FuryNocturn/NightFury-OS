@@ -6,6 +6,7 @@
 //! viaje al sistema. Las fechas, sales y el acumulador de aleatoriedad que piden algunas llamadas
 //! solo valen en `Files`: por el servicio los pone el sistema.
 use crate::accounts::{Account, AccountError};
+use crate::drives::{DriveInfo, FormatRequest};
 use crate::files::{self, Files, Std, TrashItem};
 use crate::fs::{Entry, FsError};
 use crate::keys::{KeyError, Pool};
@@ -102,4 +103,9 @@ api! {
     fn encrypt_home(&mut self, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError>;
     fn decrypt_home(&mut self, password: &str, now: DateTime) -> Result<(), KeyError>;
     fn new_home_recovery(&mut self, password: &str, pool: &mut Pool, now: DateTime) -> Result<String, KeyError>;
+    // ---- Unidades extraíbles (v0.11): `drives` lo puede pedir cualquiera; lo demás, solo el sistema ----
+    fn drives(&mut self) -> Vec<DriveInfo>;
+    fn unlock_drive(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError>;
+    fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError>;
+    fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>>;
 }

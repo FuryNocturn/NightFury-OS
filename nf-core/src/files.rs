@@ -28,8 +28,10 @@ use crate::cryptdev::{self, Core, CryptDev, Header, State};
 use crate::crypto::wipe;
 use crate::fs::{same, Entry, FsError, Nffs};
 use crate::homecrypt::{self, HState, KeyFile, Keys};
+use crate::drives::{DriveAction, DriveInfo, FormatRequest, Locked};
 use crate::keys::{self, KeyError, Pool};
 use crate::platform::DateTime;
+use crate::vol::{LockedDrive, Volume};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -41,6 +43,8 @@ use alloc::vec::Vec;
 
 /// Ubicación especial que el Explorador muestra como la Papelera (no es una ruta de disco).
 pub const TRASH: &str = "Papelera";
+/// Ubicación especial que el Explorador muestra como «Este equipo» (las unidades; no es una ruta).
+pub const COMPUTER: &str = "Este equipo";
 
 // ---- Estructura del disco (v0.5.0). Ningún otro módulo escribe estas rutas a mano. ----
 pub const USERS_DIR: &str = "C:\\Usuarios";
@@ -153,7 +157,7 @@ pub fn parent(path: &str) -> Option<String> {
     }
     match path.rfind('\\') {
         Some(i) if i > 2 => Some(String::from(&path[..i])),
-        Some(_) => Some(String::from("C:\\")),
+        Some(_) => Some(format!("{}:\\", &path[..1])),
         None => None,
     }
 }
@@ -179,16 +183,14 @@ pub fn valid_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control() || "\\/:*?\"<>|".contains(c))
 }
 
-/// Quita la letra de unidad si la hay. Devuelve (resto, tenía_unidad).
-fn strip_drive(s: &str) -> Result<(&str, bool), FsError> {
+/// Quita la letra de unidad si la hay. Devuelve (resto, letra en mayúscula). Que la unidad exista
+/// lo comprueba cada operación de `Files`, no la ruta.
+fn strip_drive(s: &str) -> Result<(&str, Option<char>), FsError> {
     let b = s.as_bytes();
     if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
-        if b[0].to_ascii_uppercase() != b'C' {
-            return Err(FsError::BadPath);
-        }
-        return Ok((&s[2..], true));
+        return Ok((&s[2..], Some(b[0].to_ascii_uppercase() as char)));
     }
-    Ok((s, false))
+    Ok((s, None))
 }
 
 fn apply<'a>(stack: &mut Vec<&'a str>, s: &'a str) -> Result<(), FsError> {
@@ -210,12 +212,13 @@ fn apply<'a>(stack: &mut Vec<&'a str>, s: &'a str) -> Result<(), FsError> {
 /// relativas a `cwd`, ".", "..", "/" como separador y letra de unidad en mayúscula o minúscula.
 pub fn resolve(cwd: &str, input: &str) -> Result<String, FsError> {
     let (rest, drive) = strip_drive(input)?;
+    let (cwd_rest, cwd_drive) = strip_drive(cwd)?;
     let mut stack = Vec::new();
-    if !drive && !rest.starts_with(['\\', '/']) {
-        apply(&mut stack, strip_drive(cwd)?.0)?;
+    if drive.is_none() && !rest.starts_with(['\\', '/']) {
+        apply(&mut stack, cwd_rest)?;
     }
     apply(&mut stack, rest)?;
-    let mut out = String::from("C:\\");
+    let mut out = format!("{}:\\", drive.or(cwd_drive).unwrap_or('C'));
     out.push_str(&stack.join("\\"));
     Ok(out)
 }
@@ -224,7 +227,7 @@ pub fn resolve(cwd: &str, input: &str) -> Result<String, FsError> {
 fn canon(path: &str) -> Result<String, FsError> {
     let c = resolve("C:\\", path)?;
     // La Papelera de la estructura antigua (huérfana hasta que una cuenta la adopta) no se toca.
-    if same(first(rel(&c)), LEGACY_STORE) {
+    if is_c(&c) && same(first(rel(&c)), LEGACY_STORE) {
         return Err(FsError::BadPath);
     }
     Ok(c)
@@ -232,13 +235,24 @@ fn canon(path: &str) -> Result<String, FsError> {
 
 /// ¿Está `path` dentro de `C:\Sistema` (o es esa carpeta)? Para que las apps pidan confirmación.
 pub fn in_system(path: &str) -> bool {
-    resolve("C:\\", path).is_ok_and(|c| same(first(rel(&c)), SYSTEM))
+    resolve("C:\\", path).is_ok_and(|c| is_c(&c) && same(first(rel(&c)), SYSTEM))
 }
 
 /// ¿Es una carpeta que no se puede eliminar, mover ni renombrar? (raíz, `Usuarios`, `Sistema` y
-/// sus subcarpetas, la carpeta de cada cuenta y sus carpetas estándar, `.config` y `.papelera`).
+/// sus subcarpetas, la carpeta de cada cuenta y sus carpetas estándar, `.config` y `.papelera`). En
+/// las demás unidades solo lo es la raíz.
 pub fn is_protected(path: &str) -> bool {
-    resolve("C:\\", path).is_ok_and(|c| protected(rel(&c)))
+    resolve("C:\\", path).is_ok_and(|c| protected(rel(&c)) && (is_c(&c) || rel(&c).is_empty()))
+}
+
+/// ¿Es una ruta canónica de la unidad C:?
+fn is_c(canon: &str) -> bool {
+    canon.starts_with('C')
+}
+
+/// Letra de una ruta canónica que no es de C: (unidad extraíble).
+fn ext(canon: &str) -> Option<char> {
+    (!is_c(canon)).then(|| canon.as_bytes()[0] as char)
 }
 
 /// Ruta relativa a la raíz de una ruta canónica.
@@ -375,6 +389,24 @@ pub struct Files {
     disk: DiskState,
     /// Cifrado de la carpeta de la sesión abierta (llaves, estado y conversión).
     hc: Home,
+    /// Unidades extraíbles D:, E:… (v0.11).
+    xd: XDrives,
+}
+
+/// Una unidad conectada: abierta (`vol`) o cifrada esperando contraseña (`locked`).
+struct XDrive {
+    letter: char,
+    disk: u32,
+    device: String,
+    vol: Option<Box<dyn Volume>>,
+    locked: Option<LockedDrive>,
+}
+
+#[derive(Default)]
+struct XDrives {
+    list: Vec<XDrive>,
+    actions: Vec<DriveAction>,
+    result: Option<Result<Option<String>, FsError>>,
 }
 
 impl Default for Files {
@@ -386,7 +418,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default() }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -415,7 +447,7 @@ impl Files {
             // Con NFFS dañado no se formatea nunca: se deja el disco como está.
             return match Nffs::mount(dev) {
                 Ok(fs) => {
-                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default() };
+                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() };
                     f.startup(now);
                     f
                 }
@@ -432,7 +464,7 @@ impl Files {
     /// Para herramientas (nfdisk): trabaja sobre un volumen NFFS ya montado, tal cual: sin arranque
     /// (no crea ni migra nada), sin sesión (hay que usar `login`) y con las reglas de siempre.
     pub fn on_volume(fs: Nffs) -> Files {
-        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default() }
+        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() }
     }
 
     /// ¿Se guarda en un disco de verdad?
@@ -545,6 +577,11 @@ impl Files {
     /// empieza por punto (`.config`, `.papelera`). En `Usuarios`, un usuario normal solo ve la suya.
     pub fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
         let c = canon(dir)?;
+        if let Some(l) = ext(&c) {
+            let mut v = self.vol(l)?.list(rel(&c))?;
+            v.sort_by_cached_key(|e| (!e.dir, lower(&e.name)));
+            return Ok(v);
+        }
         self.guard(rel(&c), false)?;
         let mut v = self.r_list(rel(&c))?;
         let depth = comps(rel(&c)).len();
@@ -564,6 +601,9 @@ impl Files {
 
     pub fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
         let c = canon(path)?;
+        if let Some(l) = ext(&c) {
+            return self.v_stat(l, rel(&c));
+        }
         self.guard(rel(&c), false)?;
         self.r_stat(rel(&c))
     }
@@ -574,6 +614,9 @@ impl Files {
 
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
         let c = canon(path)?;
+        if let Some(l) = ext(&c) {
+            return if rel(&c).is_empty() { Err(FsError::IsDir) } else { self.vol(l)?.read(rel(&c)) };
+        }
         self.guard(rel(&c), false)?;
         self.r_read(rel(&c))
     }
@@ -583,6 +626,10 @@ impl Files {
         let c = canon(path)?;
         if rel(&c).is_empty() {
             return Err(FsError::IsDir);
+        }
+        if let Some(l) = ext(&c) {
+            self.generation += 1;
+            return self.vol(l)?.write(rel(&c), data, now);
         }
         self.guard(rel(&c), true)?;
         self.generation += 1;
@@ -594,14 +641,22 @@ impl Files {
         if rel(&c).is_empty() {
             return Err(FsError::Exists);
         }
+        if let Some(l) = ext(&c) {
+            self.generation += 1;
+            return self.vol(l)?.mkdir(rel(&c), now);
+        }
         self.guard(rel(&c), true)?;
         self.generation += 1;
         self.r_mkdir(rel(&c), now)
     }
 
-    /// Mueve o renombra. Falla con `Exists` si el destino existe.
+    /// Mueve o renombra. Falla con `Exists` si el destino existe. En las unidades extraíbles solo
+    /// dentro de la misma unidad (`Invalid` entre dos: para eso está `transfer`, que copia y borra).
     pub fn rename(&mut self, from: &str, to: &str) -> Result<(), FsError> {
         let (f, t) = (canon(from)?, canon(to)?);
+        if ext(&f).is_some() || ext(&t).is_some() {
+            return self.rename_x(&f, &t);
+        }
         if protected(rel(&f)) {
             return Err(FsError::Invalid);
         }
@@ -617,6 +672,9 @@ impl Files {
     /// Copia un archivo o una carpeta entera. Falla con `Exists` si el destino existe.
     pub fn copy(&mut self, from: &str, to: &str, now: DateTime) -> Result<(), FsError> {
         let (f, t) = (canon(from)?, canon(to)?);
+        if ext(&f).is_some() || ext(&t).is_some() {
+            return self.copy_x(&f, &t, now);
+        }
         let (f, t) = (rel(&f), rel(&t));
         self.guard(f, false)?;
         self.guard(t, true)?;
@@ -700,8 +758,12 @@ impl Files {
     /// Borrado definitivo; las carpetas, con todo su contenido.
     pub fn delete(&mut self, path: &str) -> Result<(), FsError> {
         let c = canon(path)?;
-        if protected(rel(&c)) {
+        if is_protected(&c) {
             return Err(FsError::Invalid);
+        }
+        if let Some(l) = ext(&c) {
+            self.generation += 1;
+            return self.v_rm_tree(l, rel(&c));
         }
         self.guard(rel(&c), true)?;
         self.generation += 1;
@@ -709,7 +771,16 @@ impl Files {
     }
 
     fn free_rel(&mut self, dir: &str, name: &str) -> String {
-        if self.r_stat(&join_rel(dir, name)).is_err() {
+        self.free_in(None, dir, name)
+    }
+
+    /// Nombre libre en `dir` (relativo) de C: (`l` = `None`) o de la unidad extraíble `l`.
+    fn free_in(&mut self, l: Option<char>, dir: &str, name: &str) -> String {
+        let taken = |s: &mut Files, n: &str| match l {
+            Some(l) => s.v_stat(l, &join_rel(dir, n)).is_ok(),
+            None => s.r_stat(&join_rel(dir, n)).is_ok(),
+        };
+        if !taken(self, name) {
             return String::from(name);
         }
         let (stem, ext) = match name.rfind('.') {
@@ -719,7 +790,7 @@ impl Files {
         let mut n = 2;
         loop {
             let cand = format!("{stem} ({n}){ext}");
-            if self.r_stat(&join_rel(dir, &cand)).is_err() {
+            if !taken(self, &cand) {
                 return cand;
             }
             n += 1;
@@ -729,7 +800,7 @@ impl Files {
     /// Nombre libre en `dir` parecido a `name`: "nota.txt", "nota (2).txt", "nota (3).txt"...
     pub fn free_name(&mut self, dir: &str, name: &str) -> String {
         match canon(dir) {
-            Ok(c) => self.free_rel(rel(&c), name),
+            Ok(c) => self.free_in(ext(&c), rel(&c), name),
             Err(_) => String::from(name),
         }
     }
@@ -786,9 +857,13 @@ impl Files {
     }
 
     /// Envía un archivo o carpeta a la Papelera del usuario de la sesión (también lo que está
-    /// fuera de su carpeta, p. ej. en `C:\` si es administrador).
+    /// fuera de su carpeta, p. ej. en `C:\` si es administrador). Las unidades extraíbles no tienen
+    /// Papelera: allí borra definitivamente (como Windows).
     pub fn trash(&mut self, path: &str, now: DateTime) -> Result<(), FsError> {
         let c = canon(path)?;
+        if ext(&c).is_some() {
+            return self.delete(&c);
+        }
         let r = rel(&c);
         if protected(r) {
             return Err(FsError::Invalid);
@@ -932,12 +1007,16 @@ impl Files {
                 continue;
             }
             let dest = join(dir, &self.free_name(dir, file_name(src)));
-            let r = if mv { self.rename(src, &dest) } else { self.copy(src, &dest, now) };
+            let cross = mv && letter(src) != letter(&dest);
+            let r = if cross { self.move_across(src, &dest, now) } else if mv { self.rename(src, &dest) } else { self.copy(src, &dest, now) };
             if let Err(e) = r {
                 err = Some(e);
                 break;
             }
-            done.push(if mv { Undo::Move { from: src.clone(), to: dest.clone() } } else { Undo::Created(dest.clone()) });
+            // shortcut: mover entre unidades no se puede deshacer; al nacer de copiar y borrar, volver sería otra copia larga. Si hace falta, `Undo::MoveAcross`.
+            if !cross {
+                done.push(if mv { Undo::Move { from: src.clone(), to: dest.clone() } } else { Undo::Created(dest.clone()) });
+            }
             out.push(dest);
         }
         if !done.is_empty() {
@@ -968,7 +1047,10 @@ impl Files {
                 err = Some(e);
                 break;
             }
-            done.push(Undo::Trashed(p.clone()));
+            // shortcut: lo borrado de una unidad extraíble no va a la Papelera y no se deshace.
+            if letter(p) == 'C' {
+                done.push(Undo::Trashed(p.clone()));
+            }
         }
         if !done.is_empty() {
             self.undo = Some((done, "Eliminar"));
@@ -2688,44 +2770,241 @@ fn lower(s: &str) -> String {
 
 // ---- Unidades extraíbles D:, E:… (contrato v0.11; ver `drives`) ----
 
+/// Letra de unidad de lo que escribe una app (`C` si la ruta no vale).
+fn letter(path: &str) -> char {
+    resolve("C:\\", path).map_or('C', |c| c.as_bytes()[0] as char)
+}
+
 impl Files {
+    /// Volumen abierto de la unidad `l`: `BadPath` si no existe, `Denied` si está cifrada sin abrir.
+    fn vol(&mut self, l: char) -> Result<&mut dyn Volume, FsError> {
+        let d = self.xd.list.iter_mut().find(|d| d.letter == l).ok_or(FsError::BadPath)?;
+        match d.vol.as_mut() {
+            Some(v) => Ok(&mut **v),
+            None => Err(FsError::Denied),
+        }
+    }
+
+    fn v_stat(&mut self, l: char, r: &str) -> Result<Entry, FsError> {
+        let v = self.vol(l)?;
+        if r.is_empty() {
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default() });
+        }
+        v.stat(r)
+    }
+
+    /// Borra `r` y todo lo que contiene en la unidad `l` (las comprueba quien llama).
+    fn v_rm_tree(&mut self, l: char, r: &str) -> Result<(), FsError> {
+        let v = self.vol(l)?;
+        let mut order = Vec::new();
+        let mut stack = vec![String::from(r)];
+        while let Some(p) = stack.pop() {
+            if v.stat(&p)?.dir {
+                for e in v.list(&p)? {
+                    stack.push(join_rel(&p, &e.name));
+                }
+            }
+            order.push(p);
+        }
+        for p in order.iter().rev() {
+            v.delete(p)?;
+        }
+        Ok(())
+    }
+
+    /// `rename` cuando alguna ruta es de una unidad extraíble (canónicas).
+    fn rename_x(&mut self, f: &str, t: &str) -> Result<(), FsError> {
+        for p in [f, t] {
+            if let Some(l) = ext(p) {
+                self.vol(l)?;
+            }
+        }
+        let l = ext(f).filter(|l| ext(t) == Some(*l)).ok_or(FsError::Invalid)?;
+        let (rf, rt) = (lower(rel(f)), lower(rel(t)));
+        if rf.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        if rt.is_empty() {
+            return Err(FsError::Exists);
+        }
+        if rt.len() > rf.len() && rt.starts_with(&rf) && rt.as_bytes()[rf.len()] == b'\\' {
+            return Err(FsError::Invalid);
+        }
+        if rf != rt && self.v_stat(l, rel(t)).is_ok() {
+            return Err(FsError::Exists);
+        }
+        self.generation += 1;
+        self.vol(l)?.rename(rel(f), rel(t))
+    }
+
+    /// `copy` cuando alguna ruta es de una unidad extraíble (canónicas): recorre el árbol leyendo de
+    /// un lado y escribiendo en el otro con las operaciones públicas, así cada lado aplica sus reglas.
+    fn copy_x(&mut self, f: &str, t: &str, now: DateTime) -> Result<(), FsError> {
+        let src = self.stat(f)?;
+        let (lf, lt) = (lower(f), lower(t));
+        let inside = lt.len() > lf.len() && lt.starts_with(&lf) && (is_root(f) || lt.as_bytes()[lf.len()] == b'\\');
+        if src.dir && inside {
+            return Err(FsError::Invalid);
+        }
+        if is_root(t) || self.stat(t).is_ok() {
+            return Err(FsError::Exists);
+        }
+        self.generation += 1;
+        let r = self.copy_nodes(f, t, now);
+        if r.is_err() {
+            let _ = self.delete(t);
+        }
+        r
+    }
+
+    fn copy_nodes(&mut self, f: &str, t: &str, now: DateTime) -> Result<(), FsError> {
+        let mut work = vec![(String::from(f), String::from(t))];
+        while let Some((s, d)) = work.pop() {
+            if self.stat(&s)?.dir {
+                self.mkdir(&d, now)?;
+                for e in self.list(&s)? {
+                    work.push((join(&s, &e.name), join(&d, &e.name)));
+                }
+            } else {
+                let data = self.read(&s)?;
+                self.write(&d, &data, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mover entre dos unidades distintas: copia y luego borra el origen. Si el borrado falla se
+    /// deja la copia (borrarla podría perder lo que quede del origen).
+    fn move_across(&mut self, from: &str, to: &str, now: DateTime) -> Result<(), FsError> {
+        let (f, t) = (canon(from)?, canon(to)?);
+        if is_protected(&f) {
+            return Err(FsError::Invalid);
+        }
+        if ext(&f).is_none() {
+            self.guard(rel(&f), true)?;
+        }
+        self.copy_x(&f, &t, now)?;
+        self.delete(&f)
+    }
+
+    fn free_letter(&self) -> Option<char> {
+        ('D'..='Z').find(|l| self.xd.list.iter().all(|d| d.letter != *l))
+    }
+
     /// Conecta un volumen montado de la partición del disco `disk` en la primera letra libre
     /// (D..Z). `None` si no quedan letras.
-    pub fn attach(&mut self, _disk: u32, _device: &str, _vol: Box<dyn crate::vol::Volume>) -> Option<char> {
-        todo!()
+    pub fn attach(&mut self, disk: u32, device: &str, vol: Box<dyn Volume>) -> Option<char> {
+        let letter = self.free_letter()?;
+        self.xd.list.push(XDrive { letter, disk, device: String::from(device), vol: Some(vol), locked: None });
+        self.generation += 1;
+        Some(letter)
     }
+
     /// Como `attach`, para un volumen NightFury cifrado que espera contraseña.
-    pub fn attach_locked(&mut self, _locked: crate::drives::Locked) -> Option<char> {
-        todo!()
+    pub fn attach_locked(&mut self, locked: Locked) -> Option<char> {
+        let letter = self.free_letter()?;
+        self.xd.list.push(XDrive { letter, disk: locked.disk, device: locked.device, vol: None, locked: Some(locked.drive) });
+        self.generation += 1;
+        Some(letter)
     }
+
     /// El disco `disk` se ha quitado: sus letras desaparecen sin escribir nada (ya no está).
-    pub fn detach(&mut self, _disk: u32) {
-        todo!()
+    pub fn detach(&mut self, disk: u32) {
+        let n = self.xd.list.len();
+        self.xd.list.retain(|d| d.disk != disk);
+        if self.xd.list.len() != n {
+            self.generation += 1;
+        }
     }
+
     /// C: y las unidades conectadas, por letra.
-    pub fn drives(&mut self) -> Vec<crate::drives::DriveInfo> {
-        todo!()
+    pub fn drives(&mut self) -> Vec<DriveInfo> {
+        let (total, free) = self.fs.space();
+        let mut v = vec![DriveInfo { letter: 'C', label: String::new(), device: String::new(), kind: crate::vol::FsKind::NightFury, total, free, read_only: false, removable: false, locked: false }];
+        let mut rest: Vec<DriveInfo> = self
+            .xd
+            .list
+            .iter_mut()
+            .map(|d| match d.vol.as_mut() {
+                Some(vol) => {
+                    let (total, free) = vol.space();
+                    DriveInfo { letter: d.letter, label: vol.label(), device: d.device.clone(), kind: vol.kind(), total, free, read_only: vol.read_only(), removable: true, locked: false }
+                }
+                None => DriveInfo { letter: d.letter, label: String::new(), device: d.device.clone(), kind: crate::vol::FsKind::NightFury, total: 0, free: 0, read_only: false, removable: true, locked: true },
+            })
+            .collect();
+        rest.sort_by_key(|d| d.letter);
+        v.append(&mut rest);
+        v
     }
+
     /// Abre una unidad cifrada con su contraseña o con el código de recuperación.
-    pub fn unlock_drive(&mut self, _letter: char, _secret: &str, _recovery: bool) -> Result<(), KeyError> {
-        todo!()
+    pub fn unlock_drive(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError> {
+        let letter = letter.to_ascii_uppercase();
+        let d = self.xd.list.iter_mut().find(|d| d.letter == letter).ok_or(FsError::BadPath)?;
+        let locked = d.locked.take().ok_or(KeyError::NotEncrypted)?;
+        match locked.unlock(secret, recovery) {
+            Ok(vol) => {
+                d.vol = Some(vol);
+                self.generation += 1;
+                Ok(())
+            }
+            Err((locked, e)) => {
+                d.locked = Some(locked);
+                Err(e)
+            }
+        }
     }
+
     /// Pide expulsar, formatear o cifrar el disco de la unidad `letter` (solo programas del sistema;
-    /// lo comprueba el servicio). Lo ejecuta el núcleo con `take_drive_actions`.
-    pub fn request_drive_action(&mut self, _letter: char, _action: crate::drives::FormatRequest) -> Result<(), FsError> {
-        todo!()
+    /// lo comprueba el servicio). Lo ejecuta el núcleo con `take_drive_actions`. Se escribe lo
+    /// pendiente de todas las unidades de ese disco y sus letras desaparecen enseguida.
+    pub fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError> {
+        let letter = letter.to_ascii_uppercase();
+        if letter == 'C' {
+            return Err(FsError::Invalid);
+        }
+        let disk = self.xd.list.iter().find(|d| d.letter == letter).ok_or(FsError::BadPath)?.disk;
+        let eject = req == FormatRequest::Eject;
+        for d in self.xd.list.iter_mut().filter(|d| d.disk == disk) {
+            if let Some(v) = d.vol.as_mut() {
+                if !eject && v.read_only() {
+                    return Err(FsError::Denied);
+                }
+            }
+        }
+        for d in self.xd.list.iter_mut().filter(|d| d.disk == disk) {
+            if let Some(v) = d.vol.as_mut() {
+                // Al formatear se pierde todo igualmente; al expulsar, un fallo impide quitarla.
+                if let (Err(e), true) = (v.flush(), eject) {
+                    return Err(e);
+                }
+            }
+        }
+        self.xd.list.retain(|d| d.disk != disk);
+        self.generation += 1;
+        self.xd.result = None;
+        self.xd.actions.push(match req {
+            FormatRequest::Eject => DriveAction::Eject { disk },
+            FormatRequest::Format { kind, label } => DriveAction::Format { disk, kind, label },
+            FormatRequest::Encrypt { label, password } => DriveAction::Encrypt { disk, label, password },
+        });
+        Ok(())
     }
+
     /// Acciones pendientes, para el núcleo.
-    pub fn take_drive_actions(&mut self) -> Vec<crate::drives::DriveAction> {
-        todo!()
+    pub fn take_drive_actions(&mut self) -> Vec<DriveAction> {
+        core::mem::take(&mut self.xd.actions)
     }
+
     /// El núcleo terminó la última acción: `Ok(Some(código))` al cifrar, `Ok(None)` en el resto.
-    pub fn set_drive_result(&mut self, _r: Result<Option<String>, FsError>) {
-        todo!()
+    pub fn set_drive_result(&mut self, r: Result<Option<String>, FsError>) {
+        self.xd.result = Some(r);
     }
+
     /// Resultado de la última acción, una sola vez (lo consulta el programa que la pidió).
     pub fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
-        todo!()
+        self.xd.result.take()
     }
 }
 
@@ -3051,11 +3330,17 @@ mod tests {
         assert_eq!(r("C:\\a", ""), Ok("C:\\a".into()));
         assert_eq!(r("C:\\a", "b\\..\\c"), Ok("C:\\a\\c".into()));
         assert_eq!(r("C:\\", "Imágenes\\Ñu"), Ok("C:\\Imágenes\\Ñu".into()));
-        assert_eq!(r("C:\\", "D:\\x"), Err(FsError::BadPath));
-        assert_eq!(r("C:\\", "z:x"), Err(FsError::BadPath));
-        assert_eq!(r("C:\\", "a:b"), Err(FsError::BadPath));
+        // Cualquier letra vale en la ruta (que la unidad exista lo mira cada operación) y se conserva.
+        assert_eq!(r("C:\\", "D:\\x"), Ok("D:\\x".into()));
+        assert_eq!(r("C:\\", "z:x"), Ok("Z:\\x".into()));
         assert_eq!(r("C:\\", "x\\a:b"), Err(FsError::BadPath));
-        assert_eq!(r("D:\\", "x"), Err(FsError::BadPath));
+        assert_eq!(r("D:\\", "x"), Ok("D:\\x".into()));
+        assert_eq!(r("D:\\a", "..\\b"), Ok("D:\\b".into()));
+        assert_eq!(r("D:\\a", "\\x"), Ok("D:\\x".into()));
+        assert_eq!(r("D:\\a", "c:x"), Ok("C:\\x".into()));
+        assert_eq!(parent("D:\\a"), Some("D:\\".into()));
+        assert_eq!(parent("D:\\a\\b"), Some("D:\\a".into()));
+        assert_eq!(parent("D:\\"), None);
         assert_eq!(r("C:\\", "a*b"), Err(FsError::BadName));
         assert_eq!(r("C:\\", &"a".repeat(300)), Err(FsError::BadName));
         assert_eq!(r("C:\\", "C:\\a\\?"), Err(FsError::BadName));
@@ -5204,5 +5489,202 @@ mod tests {
         finish_conversion(&mut f2, 60);
         assert_eq!(raw_has(&disk2, &NEEDLES), None);
         assert_eq!(snap(&mut f2), before);
+    }
+}
+
+#[cfg(test)]
+mod drive_tests {
+    use super::*;
+    use crate::drives::FormatKind;
+    use crate::vol::{self, FsKind, MemSectors, SectorDev};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NOW: DateTime = DateTime { year: 2026, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+
+    /// Disco en memoria compartido: se puede volver a montar tras expulsarlo.
+    #[derive(Clone)]
+    struct Shared(Rc<RefCell<MemSectors>>);
+    impl SectorDev for Shared {
+        fn sector_size(&self) -> usize {
+            self.0.borrow().sector_size()
+        }
+        fn sectors(&self) -> u64 {
+            self.0.borrow().sectors()
+        }
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().read(lba, buf)
+        }
+        fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().write(lba, buf)
+        }
+        fn read_only(&self) -> bool {
+            self.0.borrow().ro
+        }
+    }
+
+    fn stick(kind: FsKind, label: &str) -> Shared {
+        let mut m = MemSectors::new(131072, 512);
+        vol::format(&mut m, kind, label, NOW).unwrap();
+        Shared(Rc::new(RefCell::new(m)))
+    }
+
+    fn mount(s: &Shared) -> Box<dyn Volume> {
+        let mut d = s.clone();
+        let p = vol::partitions(&mut d).unwrap();
+        vol::mount(Box::new(s.clone()), &p[0]).unwrap()
+    }
+
+    fn two() -> (Files, char, char) {
+        let mut f = Files::default();
+        let d = f.attach(1, "Pendrive", mount(&stick(FsKind::Fat32, "FOTOS"))).unwrap();
+        let e = f.attach(2, "Disco", mount(&stick(FsKind::ExFat, ""))).unwrap();
+        (f, d, e)
+    }
+
+    fn names(f: &mut Files, dir: &str) -> Vec<String> {
+        f.list(dir).unwrap().into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn letras_lectura_y_escritura() {
+        let (mut f, d, e) = two();
+        assert_eq!((d, e), ('D', 'E'));
+        let g = f.generation();
+        f.mkdir("D:\\Fotos", NOW).unwrap();
+        f.write("d:\\Fotos\\a.txt", b"hola", NOW).unwrap();
+        assert!(f.generation() > g);
+        assert_eq!(f.read("D:\\fotos\\A.TXT").unwrap(), b"hola");
+        assert_eq!(names(&mut f, "D:\\"), ["Fotos"]);
+        assert!(f.stat("D:\\Fotos").unwrap().dir);
+        assert!(f.stat("D:\\").unwrap().dir);
+        assert_eq!(f.stat("D:\\nada"), Err(FsError::NotFound));
+        assert_eq!(f.list("F:\\"), Err(FsError::BadPath));
+        assert_eq!(f.write("D:\\", b"x", NOW), Err(FsError::IsDir));
+        assert_eq!(f.free_name("D:\\Fotos", "a.txt"), "a (2).txt");
+        assert_eq!(f.free_name("D:\\Fotos", "b.txt"), "b.txt");
+        assert!(!is_protected("D:\\Usuarios") && is_protected("D:\\") && !in_system("D:\\Sistema"));
+        let info = f.drives();
+        assert_eq!(info.iter().map(|i| i.letter).collect::<Vec<_>>(), ['C', 'D', 'E']);
+        assert_eq!(info[1].label, "FOTOS");
+        assert_eq!(info[1].device, "Pendrive");
+        assert!(info[1].removable && !info[0].removable && info[1].total > info[1].free);
+        // Una cuenta normal también escribe en las extraíbles.
+        f.create_account("Ana", None, false, [1; 16], NOW).unwrap();
+        f.login("Ana", "").unwrap();
+        f.write("D:\\Fotos\\ana.txt", b"x", NOW).unwrap();
+        assert_eq!(f.read("D:\\Fotos\\ana.txt").unwrap(), b"x");
+    }
+
+    #[test]
+    fn copiar_y_mover_entre_unidades() {
+        let (mut f, ..) = two();
+        let docs = f.std_dir(Std::Documents);
+        let src = join(&docs, "Carpeta");
+        f.mkdir(&src, NOW).unwrap();
+        f.mkdir(&join(&src, "Sub"), NOW).unwrap();
+        f.write(&join(&src, "a.txt"), b"uno", NOW).unwrap();
+        f.write(&join(&src, "Sub\\b.txt"), b"dos", NOW).unwrap();
+        // C: -> D:
+        f.copy(&src, "D:\\Carpeta", NOW).unwrap();
+        assert_eq!(f.read("D:\\Carpeta\\Sub\\b.txt").unwrap(), b"dos");
+        assert_eq!(f.copy(&src, "D:\\Carpeta", NOW), Err(FsError::Exists));
+        // D: -> E: y E: -> C:
+        f.copy("D:\\Carpeta", "E:\\Copia", NOW).unwrap();
+        let back = join(&docs, "Vuelta");
+        f.copy("E:\\Copia", &back, NOW).unwrap();
+        assert_eq!(f.read(&join(&back, "a.txt")).unwrap(), b"uno");
+        // dentro de sí misma
+        assert_eq!(f.copy("D:\\Carpeta", "D:\\Carpeta\\Sub\\x", NOW), Err(FsError::Invalid));
+        assert_eq!(f.copy("D:\\", "D:\\y", NOW), Err(FsError::Invalid));
+        // mover entre unidades: copia y borra el origen
+        let r = f.transfer(&[String::from("D:\\Carpeta")], "E:\\", true, NOW).unwrap();
+        assert_eq!(r, ["E:\\Carpeta"]);
+        assert!(!f.exists("D:\\Carpeta") && f.exists("E:\\Carpeta\\Sub\\b.txt"));
+        // mover dentro de la misma unidad: renombrar, y se deshace
+        f.mkdir("E:\\Otra", NOW).unwrap();
+        f.transfer(&[String::from("E:\\Carpeta")], "E:\\Otra", true, NOW).unwrap();
+        assert!(f.exists("E:\\Otra\\Carpeta\\a.txt") && !f.exists("E:\\Carpeta"));
+        f.undo(NOW).unwrap();
+        assert!(f.exists("E:\\Carpeta\\a.txt"));
+        // copiar a C:
+        let r = f.transfer(&[String::from("E:\\Carpeta")], &docs, false, NOW).unwrap();
+        assert_eq!(r.len(), 1);
+        // pegar con el portapapeles, de C: a D:
+        f.set_clip(&src, false);
+        assert_eq!(f.paste_all("D:\\", NOW).unwrap(), ["D:\\Carpeta"]);
+        // rename entre unidades: no vale
+        assert_eq!(f.rename("D:\\Carpeta", "E:\\z"), Err(FsError::Invalid));
+        assert_eq!(f.rename(&src, "D:\\z"), Err(FsError::Invalid));
+        f.rename("D:\\Carpeta", "D:\\Nueva").unwrap();
+        assert_eq!(f.rename("D:\\Nueva", "D:\\Nueva\\Sub\\q"), Err(FsError::Invalid));
+        assert_eq!(f.rename("D:\\", "D:\\q"), Err(FsError::Invalid));
+    }
+
+    #[test]
+    fn borrar_es_definitivo_y_la_papelera_no_se_toca() {
+        let (mut f, ..) = two();
+        f.mkdir("D:\\x", NOW).unwrap();
+        f.write("D:\\x\\a.txt", b"a", NOW).unwrap();
+        f.user_trash_many(&[String::from("D:\\x")], NOW).unwrap();
+        assert!(!f.exists("D:\\x") && f.trash_list().unwrap().is_empty() && f.undo_label().is_none());
+        assert_eq!(f.delete("D:\\"), Err(FsError::Invalid));
+        f.user_create("D:\\nuevo.txt", false, NOW).unwrap();
+        assert!(f.exists("D:\\nuevo.txt"));
+        f.undo(NOW).unwrap();
+        assert!(!f.exists("D:\\nuevo.txt"));
+    }
+
+    #[test]
+    fn quitar_y_reutilizar_letras() {
+        let (mut f, ..) = two();
+        f.write("D:\\a.txt", b"a", NOW).unwrap();
+        let g = f.generation();
+        f.detach(1);
+        assert!(f.generation() > g);
+        assert_eq!(f.read("D:\\a.txt"), Err(FsError::BadPath));
+        assert_eq!(f.list("D:\\"), Err(FsError::BadPath));
+        assert_eq!(f.drives().len(), 2);
+        // La letra libre más baja se reutiliza.
+        assert_eq!(f.attach(3, "Otro", mount(&stick(FsKind::Fat32, ""))), Some('D'));
+        assert_eq!(f.attach(4, "Otro", mount(&stick(FsKind::Fat32, ""))), Some('F'));
+        f.detach(99);
+    }
+
+    #[test]
+    fn expulsar_escribe_lo_pendiente_y_formatear_encola() {
+        let s = stick(FsKind::Fat32, "X");
+        let mut f = Files::default();
+        f.attach(7, "Pendrive", mount(&s));
+        f.write("D:\\dato.txt", b"importante", NOW).unwrap();
+        assert_eq!(f.request_drive_action('C', FormatRequest::Eject), Err(FsError::Invalid));
+        assert_eq!(f.request_drive_action('Q', FormatRequest::Eject), Err(FsError::BadPath));
+        f.request_drive_action('d', FormatRequest::Eject).unwrap();
+        assert_eq!(f.take_drive_actions(), [DriveAction::Eject { disk: 7 }]);
+        assert!(f.take_drive_actions().is_empty());
+        assert_eq!(f.list("D:\\"), Err(FsError::BadPath));
+        // Lo escrito llegó al disco: otro montaje lo ve.
+        let mut v = mount(&s);
+        assert_eq!(v.read("dato.txt").unwrap(), b"importante");
+        // El disco expulsado se puede volver a conectar y formatear.
+        f.attach(7, "Pendrive", v).unwrap();
+        f.request_drive_action('D', FormatRequest::Format { kind: FormatKind::ExFat, label: String::from("NUEVA") }).unwrap();
+        assert_eq!(f.take_drive_actions(), [DriveAction::Format { disk: 7, kind: FormatKind::ExFat, label: String::from("NUEVA") }]);
+        assert_eq!(f.drive_result(), None);
+        f.set_drive_result(Ok(Some(String::from("codigo"))));
+        assert_eq!(f.drive_result(), Some(Ok(Some(String::from("codigo")))));
+        assert_eq!(f.drive_result(), None);
+    }
+
+    #[test]
+    fn solo_lectura_y_unidad_desconocida() {
+        let s = stick(FsKind::Fat32, "RO");
+        let mut f = Files::default();
+        s.0.borrow_mut().ro = true;
+        f.attach(1, "Lector", mount(&s));
+        assert_eq!(f.write("D:\\a", b"x", NOW), Err(FsError::Denied));
+        assert_eq!(f.request_drive_action('D', FormatRequest::Format { kind: FormatKind::Fat32, label: String::new() }), Err(FsError::Denied));
+        assert_eq!(f.unlock_drive('D', "x", false), Err(KeyError::NotEncrypted));
+        assert_eq!(f.unlock_drive('Q', "x", false), Err(KeyError::Fs(FsError::BadPath)));
     }
 }

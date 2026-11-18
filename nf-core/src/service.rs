@@ -15,7 +15,9 @@
 //! - no hay llamada para instalar programas del sistema;
 //! - la fecha, la sal y el acumulador de aleatoriedad los pone siempre el sistema.
 use crate::accounts::{salt_from, Account, AccountError};
+use crate::drives::{DriveInfo, FormatKind, FormatRequest};
 use crate::files::{in_system, resolve, Files, TrashItem, PROGRAMS_DIR};
+use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
@@ -121,6 +123,10 @@ calls! {
     Entropy = 55,
     Reboot = 56,
     Shutdown = 57,
+    Drives = 58,
+    UnlockDrive { letter: char, secret: String, recovery: bool } = 59,
+    DriveAction { letter: char, req: FormatRequest } = 60,
+    DriveResult = 61,
 }
 
 // ---------- Wire de los tipos que viajan ----------
@@ -235,6 +241,71 @@ impl Wire for KeyError {
     }
 }
 
+impl Wire for char {
+    fn put(&self, w: &mut Writer) {
+        w.put(&(*self as u32));
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        char::from_u32(u32::get(r)?).ok_or(Bad)
+    }
+}
+
+const FS_KINDS: [FsKind; 8] = [FsKind::Fat12, FsKind::Fat16, FsKind::Fat32, FsKind::ExFat, FsKind::Iso9660, FsKind::Udf, FsKind::NightFury, FsKind::Unknown];
+
+impl Wire for FsKind {
+    fn put(&self, w: &mut Writer) {
+        w.put(&(FS_KINDS.iter().position(|k| k == self).unwrap_or(7) as u8));
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        FS_KINDS.get(u8::get(r)? as usize).copied().ok_or(Bad)
+    }
+}
+
+const FORMAT_KINDS: [FormatKind; 3] = [FormatKind::Fat32, FormatKind::ExFat, FormatKind::NightFury];
+
+impl Wire for FormatKind {
+    fn put(&self, w: &mut Writer) {
+        w.put(&(FORMAT_KINDS.iter().position(|k| k == self).unwrap_or(0) as u8));
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        FORMAT_KINDS.get(u8::get(r)? as usize).copied().ok_or(Bad)
+    }
+}
+
+impl Wire for FormatRequest {
+    fn put(&self, w: &mut Writer) {
+        match self {
+            FormatRequest::Eject => {
+                w.put(&0u8);
+            }
+            FormatRequest::Format { kind, label } => {
+                w.put(&1u8).put(kind).put(label);
+            }
+            FormatRequest::Encrypt { label, password } => {
+                w.put(&2u8).put(label).put(password);
+            }
+        }
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(match u8::get(r)? {
+            0 => FormatRequest::Eject,
+            1 => FormatRequest::Format { kind: r.get()?, label: r.get()? },
+            2 => FormatRequest::Encrypt { label: r.get()?, password: r.get()? },
+            _ => return Err(Bad),
+        })
+    }
+}
+
+impl Wire for DriveInfo {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.letter).put(&self.label).put(&self.device).put(&self.kind).put(&self.total).put(&self.free);
+        w.put(&self.read_only).put(&self.removable).put(&self.locked);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(DriveInfo { letter: r.get()?, label: r.get()?, device: r.get()?, kind: r.get()?, total: r.get()?, free: r.get()?, read_only: r.get()?, removable: r.get()?, locked: r.get()? })
+    }
+}
+
 impl Wire for Entry {
     fn put(&self, w: &mut Writer) {
         w.put(&self.name).put(&self.dir).put(&self.size).put(&self.modified);
@@ -301,7 +372,8 @@ pub(crate) fn blocked(system: bool, path: &str) -> bool {
 }
 
 fn in_programs(path: &str) -> bool {
-    resolve("C:\\", path).is_ok_and(|c| c[3..].split('\\').next().is_some_and(|t| t.eq_ignore_ascii_case(&PROGRAMS_DIR[3..])))
+    // Solo en C:: `D:\Programas` es una carpeta cualquiera de una unidad extraíble.
+    resolve("C:\\", path).is_ok_and(|c| c.starts_with('C') && c[3..].split('\\').next().is_some_and(|t| t.eq_ignore_ascii_case(&PROGRAMS_DIR[3..])))
 }
 
 fn with_pool<R>(sys: &mut dyn Platform, f: impl FnOnce(&mut Files, &mut Pool) -> R) -> R {
@@ -460,6 +532,11 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
             let now = sys.now();
             gate(system, Err(no_key), || with_pool(sys, |f, pool| f.new_home_recovery(&password, pool, now)))
         }
+        // ---- Unidades extraíbles: ver, cualquiera; abrir, expulsar, formatear y cifrar, el sistema ----
+        Drives => encode(&sys.files().drives()),
+        UnlockDrive { letter, secret, recovery } => gate(system, Err(no_key), || sys.files().unlock_drive(letter, &secret, recovery)),
+        DriveAction { letter, req } => gate(system, Err(denied), || sys.files().request_drive_action(letter, req)),
+        DriveResult => gate(system, None, || sys.files().drive_result()),
     }
 }
 
@@ -656,6 +733,18 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     }
     fn new_home_recovery(&mut self, password: &str, _pool: &mut Pool, _now: DateTime) -> Result<String, KeyError> {
         self.key(Call::NewHomeRecovery { password: s(password) })
+    }
+    fn drives(&mut self) -> Vec<DriveInfo> {
+        self.ask(Call::Drives, Vec::new())
+    }
+    fn unlock_drive(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError> {
+        self.key(Call::UnlockDrive { letter, secret: s(secret), recovery })
+    }
+    fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError> {
+        self.fs(Call::DriveAction { letter, req })
+    }
+    fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
+        self.ask(Call::DriveResult, None)
     }
 }
 
@@ -962,5 +1051,53 @@ mod tests {
         p.fs.ask(Call::Reboot, ());
         p.fs.ask(Call::Shutdown, ());
         assert!(real.borrow().rebooted && real.borrow().halted);
+    }
+
+    fn usb() -> Box<dyn crate::vol::Volume> {
+        use crate::vol::{self, MemSectors};
+        let mut m = MemSectors::new(131072, 512);
+        vol::format(&mut m, FsKind::Fat32, "USB", NOW).unwrap();
+        let part = vol::partitions(&mut m).unwrap();
+        vol::mount(Box::new(m), &part[0]).unwrap()
+    }
+
+    #[test]
+    fn unidades_extraibles_por_el_servicio() {
+        for system in [false, true] {
+            let (real, mut p) = prog(system);
+            assert_eq!(real.borrow_mut().files.attach(1, "Pendrive", usb()), Some('D'));
+            let f = p.fs();
+            let d = f.drives();
+            assert_eq!(d.iter().map(|i| (i.letter, i.removable)).collect::<Vec<_>>(), [('C', false), ('D', true)]);
+            assert_eq!((d[1].label.as_str(), d[1].device.as_str(), d[1].kind), ("USB", "Pendrive", FsKind::Fat16));
+            // Los programas de terceros también leen y escriben en D:, también en una carpeta llamada Programas.
+            f.mkdir("D:\\Programas", NOW).unwrap();
+            f.write("D:\\Programas\\a.txt", b"hola", NOW).unwrap();
+            assert_eq!(f.read("D:\\programas\\a.txt").unwrap(), b"hola");
+            assert_eq!(f.list("D:\\").unwrap().len(), 1);
+            // Pero C:\Sistema sigue cerrado, también desde una unidad extraíble.
+            assert_eq!(f.copy("D:\\Programas\\a.txt", "C:\\Sistema\\temp\\a.txt", NOW), Err(FsError::Denied));
+            assert_eq!(f.transfer(&[s("D:\\Programas\\a.txt")], "C:\\Sistema\\temp", false, NOW), Err(FsError::Denied));
+            assert!(!f.exists("C:\\Sistema\\temp\\a.txt"));
+            // Abrir, expulsar, formatear y cifrar: solo el sistema.
+            assert_eq!(f.unlock_drive('D', "x", false), Err(if system { KeyError::NotEncrypted } else { KeyError::NotAdmin }));
+            assert_eq!(f.request_drive_action('C', FormatRequest::Eject), Err(if system { FsError::Invalid } else { FsError::Denied }));
+            if !system {
+                assert_eq!(f.request_drive_action('D', FormatRequest::Eject), Err(FsError::Denied));
+                assert!(f.drive_result().is_none());
+                assert!(real.borrow_mut().files.take_drive_actions().is_empty());
+                assert_eq!(f.drives().len(), 2);
+            } else {
+                let req = FormatRequest::Format { kind: FormatKind::ExFat, label: s("Ñ") };
+                assert_eq!(f.request_drive_action('D', req), Ok(()));
+                assert_eq!(real.borrow_mut().files.take_drive_actions().len(), 1);
+                real.borrow_mut().files.set_drive_result(Ok(Some(s("codigo"))));
+                assert_eq!(p.fs().drive_result(), Some(Ok(Some(s("codigo")))));
+                assert_eq!(p.fs().drives().len(), 1);
+            }
+        }
+        let c = Call::DriveAction { letter: 'E', req: FormatRequest::Encrypt { label: s("x"), password: s("y") } };
+        assert!(matches!(decode::<Call>(&encode(&c)), Ok(Call::DriveAction { letter: 'E', req: FormatRequest::Encrypt { .. } })));
+        assert!(decode::<FormatRequest>(&[9]).is_err() && decode::<char>(&0xD800u32.to_le_bytes()).is_err());
     }
 }
