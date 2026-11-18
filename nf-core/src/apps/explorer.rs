@@ -4611,4 +4611,218 @@ mod tests {
         t.over(Some(T::place_pt(3)), &[p]);
         guarda(&t.draw(), "destino_panel");
     }
+
+    // ---- unidades extraíbles (v0.11) ----
+
+    fn usb(label: &str) -> Box<dyn crate::vol::Volume> {
+        use crate::vol::{self, FsKind, MemSectors};
+        let mut m = MemSectors::new(131072, 512);
+        vol::format(&mut m, FsKind::Fat32, label, DateTime::default()).unwrap();
+        let part = vol::partitions(&mut m).unwrap();
+        vol::mount(Box::new(m), &part[0]).unwrap()
+    }
+
+    fn con_usb() -> T {
+        let mut t = T::new();
+        assert_eq!(t.sys.files.attach(1, "Pendrive", usb("DATOS")), Some('D'));
+        t.open(files::COMPUTER);
+        t
+    }
+
+    fn msg(d: Option<DialogRequest>) -> (u32, String) {
+        match d {
+            Some(DialogRequest::Message { tag, text, .. }) => (tag, text),
+            other => panic!("se esperaba un mensaje: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn este_equipo_lista_las_unidades_y_se_entra_en_ellas() {
+        let mut t = con_usb();
+        assert_eq!(t.e.title(), "Este equipo");
+        assert_eq!(t.rows(), ["C:", "D:"]);
+        assert_eq!(t.e.drives.iter().map(|d| d.name()).collect::<Vec<_>>(), ["Disco local (C:)", "DATOS (D:)"]);
+        assert!(!t.e.can_create);
+        // Doble clic en D:.
+        let r = t.e.item_rect(1);
+        t.click(r.x + 20, r.y + 20);
+        t.click(r.x + 20, r.y + 20);
+        assert_eq!(t.e.cwd, "D:\\");
+        assert_eq!(t.e.title(), "DATOS (D:)");
+        assert!(t.e.can_create);
+        // Crear una carpeta ahí llega al volumen y Atrás/Subir vuelven a «Este equipo».
+        t.sys.files.mkdir("D:\\Fotos", DateTime::default()).unwrap();
+        t.draw();
+        assert_eq!(t.rows(), ["Fotos"]);
+        t.key(Key::Backspace, false);
+        assert_eq!(t.e.cwd, files::COMPUTER);
+        t.key(Key::Down, false);
+        t.key(Key::Down, false);
+        t.key(Key::Enter, false);
+        assert_eq!(t.e.cwd, "D:\\");
+        // Subir desde C:\ no sale de C:.
+        t.open("C:\\");
+        t.key(Key::Backspace, false);
+        assert_eq!(t.e.cwd, "C:\\");
+    }
+
+    #[test]
+    fn la_vista_de_este_equipo_se_dibuja_y_el_panel_lleva_la_entrada() {
+        let mut t = con_usb();
+        t.draw();
+        let (x, y) = T::place_pt(8);
+        t.open(dd(Std::Documents).as_str());
+        t.click(x, y);
+        assert_eq!(t.e.cwd, files::COMPUTER);
+        // Sin Nuevo, Pegar, Eliminar ni Cambiar nombre.
+        for c in [Cmd::NewFolder, Cmd::Paste, Cmd::Delete, Cmd::Rename, Cmd::Cut] {
+            assert!(!t.e.enabled(c), "{c:?}");
+        }
+        t.e.set_one(1);
+        assert!(t.e.enabled(Cmd::Open) && t.e.enabled(Cmd::Props));
+    }
+
+    #[test]
+    fn menu_de_unidad_y_propiedades() {
+        let mut t = con_usb();
+        let m = t.right_row("D:");
+        assert_eq!(texts(&m.items), ["Abrir", "Expulsar", "Formatear… >", "Cifrar…", "-", "Propiedades"]);
+        let m = t.right_row("C:");
+        assert_eq!(texts(&m.items), ["Abrir", "-", "Propiedades"]);
+        t.right_row("D:");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_PROPS);
+        let (_, text) = msg(d);
+        for s in ["Unidad extraíble", "Formato: FAT16", "Capacidad: 62.8 MB", "Dispositivo: Pendrive"] {
+            assert!(text.contains(s), "{s} en {text}");
+        }
+    }
+
+    #[test]
+    fn expulsar_pide_la_accion_y_avisa() {
+        let mut t = con_usb();
+        t.right_row("D:");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_EJECT);
+        assert_eq!(msg(d).1, "Ya puedes quitar la unidad (D:).");
+        assert_eq!(t.sys.files.take_drive_actions(), [crate::drives::DriveAction::Eject { disk: 1 }]);
+        assert_eq!(t.rows(), ["C:"]);
+        // C: no se expulsa.
+        t.right_row("C:");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_EJECT);
+        assert!(d.is_none() && t.sys.files.take_drive_actions().is_empty());
+    }
+
+    #[test]
+    fn formatear_pide_etiqueta_confirmacion_y_espera_el_resultado() {
+        let mut t = con_usb();
+        t.right_row("D:");
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_DRV_LABEL, .. })));
+        // Etiqueta demasiado larga: error y no sigue.
+        let d = t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("DEMASIADO LARGA")) });
+        assert_eq!(msg(d).0, TAG_ERROR);
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        let d = t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("COPIAS")) });
+        assert_eq!(msg(d), (TAG_DRV_SURE, String::from("Se borrará todo lo que hay en la unidad (D:). ¿Continuar?")));
+        // No: no se hace nada.
+        t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::No });
+        assert!(t.sys.files.take_drive_actions().is_empty() && t.e.waiting.is_none());
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("COPIAS")) });
+        t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::Yes });
+        assert_eq!(t.sys.files.take_drive_actions(), [crate::drives::DriveAction::Format { disk: 1, kind: FormatKind::ExFat, label: String::from("COPIAS") }]);
+        assert_eq!(t.e.waiting, Some(('D', false)));
+        // Hasta que llega el resultado no hay aviso; luego, «formateada».
+        let (_, d, _) = t.cx(|e, cx| e.tick(cx));
+        assert!(d.is_none());
+        t.sys.files.set_drive_result(Ok(None));
+        let (_, d, _) = t.cx(|e, cx| e.tick(cx));
+        assert_eq!(msg(d).1, "La unidad (D:) se ha formateado.");
+        assert_eq!(t.e.waiting, None);
+    }
+
+    #[test]
+    fn cifrar_pide_aviso_contrasena_repetida_y_muestra_el_codigo() {
+        let mut t = con_usb();
+        let pw = |tag, v: &str| DialogResult::Text { tag, value: Some(String::from(v)) };
+        let empieza = |t: &mut T| {
+            t.right_row("D:");
+            let (d, _) = t.pick(TAG_MENU_ITEM, M_ENCRYPT);
+            assert_eq!(msg(d).0, TAG_DRV_WARN);
+        };
+        // Contraseña corta.
+        empieza(&mut t);
+        let d = t.answer(DialogResult::Answer { tag: TAG_DRV_WARN, answer: Answer::Yes });
+        assert!(matches!(d, Some(DialogRequest::Password { tag: TAG_DRV_PW, .. })));
+        let d = t.answer(pw(TAG_DRV_PW, "abc"));
+        assert!(msg(d).1.contains("al menos 6"));
+        // No coinciden.
+        empieza(&mut t);
+        t.answer(DialogResult::Answer { tag: TAG_DRV_WARN, answer: Answer::Yes });
+        let d = t.answer(pw(TAG_DRV_PW, "secreto1"));
+        assert!(matches!(d, Some(DialogRequest::Password { tag: TAG_DRV_PW2, .. })));
+        let d = t.answer(pw(TAG_DRV_PW2, "secreto2"));
+        assert_eq!(msg(d).1, "Las contraseñas no coinciden.");
+        assert!(t.sys.files.take_drive_actions().is_empty());
+        // Bien.
+        empieza(&mut t);
+        t.answer(DialogResult::Answer { tag: TAG_DRV_WARN, answer: Answer::Yes });
+        t.answer(pw(TAG_DRV_PW, "secreto1"));
+        t.answer(pw(TAG_DRV_PW2, "secreto1"));
+        assert_eq!(
+            t.sys.files.take_drive_actions(),
+            [crate::drives::DriveAction::Encrypt { disk: 1, label: String::from("DATOS"), password: String::from("secreto1") }]
+        );
+        assert_eq!(t.e.waiting, Some(('D', true)));
+        t.sys.files.set_drive_result(Ok(Some(String::from("AAAA-BBBB"))));
+        let (_, d, _) = t.cx(|e, cx| e.tick(cx));
+        let (_, text) = msg(d);
+        assert!(text.contains("AAAA-BBBB") && text.contains("D:"));
+        // Cancelar el aviso no deja nada a medias (la unidad se quitó al cifrar: se vuelve a conectar).
+        t.sys.files.attach(1, "Pendrive", usb("DATOS"));
+        t.open(files::COMPUTER);
+        empieza(&mut t);
+        t.answer(DialogResult::Answer { tag: TAG_DRV_WARN, answer: Answer::No });
+        assert!(t.e.job.is_none());
+    }
+
+    #[test]
+    fn desbloquear_pide_contrasena_o_codigo() {
+        let mut t = con_usb();
+        let d = t.e.drives[1].clone();
+        t.cx(|e, cx| e.ask_unlock(DriveInfo { locked: true, ..d }, cx));
+        // Vacía: se pasa al código de recuperación.
+        let d = t.answer(DialogResult::Text { tag: TAG_DRV_PW, value: Some(String::new()) });
+        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_DRV_REC, .. })));
+        // Cancelar cierra la operación.
+        t.answer(DialogResult::Text { tag: TAG_DRV_REC, value: None });
+        assert!(t.e.job.is_none());
+    }
+
+    #[test]
+    fn eliminar_en_una_unidad_extraible_es_definitivo() {
+        let mut t = con_usb();
+        t.auto_del = false;
+        t.sys.files.write("D:\\viejo.txt", b"x", DateTime::default()).unwrap();
+        t.open("D:\\");
+        t.select("viejo.txt");
+        let (d, _) = t.key(Key::Delete, false);
+        assert_eq!(msg(d).1, "¿Quieres eliminar definitivamente «viejo.txt»? No se podrá deshacer.");
+        t.answer(DialogResult::Answer { tag: TAG_DEL, answer: Answer::Yes });
+        assert!(!t.sys.files.exists("D:\\viejo.txt"));
+        assert!(t.sys.files.trash_list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn solo_lectura_y_unidad_que_desaparece() {
+        let mut t = con_usb();
+        t.open("D:\\");
+        assert!(t.e.can_create);
+        // La unidad se quita estando dentro: se vuelve a «Este equipo».
+        t.sys.files.detach(1);
+        let (_, _, _) = t.cx(|e, cx| e.tick(cx));
+        assert_eq!(t.e.cwd, files::COMPUTER);
+        assert_eq!(t.rows(), ["C:"]);
+    }
 }
