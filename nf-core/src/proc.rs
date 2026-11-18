@@ -10,15 +10,17 @@
 //! un evento. `ProcApp` es la ventana: deja eventos en la cola (`SysState::post`) y en cada tick
 //! recoge lo que el programa pidió (imagen, título, guardar) y su `status`.
 use crate::abi::*;
-use crate::apps::{App, AppKind, Ctx, MouseEv};
+use crate::apps::{App, AppKind, Ctx, DragRequest, MouseEv};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::files::{self, Std};
 use crate::geom::Rect;
 use crate::icons::Icon;
 use crate::input::KeyEvent;
 use crate::platform::{DateTime, Platform};
+use crate::request::Request;
 use crate::surface::{blend, Surface};
 use crate::theme::Theme;
+use crate::wire::{decode, encode};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -86,7 +88,15 @@ pub struct Outbox {
     pub log: Vec<String>,
     /// `SAVE_AS`: nombre propuesto y contenido. La ventana enseña el diálogo Guardar.
     pub save: Option<(String, Vec<u8>)>,
+    /// `REQUEST`: peticiones ya decodificadas, hasta `REQUESTS_MAX`. `ProcApp` las atiende en orden.
+    pub requests: VecDeque<Request>,
 }
+
+/// Peticiones `REQUEST` que pueden esperar a que el escritorio las recoja; las demás dan `E_BUSY`.
+pub const REQUESTS_MAX: usize = 64;
+/// Los programas pueden pedir diálogos con cualquier etiqueta salvo las que tienen este bit: el
+/// escritorio lo usa para distinguir los diálogos del programa de los suyos.
+const TAG_PROGRAMA: u32 = 1 << 31;
 
 /// Estado de un programa que necesitan las llamadas.
 #[derive(Default)]
@@ -102,7 +112,16 @@ pub struct SysState {
     pub out: Outbox,
     /// Eventos que el escritorio ha dejado y el programa no ha recogido (`now_ms` = cuándo llegó).
     pub queue: VecDeque<WireEvent>,
+    /// Datos de los eventos de `queue` que los llevan (`lleva_datos`), en el mismo orden.
+    pub payload: VecDeque<Vec<u8>>,
+    /// Datos del último evento entregado (`EVENT_DATA`).
+    pub event_data: Vec<u8>,
     pub status: Status,
+}
+
+/// ¿Este evento lleva datos (su `d` es la longitud)?
+fn lleva_datos(kind: u32) -> bool {
+    matches!(kind, EV_DIALOG | EV_DRAG_OVER | EV_DROP | EV_OPEN)
 }
 
 /// Eventos que caben en la cola de un programa; lo que llega con la cola llena se descarta.
@@ -127,11 +146,24 @@ impl SysState {
         }
     }
 
+    /// Deja un evento con datos (`lleva_datos`); `d` pasa a ser su longitud.
+    pub fn post_data(&mut self, mut ev: WireEvent, data: Vec<u8>) {
+        if self.queue.len() < QUEUE_MAX {
+            ev.d = data.len() as u32;
+            self.queue.push_back(ev);
+            self.payload.push_back(data);
+        }
+    }
+
     /// Lo siguiente que recibe un `WAIT_EVENT` en el instante `now` con ese plazo: un evento de la
     /// cola, `EV_TIMER` si ha vencido el temporizador, `EV_NONE` si ha vencido el plazo. `None` =
     /// hay que dormir (hasta `wake_at` o hasta que llegue un evento).
     pub fn next_event(&mut self, now: u64, deadline: Option<u64>) -> Option<WireEvent> {
+        self.event_data.clear();
         if let Some(e) = self.queue.pop_front() {
+            if lleva_datos(e.kind) {
+                self.event_data = self.payload.pop_front().unwrap_or_default();
+            }
             return Some(e);
         }
         if self.timer_at.is_some_and(|t| now >= t) {
@@ -197,6 +229,16 @@ pub fn dispatch(nr: u64, args: [u64; 5], mem: &mut dyn UserMem, st: &mut SysStat
         },
         SYS_PRESENT => present(mem, st, a0, a1, a2, a3),
         SYS_SAVE_AS => save_as(mem, st, a0, a1, a2, a3),
+        SYS_REQUEST => request(mem, st, a0, a1),
+        SYS_EVENT_DATA => {
+            if (st.event_data.len() as u64) > a1 {
+                E_INVAL
+            } else if mem.write(a0, &st.event_data) {
+                st.event_data.len() as i64
+            } else {
+                E_FAULT
+            }
+        }
         SYS_MEM_GROW => mem_grow(mem, st, a0),
         SYS_UPTIME => st.now_ms as i64,
         SYS_DATETIME => {
@@ -288,6 +330,49 @@ fn save_as(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, len: u64, name_pt
     0
 }
 
+fn request(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, len: u64) -> i64 {
+    if st.out.requests.len() >= REQUESTS_MAX {
+        return E_BUSY;
+    }
+    if len > REQUEST_MAX {
+        return E_INVAL;
+    }
+    // Validado antes de reservar en el núcleo.
+    if !mem.check(ptr, len, false) {
+        return E_FAULT;
+    }
+    let mut b = vec![0u8; len as usize];
+    if !mem.read(ptr, &mut b) {
+        return E_FAULT;
+    }
+    let Ok(mut r) = decode::<Request>(&b) else { return E_INVAL };
+    if let Request::Dialog(d) = &mut r {
+        if *tag_de(d) & TAG_PROGRAMA != 0 {
+            return E_INVAL;
+        }
+    }
+    st.out.requests.push_back(r);
+    0
+}
+
+fn tag_de(d: &mut DialogRequest) -> &mut u32 {
+    match d {
+        DialogRequest::Message { tag, .. }
+        | DialogRequest::Input { tag, .. }
+        | DialogRequest::Password { tag, .. }
+        | DialogRequest::Open { tag, .. }
+        | DialogRequest::Save { tag, .. }
+        | DialogRequest::Folder { tag, .. }
+        | DialogRequest::Entropy { tag, .. } => tag,
+    }
+}
+
+fn tag_resultado(r: &mut DialogResult) -> &mut u32 {
+    match r {
+        DialogResult::Answer { tag, .. } | DialogResult::Text { tag, .. } | DialogResult::Path { tag, .. } => tag,
+    }
+}
+
 fn mem_grow(mem: &mut dyn UserMem, st: &mut SysState, bytes: u64) -> i64 {
     let old = st.brk;
     if bytes == 0 {
@@ -375,7 +460,21 @@ pub struct ProcApp {
     hung: bool,
     /// Datos de un `SAVE_AS` mientras el diálogo Guardar está abierto.
     saving: Option<Vec<u8>>,
+    /// Peticiones recogidas del programa y aún sin pasar al `Ctx` (el escritorio atiende un diálogo,
+    /// un menú, etc. a la vez).
+    pend: VecDeque<Request>,
+    /// Hay un diálogo del programa abierto, sin respuesta.
+    dlg_open: bool,
+    /// Últimas respuestas de arrastre (`DragAnswer`, `DragSourceAnswer`) y la última conocida de `drag_over`.
+    over_ans: Option<bool>,
+    src_ans: Option<Option<Vec<String>>>,
+    last_over: bool,
 }
+
+/// Cuánto espera `drag_over`/`drag_source` la respuesta del programa, y cuántas veces como mucho
+/// cede el procesador a los programas mientras tanto (el reloj puede no avanzar en las pruebas).
+const DRAG_WAIT_MS: u64 = 5;
+const DRAG_SPINS: u32 = 100_000;
 
 impl ProcApp {
     pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>) -> Self {
@@ -393,6 +492,11 @@ impl ProcApp {
             close_asked: false,
             hung: false,
             saving: None,
+            pend: VecDeque::new(),
+            dlg_open: false,
+            over_ans: None,
+            src_ans: None,
+            last_over: false,
         }
     }
 
@@ -410,9 +514,84 @@ impl ProcApp {
         self.proc.state().post(ev);
     }
 
+    fn post_data<T: crate::wire::Wire>(&mut self, ev: WireEvent, data: &T, now: u64) {
+        self.proc.state().post_data(WireEvent { now_ms: now, ..ev }, encode(data));
+    }
+
+    /// Pasa las peticiones `REQUEST` del programa a `pend` y guarda las respuestas de arrastre.
+    fn recoger(&mut self) {
+        let st = self.proc.state();
+        while let Some(r) = st.out.requests.front() {
+            let respuesta = matches!(r, Request::DragAnswer(_) | Request::DragSourceAnswer(_));
+            if !respuesta && self.pend.len() >= REQUESTS_MAX {
+                break;
+            }
+            match st.out.requests.pop_front() {
+                Some(Request::DragAnswer(b)) => self.over_ans = Some(b),
+                Some(Request::DragSourceAnswer(v)) => self.src_ans = Some(v),
+                Some(r) => self.pend.push_back(r),
+                None => {}
+            }
+        }
+    }
+
+    /// Pasa al `Ctx` las peticiones pendientes, en orden. Cada casilla del `Ctx` admite una: si
+    /// está ocupada, esa petición y las que siguen esperan al próximo turno.
+    fn atender(&mut self, cx: &mut Ctx) {
+        while let Some(r) = self.pend.front() {
+            let ocupado = match r {
+                Request::Open(_) => cx.open.is_some(),
+                Request::OpenNew(_) => cx.open_new.is_some(),
+                Request::OpenTerminal(_) => cx.open_terminal.is_some(),
+                Request::Dialog(_) => cx.dialog.is_some() || self.dlg_open || self.saving.is_some(),
+                Request::Menu(_) => cx.menu.is_some(),
+                Request::Drag(_) => cx.drag.is_some(),
+                _ => false,
+            };
+            if ocupado {
+                break;
+            }
+            match self.pend.pop_front() {
+                Some(Request::Open(p)) => cx.open = Some(p),
+                Some(Request::OpenNew(p)) => cx.open_new = Some(p),
+                Some(Request::OpenTerminal(p)) => cx.open_terminal = Some(p),
+                Some(Request::Dialog(mut d)) => {
+                    *tag_de(&mut d) |= TAG_PROGRAMA;
+                    self.dlg_open = true;
+                    cx.dialog = Some(d);
+                }
+                Some(Request::Menu(m)) => cx.menu = Some(m),
+                Some(Request::Drag(paths)) => cx.drag = Some(DragRequest { paths }),
+                Some(Request::SetTheme(t)) => {
+                    *cx.theme = t;
+                    cx.theme_changed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Cede el procesador a los programas hasta que `listo` diga que ha llegado la respuesta o pasen
+    /// `DRAG_WAIT_MS`. `true` si llegó.
+    fn esperar(&mut self, cx: &mut Ctx, listo: impl Fn(&Self) -> bool) -> bool {
+        let t0 = cx.sys.uptime_ms();
+        for _ in 0..DRAG_SPINS {
+            cx.sys.run_programs();
+            self.recoger();
+            if listo(self) {
+                return true;
+            }
+            if cx.sys.uptime_ms().saturating_sub(t0) >= DRAG_WAIT_MS || self.proc.state().status != Status::Alive {
+                break;
+            }
+        }
+        false
+    }
+
     /// Recoge lo que el programa ha pedido y mira si sigue vivo y respondiendo.
     fn poll(&mut self, cx: &mut Ctx) {
         let now = cx.now_ms;
+        self.recoger();
         let st = self.proc.state();
         let out = core::mem::take(&mut st.out);
         let status = st.status.clone();
@@ -432,13 +611,16 @@ impl ProcApp {
             cx.redraw = true;
         }
         if let Some((name, data)) = out.save {
-            if self.saving.is_none() && cx.dialog.is_none() {
+            if self.saving.is_none() && !self.dlg_open && cx.dialog.is_none() {
                 let dir = cx.sys.files().std_dir(if name.to_lowercase().ends_with(".bmp") { Std::Pictures } else { Std::Documents });
                 cx.dialog = Some(DialogRequest::Save { tag: T_SAVE, title: String::from("Guardar como"), dir, name });
                 self.saving = Some(data);
             } else {
                 self.post(WireEvent { kind: EV_SAVED, a: -1, ..Default::default() }, now);
             }
+        }
+        if !matches!(status, Status::Killed(_)) {
+            self.atender(cx);
         }
         match status {
             Status::Alive => {}
@@ -530,8 +712,50 @@ impl App for ProcApp {
                 self.proc.kill();
                 cx.close = true;
             }
-            _ => {}
+            // Diálogo del programa: vuelve con su etiqueta original.
+            mut r => {
+                let tag = tag_resultado(&mut r);
+                if *tag & TAG_PROGRAMA != 0 {
+                    *tag &= !TAG_PROGRAMA;
+                    self.dlg_open = false;
+                    self.post_data(WireEvent::new(EV_DIALOG, 0), &r, cx.now_ms);
+                }
+            }
         }
+    }
+    fn menu_result(&mut self, tag: u32, id: u32, cx: &mut Ctx) {
+        self.post(WireEvent { kind: EV_MENU, a: tag as i32, b: id as i32, ..Default::default() }, cx.now_ms);
+    }
+    fn drop_files(&mut self, x: i32, y: i32, paths: &[String], copy: bool, cx: &mut Ctx) {
+        let ev = WireEvent { kind: EV_DROP, a: x, b: y, c: copy as i32, ..Default::default() };
+        self.post_data(ev, &paths.to_vec(), cx.now_ms);
+    }
+    fn open_path(&mut self, path: &str, cx: &mut Ctx) {
+        self.post_data(WireEvent::new(EV_OPEN, 0), &String::from(path), cx.now_ms);
+    }
+    /// Pregunta al programa y espera su respuesta un momento (la llamada del escritorio es síncrona).
+    /// Si no llega a tiempo, vale la última respuesta conocida.
+    fn drag_over(&mut self, pos: Option<(i32, i32)>, paths: &[String], cx: &mut Ctx) -> bool {
+        let (x, y) = pos.unwrap_or((0, 0));
+        let ev = WireEvent { kind: EV_DRAG_OVER, a: x, b: y, c: pos.is_some() as i32, ..Default::default() };
+        self.post_data(ev, &paths.to_vec(), cx.now_ms);
+        if pos.is_none() {
+            self.last_over = false;
+            return false;
+        }
+        self.over_ans = None;
+        if self.esperar(cx, |s| s.over_ans.is_some()) {
+            self.last_over = self.over_ans.take().unwrap_or(false);
+        }
+        self.atender(cx);
+        self.last_over
+    }
+    fn drag_source(&mut self, x: i32, y: i32, cx: &mut Ctx) -> Option<Vec<String>> {
+        self.post(WireEvent { kind: EV_DRAG_SOURCE, a: x, b: y, ..Default::default() }, cx.now_ms);
+        self.src_ans = None;
+        let ok = self.esperar(cx, |s| s.src_ans.is_some());
+        self.atender(cx);
+        if ok { self.src_ans.take().flatten() } else { None }
     }
     fn request_close(&mut self, cx: &mut Ctx) -> bool {
         if self.proc.state().status != Status::Alive {
@@ -539,6 +763,7 @@ impl App for ProcApp {
         }
         if self.hung {
             let text = format!("«{}» no responde.\n¿Quieres finalizarlo? Se perderá lo que no esté guardado.", self.name);
+            self.dlg_open = false;
             cx.dialog = Some(DialogRequest::Message { tag: T_HUNG, title: self.name.clone(), text, buttons: Buttons::YesNo });
             return false;
         }
@@ -561,6 +786,7 @@ impl Drop for ProcApp {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::menu::MenuRequest;
     use crate::platform::TestPlatform;
 
     /// Memoria de programa simulada, byte a byte (lo no escrito vale 0).
@@ -795,6 +1021,205 @@ pub(crate) mod tests {
         app.dialog_result(DialogResult::Path { tag: T_SAVE, path: Some(String::from("C:\\Usuarios\\x.bmp")) }, &mut cx);
         assert_eq!(sh.borrow().queue.back().map(|e| e.a), Some(-1));
         assert!(cx.dialog.is_some());
+    }
+
+    fn pide(m: &mut FakeMem, st: &mut SysState, r: &Request) -> Sys {
+        let b = encode(r);
+        m.write(D, &b);
+        dispatch(SYS_REQUEST, [D, b.len() as u64, 0, 0, 0], m, st)
+    }
+
+    #[test]
+    fn request_valida_y_encola() {
+        let mut m = mem();
+        let mut st = SysState::default();
+        assert_eq!(pide(&mut m, &mut st, &Request::Open(String::from("C:\\"))), Sys::Ret(0));
+        assert_eq!(st.out.requests.len(), 1);
+        let dlg = |tag| Request::Dialog(DialogRequest::Message { tag, title: String::new(), text: String::new(), buttons: Buttons::Ok });
+        assert_eq!(pide(&mut m, &mut st, &dlg(5)), Sys::Ret(0));
+        assert_eq!(pide(&mut m, &mut st, &dlg(TAG_PROGRAMA)), Sys::Ret(E_INVAL), "ese bit es del escritorio");
+        m.write(D, &[99, 1, 2]);
+        assert_eq!(dispatch(SYS_REQUEST, [D, 3, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL), "roto");
+        assert_eq!(dispatch(SYS_REQUEST, [D, REQUEST_MAX + 1, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL));
+        assert_eq!(dispatch(SYS_REQUEST, [0x1000, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert_eq!(dispatch(SYS_REQUEST, [D + 0x4FF0, 0x100, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert_eq!(st.out.requests.len(), 2, "lo rechazado no se encola");
+        while st.out.requests.len() < REQUESTS_MAX {
+            assert_eq!(pide(&mut m, &mut st, &Request::DragAnswer(true)), Sys::Ret(0));
+        }
+        assert_eq!(pide(&mut m, &mut st, &Request::DragAnswer(true)), Sys::Ret(E_BUSY));
+    }
+
+    #[test]
+    fn event_data_acompana_al_evento() {
+        let mut m = mem();
+        let mut st = SysState::default();
+        st.post_data(WireEvent::new(EV_OPEN, 1), encode(&String::from("C:\\a")));
+        st.post(WireEvent::new(EV_KEY, 1));
+        let get = |m: &mut FakeMem, st: &mut SysState, cap| dispatch(SYS_EVENT_DATA, [D, cap, 0, 0, 0], m, st);
+        assert_eq!(get(&mut m, &mut st, 100), Sys::Ret(0), "antes de recibir nada");
+        let e = st.next_event(2, None).unwrap();
+        assert_eq!((e.kind, e.d), (EV_OPEN, 8));
+        assert_eq!(get(&mut m, &mut st, 7), Sys::Ret(E_INVAL), "no cabe");
+        assert_eq!(get(&mut m, &mut st, 100), Sys::Ret(8));
+        let mut b = [0u8; 8];
+        m.read(D, &mut b);
+        assert_eq!(decode::<String>(&b).as_deref(), Ok("C:\\a"));
+        assert_eq!(dispatch(SYS_EVENT_DATA, [D + 0x4000, 100, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        st.next_event(3, None);
+        assert_eq!(get(&mut m, &mut st, 100), Sys::Ret(0), "valen hasta el siguiente WAIT_EVENT");
+        // Cola llena: el evento con datos se descarta con los suyos.
+        for _ in 0..QUEUE_MAX {
+            st.post(WireEvent::new(EV_KEY, 1));
+        }
+        st.post_data(WireEvent::new(EV_OPEN, 1), vec![1]);
+        assert!(st.payload.is_empty());
+    }
+
+    fn dialogo(tag: u32) -> Request {
+        Request::Dialog(DialogRequest::Input { tag, title: String::from("t"), label: String::new(), value: String::new() })
+    }
+
+    #[test]
+    fn peticiones_pasan_al_ctx_de_una_en_una() {
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        {
+            let mut s = sh.borrow_mut();
+            let q = &mut s.out.requests;
+            q.push_back(Request::Open(String::from("C:\\a")));
+            q.push_back(Request::OpenNew(String::from("C:\\b")));
+            q.push_back(Request::OpenTerminal(String::from("C:\\c")));
+            q.push_back(Request::Drag(vec![String::from("C:\\d")]));
+            q.push_back(dialogo(7));
+            q.push_back(dialogo(8));
+            q.push_back(Request::Menu(MenuRequest { tag: 4, x: 1, y: 2, items: vec![] }));
+            q.push_back(Request::SetTheme(Theme { accent: 0x123456, wallpaper: 1 }));
+            q.push_back(Request::Open(String::from("C:\\e")));
+        }
+        let mut cx = Ctx::new(&mut sys, &mut theme, 1);
+        app.tick(&mut cx);
+        assert_eq!(cx.open.take().as_deref(), Some("C:\\a"));
+        assert_eq!(cx.open_new.as_deref(), Some("C:\\b"));
+        assert_eq!(cx.open_terminal.as_deref(), Some("C:\\c"));
+        assert_eq!(cx.drag.as_ref().map(|d| d.paths.len()), Some(1));
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Input { tag, .. }) if tag == 7 | TAG_PROGRAMA));
+        assert!(cx.menu.is_none() && !cx.theme_changed, "el segundo diálogo y todo lo que sigue esperan");
+        // Mientras el primer diálogo siga abierto, el segundo espera.
+        app.tick(&mut cx);
+        assert!(cx.dialog.is_none() && cx.open.is_none());
+        // El programa recibe su respuesta con su etiqueta; entonces sale el segundo.
+        app.dialog_result(DialogResult::Text { tag: 7 | TAG_PROGRAMA, value: Some(String::from("hola")) }, &mut cx);
+        let d = sh.borrow().payload.back().cloned().unwrap();
+        assert_eq!(sh.borrow().queue.back().map(|e| (e.kind, e.d as usize)), Some((EV_DIALOG, d.len())));
+        assert_eq!(decode::<DialogResult>(&d), Ok(DialogResult::Text { tag: 7, value: Some(String::from("hola")) }));
+        app.tick(&mut cx);
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Input { tag, .. }) if tag == 8 | TAG_PROGRAMA));
+        assert_eq!(cx.menu.take().map(|m| m.tag), Some(4), "el menú no espera al diálogo");
+        app.dialog_result(DialogResult::Text { tag: 8 | TAG_PROGRAMA, value: None }, &mut cx);
+        app.tick(&mut cx);
+        assert!(cx.theme_changed && cx.theme.accent == 0x123456);
+        assert_eq!(cx.open.as_deref(), Some("C:\\e"));
+        // Sus diálogos internos no se confunden con los del programa (etiquetas 1 a 3).
+        let n = sh.borrow().queue.len();
+        app.dialog_result(DialogResult::Answer { tag: T_HUNG, answer: Answer::No }, &mut cx);
+        assert_eq!(sh.borrow().queue.len(), n);
+    }
+
+    #[test]
+    fn eventos_con_datos_hacia_el_programa() {
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut theme, 9);
+        app.menu_result(3, 11, &mut cx);
+        let paths = vec![String::from("C:\\x"), String::from("C:\\y")];
+        app.drop_files(5, 6, &paths, true, &mut cx);
+        app.open_path("C:\\z", &mut cx);
+        let s = sh.borrow();
+        let ev: Vec<_> = s.queue.iter().map(|e| (e.kind, e.a, e.b, e.c, e.now_ms)).collect();
+        assert_eq!(ev, [(EV_MENU, 3, 11, 0, 9), (EV_DROP, 5, 6, 1, 9), (EV_OPEN, 0, 0, 0, 9)]);
+        assert_eq!(decode::<Vec<String>>(&s.payload[0]), Ok(paths));
+        assert_eq!(decode::<String>(&s.payload[1]).as_deref(), Ok("C:\\z"));
+        assert_eq!(s.queue[1].d as usize, s.payload[0].len());
+    }
+
+    /// Plataforma que, al ceder el turno a los programas, hace de programa: contesta con `respuesta`.
+    struct Contesta {
+        p: TestPlatform,
+        st: Shared,
+        respuesta: Option<Request>,
+        cedidas: u32,
+    }
+
+    impl Platform for Contesta {
+        fn now(&mut self) -> DateTime {
+            self.p.now()
+        }
+        fn uptime_ms(&self) -> u64 {
+            self.p.uptime_ms()
+        }
+        fn mem(&self) -> crate::platform::MemInfo {
+            self.p.mem()
+        }
+        fn cpu(&self) -> String {
+            self.p.cpu()
+        }
+        fn screen(&self) -> (u32, u32) {
+            self.p.screen()
+        }
+        fn reboot(&mut self) {}
+        fn shutdown(&mut self) {}
+        fn files(&mut self) -> &mut crate::files::Files {
+            &mut self.p.files
+        }
+        fn entropy(&mut self) -> u64 {
+            0
+        }
+        fn pool(&mut self) -> &mut crate::keys::Pool {
+            &mut self.p.pool
+        }
+        fn run_programs(&mut self) {
+            self.cedidas += 1;
+            if let Some(r) = self.respuesta.take() {
+                self.st.borrow_mut().out.requests.push_back(r);
+            }
+        }
+    }
+
+    #[test]
+    fn arrastre_espera_la_respuesta_del_programa() {
+        let (mut app, sh, _) = fake();
+        let mut sys = Contesta { p: TestPlatform::default(), st: sh.clone(), respuesta: Some(Request::DragAnswer(true)), cedidas: 0 };
+        let mut theme = Theme::default();
+        let paths = vec![String::from("C:\\x")];
+        let mut cx = Ctx::new(&mut sys, &mut theme, 1);
+        assert!(app.drag_over(Some((3, 4)), &paths, &mut cx));
+        let e = *sh.borrow().queue.back().unwrap();
+        assert_eq!((e.kind, e.a, e.b, e.c), (EV_DRAG_OVER, 3, 4, 1));
+        assert_eq!(decode::<Vec<String>>(sh.borrow().payload.back().unwrap()), Ok(paths.clone()));
+        // Sin respuesta a tiempo (el reloj de prueba no avanza: salen los giros): vale la última conocida.
+        drop(cx);
+        sys.respuesta = None;
+        let mut cx = Ctx::new(&mut sys, &mut theme, 2);
+        assert!(app.drag_over(Some((5, 4)), &paths, &mut cx), "última respuesta conocida");
+        // Al salir se avisa sin esperar y se olvida.
+        drop(cx);
+        let antes = sys.cedidas;
+        let mut cx = Ctx::new(&mut sys, &mut theme, 3);
+        assert!(!app.drag_over(None, &paths, &mut cx));
+        drop(cx);
+        assert_eq!(sys.cedidas, antes);
+        assert_eq!(sh.borrow().queue.back().map(|e| (e.kind, e.c)), Some((EV_DRAG_OVER, 0)));
+        // Origen del arrastre con el botón derecho; las peticiones que llegan a la vez no se pierden.
+        sys.respuesta = Some(Request::DragSourceAnswer(Some(paths.clone())));
+        sh.borrow_mut().out.requests.push_back(Request::OpenNew(String::from("C:\\n")));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 4);
+        assert_eq!(app.drag_source(7, 8, &mut cx), Some(paths));
+        assert_eq!(cx.open_new.as_deref(), Some("C:\\n"));
+        assert_eq!(sh.borrow().queue.back().map(|e| (e.kind, e.a, e.b)), Some((EV_DRAG_SOURCE, 7, 8)));
+        assert_eq!(app.drag_source(1, 1, &mut cx), None, "sin respuesta a tiempo");
     }
 
     #[test]
