@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Programas de prueba en modo usuario (feature `demo`): una ventana que pinta y se cierra, uno
-//! que lee memoria del núcleo y uno que se cuelga. Son código independiente de la posición:
+//! Programas de prueba en modo usuario (feature `demo`): dos ventanas que pintan y se cierran, una
+//! que lee memoria del núcleo y una que se cuelga. Son código independiente de la posición:
 //! se copian sus bytes a una sección Code de un `.nfx` armado aquí mismo.
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -99,7 +99,7 @@ global_asm!(
     "syscall",
     ".global DEMO_B_END",
     "DEMO_B_END:",
-    // (c) Bucle infinito: debe morir como colgado.
+    // (c) Bucle infinito: no bloquea nada; el escritorio lo marca "No responde".
     ".global DEMO_C_START",
     "DEMO_C_START:",
     "2:",
@@ -121,19 +121,20 @@ fn montar(start: &u8, end: &u8, bss: u64) -> Vec<u8> {
     nfx::encode(CODE, &s)
 }
 
-/// Abre los tres programas de prueba como ventanas del escritorio.
+/// Abre los programas de prueba como ventanas del escritorio.
 pub fn lanzar(desk: &mut Desktop, plat: &mut dyn Platform) {
     // Solo se toman las direcciones de los símbolos, no se leen como datos.
     let progs = unsafe {
         [
             ("Demo", montar(&DEMO_A_START, &DEMO_A_END, BSS_SIZE)),
+            ("Demo 2", montar(&DEMO_A_START, &DEMO_A_END, BSS_SIZE)),
             ("Demo lee el núcleo", montar(&DEMO_B_START, &DEMO_B_END, 0)),
             ("Demo se cuelga", montar(&DEMO_C_START, &DEMO_C_END, 0)),
         ]
     };
     for (nombre, bytes) in progs {
-        match plat.spawn(&bytes) {
-            Ok((p, fixed)) => desk.launch_app(Box::new(ProcApp::new(p, fixed, nombre, None)), plat),
+        match plat.spawn(&bytes, nombre) {
+            Ok(p) => desk.launch_app(Box::new(ProcApp::new(p, nombre, None)), plat),
             Err(e) => crate::serial::traza!("NF demo: {nombre}: {e}"),
         }
     }

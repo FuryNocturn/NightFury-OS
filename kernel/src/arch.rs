@@ -109,7 +109,7 @@ extern "C" {
 extern "sysv64" fn timer_handler(frame: *const u64) {
     TICKS.fetch_add(1, Relaxed);
     eoi(0);
-    // frame[1] = CS interrumpido: si era un programa (ring 3), mira si lleva demasiado sin esperar.
+    // frame[1] = CS interrumpido: si era un programa (ring 3), se le quita el procesador (turno).
     // La rutina de entrada nos pasa un marco válido (5 qwords de la CPU).
     if unsafe { *frame.add(1) } & 3 == 3 {
         crate::user::tick_en_usuario();
@@ -290,11 +290,13 @@ pub fn init_pit() {
     }
 }
 
-/// Espera a la próxima interrupción si no hay trabajo pendiente.
+/// Punto de espera de la tarea 0: sin trabajo pendiente deja correr al siguiente programa listo
+/// (vuelve cuando el temporizador lo expropia o se duerme) y, si no hay ninguno, espera a la
+/// próxima interrupción. Es el único sitio donde la tarea 0 cede el procesador.
 pub fn idle(hay_trabajo: impl Fn() -> bool) {
     unsafe {
         asm!("cli", options(nomem, nostack));
-        if hay_trabajo() {
+        if hay_trabajo() || crate::user::correr() {
             asm!("sti", options(nomem, nostack));
         } else {
             asm!("sti", "hlt", options(nomem, nostack));
