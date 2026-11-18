@@ -19,6 +19,7 @@ pub mod fs;
 pub mod fsapi;
 pub mod desktop;
 pub mod font;
+pub mod gamepad;
 pub mod geom;
 pub mod glyphs;
 pub mod heap;

@@ -128,6 +128,14 @@ pub const EV_DRAG_SOURCE: u32 = 17;
 pub const EV_DROP: u32 = 18;
 /// Abrir una ruta en esta ventana (`App::open_path`); datos: la ruta.
 pub const EV_OPEN: u32 = 19;
+/// Estado de un mando (solo a la ventana activa, cuando cambia y al ganar el foco). `a` = id del
+/// mando, `b` = botones (`gamepad::BTN_*`), y los ejes de dos en dos como i16 (bajo | alto << 16):
+/// `c` = LX, LY; `d` = RX, RY; `flags` = LT, RT. Ver `WireEvent::gamepad` y `to_gamepad`.
+/// Al perder el foco, el programa debe dar todo por suelto.
+pub const EV_GAMEPAD: u32 = 20;
+/// Lista de mandos conectados (lleva datos: `Vec<gamepad::PadInfo>`). Llega a todas las ventanas
+/// al abrirse y cada vez que se conecta o quita uno.
+pub const EV_GAMEPADS: u32 = 21;
 
 pub const F_SHIFT: u32 = 1;
 pub const F_CTRL: u32 = 2;
@@ -187,6 +195,17 @@ impl WireEvent {
         let (code, kc) = key_code(ev.key);
         let d = ev.ch.or(kc).map_or(0, |c| c as u32);
         WireEvent { kind: EV_KEY, a: code, d, flags, now_ms, ..Default::default() }
+    }
+
+    /// `EV_GAMEPAD` del mando `id`.
+    pub fn gamepad(id: u32, st: &crate::gamepad::PadState, now_ms: u64) -> Self {
+        let _ = (id, st, now_ms);
+        todo!("paso 5: implementar")
+    }
+
+    /// Vuelve a (id, estado). `None` si no es `EV_GAMEPAD`.
+    pub fn to_gamepad(&self) -> Option<(u32, crate::gamepad::PadState)> {
+        todo!("paso 5: implementar")
     }
 
     /// Vuelve a `KeyEvent` (siempre `down = true`). `None` si no es `EV_KEY` o el código no existe.

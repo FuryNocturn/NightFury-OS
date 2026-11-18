@@ -125,6 +125,10 @@ pub trait App {
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx);
     /// Se llama unas 100 veces por segundo; `cx.now_ms` es el reloj.
     fn tick(&mut self, cx: &mut Ctx);
+    /// Estado nuevo del mando `id` (solo con la ventana activa; al perder el foco, dar todo por suelto).
+    fn gamepad(&mut self, _id: u32, _state: &crate::gamepad::PadState, _cx: &mut Ctx) {}
+    /// Lista de mandos conectados: al abrir la ventana y cada vez que cambia.
+    fn gamepads(&mut self, _list: &[crate::gamepad::PadInfo], _cx: &mut Ctx) {}
     /// Respuesta al diálogo pedido con `cx.dialog`.
     fn dialog_result(&mut self, _result: DialogResult, _cx: &mut Ctx) {}
     /// Elemento elegido en el menú pedido con `cx.menu` (si se cierra sin elegir no se llama).

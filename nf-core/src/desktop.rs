@@ -1235,6 +1235,14 @@ impl Desktop {
         }
     }
 
+    /// Un mando se conecta, se quita o cambia (lo llama el núcleo). El estado va a la ventana activa
+    /// (`App::gamepad`) y la lista a todas (`App::gamepads`); al cambiar el foco, la ventana nueva
+    /// recibe el estado actual de cada mando y las ventanas nuevas reciben la lista al abrirse.
+    pub fn gamepad(&mut self, ev: crate::gamepad::PadEvent, sys: &mut dyn Platform) {
+        let _ = (ev, sys);
+        todo!("paso 5: implementar")
+    }
+
     /// Mueve el puntero a una posición absoluta.
     pub fn mouse_to(&mut self, x: i32, y: i32, sys: &mut dyn Platform) {
         let (x, y) = (x.clamp(0, (self.w - 1).max(0)), y.clamp(0, (self.h - 1).max(0)));
