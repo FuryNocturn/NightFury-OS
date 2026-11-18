@@ -7,6 +7,7 @@
 //! a `damage`; `render` redibuja lo sucio, normaliza las zonas y recompone solo dentro de cada una.
 use crate::apps::{self, App, AppKind, Ctx, MouseEv, APPS};
 use crate::dialogs::{self, Answer, Buttons, Dialog, DialogRequest, DialogResult};
+use crate::drives::{DriveInfo, FormatRequest};
 use crate::files::{self, Std};
 use crate::fs::FsError;
 use crate::font::{self, Align};
@@ -103,6 +104,9 @@ enum Hit {
     Start,
     Task(u32),
     Show,
+    /// «Quitar hardware de forma segura» de la bandeja y el globo de unidades.
+    Tray,
+    Tip,
     Bar,
     Row(usize),
     Tile(usize),
@@ -298,6 +302,11 @@ const TAG_DEL: u32 = 0xFFFF_FF16;
 /// Etiquetas e identificadores de los menús contextuales del escritorio.
 const MENU_ICON: u32 = 1;
 const MENU_DESK: u32 = 2;
+/// Menú de «Quitar hardware de forma segura»: cada entrada es `M_EJECT + letra - 'A'`.
+const MENU_TRAY: u32 = 4;
+const M_EJECT: u32 = 100;
+/// Cuánto se ve el globo de una unidad.
+const TIP_MS: u64 = 6000;
 /// Menú que sale al soltar un arrastre con el botón derecho.
 const MENU_DROP: u32 = 3;
 const M_MOVE_HERE: u32 = 1;
@@ -391,6 +400,13 @@ impl Window {
 }
 
 /// Menú contextual abierto: lo pide una ventana (`owner = Some(id)`) o el propio escritorio (`None`).
+/// Globo junto a la bandeja: texto, unidad que abre al hacer clic (si abre alguna) y hasta cuándo se ve.
+struct Tip {
+    text: String,
+    letter: Option<char>,
+    until: u64,
+}
+
 struct OpenMenu {
     menu: Menu,
     owner: Option<u32>,
@@ -478,6 +494,11 @@ pub struct Desktop {
     pending_drop: Option<(Dest, Vec<String>, bool)>,
     /// Lo que se enviará a la Papelera si se responde Sí a `TAG_DEL`.
     pending_del: Option<Vec<String>>,
+    /// Unidades de la última lectura (`None` hasta la primera: las que ya estaban no avisan) y la
+    /// generación de `Files` en que se leyeron.
+    drv: Option<Vec<DriveInfo>>,
+    drv_gen: u64,
+    tip: Option<Tip>,
 }
 
 /// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
@@ -773,6 +794,9 @@ impl Desktop {
             band_base: Vec::new(),
             pending_drop: None,
             pending_del: None,
+            drv: None,
+            drv_gen: 0,
+            tip: None,
         };
         d.login.set_clock(d.clock);
         if sys.files().user().is_some() && !sys.files().disk_locked() {
@@ -931,6 +955,85 @@ impl Desktop {
 
     fn conv_rect(&self) -> Rect {
         Rect::new(self.w - 292, self.bar_y() - 60, 280, 52)
+    }
+
+    /// Pone un globo de unidad (sustituye al anterior).
+    fn set_tip(&mut self, text: String, letter: Option<char>) {
+        self.dmg(self.tip_rect());
+        self.tip = Some(Tip { text, letter, until: self.now_ms + TIP_MS });
+        self.dmg(self.tip_rect());
+    }
+
+    /// Detecta unidades nuevas (globo) y las que se quitan (la bandeja se pone al día). Solo mira
+    /// cuando cambia la generación de `Files`.
+    fn drives_tick(&mut self, sys: &mut dyn Platform) {
+        if self.tip.as_ref().is_some_and(|t| self.now_ms >= t.until) {
+            self.dmg(self.tip_rect());
+            self.tip = None;
+        }
+        let g = sys.files().generation();
+        if self.drv.is_some() && g == self.drv_gen {
+            return;
+        }
+        self.drv_gen = g;
+        let now = sys.files().drives();
+        let mut new = Vec::new();
+        if let Some(old) = &self.drv {
+            new = now.iter().filter(|d| d.removable && !old.iter().any(|o| o.letter == d.letter)).map(|d| (d.letter, d.locked)).collect();
+        }
+        let letters = |v: &[DriveInfo]| v.iter().filter(|d| d.removable).map(|d| d.letter).collect::<Vec<_>>();
+        let changed = self.drv.as_ref().map_or(!letters(&now).is_empty(), |o| letters(o) != letters(&now));
+        self.drv = Some(now);
+        if changed {
+            self.dmg(self.tray_rect());
+        }
+        // shortcut: con varias unidades nuevas a la vez, el globo es el de la última; subir si hace falta una cola.
+        if let Some(&(l, locked)) = new.last() {
+            let text = if locked { format!("Unidad USB ({l}:) está cifrada. Haz clic para desbloquearla.") } else { format!("Unidad USB ({l}:) conectada. Haz clic para abrirla.") };
+            self.set_tip(text, Some(l));
+        }
+    }
+
+    /// Abre la unidad `l` en el Explorador (una cifrada pide allí su contraseña).
+    fn open_drive(&mut self, l: char, sys: &mut dyn Platform) {
+        let id = match self.wins.iter().rev().find(|w| w.kind == AppKind::Files && w.dlg.is_none()) {
+            Some(w) => w.id,
+            None => self.launch_id(AppKind::Files, sys),
+        };
+        self.raise(id);
+        let path = format!("{l}:\\");
+        self.with_app(id, sys, |a, cx| a.open_path(&path, cx));
+    }
+
+    /// Menú de la bandeja: una entrada «Expulsar …» por cada unidad extraíble.
+    fn tray_menu(&mut self) {
+        let items: Vec<MenuItem> = self.removable().iter().map(|d| MenuItem::new(M_EJECT + (d.letter as u32 - 'A' as u32), &format!("Expulsar {}", d.name()))).collect();
+        if items.is_empty() {
+            return;
+        }
+        let r = self.tray_rect();
+        self.open_menu(None, MENU_TRAY, r.x, r.y, items);
+    }
+
+    fn eject(&mut self, l: char, sys: &mut dyn Platform) {
+        match sys.files().request_drive_action(l, FormatRequest::Eject) {
+            Ok(()) => self.set_tip(format!("Ya puedes quitar la unidad ({l}:)."), None),
+            Err(e) => self.info("Expulsar", e.message(), sys),
+        }
+    }
+
+    fn paint_tip(&self, s: &mut Surface) {
+        let r = self.tip_rect();
+        let Some(t) = self.tip.as_ref().filter(|_| r.intersects(s.clip())) else { return };
+        s.fill_rect(r, 0x2B2B2B);
+        s.frame(r, blend(0x2B2B2B, 0xFFFFFF, 40));
+        let mut lines = dialogs::wrap(&t.text, 9, r.w - 28);
+        lines.truncate(2);
+        let lh = font::line_h(9);
+        let top = r.y + (r.h - lh * lines.len() as i32) / 2;
+        for (j, l) in lines.iter().enumerate() {
+            text_in(s, Rect::new(r.x + 14, top + j as i32 * lh, r.w - 28, lh), l, 9, 0xFFFFFF, Align::Left);
+        }
     }
 
     /// Un paso de la conversión en curso (si la hay) y actualización del aviso. Si falla, no se
@@ -1469,6 +1572,10 @@ impl Desktop {
                     M_COPY_HERE => self.run_drop_act(act, paths, true, sys),
                     _ => {}
                 }
+            }
+        } else if tag == MENU_TRAY {
+            if let Some(l) = char::from_u32('A' as u32 + id.wrapping_sub(M_EJECT)).filter(|c| c.is_ascii_uppercase()) {
+                self.eject(l, sys);
             }
         } else if tag == MENU_ICON {
             if self.sel.len() > 1 {
@@ -2327,6 +2434,19 @@ impl Desktop {
     fn clock_rect(&self) -> Rect {
         Rect::new(self.w - 92, self.bar_y(), 86, BAR_H)
     }
+    /// Icono «Quitar hardware de forma segura»: a la izquierda del reloj.
+    fn tray_rect(&self) -> Rect {
+        Rect::new(self.w - 92 - 36, self.bar_y(), 34, BAR_H)
+    }
+    /// Unidades extraíbles conectadas (de la última lectura).
+    fn removable(&self) -> Vec<&DriveInfo> {
+        self.drv.iter().flatten().filter(|d| d.removable).collect()
+    }
+    /// Globo de unidades: encima del aviso de cifrado.
+    fn tip_rect(&self) -> Rect {
+        let up = if self.conv.is_some() || self.conv_note.is_some() { 120 } else { 60 };
+        Rect::new(self.w - 292, self.bar_y() - up, 280, 52)
+    }
     fn menu_rect(&self) -> Rect {
         let (w, h) = (self.w.min(620), (self.h - BAR_H).min(500));
         Rect::new(0, self.bar_y() - h, w, h)
@@ -2450,12 +2570,18 @@ impl Desktop {
             }
             return Hit::MenuBg;
         }
+        if self.tip.is_some() && !boot && self.tip_rect().contains(x, y) {
+            return Hit::Tip;
+        }
         if y >= self.bar_y() && !boot {
             if self.start_rect().contains(x, y) {
                 return Hit::Start;
             }
             if self.show_rect().contains(x, y) {
                 return Hit::Show;
+            }
+            if !self.removable().is_empty() && self.tray_rect().contains(x, y) {
+                return Hit::Tray;
             }
             for (i, id) in self.task_ids().into_iter().enumerate() {
                 if self.task_rect(i).contains(x, y) {
@@ -2500,7 +2626,7 @@ impl Desktop {
     /// Solo los elementos que cambian de aspecto al pasar el ratón.
     fn hot_of(h: Hit) -> Hit {
         match h {
-            Hit::Start | Hit::Task(_) | Hit::Show | Hit::Row(_) | Hit::Tile(_) | Hit::MSettings | Hit::MPower | Hit::Shut(_) | Hit::Cap(..) => h,
+            Hit::Start | Hit::Task(_) | Hit::Show | Hit::Tray | Hit::Row(_) | Hit::Tile(_) | Hit::MSettings | Hit::MPower | Hit::Shut(_) | Hit::Cap(..) => h,
             _ => Hit::None,
         }
     }
@@ -2510,6 +2636,7 @@ impl Desktop {
             Hit::Start => self.start_rect(),
             Hit::Task(id) => self.task_ids().iter().position(|&t| t == id).map_or(Rect::default(), |i| self.task_rect(i)),
             Hit::Show => self.show_rect(),
+            Hit::Tray => self.tray_rect(),
             Hit::Row(i) => self.row_rect(i),
             Hit::Tile(i) => self.tile_rect(i),
             Hit::MSettings => self.msettings_rect(),
@@ -2590,6 +2717,15 @@ impl Desktop {
             Hit::Show => {
                 for id in self.task_ids() {
                     self.minimize(id);
+                }
+            }
+            Hit::Tray => self.tray_menu(),
+            Hit::Tip => {
+                if let Some(t) = self.tip.take() {
+                    self.dmg(self.tip_rect());
+                    if let Some(l) = t.letter {
+                        self.open_drive(l, sys);
+                    }
                 }
             }
             Hit::Icon(i) => self.press_icon(i, hit, sys),
@@ -3068,6 +3204,7 @@ impl Desktop {
             self.boot_flow(sys);
         }
         self.convert_tick(sys);
+        self.drives_tick(sys);
         self.refresh_icons(sys);
         self.sync_mods(sys);
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
@@ -3118,6 +3255,7 @@ impl Desktop {
             if self.login.mode == Mode::Off {
                 self.paint_bar(s, active);
                 self.paint_conv(s);
+                self.paint_tip(s);
                 if self.start_open {
                     self.paint_menu(s);
                 }
@@ -3275,6 +3413,13 @@ impl Desktop {
         let t = &self.clock;
         text_in(s, Rect::new(c.x, y0, c.w, lh), &format!("{:02}:{:02}", t.hour, t.minute), 8, 0xFFFFFF, Align::Center);
         text_in(s, Rect::new(c.x, y0 + lh, c.w, lh), &format!("{}/{}/{}", t.day, t.month, t.year), 8, 0xFFFFFF, Align::Center);
+        if !self.removable().is_empty() {
+            let r = self.tray_rect();
+            if self.hot == Hit::Tray || self.menu.as_ref().is_some_and(|m| m.tag == MENU_TRAY) {
+                s.fill_rect(r, HOVER_BAR);
+            }
+            icons::draw(s, Icon::Usb, r.x + 7, r.y + 10, 20, 0xFFFFFF);
+        }
         let sh = self.show_rect();
         if self.hot == Hit::Show {
             s.fill_rect(sh, HOVER_BAR);
@@ -3480,6 +3625,61 @@ mod tests {
         click!(d, sys, center(d.show_rect()));
         assert!(d.wins.iter().all(|w| w.min));
         assert_eq!(d.active_id(), None);
+    }
+
+    fn usb_vol(label: &str) -> Box<dyn crate::vol::Volume> {
+        use crate::vol::{self, FsKind, MemSectors};
+        let mut m = MemSectors::new(131072, 512);
+        vol::format(&mut m, FsKind::Fat32, label, DateTime::default()).unwrap();
+        let part = vol::partitions(&mut m).unwrap();
+        vol::mount(Box::new(m), &part[0]).unwrap()
+    }
+
+    #[test]
+    fn unidad_nueva_avisa_se_abre_con_clic_y_se_expulsa_desde_la_bandeja() {
+        let (mut d, mut sys) = setup(1280, 800);
+        d.tick(1000, &mut sys);
+        assert!(d.tip.is_none() && d.removable().is_empty());
+        assert_ne!(d.hit(center(d.tray_rect()).0, center(d.tray_rect()).1), Hit::Tray, "sin unidades no hay icono");
+        // Una unidad que aparece: globo y icono de la bandeja.
+        sys.files.attach(1, "Pendrive", usb_vol("DATOS"));
+        d.tick(1100, &mut sys);
+        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("Unidad USB (D:) conectada. Haz clic para abrirla."));
+        assert_eq!(d.hit(center(d.tray_rect()).0, center(d.tray_rect()).1), Hit::Tray);
+        let mut s = Surface::new(1280, 800, 0);
+        d.paint(&mut s, None);
+        // Clic en el globo: abre el Explorador en D:.
+        click!(d, sys, center(d.tip_rect()));
+        assert!(d.tip.is_none());
+        let w = d.wins.iter().find(|w| w.kind == AppKind::Files).expect("Explorador");
+        assert_eq!(w.title, "DATOS (D:)");
+        // El globo se apaga solo.
+        sys.files.attach(2, "Otro", usb_vol(""));
+        d.tick(1200, &mut sys);
+        assert_eq!(d.tip.as_ref().and_then(|t| t.letter), Some('E'));
+        d.tick(1200 + TIP_MS, &mut sys);
+        assert!(d.tip.is_none());
+        // Bandeja: una entrada por unidad; elegir «Expulsar» pide la acción y avisa.
+        click!(d, sys, center(d.tray_rect()));
+        let m = d.menu.as_ref().expect("menú de la bandeja");
+        assert_eq!(m.tag, MENU_TRAY);
+        assert!(m.menu.rect().bottom() <= d.bar_y());
+        d.desktop_menu_result(MENU_TRAY, M_EJECT + 3, &mut sys);
+        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("Ya puedes quitar la unidad (D:)."));
+        assert_eq!(sys.files.take_drive_actions(), [crate::drives::DriveAction::Eject { disk: 1 }]);
+        // Al quitarse, queda solo la E: y su entrada.
+        d.tick(9000, &mut sys);
+        assert_eq!(d.removable().iter().map(|x| x.letter).collect::<Vec<_>>(), ['E']);
+    }
+
+    #[test]
+    fn las_unidades_que_ya_estaban_no_avisan() {
+        let (mut d, mut sys) = setup(1280, 800);
+        // Ya conectada al arrancar: ni globo.
+        sys.files.attach(1, "Pendrive", usb_vol("A"));
+        d.tick(1000, &mut sys);
+        assert!(d.tip.is_none());
+        assert_eq!(d.removable().len(), 1);
     }
 
     #[test]
