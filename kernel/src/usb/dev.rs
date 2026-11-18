@@ -66,7 +66,7 @@ fn interfaces(cfg: &[u8]) -> Vec<Iface> {
 
 fn nombre(u: &Uso) -> &'static str {
     match u {
-        Uso::Nada => "-",
+        Uso::Nada => "bulk",
         Uso::Teclado(_) => "teclado",
         Uso::Raton => "raton",
         Uso::Hub => "hub",
