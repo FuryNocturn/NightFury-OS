@@ -323,6 +323,16 @@ impl Bucle<'_> {
                     self.app.open_path(&p, &mut cx);
                 }
             }
+            EV_GAMEPAD => {
+                if let Some((id, st)) = ev.to_gamepad() {
+                    self.app.gamepad(id, &st, &mut cx);
+                }
+            }
+            EV_GAMEPADS => {
+                if let Ok(l) = decode::<Vec<nf_core::gamepad::PadInfo>>(&datos) {
+                    self.app.gamepads(&l, &mut cx);
+                }
+            }
             EV_DRAG_OVER => {
                 if let Ok(p) = decode::<Vec<String>>(&datos) {
                     let pos = (ev.c != 0).then_some((ev.a, ev.b));
@@ -658,6 +668,12 @@ mod tests {
         fn open_path(&mut self, p: &str, _: &mut Ctx) {
             self.0.borrow_mut().vistos.push(alloc::format!("open {p}"));
         }
+        fn gamepad(&mut self, id: u32, s: &nf_core::gamepad::PadState, _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("mando {id} {} {}", s.buttons, s.axes[0]));
+        }
+        fn gamepads(&mut self, l: &[nf_core::gamepad::PadInfo], _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("mandos {l:?}"));
+        }
         fn drag_over(&mut self, pos: Option<(i32, i32)>, p: &[String], _: &mut Ctx) -> bool {
             self.0.borrow_mut().vistos.push(alloc::format!("over {pos:?} {p:?}"));
             pos.is_some_and(|(x, _)| x > 0)
@@ -686,8 +702,13 @@ mod tests {
         ponlo(&mut c, EV_DRAG_OVER, 0, 0, 0, encode(&rutas));
         c.cola.push(ev(EV_DRAG_SOURCE, 7, 8, 0));
         c.cola.push(ev(EV_DRAG_SOURCE, 0, 0, 0));
+        let st = nf_core::gamepad::PadState { buttons: 5, axes: [-7, 0, 0, 0, 0, 0] };
+        c.cola.push(WireEvent::gamepad(3, &st, 0));
+        let lista = vec![nf_core::gamepad::PadInfo { id: 3, kind: nf_core::gamepad::PadKind::Generic, name: String::from("M") }];
+        ponlo(&mut c, EV_GAMEPADS, 0, 0, 0, encode(&lista));
         // Un mensaje roto no llega a la app ni la tumba.
         ponlo(&mut c, EV_DROP, 0, 0, 0, vec![1, 2]);
+        ponlo(&mut c, EV_GAMEPADS, 0, 0, 0, vec![9, 9]);
         c.cola.push(WireEvent { kind: EV_KEY, a: 0, d: 'a' as u32, ..Default::default() });
         ejecutar(&mut c, Box::new(DatosApp(d.clone())), None);
         assert_eq!(
@@ -701,6 +722,8 @@ mod tests {
                 "over None [\"C:\\\\x\"]",
                 "origen 7 8",
                 "origen 0 0",
+                "mando 3 5 -7",
+                "mandos [PadInfo { id: 3, kind: Generic, name: \"M\" }]",
             ]
         );
         // Respuestas de arrastre (ninguna al salir), y lo que pidió la tecla, tras ellas.

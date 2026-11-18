@@ -199,13 +199,19 @@ impl WireEvent {
 
     /// `EV_GAMEPAD` del mando `id`.
     pub fn gamepad(id: u32, st: &crate::gamepad::PadState, now_ms: u64) -> Self {
-        let _ = (id, st, now_ms);
-        todo!("paso 5: implementar")
+        let pair = |i: usize| (st.axes[i] as u16 as u32 | (st.axes[i + 1] as u16 as u32) << 16) as i32;
+        WireEvent { kind: EV_GAMEPAD, a: id as i32, b: st.buttons as i32, c: pair(0), d: pair(2) as u32, flags: pair(4) as u32, now_ms }
     }
 
     /// Vuelve a (id, estado). `None` si no es `EV_GAMEPAD`.
     pub fn to_gamepad(&self) -> Option<(u32, crate::gamepad::PadState)> {
-        todo!("paso 5: implementar")
+        if self.kind != EV_GAMEPAD {
+            return None;
+        }
+        let (c, d, f) = (self.c as u32, self.d, self.flags);
+        let lo = |v: u32| v as u16 as i16;
+        let hi = |v: u32| (v >> 16) as u16 as i16;
+        Some((self.a as u32, crate::gamepad::PadState { buttons: self.b as u32, axes: [lo(c), hi(c), lo(d), hi(d), lo(f), hi(f)] }))
     }
 
     /// Vuelve a `KeyEvent` (siempre `down = true`). `None` si no es `EV_KEY` o el código no existe.
@@ -301,6 +307,16 @@ mod tests {
         let e = WireEvent { kind: EV_MOUSE_WHEEL, a: -5, b: 7, c: 3, d: 0xABCD, flags: 6, now_ms: 0x1122_3344_5566 };
         assert_eq!(WireEvent::from_bytes(&e.to_bytes()), e);
         assert_eq!(core::mem::size_of::<WireEvent>(), WIRE_EVENT_SIZE);
+    }
+
+    #[test]
+    fn mando_ida_y_vuelta() {
+        use crate::gamepad::*;
+        let st = PadState { buttons: BTN_SOUTH | BTN_EXTRA | BTN_RIGHT, axes: [-32768, 32767, -1, 1, 0, 32767] };
+        let e = WireEvent::gamepad(7, &st, 99);
+        assert_eq!((e.kind, e.a, e.now_ms), (EV_GAMEPAD, 7, 99));
+        assert_eq!(WireEvent::from_bytes(&e.to_bytes()).to_gamepad(), Some((7, st)));
+        assert_eq!(WireEvent::new(EV_KEY, 0).to_gamepad(), None);
     }
 
     #[test]

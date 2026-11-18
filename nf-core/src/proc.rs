@@ -129,7 +129,7 @@ pub struct SysState {
 
 /// ¿Este evento lleva datos (su `d` es la longitud)?
 pub fn lleva_datos(kind: u32) -> bool {
-    matches!(kind, EV_DIALOG | EV_DRAG_OVER | EV_DROP | EV_OPEN)
+    matches!(kind, EV_DIALOG | EV_DRAG_OVER | EV_DROP | EV_OPEN | EV_GAMEPADS)
 }
 
 /// Eventos que caben en la cola de un programa; lo que llega con la cola llena se descarta.
@@ -144,6 +144,12 @@ impl SysState {
     pub fn post(&mut self, ev: WireEvent) {
         if let Some(last) = self.queue.back_mut() {
             if last.kind == EV_MOUSE_MOVE && ev.kind == EV_MOUSE_MOVE {
+                *last = WireEvent { now_ms: last.now_ms, ..ev };
+                return;
+            }
+            // Dos estados seguidos del mismo mando con los mismos botones: vale el último. Si cambian los
+            // botones no se junta, para no perder una pulsación corta.
+            if last.kind == EV_GAMEPAD && ev.kind == EV_GAMEPAD && last.a == ev.a && last.b == ev.b {
                 *last = WireEvent { now_ms: last.now_ms, ..ev };
                 return;
             }
@@ -823,6 +829,12 @@ impl App for ProcApp {
     fn open_path(&mut self, path: &str, cx: &mut Ctx) {
         self.post_data(WireEvent::new(EV_OPEN, 0), &String::from(path), cx.now_ms);
     }
+    fn gamepad(&mut self, id: u32, state: &crate::gamepad::PadState, cx: &mut Ctx) {
+        self.post(WireEvent::gamepad(id, state, 0), cx.now_ms);
+    }
+    fn gamepads(&mut self, list: &[crate::gamepad::PadInfo], cx: &mut Ctx) {
+        self.post_data(WireEvent::new(EV_GAMEPADS, 0), &list.to_vec(), cx.now_ms);
+    }
     /// Pregunta al programa y espera su respuesta un momento (la llamada del escritorio es síncrona).
     /// Si no llega a tiempo, vale la última respuesta conocida.
     fn drag_over(&mut self, pos: Option<(i32, i32)>, paths: &[String], cx: &mut Ctx) -> bool {
@@ -1380,6 +1392,34 @@ pub(crate) mod tests {
         assert_eq!(decode::<Vec<String>>(&s.payload[0]), Ok(paths));
         assert_eq!(decode::<String>(&s.payload[1]).as_deref(), Ok("C:\\z"));
         assert_eq!(s.queue[1].d as usize, s.payload[0].len());
+    }
+
+    #[test]
+    fn mandos_hacia_el_programa() {
+        use crate::gamepad::{PadInfo, PadKind, PadState, BTN_SOUTH};
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        let mut cx = Ctx::new(&mut sys, &mut theme, 9);
+        let st = |buttons, lx| PadState { buttons, axes: [lx, 0, 0, 0, 0, 0] };
+        app.gamepad(1, &st(0, 10), &mut cx);
+        // Mismo mando y mismos botones: se junta en uno (el último).
+        app.gamepad(1, &st(0, 20), &mut cx);
+        assert_eq!(sh.borrow().queue.len(), 1);
+        assert_eq!(sh.borrow().queue[0].to_gamepad(), Some((1, st(0, 20))));
+        // Cambian los botones, o es otro mando: no se juntan (no se pierde una pulsación corta).
+        app.gamepad(1, &st(BTN_SOUTH, 20), &mut cx);
+        app.gamepad(1, &st(0, 20), &mut cx);
+        app.gamepad(2, &st(0, 20), &mut cx);
+        assert_eq!(sh.borrow().queue.len(), 4);
+        // La lista viaja con datos.
+        let list = vec![PadInfo { id: 1, kind: PadKind::Xbox360, name: String::from("Mando Xbox 360") }];
+        app.gamepads(&list, &mut cx);
+        let s = sh.borrow();
+        let e = s.queue.back().unwrap();
+        assert_eq!((e.kind, e.now_ms), (EV_GAMEPADS, 9));
+        assert_eq!(decode::<Vec<PadInfo>>(s.payload.back().unwrap()), Ok(list));
+        assert_eq!(e.d as usize, s.payload.back().unwrap().len());
     }
 
     /// Plataforma que, al ceder el turno a los programas, hace de programa: contesta con `respuesta`.

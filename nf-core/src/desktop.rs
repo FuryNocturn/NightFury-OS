@@ -212,6 +212,8 @@ struct Window {
     /// Icono propio del programa (`icono.bmp`); si está, sustituye a `App::icon`.
     // shortcut: se guarda aquí y no en `App::picture()` para no tocar el contrato; mover si hay más apps con imagen.
     pic: Option<Picture>,
+    /// ¿Ya recibió la lista de mandos (`App::gamepads`)?
+    pads_ok: bool,
 }
 
 /// App de relleno para las ventanas de diálogo.
@@ -499,6 +501,9 @@ pub struct Desktop {
     drv: Option<Vec<DriveInfo>>,
     drv_gen: u64,
     tip: Option<Tip>,
+    /// Mandos conectados y su último estado, y la ventana que recibe sus estados.
+    pads: Vec<(crate::gamepad::PadInfo, crate::gamepad::PadState)>,
+    pads_to: Option<u32>,
 }
 
 /// Bloques del disco que se convierten en cada tick (el reloj da unas 100 vueltas por segundo).
@@ -772,6 +777,8 @@ impl Desktop {
             show_ext: true,
             mods_sent: (false, false),
             mods_to: None,
+            pads: Vec::new(),
+            pads_to: None,
             mods: (false, false),
             booted: false,
             menu: None,
@@ -1239,8 +1246,62 @@ impl Desktop {
     /// (`App::gamepad`) y la lista a todas (`App::gamepads`); al cambiar el foco, la ventana nueva
     /// recibe el estado actual de cada mando y las ventanas nuevas reciben la lista al abrirse.
     pub fn gamepad(&mut self, ev: crate::gamepad::PadEvent, sys: &mut dyn Platform) {
-        let _ = (ev, sys);
-        todo!("paso 5: implementar")
+        use crate::gamepad::{PadEvent, PadState};
+        match ev {
+            PadEvent::State(id, st) => {
+                let Some(p) = self.pads.iter_mut().find(|p| p.0.id == id) else { return };
+                p.1 = st;
+                // Si el foco ha cambiado, `sync_pads` ya entrega el estado entero a la ventana nueva.
+                let before = self.pads_to;
+                self.sync_pads(sys);
+                if let Some(w) = self.pads_to.filter(|_| self.pads_to == before) {
+                    self.with_app(w, sys, |a, cx| a.gamepad(id, &st, cx));
+                }
+            }
+            PadEvent::Connected(info) => {
+                match self.pads.iter_mut().find(|p| p.0.id == info.id) {
+                    Some(p) => p.0 = info,
+                    None => self.pads.push((info, PadState::default())),
+                }
+                self.send_pads(sys, true);
+            }
+            PadEvent::Removed(id) => {
+                self.pads.retain(|p| p.0.id != id);
+                self.send_pads(sys, true);
+            }
+        }
+    }
+
+    /// Manda la lista de mandos a las ventanas que no la tienen, o a todas con `all`.
+    fn send_pads(&mut self, sys: &mut dyn Platform, all: bool) {
+        let list: Vec<crate::gamepad::PadInfo> = self.pads.iter().map(|p| p.0.clone()).collect();
+        let ids: Vec<u32> = self.wins.iter().filter(|w| w.dlg.is_none() && (all || !w.pads_ok)).map(|w| w.id).collect();
+        for id in ids {
+            if let Some(i) = self.pos(id) {
+                self.wins[i].pads_ok = true;
+            }
+            // Una ventana nueva sin mandos delante no necesita enterarse de que no hay ninguno.
+            if all || !list.is_empty() {
+                self.with_app(id, sys, |a, cx| a.gamepads(&list, cx));
+            }
+        }
+    }
+
+    /// Reparto de mandos tras un cambio de foco o de ventanas: lista a las ventanas nuevas y, a la que
+    /// pasa a ser la activa, el estado actual de cada mando.
+    fn sync_pads(&mut self, sys: &mut dyn Platform) {
+        self.send_pads(sys, false);
+        let target = self.input_target();
+        if target == self.pads_to {
+            return;
+        }
+        self.pads_to = target;
+        if let Some(w) = target {
+            let states: Vec<_> = self.pads.iter().map(|p| (p.0.id, p.1)).collect();
+            for (id, st) in states {
+                self.with_app(w, sys, |a, cx| a.gamepad(id, &st, cx));
+            }
+        }
     }
 
     /// Mueve el puntero a una posición absoluta.
@@ -1922,6 +1983,7 @@ impl Desktop {
             dlg,
             owner: None,
             pic: None,
+            pads_ok: false,
         });
         self.dmg_all();
         self.launched
@@ -3107,12 +3169,16 @@ impl Desktop {
     /// `KeyEvent` con `key: Key::Other`, `ch: None`, `alt: false` y las banderas `ctrl`/`shift`
     /// al día (`down` = alguna de las dos pulsada). Si el foco pasa a otra ventana, o se abre un
     /// menú, diálogo o el menú Inicio, la app anterior recibe el estado neutro (todo en `false`).
+    /// Ventana que recibe el teclado (modificadores) y los mandos: la activa, si no hay menús ni pantallas encima.
+    fn input_target(&self) -> Option<u32> {
+        if self.menu.is_some() || self.start_open || self.shut_open || self.login.covers() {
+            return None;
+        }
+        self.active_id().filter(|&id| self.pos(id).is_some_and(|i| self.wins[i].dlg.is_none()))
+    }
+
     fn sync_mods(&mut self, sys: &mut dyn Platform) {
-        let target = if self.menu.is_some() || self.start_open || self.shut_open || self.login.covers() {
-            None
-        } else {
-            self.active_id().filter(|&id| self.pos(id).is_some_and(|i| self.wins[i].dlg.is_none()))
-        };
+        let target = self.input_target();
         let want = if target.is_some() { self.mods } else { (false, false) };
         if self.mods_to != target {
             if let Some(old) = self.mods_to.take() {
@@ -3215,6 +3281,7 @@ impl Desktop {
         self.drives_tick(sys);
         self.refresh_icons(sys);
         self.sync_mods(sys);
+        self.sync_pads(sys);
         let ids: Vec<u32> = self.wins.iter().filter(|w| !w.min && w.dlg.is_none()).map(|w| w.id).collect();
         for id in ids {
             self.with_app(id, sys, |a, cx| a.tick(cx));
@@ -5196,6 +5263,58 @@ mod cinta_tests {
         let n = log.borrow().len();
         d.event(other(false, false, false), &mut sys);
         assert_eq!(log.borrow().len(), n);
+    }
+
+    /// App de pruebas que anota los mandos que recibe: "lista n" y "estado id botones".
+    struct PadRec(Rc<RefCell<Vec<String>>>);
+    impl App for PadRec {
+        fn kind(&self) -> AppKind {
+            AppKind::Calc
+        }
+        fn title(&self) -> String {
+            String::from("PadRec")
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (100, 100)
+        }
+        fn draw(&mut self, _s: &mut Surface, _t: &Theme, _p: &mut dyn Platform, _f: bool) {}
+        fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
+        fn mouse(&mut self, _ev: MouseEv, _cx: &mut Ctx) {}
+        fn tick(&mut self, _cx: &mut Ctx) {}
+        fn gamepad(&mut self, id: u32, st: &crate::gamepad::PadState, _cx: &mut Ctx) {
+            self.0.borrow_mut().push(format!("estado {id} {}", st.buttons));
+        }
+        fn gamepads(&mut self, list: &[crate::gamepad::PadInfo], _cx: &mut Ctx) {
+            self.0.borrow_mut().push(format!("lista {}", list.len()));
+        }
+    }
+
+    #[test]
+    fn gamepads_reach_the_right_windows() {
+        use crate::gamepad::{PadEvent, PadInfo, PadKind, PadState, BTN_SOUTH};
+        let (mut d, mut sys) = setup();
+        let (la, lb) = (Rc::new(RefCell::new(Vec::new())), Rc::new(RefCell::new(Vec::new())));
+        d.launch_app(Box::new(PadRec(la.clone())), &mut sys);
+        d.event(Event::Tick(10), &mut sys);
+        assert!(la.borrow().is_empty(), "sin mandos no hay nada que contar");
+        let info = |id| PadInfo { id, kind: PadKind::Xbox360, name: String::from("M") };
+        let st = |b| PadState { buttons: b, axes: [0; 6] };
+        d.gamepad(PadEvent::Connected(info(1)), &mut sys);
+        d.gamepad(PadEvent::State(1, st(BTN_SOUTH)), &mut sys);
+        d.gamepad(PadEvent::State(9, st(1)), &mut sys);
+        assert_eq!(*la.borrow(), ["lista 1", &format!("estado 1 {BTN_SOUTH}")]);
+        // Una ventana nueva recibe la lista y, como pasa a ser la activa, el estado actual del mando.
+        d.launch_app(Box::new(PadRec(lb.clone())), &mut sys);
+        d.event(Event::Tick(20), &mut sys);
+        assert_eq!(*lb.borrow(), ["lista 1", &format!("estado 1 {BTN_SOUTH}")]);
+        // Los estados solo van a la activa; las conexiones, a todas.
+        la.borrow_mut().clear();
+        lb.borrow_mut().clear();
+        d.gamepad(PadEvent::State(1, st(0)), &mut sys);
+        assert!(la.borrow().is_empty());
+        assert_eq!(*lb.borrow(), ["estado 1 0"]);
+        d.gamepad(PadEvent::Removed(1), &mut sys);
+        assert_eq!((la.borrow().last().cloned(), lb.borrow().last().cloned()), (Some(String::from("lista 0")), Some(String::from("lista 0"))));
     }
 
     #[test]

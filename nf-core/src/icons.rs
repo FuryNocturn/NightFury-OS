@@ -68,6 +68,8 @@ pub enum Icon {
     UsbSeguro,
     /// Este equipo: pantalla sobre una base.
     Equipo,
+    /// Mando de juego.
+    Mando,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -470,6 +472,20 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             cell(s, o, k, (7.0, 11.0, 9.0, 13.0), GRIS);
             cell(s, o, k, (4.0, 13.0, 12.0, 14.5), GRIS);
         }
+        Icon::Mando => {
+            // Cuerpo oscuro con dos agarres, cruceta a la izquierda y dos botones de color a la derecha.
+            for (cx, cy) in [(4.2, 10.6), (11.8, 10.6)] {
+                let (px, py) = p(cx, cy);
+                s.fill_circle(px, py, 3.4 * k, OSCURO, 255);
+            }
+            cell(s, o, k, (3.5, 4.5, 12.5, 11.5), OSCURO);
+            cell(s, o, k, (3.8, 7.0, 7.2, 8.0), CLARO);
+            cell(s, o, k, (4.95, 5.9, 6.05, 9.1), CLARO);
+            for (cx, cy, c) in [(10.6, 6.4, VERDE), (12.0, 7.8, ROJO)] {
+                let (px, py) = p(cx, cy);
+                s.fill_circle(px, py, 0.9 * k, c, 255);
+            }
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -486,7 +502,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 47] = [
+    const ALL: [Icon; 48] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -534,6 +550,7 @@ mod tests {
         Icon::Usb,
         Icon::UsbSeguro,
         Icon::Equipo,
+        Icon::Mando,
     ];
     const SENT: u32 = 0x123456;
 
