@@ -134,8 +134,10 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
         return Err(String::from("El programa es demasiado grande"));
     }
     let data = fs.read(path).map_err(fs_msg)?;
+    // Del binario y no de la marca `.sistema`, que cualquiera con permisos puede crear.
+    let system = sys.is_system_binary(&data);
     let proc = sys.spawn(&data, &p.name)?;
-    Ok(ProcApp::new(proc, &p.name, Some(p.icon)))
+    Ok(ProcApp::new(proc, &p.name, Some(p.icon), system))
 }
 
 /// Comprueba una carpeta con un programa para instalar: `app.txt` con nombre válido y un
