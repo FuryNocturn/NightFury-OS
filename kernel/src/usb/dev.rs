@@ -70,6 +70,7 @@ fn nombre(u: &Uso) -> &'static str {
         Uso::Teclado(_) => "teclado",
         Uso::Raton => "raton",
         Uso::Hub => "hub",
+        Uso::Masivo => "almacenamiento",
     }
 }
 
@@ -168,8 +169,31 @@ fn identificar(x: &mut Xhci, slot: u8) -> R<()> {
 fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
     let vel = x.dev(slot).ok_or(Error::Ausente)?.vel;
     let mut planes: Vec<(u8, CfgEp, Uso)> = Vec::new();
+    // Interfaces de almacenamiento: (interfaz, dci bulk IN, dci bulk OUT, direcciones de los endpoints).
+    let mut masivos: Vec<(u8, u8, u8, u8, u8)> = Vec::new();
     for f in interfaces(cfg) {
+        if f.clase == 8 && f.proto == 0x62 {
+            // UAS sin alternativa BOT en el ajuste 0 (con ella, `interfaces` ya ve la BOT): no se soporta.
+            traza!("NF usb: ranura {}: interfaz {} es UAS sin alternativa BOT, se ignora", slot, f.num);
+        }
         let Some(uso) = Uso::de(f.clase, f.sub, f.proto) else { continue };
+        if let Uso::Masivo = uso {
+            let bulk = |dir_in: bool| f.eps.iter().find(|e| e.attr & 3 == 2 && (e.addr & 0x80 != 0) == dir_in);
+            let (Some(ei), Some(eo)) = (bulk(true), bulk(false)) else {
+                traza!("NF usb: ranura {}: interfaz {} de almacenamiento sin endpoints bulk IN y OUT", slot, f.num);
+                continue;
+            };
+            let (di, d_o) = ((ei.addr & 0xF) * 2 + 1, (eo.addr & 0xF) * 2);
+            if di == 1 || d_o == 0 || planes.iter().any(|p| p.1.dci == di || p.1.dci == d_o) {
+                continue;
+            }
+            for (e, dci, tipo) in [(ei, di, 6), (eo, d_o, 2)] {
+                let rafaga = if vel >= 4 { e.rafaga } else { 0 };
+                planes.push((f.num, CfgEp { dci, tipo, mps: e.mps & 0x7FF, intervalo: 0, rafaga }, Uso::Nada));
+            }
+            masivos.push((f.num, di, d_o, ei.addr, eo.addr));
+            continue;
+        }
         let Some(e) = f.eps.iter().find(|e| e.attr & 3 == 3 && e.addr & 0x80 != 0) else { continue };
         let dci = (e.addr & 0xF) * 2 + 1;
         if planes.iter().any(|p| p.1.dci == dci) {
@@ -205,10 +229,11 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
                 hub = Some((h[2], if vel >= 4 { 0 } else { h[3] >> 5 & 3 }));
                 espera_hub = h[5] as u64 * 2;
             }
-            Uso::Nada => {}
+            Uso::Nada | Uso::Masivo => {}
         }
     }
-    let dcis: Vec<(u8, bool)> = planes.iter().map(|p| (p.1.dci, matches!(p.2, Uso::Hub))).collect();
+    // Solo los endpoints de interrupción se arman: los bulk los usa `masivo` bajo demanda.
+    let dcis: Vec<(u8, bool)> = planes.iter().filter(|p| p.1.tipo == 7).map(|p| (p.1.dci, matches!(p.2, Uso::Hub))).collect();
     let nombres: Vec<&str> = planes.iter().map(|p| nombre(&p.2)).collect();
     x.configurar(slot, planes.into_iter().map(|(_, c, u)| (c, u)).collect(), hub)?;
     traza!("NF usb: ranura {} configurada: {:?}{}", slot, nombres, hub.map_or(alloc::string::String::new(), |h| alloc::format!(" ({} puertos)", h.0)));
@@ -217,6 +242,9 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8]) -> R<()> {
         if es_hub {
             hub_listar(x, slot, espera_hub);
         }
+    }
+    for (num, di, d_o, ai, ao) in masivos {
+        super::masivo::alta(x, slot, num, (di, ai), (d_o, ao));
     }
     Ok(())
 }

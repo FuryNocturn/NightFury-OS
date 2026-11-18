@@ -270,7 +270,8 @@ impl Xhci {
         Some(x)
     }
 
-    fn mem(&self, t: usize, a: usize) -> R<Dma> {
+    /// Memoria para DMA que el controlador alcanza (por debajo de 4 GiB si no es de 64 bits).
+    pub fn mem(&self, t: usize, a: usize) -> R<Dma> {
         Dma::nuevo(t, a).filter(|d| self.ac64 || d.dir() >> 32 == 0).ok_or(Error::Memoria)
     }
 
@@ -490,6 +491,7 @@ impl Xhci {
         let Some(d) = self.devs.get_mut(slot as usize).and_then(|d| d.take()) else { return };
         let _ = self.comando(trb_cmd(10, 0, slot, 0));
         unsafe { write_volatile(self.dcbaa.ptr::<u64>().add(slot as usize), 0) };
+        super::masivo::quitado(self.id, slot);
         if d.padre.is_none() && self.puerto_slot[d.raiz as usize] == slot {
             self.puerto_slot[d.raiz as usize] = 0;
         }
@@ -535,7 +537,8 @@ impl Xhci {
                 add |= 1 << c.dci;
                 max = max.max(c.dci as u32);
                 let k = ent.add((1 + c.dci as usize) * cs) as *mut u32;
-                let esit = c.mps as u32 * (c.rafaga as u32 + 1);
+                // Los endpoints bulk no son periódicos: su carga por intervalo es 0.
+                let esit = if matches!(c.tipo, 2 | 6) { 0 } else { c.mps as u32 * (c.rafaga as u32 + 1) };
                 *k = (c.intervalo as u32) << 16;
                 *k.add(1) = 3 << 1 | (c.tipo as u32) << 3 | (c.rafaga as u32) << 8 | (c.mps as u32) << 16;
                 *k.add(2) = e.anillo.m.dir() as u32 | 1;
@@ -657,6 +660,16 @@ impl Xhci {
         let Some(ep) = self.ep_mut(slot, dci) else { return };
         let (p, c) = (ep.anillo.pos(), ep.anillo.ciclo as u64);
         let _ = self.comando(trb_cmd(16, p | c, slot, (dci as u32) << 16));
+    }
+
+    /// Una transferencia no termina (plazo agotado): Stop Endpoint y vuelta al anillo limpio, para poder
+    /// seguir usando el endpoint. El evento de «parado» que deja el TD pendiente se descarta al encolar de nuevo.
+    pub fn abortar(&mut self, slot: u8, dci: u8) {
+        let _ = self.comando(trb_cmd(15, 0, slot, (dci as u32) << 16));
+        self.recuperar(slot, dci);
+        if let Some(ep) = self.ep_mut(slot, dci) {
+            ep.hecho = None;
+        }
     }
 
     // ---------- Endpoints de interrupción (lo que usan las clases) ----------
