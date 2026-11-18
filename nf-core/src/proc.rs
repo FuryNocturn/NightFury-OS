@@ -120,7 +120,7 @@ pub struct SysState {
 }
 
 /// ¿Este evento lleva datos (su `d` es la longitud)?
-fn lleva_datos(kind: u32) -> bool {
+pub fn lleva_datos(kind: u32) -> bool {
     matches!(kind, EV_DIALOG | EV_DRAG_OVER | EV_DROP | EV_OPEN)
 }
 
