@@ -93,7 +93,7 @@ pub fn parse_manifest(dir: &str, text: &str) -> Option<Program> {
 
 /// Programas de `C:\Programas` con `app.txt` válido y `programa.nfx`, por nombre.
 pub fn installed(sys: &mut dyn Platform) -> Vec<Program> {
-    let fs = sys.files();
+    let fs = sys.fs();
     let mut v = Vec::new();
     for e in fs.list(PROGRAMS_DIR).unwrap_or_default() {
         if !e.dir {
@@ -131,7 +131,7 @@ pub fn for_binary(sys: &mut dyn Platform, path: &str) -> Option<Program> {
 
 /// Carga el `.nfx` de `path` y lo arranca. `Err` con el motivo para enseñarlo al usuario.
 pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, String> {
-    let fs = sys.files();
+    let fs = sys.fs();
     let st = fs.stat(path).map_err(fs_msg)?;
     if st.size > MAX_NFX {
         return Err(String::from("El programa es demasiado grande"));

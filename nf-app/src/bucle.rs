@@ -834,4 +834,18 @@ mod tests {
         ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
         assert_eq!(*visto.borrow(), [(false, (1280, 720))]);
     }
+
+    #[test]
+    fn configuracion_pide_cambiar_el_fondo() {
+        let _g = SERIE.lock();
+        let mut c = Falso::default();
+        c.cola.push(WireEvent { kind: EV_THEME, a: 0, d: 0x1E78D7, ..Default::default() });
+        c.cola.push(ev(EV_RESIZE, 780, 520, 0));
+        c.cola.push(ev(EV_FOCUS, 1, 0, 0));
+        c.cola.push(ev(EV_MOUSE_MOVE, 444, 120, 1));
+        c.cola.push(ev(EV_MOUSE_DOWN, 444, 120, 2));
+        c.cola.push(ev(EV_MOUSE_UP, 444, 120, 3));
+        ejecutar(&mut c, nf_core::apps::create(AppKind::Settings), None);
+        assert!(c.pedidos.iter().any(|r| matches!(r, Request::SetTheme(t) if t.wallpaper == 1)), "{:?}", c.pedidos);
+    }
 }
