@@ -4,7 +4,10 @@
 //! y operaciones sobre `Files`.
 //! CONTRATO: `pub fn new() -> Box<dyn App>`.
 use super::{App, AppKind, Ctx, DragRequest, MouseEv};
+use crate::accounts::MIN_PASSWORD;
+use crate::crypto::wipe;
 use crate::dialogs::{self, Answer, Buttons, DialogRequest, DialogResult};
+use crate::drives::{self, DriveInfo, FormatKind, FormatRequest};
 use crate::files::{self, file_name, join, parent, valid_name, Std};
 use crate::fsapi::FilesApi;
 use crate::font::{self, Align};
@@ -57,8 +60,10 @@ enum Place {
     Std(Std),
     Disk,
     Trash,
+    /// «Este equipo»: las unidades.
+    Computer,
 }
-const PLACES: [Place; 8] = [
+const PLACES: [Place; 9] = [
     Place::Std(Std::Desktop),
     Place::Std(Std::Documents),
     Place::Std(Std::Downloads),
@@ -67,6 +72,7 @@ const PLACES: [Place; 8] = [
     Place::Std(Std::Videos),
     Place::Disk,
     Place::Trash,
+    Place::Computer,
 ];
 
 impl Place {
@@ -75,6 +81,7 @@ impl Place {
             Place::Std(d) => d.name(),
             Place::Disk => "Disco local (C:)",
             Place::Trash => "Papelera",
+            Place::Computer => files::COMPUTER,
         }
     }
     fn icon(self) -> Icon {
@@ -82,14 +89,16 @@ impl Place {
             Place::Std(d) => std_icon(d),
             Place::Disk => Icon::Drive,
             Place::Trash => Icon::Trash,
+            Place::Computer => Icon::Equipo,
         }
     }
-    /// Carpeta de la sesión actual (o `TRASH` / `C:\`).
+    /// Carpeta de la sesión actual (o `TRASH` / `COMPUTER` / `C:\`).
     fn path(self, f: &mut dyn FilesApi) -> String {
         match self {
             Place::Std(d) => f.std_dir(d),
             Place::Disk => String::from("C:\\"),
             Place::Trash => String::from(files::TRASH),
+            Place::Computer => String::from(files::COMPUTER),
         }
     }
 }
@@ -115,6 +124,16 @@ const TAG_COPYTO: u32 = 8;
 const TAG_SYS: u32 = 9;
 /// Confirmación de enviar a la Papelera.
 const TAG_DEL: u32 = 10;
+/// Unidades: etiqueta al formatear, confirmación, contraseñas, código de recuperación, avisos.
+const TAG_DRV_LABEL: u32 = 11;
+const TAG_DRV_SURE: u32 = 12;
+const TAG_DRV_PW: u32 = 13;
+const TAG_DRV_PW2: u32 = 14;
+const TAG_DRV_REC: u32 = 15;
+const TAG_DRV_MSG: u32 = 16;
+const TAG_DRV_WARN: u32 = 17;
+/// Tarjeta de unidad en «Este equipo»: (ancho, alto, icono, nombre a la derecha).
+const CARD: (i32, i32, i32, bool) = (264, 80, 40, true);
 /// Menús: sobre un elemento / sobre la zona vacía / de la cinta (Archivo y Ordenar por).
 const TAG_MENU_ITEM: u32 = 1;
 const TAG_MENU_BG: u32 = 2;
@@ -149,6 +168,11 @@ const M_DESC: u32 = 35;
 const M_FILE_NEWWIN: u32 = 40;
 const M_FILE_TERM: u32 = 41;
 const M_FILE_CLOSE: u32 = 42;
+const M_EJECT: u32 = 50;
+const M_FMT_FAT32: u32 = 51;
+const M_FMT_EXFAT: u32 = 52;
+const M_FMT_NF: u32 = 53;
+const M_ENCRYPT: u32 = 54;
 /// Botones de la cinta.
 const R_COPY: u32 = 1;
 const R_PASTE: u32 = 2;
@@ -272,6 +296,23 @@ struct Row {
     id: String,
 }
 
+/// Operación sobre una unidad que va pidiendo datos con diálogos.
+struct DrvJob {
+    letter: char,
+    name: String,
+    op: DrvOp,
+    kind: FormatKind,
+    label: String,
+    pw: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrvOp {
+    Format,
+    Encrypt,
+    Unlock,
+}
+
 /// Pulsación sobre un elemento: puede acabar en arrastre de archivos.
 struct Press {
     x: i32,
@@ -358,6 +399,11 @@ struct Explorer {
     press: Option<Press>,
     mq: Option<Mq>,
     drop_tgt: Option<Tgt>,
+    /// Unidades (se cargan en cada `reload`).
+    drives: Vec<DriveInfo>,
+    job: Option<DrvJob>,
+    /// Esperando el resultado de formatear o cifrar: (letra, es cifrar).
+    waiting: Option<(char, bool)>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -450,6 +496,9 @@ fn make() -> Explorer {
         press: None,
         mq: None,
         drop_tgt: None,
+        drives: Vec::new(),
+        job: None,
+        waiting: None,
     }
 }
 
@@ -525,6 +574,13 @@ fn clipped(s: &mut Surface, r: Rect, text: &str, color: u32, align: Align) {
 /// ¿Deja la sesión crear o pegar algo directamente en `dir`? (No en `C:\Usuarios` ni en la
 /// carpeta de una cuenta, ni en `C:\Sistema` sin ser administrador.)
 fn can_create_in(f: &mut dyn FilesApi, dir: &str) -> bool {
+    if dir.as_bytes().get(1) != Some(&b':') {
+        return false;
+    }
+    let l = dir.chars().next().map(|c| c.to_ascii_uppercase());
+    if l != Some('C') {
+        return f.drives().iter().any(|d| Some(d.letter) == l && !d.read_only && !d.locked);
+    }
     let c = dir.get(3..).unwrap_or("");
     let mut parts = c.split('\\').filter(|p| !p.is_empty());
     let users = parts.next().is_some_and(|p| same(p, "Usuarios"));
@@ -534,6 +590,31 @@ fn can_create_in(f: &mut dyn FilesApi, dir: &str) -> bool {
     !files::in_system(dir) || f.is_admin()
 }
 
+/// Texto de «Propiedades» de una unidad.
+fn drive_text(d: &DriveInfo) -> String {
+    let mut t = format!("Nombre: {}\nTipo: {}\n", d.name(), if d.removable { "Unidad extraíble" } else { "Disco local" });
+    t += &format!("Formato: {}\n", drives::kind_name(d.kind));
+    if d.locked {
+        t += "Cifrada: sí (hay que desbloquearla para ver su contenido)\n";
+    } else {
+        t += &format!("Capacidad: {}\nEspacio libre: {}\nEspacio usado: {}\n", size_text(d.total), size_text(d.free), size_text(d.total.saturating_sub(d.free)));
+    }
+    if !d.device.is_empty() {
+        t += &format!("Dispositivo: {}\n", d.device);
+    }
+    if d.read_only {
+        t += "Solo lectura: sí\n";
+    }
+    String::from(t.trim_end())
+}
+
+/// Borra de la memoria un texto secreto (contraseña, código).
+fn scrub(s: &mut String) {
+    // SAFETY: se escriben ceros, que son UTF-8 válido.
+    wipe(unsafe { s.as_bytes_mut() });
+    s.clear();
+}
+
 fn chevron(s: &mut Surface, x: f32, y: f32, dir: f32, c: u32) {
     s.stroke(&[(x + 2.0 * dir, y - 3.0), (x, y), (x + 2.0 * dir, y + 3.0)], 1.0, c);
 }
@@ -541,6 +622,50 @@ fn chevron(s: &mut Surface, x: f32, y: f32, dir: f32, c: u32) {
 impl Explorer {
     fn trash(&self) -> bool {
         self.cwd == files::TRASH
+    }
+
+    fn computer(&self) -> bool {
+        self.cwd == files::COMPUTER
+    }
+
+    /// Vista efectiva: «Este equipo» siempre en tarjetas.
+    fn vw(&self) -> View {
+        if self.computer() {
+            View::Icons
+        } else {
+            self.view
+        }
+    }
+
+    fn grid(&self) -> Option<(i32, i32, i32, bool)> {
+        if self.computer() {
+            Some(CARD)
+        } else {
+            self.view.grid()
+        }
+    }
+
+    fn drive(&self, letter: char) -> Option<&DriveInfo> {
+        self.drives.iter().find(|d| d.letter == letter)
+    }
+
+    /// Unidad de la fila `i` en «Este equipo».
+    fn row_drive(&self, i: usize) -> Option<&DriveInfo> {
+        let n = self.rows.get(i)?;
+        self.drive(n.name.chars().next()?)
+    }
+
+    /// Unidad de la carpeta actual (si es de una).
+    fn cwd_drive(&self) -> Option<&DriveInfo> {
+        if self.trash() || self.computer() {
+            return None;
+        }
+        self.drive(self.cwd.chars().next()?.to_ascii_uppercase())
+    }
+
+    /// ¿Está en una unidad que no es C:? (Allí no hay Papelera: se elimina para siempre.)
+    fn on_removable(&self) -> bool {
+        self.cwd_drive().is_some_and(|d| d.removable)
     }
 
     fn sel_row(&self) -> Option<&Row> {
@@ -688,6 +813,9 @@ impl Explorer {
     }
 
     fn sort_rows(&mut self) {
+        if self.computer() {
+            return;
+        }
         let (key, desc) = (self.sort, self.desc);
         self.rows.sort_by(|a, b| {
             b.dir.cmp(&a.dir).then_with(|| {
@@ -709,11 +837,11 @@ impl Explorer {
     }
 
     fn top_y(&self) -> i32 {
-        self.body_y() + if self.view == View::Details { HEAD_H } else { 0 }
+        self.body_y() + if self.vw() == View::Details { HEAD_H } else { 0 }
     }
 
     fn horiz(&self) -> bool {
-        self.view == View::List
+        self.vw() == View::List
     }
 
     /// (elementos por línea, líneas que caben, líneas totales) con o sin barra de desplazamiento.
@@ -721,7 +849,7 @@ impl Explorer {
         let n = self.rows.len();
         let free_h = self.h - STATUS_H - self.top_y();
         let free_w = self.w - PANEL_W;
-        let (pl, page) = match (self.view, self.view.grid()) {
+        let (pl, page) = match (self.vw(), self.grid()) {
             (View::Details, _) => (1, (free_h / ROW_H).max(1) as usize),
             (View::List, _) => (((free_h - if sb { SB_W } else { 0 }) / ROW_H).max(1) as usize, (free_w / LCOL_W).max(1) as usize),
             (_, Some((cw, ch, _, _))) => (((free_w - if sb { SB_W } else { 0 }) / cw).max(1) as usize, (free_h / ch).max(1) as usize),
@@ -792,7 +920,7 @@ impl Explorer {
         let a = self.area();
         let pl = self.per_line();
         let (line, slot) = ((i / pl) as i32 - self.top as i32, (i % pl) as i32);
-        match (self.view, self.view.grid()) {
+        match (self.vw(), self.grid()) {
             (_, Some((cw, ch, _, _))) => Rect::new(a.x + slot * cw, a.y + line * ch, cw, ch),
             (View::List, _) => Rect::new(a.x + line * LCOL_W, a.y + slot * ROW_H, LCOL_W, ROW_H),
             _ => Rect::new(a.x + GUTTER, a.y + line * ROW_H, a.w - GUTTER, ROW_H),
@@ -805,7 +933,7 @@ impl Explorer {
             return None;
         }
         let (dx, dy) = (x - a.x, y - a.y);
-        let (line, slot) = match (self.view, self.view.grid()) {
+        let (line, slot) = match (self.vw(), self.grid()) {
             (_, Some((cw, ch, _, _))) => (dy / ch, dx / cw),
             (View::List, _) => (dx / LCOL_W, dy / ROW_H),
             _ if dx < GUTTER => return None,
@@ -828,7 +956,7 @@ impl Explorer {
     /// Desplazamiento del contenido: coordenada de contenido = de ventana + esto.
     fn off(&self) -> (i32, i32) {
         let t = self.top as i32;
-        match (self.view, self.view.grid()) {
+        match (self.vw(), self.grid()) {
             (_, Some((_, ch, _, _))) => (0, t * ch),
             (View::List, _) => (t * LCOL_W, 0),
             _ => (0, t * ROW_H),
@@ -910,7 +1038,20 @@ impl Explorer {
         let prefs = f.explorer_prefs();
         self.show_ext = f.read(&prefs).map_or(true, |d| !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"));
         self.rows.clear();
-        if self.trash() {
+        self.drives = f.drives();
+        // La unidad ya no está (o se cerró): se vuelve a «Este equipo».
+        if !self.trash() && !self.computer() {
+            let l = self.cwd.chars().next().map(|c| c.to_ascii_uppercase());
+            if !self.drives.iter().any(|d| Some(d.letter) == l && !d.locked) {
+                self.cwd = String::from(files::COMPUTER);
+                self.top = 0;
+            }
+        }
+        if self.computer() {
+            for d in &self.drives {
+                self.rows.push(Row { name: format!("{}:", d.letter), dir: true, size: d.total, date: DateTime::default(), loc: String::new(), id: String::new() });
+            }
+        } else if self.trash() {
             for t in f.trash_list().unwrap_or_default() {
                 let loc = parent(&t.original).unwrap_or_default();
                 self.rows.push(Row { name: t.name, dir: t.dir, size: t.size, date: t.deleted, loc, id: t.id });
@@ -939,7 +1080,7 @@ impl Explorer {
                 }
             }
         }
-        self.can_create = !self.trash() && can_create_in(f, &self.cwd);
+        self.can_create = !self.trash() && !self.computer() && can_create_in(f, &self.cwd);
         self.sort_rows();
         self.marked = (0..self.rows.len()).filter(|&i| keep.contains(&self.rows[i].name)).collect();
         self.sel = cur.and_then(|c| self.marked.iter().copied().find(|&i| self.rows[i].name == c)).or(self.marked.last().copied());
@@ -964,8 +1105,128 @@ impl Explorer {
         cx.redraw = true;
     }
 
+    // ---- unidades ----
+
+    fn drive_msg(&self, title: &str, text: String, cx: &mut Ctx) {
+        cx.dialog = Some(DialogRequest::Message { tag: TAG_DRV_MSG, title: String::from(title), text, buttons: Buttons::Ok });
+        cx.redraw = true;
+    }
+
+    /// Cierra la operación en curso y borra la contraseña que guardara.
+    fn drop_job(&mut self) {
+        if let Some(mut j) = self.job.take() {
+            scrub(&mut j.pw);
+        }
+    }
+
+    /// Pide la contraseña de una unidad cifrada (vacía + Aceptar = usar el código de recuperación).
+    fn ask_unlock(&mut self, d: DriveInfo, cx: &mut Ctx) {
+        self.job = Some(DrvJob { letter: d.letter, name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
+        cx.dialog = Some(DialogRequest::Password {
+            tag: TAG_DRV_PW,
+            title: String::from("Desbloquear unidad"),
+            label: format!("Contraseña de {} (si la has olvidado, déjala vacía y pulsa Aceptar para usar el código de recuperación):", d.name()),
+        });
+        cx.redraw = true;
+    }
+
+    /// Empieza Formatear (con `kind`), Cifrar o Expulsar sobre la unidad de la fila seleccionada.
+    fn drive_cmd(&mut self, id: u32, cx: &mut Ctx) {
+        let Some(d) = self.sel.and_then(|i| self.row_drive(i)).cloned() else { return };
+        if !d.removable {
+            return;
+        }
+        let job = |op, kind| DrvJob { letter: d.letter, name: d.name(), op, kind, label: String::new(), pw: String::new() };
+        match id {
+            M_EJECT => match cx.sys.fs().request_drive_action(d.letter, FormatRequest::Eject) {
+                Ok(()) => {
+                    self.reload(cx.sys);
+                    self.drive_msg("Expulsar", format!("Ya puedes quitar la unidad ({}:).", d.letter), cx);
+                }
+                Err(e) => self.fail(e, cx),
+            },
+            M_FMT_FAT32 | M_FMT_EXFAT | M_FMT_NF if !d.read_only => {
+                let kind = match id {
+                    M_FMT_FAT32 => FormatKind::Fat32,
+                    M_FMT_EXFAT => FormatKind::ExFat,
+                    _ => FormatKind::NightFury,
+                };
+                self.job = Some(job(DrvOp::Format, kind));
+                cx.dialog = Some(DialogRequest::Input {
+                    tag: TAG_DRV_LABEL,
+                    title: format!("Formatear {}", d.name()),
+                    label: String::from("Etiqueta del volumen (hasta 11 caracteres, puede quedar vacía):"),
+                    value: d.label.clone(),
+                });
+            }
+            M_ENCRYPT if !d.read_only && !d.locked => {
+                self.job = Some(job(DrvOp::Encrypt, FormatKind::NightFury));
+                cx.dialog = Some(DialogRequest::Message {
+                    tag: TAG_DRV_WARN,
+                    title: format!("Cifrar {}", d.name()),
+                    text: format!(
+                        "Cifrar la unidad ({}:) borra todo lo que hay en ella y la convierte al formato NightFury; otros sistemas, como Windows, no podrán leerla. Si olvidas la contraseña y pierdes el código de recuperación, los datos no se podrán recuperar. ¿Continuar?",
+                        d.letter
+                    ),
+                    buttons: Buttons::YesNo,
+                });
+            }
+            _ => {}
+        }
+        cx.redraw = true;
+    }
+
+    /// Manda formatear o cifrar y queda a la espera del resultado.
+    fn drive_request(&mut self, letter: char, req: FormatRequest, cx: &mut Ctx) {
+        let enc = matches!(req, FormatRequest::Encrypt { .. });
+        match cx.sys.fs().request_drive_action(letter, req) {
+            Ok(()) => self.waiting = Some((letter, enc)),
+            Err(e) => self.fail(e, cx),
+        }
+        self.reload(cx.sys);
+        cx.redraw = true;
+    }
+
+    fn drive_done(&mut self, l: char, enc: bool, r: Result<Option<String>, FsError>, cx: &mut Ctx) {
+        self.reload(cx.sys);
+        match r {
+            Ok(Some(mut code)) => {
+                let text = format!("La unidad ({l}:) está cifrada. Tu código de recuperación es:\n\n{code}\n\nApúntalo en papel y guárdalo en un lugar seguro. Es la única forma de recuperar tus datos si olvidas la contraseña. No se volverá a mostrar.");
+                scrub(&mut code);
+                self.drive_msg("Código de recuperación", text, cx);
+            }
+            Ok(None) => {
+                let t = if enc { format!("La unidad ({l}:) se ha cifrado.") } else { format!("La unidad ({l}:) se ha formateado.") };
+                self.drive_msg("Unidades", t, cx);
+            }
+            Err(e) => self.fail(e, cx),
+        }
+    }
+
+    /// Desbloquea con la contraseña o el código y abre la unidad.
+    fn drive_unlock(&mut self, secret: &str, recovery: bool, cx: &mut Ctx) {
+        let Some(j) = self.job.as_ref() else { return };
+        let l = j.letter;
+        match cx.sys.fs().unlock_drive(l, secret, recovery) {
+            Ok(()) => {
+                self.drop_job();
+                self.reload(cx.sys);
+                self.go(&format!("{l}:\\"), true, cx);
+            }
+            Err(e) => {
+                self.drop_job();
+                self.drive_msg("Desbloquear unidad", String::from(e.text()), cx);
+            }
+        }
+    }
+
     fn go(&mut self, path: &str, push: bool, cx: &mut Ctx) {
-        if path != files::TRASH {
+        if path != files::TRASH && path != files::COMPUTER {
+            let l = path.chars().next().map(|c| c.to_ascii_uppercase());
+            if let Some(d) = cx.sys.fs().drives().into_iter().find(|d| Some(d.letter) == l && d.locked) {
+                self.ask_unlock(d, cx);
+                return;
+            }
             if let Err(e) = cx.sys.fs().list(path) {
                 self.fail(e, cx);
                 return;
@@ -982,10 +1243,14 @@ impl Explorer {
     }
 
     fn up(&mut self, cx: &mut Ctx) {
-        if !self.trash() {
-            if let Some(p) = parent(&self.cwd) {
-                self.go(&p, true, cx);
-            }
+        if self.trash() || self.computer() {
+            return;
+        }
+        match parent(&self.cwd) {
+            Some(p) => self.go(&p, true, cx),
+            // Desde la raíz de una unidad extraíble se sube a «Este equipo».
+            None if self.on_removable() => self.go(files::COMPUTER, true, cx),
+            None => {}
         }
     }
 
@@ -1000,7 +1265,8 @@ impl Explorer {
             return;
         }
         if let Some(r) = self.single() {
-            let path = join(&self.cwd, &r.name);
+            // En «Este equipo» la fila es la letra: «D:».
+            let path = if self.computer() { format!("{}\\", r.name) } else { join(&self.cwd, &r.name) };
             if r.dir {
                 self.go(&path, true, cx);
             } else {
@@ -1017,6 +1283,15 @@ impl Explorer {
     fn enabled(&self, c: Cmd) -> bool {
         let n = self.marked.len();
         let trash = self.trash();
+        if self.computer() {
+            return match c {
+                Cmd::Open => n == 1,
+                Cmd::Props => true,
+                Cmd::SelAll | Cmd::Invert => !self.rows.is_empty(),
+                Cmd::SelNone => n > 0,
+                _ => false,
+            };
+        }
         match c {
             Cmd::NewFolder | Cmd::NewDoc => self.can_create,
             Cmd::Open => n == 1 && !trash,
@@ -1072,6 +1347,10 @@ impl Explorer {
             }
             Cmd::Delete => {
                 let text = match paths.as_slice() {
+                    _ if self.on_removable() => match paths.as_slice() {
+                        [one] => format!("¿Quieres eliminar definitivamente «{}»? No se podrá deshacer.", files::file_name(one)),
+                        many => format!("¿Quieres eliminar definitivamente estos {} elementos? No se podrá deshacer.", many.len()),
+                    },
                     [one] => format!("¿Quieres enviar «{}» a la Papelera?", files::file_name(one)),
                     many => format!("¿Quieres enviar estos {} elementos a la Papelera?", many.len()),
                 };
@@ -1326,6 +1605,9 @@ impl Explorer {
     /// `paste_ok`: se puede pegar dentro de la carpeta clicada.
     fn item_menu(&self, dir: bool, has_clip: bool, multi: bool, paste_ok: bool) -> Vec<MenuItem> {
         let n = MenuItem::new;
+        if self.computer() {
+            return self.drive_menu();
+        }
         if self.trash() {
             return vec![n(M_RESTORE, "Restaurar"), MenuItem::sep(), n(M_PROPS, "Propiedades")];
         }
@@ -1352,8 +1634,26 @@ impl Explorer {
         v
     }
 
+    /// Menú de una unidad en «Este equipo».
+    fn drive_menu(&self) -> Vec<MenuItem> {
+        let n = MenuItem::new;
+        let Some(d) = self.sel.and_then(|i| self.row_drive(i)) else { return vec![n(M_REFRESH, "Actualizar")] };
+        let mut v = vec![n(M_OPEN, "Abrir").bold()];
+        if d.removable {
+            v.push(n(M_EJECT, "Expulsar"));
+            let fmt = vec![n(M_FMT_FAT32, "FAT32"), n(M_FMT_EXFAT, "exFAT"), n(M_FMT_NF, "NightFury")];
+            v.push(MenuItem::submenu("Formatear…", fmt).disabled(d.read_only));
+            v.push(n(M_ENCRYPT, "Cifrar…").disabled(d.read_only || d.locked));
+        }
+        v.extend([MenuItem::sep(), n(M_PROPS, "Propiedades")]);
+        v
+    }
+
     fn bg_menu(&self, has_clip: bool, undo: Option<&'static str>) -> Vec<MenuItem> {
         let n = MenuItem::new;
+        if self.computer() {
+            return vec![n(M_REFRESH, "Actualizar")];
+        }
         if self.trash() {
             return vec![
                 self.sort_menu(),
@@ -1391,6 +1691,14 @@ impl Explorer {
 
     /// Cuadro "Propiedades" de la selección (`item`) o de la carpeta actual.
     fn props(&self, item: bool, cx: &mut Ctx) {
+        if self.computer() {
+            let (title, text) = match self.sel_row().filter(|_| item).and_then(|_| self.row_drive(self.sel.unwrap_or(0))) {
+                Some(d) => (d.name(), drive_text(d)),
+                None => (String::from(files::COMPUTER), format!("Unidades: {}", self.drives.len())),
+            };
+            cx.dialog = Some(DialogRequest::Message { tag: TAG_PROPS, title: format!("Propiedades de {title}"), text, buttons: Buttons::Ok });
+            return;
+        }
         let (title, text) = if item && self.marked.len() > 1 {
             let rows: Vec<&Row> = self.marked.iter().filter_map(|&i| self.rows.get(i)).collect();
             let dirs = rows.iter().filter(|r| r.dir).count();
@@ -1421,8 +1729,8 @@ impl Explorer {
             (r.name.clone(), t)
         } else {
             let name = match file_name(&self.cwd) {
-                "" => "Disco local (C:)",
-                n => n,
+                "" => self.cwd_drive().map_or(String::from("Disco local (C:)"), |d| d.name()),
+                n => String::from(n),
             };
             let mut t = format!("Nombre: {name}\nTipo: Carpeta de archivos\n");
             if let Some(p) = parent(&self.cwd) {
@@ -1432,7 +1740,7 @@ impl Explorer {
             if let Ok(e) = cx.sys.fs().stat(&self.cwd) {
                 t += &format!("\nModificado: {}", fmt_date(e.modified));
             }
-            (String::from(name), t)
+            (name, t)
         };
         cx.dialog = Some(DialogRequest::Message {
             tag: TAG_PROPS,
@@ -1458,9 +1766,17 @@ impl Explorer {
         let mut parts: Vec<(String, String)> = Vec::new();
         if self.trash() {
             parts.push((String::from("Papelera"), String::from(files::TRASH)));
+        } else if self.computer() {
+            parts.push((String::from(files::COMPUTER), String::from(files::COMPUTER)));
         } else {
-            let mut acc = String::from("C:");
-            parts.push((String::from("C:"), String::from("C:\\")));
+            let l = self.cwd.chars().next().map_or('C', |c| c.to_ascii_uppercase());
+            let mut acc = format!("{l}:");
+            if let Some(d) = self.cwd_drive().filter(|d| d.removable) {
+                parts.push((String::from(files::COMPUTER), String::from(files::COMPUTER)));
+                parts.push((d.name(), format!("{l}:\\")));
+            } else {
+                parts.push((format!("{l}:"), format!("{l}:\\")));
+            }
             for seg in self.cwd.split('\\').skip(1).filter(|p| !p.is_empty()) {
                 acc = join(&acc, seg);
                 parts.push((String::from(seg), acc.clone()));
@@ -1501,7 +1817,7 @@ impl Explorer {
         s.fill_rect(Rect::new(0, y0, self.w, NAV_H), 0xFFFFFF);
         s.fill_rect(Rect::new(0, y0 + NAV_H - 1, self.w, 1), LINE);
         let can_back = !self.back.is_empty();
-        let can_up = !self.trash() && parent(&self.cwd).is_some();
+        let can_up = !self.trash() && !self.computer() && (parent(&self.cwd).is_some() || self.on_removable());
         for (i, (hit, ok)) in [(Hit::Back, can_back), (Hit::Up, can_up)].into_iter().enumerate() {
             let r = Rect::new(6 + i as i32 * 30, y0 + 5, 26, 24);
             let c = if ok { TEXT } else { DISABLED };
@@ -1588,12 +1904,42 @@ impl Explorer {
         }
     }
 
+    /// Tarjeta de una unidad en «Este equipo».
+    fn card(&self, s: &mut Surface, theme: &Theme, i: usize, r: Rect) {
+        let Some(d) = self.row_drive(i) else { return };
+        let body = Rect::new(r.x + 3, r.y + 3, r.w - 6, r.h - 6);
+        if self.is_sel(i) {
+            s.fill_rect(body, blend(0xFFFFFF, theme.accent, 55));
+        }
+        s.frame(body, LINE);
+        let icon = match (d.removable, d.locked) {
+            (false, _) => Icon::Drive,
+            (true, true) => Icon::UsbSeguro,
+            (true, false) => Icon::Usb,
+        };
+        icons::draw(s, icon, body.x + 8, body.y + (body.h - 40) / 2, 40, 0x444444);
+        let (tx, tw) = (body.x + 56, body.w - 64);
+        clipped(s, Rect::new(tx, body.y + 6, tw, 18), &d.name(), TEXT, Align::Left);
+        if d.locked {
+            clipped(s, Rect::new(tx, body.y + 28, tw, 36), "Cifrada: doble clic para desbloquearla", GRAY, Align::Left);
+            return;
+        }
+        let bar = Rect::new(tx, body.y + 30, tw, 10);
+        s.fill_rect(bar, 0xE6E6E6);
+        let used = d.total.saturating_sub(d.free);
+        let fill = if d.total == 0 { 0 } else { (bar.w as u64 * used / d.total) as i32 };
+        s.fill_rect(Rect::new(bar.x, bar.y, fill, bar.h), if used * 10 > d.total * 9 { 0xC62828 } else { theme.accent });
+        s.frame(bar, 0xBFBFBF);
+        let t = format!("{} libres de {}", fmt_size(d.free), fmt_size(d.total));
+        clipped(s, Rect::new(tx, body.y + 44, tw, 18), &t, GRAY, Align::Left);
+    }
+
     fn list(&mut self, s: &mut Surface, theme: &Theme) {
         let trash = self.trash();
         let y0 = self.body_y();
         let a = self.area();
         s.fill_rect(Rect::new(PANEL_W, y0, self.w - PANEL_W, self.h - y0 - STATUS_H), 0xFFFFFF);
-        if self.view == View::Details {
+        if self.vw() == View::Details {
             self.heads(s, a.right());
         }
         let cx = self.col_x();
@@ -1603,6 +1949,10 @@ impl Explorer {
         s.set_clip(old.intersect(a));
         for (n, row) in self.rows.iter().enumerate().skip(self.top * pl).take(page * pl) {
             let r = self.item_rect(n);
+            if self.computer() {
+                self.card(s, theme, n, r);
+                continue;
+            }
             let icon = if row.dir {
                 // Dentro de la carpeta de una cuenta, las seis estándar llevan su icono.
                 match Std::ALL.iter().find(|d| in_home && same(d.name(), &row.name)) {
@@ -1617,7 +1967,7 @@ impl Explorer {
             let hl = blend(0xFFFFFF, theme.accent, 55);
             let on = self.is_sel(n);
             let name = files::display_name(&row.name, row.dir, self.show_ext);
-            match (self.view, self.view.grid()) {
+            match (self.vw(), self.grid()) {
                 (_, Some((_, _, ic, right))) => {
                     if on {
                         s.fill_rect(Rect::new(r.x + 2, r.y + 1, r.w - 4, r.h - 2), hl);
@@ -1678,7 +2028,7 @@ impl Explorer {
             }
         }
         if self.rows.is_empty() {
-            let t = if trash { "La Papelera está vacía." } else { "Esta carpeta está vacía." };
+            let t = if trash { "La Papelera está vacía." } else if self.computer() { "No hay unidades." } else { "Esta carpeta está vacía." };
             font::draw_in(s, Rect::new(PANEL_W, a.y + 10, a.w, 20), t, 9, false, GRAY, Align::Center);
         }
     }
@@ -1691,8 +2041,17 @@ impl Explorer {
         if self.marked.len() > 1 {
             t += &format!("     {} elementos seleccionados", self.marked.len());
         }
+        if let Some((l, enc)) = self.waiting {
+            t = format!("{} la unidad ({l}:)…", if enc { "Cifrando" } else { "Formateando" });
+        }
         font::draw_in(s, Rect::new(10, y, 320, STATUS_H), &t, 9, false, GRAY, Align::Left);
-        let (total, free) = sys.fs().space();
+        if self.computer() {
+            return;
+        }
+        let (total, free) = match self.cwd_drive().filter(|d| d.removable) {
+            Some(d) => (d.total, d.free),
+            None => sys.fs().space(),
+        };
         let t = format!("{} libres de {}", fmt_size(free), fmt_size(total));
         font::draw_in(s, Rect::new(self.w - 310, y, 300, STATUS_H), &t, 9, false, GRAY, Align::Right);
     }
@@ -1705,10 +2064,12 @@ impl App for Explorer {
     fn title(&self) -> String {
         if self.trash() {
             String::from("Papelera")
+        } else if self.computer() {
+            String::from(files::COMPUTER)
         } else {
             match file_name(&self.cwd) {
                 "" if self.cwd.is_empty() => String::from(Std::Documents.name()),
-                "" => String::from("Disco local (C:)"),
+                "" => self.cwd_drive().map_or(String::from("Disco local (C:)"), |d| d.name()),
                 n => String::from(n),
             }
         }
@@ -1757,7 +2118,7 @@ impl App for Explorer {
         let trash = self.trash();
         let (pl, page) = (self.per_line() as i32, self.page() as i32);
         // Desplazamientos de la selección según la vista: (arriba, abajo, izquierda, derecha, página).
-        let (up, down, left, right, pg) = match self.view {
+        let (up, down, left, right, pg) = match self.vw() {
             View::Details => (-1, 1, 0, 0, page),
             View::List => (-1, 1, -pl, pl, pl * page),
             _ => (-pl, pl, -1, 1, pl * page),
@@ -1841,7 +2202,7 @@ impl App for Explorer {
             }
             MouseEv::Wheel { x, y, dz } => {
                 if x >= PANEL_W && y >= self.body_y() && y < self.h - STATUS_H {
-                    let step = if self.view == View::Details { WHEEL_ROWS } else { 1 };
+                    let step = if self.vw() == View::Details { WHEEL_ROWS } else { 1 };
                     let t = (self.top as i32 + dz * step).clamp(0, self.max_top() as i32) as usize;
                     if t != self.top {
                         self.top = t;
@@ -1873,7 +2234,7 @@ impl App for Explorer {
                 }
                 if let Some(p) = self.press.as_ref().filter(|p| !p.dead && (x - p.x).abs().max((y - p.y).abs()) > DRAG_PX) {
                     let paths = self.paths();
-                    if p.i >= self.rows.len() || self.trash() || paths.iter().any(|q| files::is_protected(q)) {
+                    if p.i >= self.rows.len() || self.trash() || self.computer() || paths.iter().any(|q| files::is_protected(q)) {
                         if let Some(p) = &mut self.press {
                             p.dead = true;
                         }
@@ -1960,6 +2321,12 @@ impl App for Explorer {
             self.reload(cx.sys);
             cx.redraw = true;
         }
+        if let Some((l, enc)) = self.waiting {
+            if let Some(r) = cx.sys.fs().drive_result() {
+                self.waiting = None;
+                self.drive_done(l, enc, r, cx);
+            }
+        }
         let m = self.metrics();
         let p = if self.horiz() { self.sb_h.tick(&m, cx.now_ms) } else { self.sb_v.tick(&m, cx.now_ms) };
         if let Some(p) = p {
@@ -1994,7 +2361,7 @@ impl App for Explorer {
         self.last_click = None;
         cx.redraw = true;
         let paths = self.paths();
-        (!self.trash() && !paths.iter().any(|q| files::is_protected(q))).then_some(paths)
+        (!self.trash() && !self.computer() && !paths.iter().any(|q| files::is_protected(q))).then_some(paths)
     }
 
     fn drag_over(&mut self, pos: Option<(i32, i32)>, paths: &[String], cx: &mut Ctx) -> bool {
@@ -2077,6 +2444,84 @@ impl App for Explorer {
                 let r = cx.sys.fs().empty_trash();
                 self.done(r, cx);
             }
+            DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(v) } => {
+                let v = v.trim();
+                let ok = v.chars().count() <= 11 && (v.is_empty() || valid_name(v));
+                match self.job.as_mut() {
+                    Some(j) if ok => {
+                        j.label = String::from(v);
+                        let text = format!("Se borrará todo lo que hay en la unidad ({}:). ¿Continuar?", j.letter);
+                        cx.dialog = Some(DialogRequest::Message { tag: TAG_DRV_SURE, title: format!("Formatear {}", j.name), text, buttons: Buttons::YesNo });
+                    }
+                    _ => {
+                        self.drop_job();
+                        if !ok {
+                            self.fail(FsError::BadName, cx);
+                        }
+                    }
+                }
+            }
+            DialogResult::Answer { tag: TAG_DRV_SURE, answer } => match (answer, self.job.take()) {
+                (Answer::Yes, Some(j)) => self.drive_request(j.letter, FormatRequest::Format { kind: j.kind, label: j.label }, cx),
+                _ => {}
+            },
+            DialogResult::Answer { tag: TAG_DRV_WARN, answer } => match (answer, self.job.as_ref()) {
+                (Answer::Yes, Some(j)) => {
+                    cx.dialog = Some(DialogRequest::Password {
+                        tag: TAG_DRV_PW,
+                        title: format!("Cifrar {}", j.name),
+                        label: format!("Elige una contraseña para la unidad (al menos {} caracteres):", MIN_PASSWORD),
+                    });
+                }
+                _ => self.drop_job(),
+            },
+            DialogResult::Text { tag: TAG_DRV_PW, value: Some(mut pw) } => {
+                match self.job.as_ref().map(|j| j.op) {
+                    Some(DrvOp::Unlock) if pw.is_empty() => {
+                        cx.dialog = Some(DialogRequest::Input {
+                            tag: TAG_DRV_REC,
+                            title: String::from("Código de recuperación"),
+                            label: String::from("Escribe el código de recuperación de la unidad:"),
+                            value: String::new(),
+                        });
+                    }
+                    Some(DrvOp::Unlock) => self.drive_unlock(&pw, false, cx),
+                    Some(DrvOp::Encrypt) if pw.chars().count() < MIN_PASSWORD => {
+                        self.drop_job();
+                        self.drive_msg("Cifrar unidad", format!("La contraseña debe tener al menos {MIN_PASSWORD} caracteres."), cx);
+                    }
+                    Some(DrvOp::Encrypt) => {
+                        if let Some(j) = self.job.as_mut() {
+                            j.pw = core::mem::take(&mut pw);
+                        }
+                        cx.dialog = Some(DialogRequest::Password {
+                            tag: TAG_DRV_PW2,
+                            title: String::from("Cifrar unidad"),
+                            label: String::from("Repite la contraseña:"),
+                        });
+                    }
+                    _ => {}
+                }
+                scrub(&mut pw);
+            }
+            DialogResult::Text { tag: TAG_DRV_PW2, value: Some(mut p2) } => {
+                if let Some(mut j) = self.job.take() {
+                    if p2 != j.pw {
+                        scrub(&mut j.pw);
+                        self.drive_msg("Cifrar unidad", String::from("Las contraseñas no coinciden."), cx);
+                    } else {
+                        let label = self.drive(j.letter).map(|d| d.label.clone()).unwrap_or_default();
+                        let password = core::mem::take(&mut j.pw);
+                        self.drive_request(j.letter, FormatRequest::Encrypt { label, password }, cx);
+                    }
+                }
+                scrub(&mut p2);
+            }
+            DialogResult::Text { tag: TAG_DRV_REC, value: Some(mut code) } => {
+                self.drive_unlock(code.trim(), true, cx);
+                scrub(&mut code);
+            }
+            DialogResult::Text { tag: TAG_DRV_LABEL | TAG_DRV_PW | TAG_DRV_PW2 | TAG_DRV_REC, value: None } => self.drop_job(),
             _ => {}
         }
     }
@@ -2108,6 +2553,7 @@ impl App for Explorer {
             M_RESTORE => self.run(Cmd::Restore, cx),
             M_EMPTY => self.run(Cmd::EmptyTrash, cx),
             M_REFRESH => self.reload(cx.sys),
+            M_EJECT | M_FMT_FAT32 | M_FMT_EXFAT | M_FMT_NF | M_ENCRYPT if self.computer() => self.drive_cmd(id, cx),
             M_UNDO => self.undo(cx),
             M_NEW_FOLDER => self.run(Cmd::NewFolder, cx),
             M_NEW_DOC if self.can_create => self.new_doc(cx),
@@ -3522,12 +3968,12 @@ mod tests {
     }
 
     #[test]
-    fn panel_con_ocho_entradas_y_navegacion() {
+    fn panel_con_nueve_entradas_y_navegacion() {
         let mut t = T::new();
-        let nombres = ["Escritorio", "Documentos", "Descargas", "Imágenes", "Música", "Vídeos", "Disco local (C:)", "Papelera"];
+        let nombres = ["Escritorio", "Documentos", "Descargas", "Imágenes", "Música", "Vídeos", "Disco local (C:)", "Papelera", "Este equipo"];
         assert_eq!(PLACES.map(|p| p.name()), nombres);
         let iconos: Vec<Icon> = PLACES.iter().map(|p| p.icon()).collect();
-        assert!((0..8).all(|i| (0..i).all(|j| iconos[i] != iconos[j])), "cada entrada lleva su icono: {iconos:?}");
+        assert!((0..9).all(|i| (0..i).all(|j| iconos[i] != iconos[j])), "cada entrada lleva su icono: {iconos:?}");
         for (i, n) in nombres.iter().enumerate() {
             t.click(30, RIB_H + NAV_H + 8 + PLACE_H * i as i32 + 4);
             assert_eq!(t.e.title(), *n);
@@ -3535,6 +3981,7 @@ mod tests {
                 Place::Std(d) => dd(d),
                 Place::Disk => String::from("C:\\"),
                 Place::Trash => String::from(files::TRASH),
+                Place::Computer => String::from(files::COMPUTER),
             };
             assert_eq!(t.e.cwd, esperada);
         }
