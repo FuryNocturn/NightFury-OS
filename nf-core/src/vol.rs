@@ -160,3 +160,28 @@ pub mod fat;
 pub mod iso;
 pub mod part;
 pub mod udf;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Imagen real por ruta (`NF_IMG`): monta la primera partición y lee `Carpeta\Sub\texto.txt`.
+    #[test]
+    #[ignore]
+    fn imagen_real() {
+        extern crate std;
+        let Ok(path) = std::env::var("NF_IMG") else { return };
+        let mut m = MemSectors::new(0, 2048);
+        m.data = std::fs::read(path).unwrap();
+        let p = partitions(&mut m).unwrap();
+        std::println!("particiones: {:?}", p);
+        let mut v = mount(Box::new(m), &p[0]).unwrap();
+        std::println!("{:?} «{}» raíz: {:?}", v.kind(), v.label(), v.list("").unwrap().iter().map(|e| e.name.clone()).collect::<Vec<_>>());
+        // ISO9660 sin Joliet solo tiene nombres 8.3: ahí el nombre largo no existe.
+        match v.read(r"carpeta\SUB\Texto con ñ y acentos áé.txt") {
+            Ok(t) => std::println!("texto: {}", core::str::from_utf8(&t).unwrap()),
+            Err(e) => std::println!("sin nombre largo: {:?} {:?}", e, v.list(r"carpeta\sub").unwrap()),
+        }
+        assert_eq!(v.read("grande.bin").unwrap().len(), 300_000);
+    }
+}
