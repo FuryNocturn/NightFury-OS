@@ -683,6 +683,14 @@ impl App for ProcApp {
     }
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         self.post(WireEvent::mouse(ev, 0), cx.now_ms);
+        // Un arrastre empieza con un `Move`: se deja correr al programa en seguida para que su
+        // `Request::Drag` llegue mientras el botón sigue pulsado (si esperara al tick, se perdería
+        // al soltar rápido).
+        if matches!(ev, MouseEv::Move { .. }) {
+            cx.sys.run_programs();
+            self.recoger();
+            self.atender(cx);
+        }
     }
     fn tick(&mut self, cx: &mut Ctx) {
         self.poll(cx);
