@@ -11,8 +11,8 @@
 | ![Explorador](docs/img/explorador.png) | ![Terminal](docs/img/terminal.png) |
 
 ## Estado / Status
-Versión 0.8, en desarrollo. Probado en QEMU; en hardware real todavía no.
-Version 0.8, work in progress. Tested in QEMU; not yet on real hardware.
+Versión 0.10, en desarrollo. Probado en QEMU; en hardware real todavía no.
+Version 0.10, work in progress. Tested in QEMU; not yet on real hardware.
 
 > **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS) es una implementación propia **no auditada**. No protejas con ella nada importante.
 > The cryptography is a custom, **unaudited** implementation. Do not rely on it for anything important.

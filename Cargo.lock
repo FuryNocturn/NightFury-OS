@@ -36,39 +36,39 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-app"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.9.0"
+version = "0.10.0"
 
 [[package]]
 name = "nfdisk"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfpack"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfprog"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "nf-core",
  "paint",

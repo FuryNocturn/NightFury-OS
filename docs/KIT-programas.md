@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.9)
+# Kit de programas de NightFury (v0.10)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -27,10 +27,14 @@ Nada más: ni Visual Studio ni librerías extra.
    icono=app
    ancho=480
    alto=320
+   abre=txt,md
    ```
 
    `nombre` es también el nombre de la carpeta de salida. `icono` es el icono del sistema que se
-   usará (`app` si no sabes cuál) cuando el programa no trae uno propio.
+   usará (`app` si no sabes cuál) cuando el programa no trae uno propio. `abre` (opcional) son las
+   extensiones que el programa sabe abrir, sin punto y separadas por comas (hasta 32, de 16 letras como
+   mucho): al abrir un archivo así, el escritorio lo abre con él y se lo pasa en `App::open_path`. Si un
+   programa del sistema declara la misma extensión, gana el del sistema.
 5. (Opcional) Icono propio: un `icono.bmp` en la carpeta del programa (ver "Icono propio").
 
 ## Compilar
@@ -43,8 +47,8 @@ Compila todos los de `programs\` y deja, para cada uno, `target\programas\<nombr
 `app.txt` y su `icono.bmp` si lo tiene. Si algo falla, sale con código distinto de 0. Lo hace `nfpack`, que también comprueba que
 el `.nfx` es válido y muestra sus secciones.
 
-> **Instalar en el disco** (copiar la carpeta a NightFury con `nfdisk`) llega en la **v0.9**; en la
-> v0.8 el núcleo ya sabe cargar `.nfx`, pero todavía no hay forma cómoda de meterlos en el disco.
+Para instalarlo, copia esa carpeta al disco de NightFury y elígela en Configuración → Aplicaciones →
+«Instalar programa…».
 
 ## Icono propio
 
@@ -87,10 +91,28 @@ nf_app::programa!(Box::new(MiPrograma::new()), None);   // None = sin tick; Some
 - Tienes `alloc` (`Vec`, `String`, `Box`…): el montón crece solo hasta 256 MiB en total.
 - Si el programa entra en pánico, el mensaje va al registro (puerto serie) y termina con código 101.
 
-**No existe todavía para programas** (se ignora con una línea en el registro): diálogos
-(`cx.dialog`), menús (`cx.menu`), abrir rutas (`cx.open*`) y arrastrar archivos (`cx.drag`).
-`cx.sys.files()` es una unidad C: en memoria, **no** el disco real (hasta la v0.10). Para guardar un
-archivo en el disco real usa `guardar_como` (siguiente apartado).
+### Disco, diálogos, menús y arrastre (v0.10)
+
+Un programa tiene lo mismo que una app del sistema:
+
+- **Disco real**: `cx.sys.fs()` (el trait `FilesApi`), con los permisos del usuario de la sesión. Cada
+  llamada viaja al sistema (`SERVICE`) y el programa espera la respuesta. `cx.sys.files()` sigue siendo una
+  unidad en memoria: no la uses para el disco.
+- **Diálogos** (`cx.dialog`), **menús** (`cx.menu`), **abrir rutas** (`cx.open`, `cx.open_new`,
+  `cx.open_terminal`), **arrastrar archivos** (`cx.drag`) y **cambiar el tema** (`cx.theme` +
+  `cx.theme_changed`): el runtime los manda al escritorio (`REQUEST`) y las respuestas llegan a
+  `dialog_result`, `menu_result`, `drop_files`, `open_path`, `drag_over` y `drag_source`. Los diálogos de
+  Abrir y Guardar devuelven la ruta elegida.
+
+Lo que un programa **de terceros** no puede (se le contesta `FsError::Denied` o se ignora):
+
+- escribir, borrar, mover o leer en `C:\Sistema`;
+- escribir, borrar o mover en `C:\Programas` (instalar y desinstalar es cosa de Configuración);
+- arrastrar rutas de esas carpetas;
+- cuentas, contraseñas, cifrado, reiniciar o apagar.
+
+Eso solo lo hacen los programas del sistema que vienen con NightFury (Bloc de notas, Terminal,
+Configuración y Explorador), que el sistema reconoce por su binario exacto.
 
 ## Guardar un archivo (`SAVE_AS`)
 
@@ -142,6 +164,10 @@ error). Se pierden `rcx` y `r11`. Contrato completo en `nf-core\src\abi.rs`.
 | 8 | `SET_TIMER(ms)` | pide un evento de temporizador |
 | 9 | `SET_MIN_SIZE(w, h)` | tamaño mínimo del contenido |
 | 10 | `SAVE_AS(ptr, len, name_ptr, name_len)` | diálogo Guardar como; la respuesta llega como el evento `EV_SAVED` (`a` = 1 guardado, 0 cancelado, -1 error) |
+| 11 | `SERVICE(ptr, len)` | petición de archivos codificada con `nf_core::wire` (`service::Call`); el programa espera y devuelve el tamaño de la respuesta |
+| 12 | `TAKE_REPLY(ptr, cap)` | copia esa respuesta |
+| 13 | `REQUEST(ptr, len)` | petición al escritorio (`request::Request`), sin esperar |
+| 14 | `EVENT_DATA(ptr, cap)` | datos del último evento (diálogo, menú, arrastre, abrir); su tamaño viene en `d` |
 
 ## Límites
 
