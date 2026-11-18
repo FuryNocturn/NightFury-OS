@@ -8,7 +8,8 @@ param(
     [int]$Port = 4455,
     [switch]$NoBuild,
     [string]$Disk = 'disco.img',
-    [switch]$NoDisk
+    [switch]$NoDisk,
+    [string[]]$Usb = @()   # imágenes de pendrive (`nfdisk usb`), como usb-storage del xHCI
 )
 $ErrorActionPreference = 'Stop'
 $Commands = @($Commands | ForEach-Object { $_ -split "," })  # con -File, una lista llega como una sola cadena con comas
@@ -42,6 +43,12 @@ if (-not $NoDisk) {
     $img = if ([System.IO.Path]::IsPathRooted($Disk)) { $Disk } else { [System.IO.Path]::GetFullPath((Join-Path $root $Disk)) }
     if (-not (Test-Path $img)) { fsutil file createnew $img 268435456 | Out-Null }
     $q += @('-drive', "id=datos,if=none,format=raw,file=$img", '-device', 'ide-hd,drive=datos,bus=ide.1')
+}
+$n = 0
+foreach ($u in @($Usb | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+    $img = if ([System.IO.Path]::IsPathRooted($u)) { $u } else { [System.IO.Path]::GetFullPath((Join-Path $root $u)) }
+    $q += @('-drive', "if=none,id=usb$n,format=raw,file=$img", '-device', "usb-storage,bus=xhci.0,drive=usb$n")
+    $n++
 }
 if ($Serial) {
     $s = [System.IO.Path]::GetFullPath((Join-Path $root $Serial))

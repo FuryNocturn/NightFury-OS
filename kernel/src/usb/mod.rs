@@ -10,17 +10,21 @@
 //! si hace falta preparar algo al configurar, en `dev::preparar`. El controlador no se toca: ofrece
 //! `Xhci::control`, `Xhci::normal` (bulk/interrupción) y `Xhci::esperar`.
 mod dev;
+mod masivo;
 mod xhci;
 
 use crate::arch::{inb, outb};
 use crate::{paging, pci};
 use crate::serial::traza;
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use nf_core::input::MousePacket;
 use nf_core::usbhid::BootKeyboard;
+use nf_core::vol::SectorDev;
 use xhci::Xhci;
 
 /// Memoria para DMA: alineada y a cero. El núcleo es de mapeo identidad: físico = virtual.
@@ -55,6 +59,8 @@ pub enum Uso {
     Teclado(BootKeyboard),
     Raton,
     Hub,
+    /// Almacenamiento masivo BOT (`masivo.rs`): solo reclama la interfaz; sus endpoints bulk llevan `Nada`.
+    Masivo,
 }
 
 impl Uso {
@@ -64,6 +70,8 @@ impl Uso {
             (3, 1, 1) => Some(Uso::Teclado(BootKeyboard::new())),
             (3, 1, 2) => Some(Uso::Raton),
             (9, _, _) => Some(Uso::Hub),
+            // SCSI transparente (6), MMC-5/ATAPI (2) y SFF-8070i (5), protocolo solo-bulk (BOT).
+            (8, 2 | 5 | 6, 0x50) => Some(Uso::Masivo),
             _ => None,
         }
     }
@@ -173,4 +181,22 @@ pub fn poll(now_ms: u64, teclado: &mut Vec<u8>, raton: &mut Vec<MousePacket>) {
     for x in unsafe { &mut *USB.0.get() }.iter_mut() {
         dev::servir(x, now_ms, teclado, raton);
     }
+}
+
+// ---------- Discos (almacenamiento masivo) ----------
+
+/// Un disco USB (un LUN) que aparece o desaparece.
+pub enum CambioDisco {
+    Conectado { id: u32, nombre: String, dev: Box<dyn SectorDev> },
+    Quitado { id: u32 },
+}
+
+/// Altas y bajas de discos desde la última llamada. Se llama desde el bucle principal.
+pub fn cambios_discos() -> Vec<CambioDisco> {
+    masivo::tomar_cambios()
+}
+
+/// Otro manejador del mismo disco (para montar más de una partición). `None` si ya no está.
+pub fn abrir_disco(id: u32) -> Option<Box<dyn SectorDev>> {
+    masivo::abrir(id)
 }
