@@ -39,6 +39,8 @@ pub mod service;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod usbhid;
+pub mod vol;
 pub mod wire;
 
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).
