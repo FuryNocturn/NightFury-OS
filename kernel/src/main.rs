@@ -92,6 +92,35 @@ const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[
             ("icono.bmp", include_bytes!("../../programs/paint/icono.bmp")),
         ],
     ),
+    // v0.10: las apps que antes iban dentro del núcleo.
+    (
+        "Bloc de notas",
+        &[
+            ("app.txt", include_bytes!("../../programs/bloc-notas/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Bloc de notas/programa.nfx")),
+        ],
+    ),
+    (
+        "Terminal",
+        &[
+            ("app.txt", include_bytes!("../../programs/terminal/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Terminal/programa.nfx")),
+        ],
+    ),
+    (
+        "Configuración",
+        &[
+            ("app.txt", include_bytes!("../../programs/configuracion/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Configuración/programa.nfx")),
+        ],
+    ),
+    (
+        "Explorador de archivos",
+        &[
+            ("app.txt", include_bytes!("../../programs/explorador/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Explorador de archivos/programa.nfx")),
+        ],
+    ),
 ];
 
 #[global_allocator]
@@ -181,6 +210,17 @@ impl Platform for Plat {
     }
     fn kill_process(&mut self, id: u64) {
         user::finalizar(id)
+    }
+    fn run_programs(&mut self) {
+        // `correr` exige las interrupciones cerradas, como en `arch::idle`.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+            user::correr();
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+    fn is_system_binary(&self, nfx: &[u8]) -> bool {
+        PROGRAMAS_SISTEMA.iter().flat_map(|(_, items)| items.iter()).any(|(n, b)| *n == "programa.nfx" && *b == nfx)
     }
     fn entropy(&mut self) -> u64 {
         use core::arch::x86_64::{__cpuid, _rdtsc};

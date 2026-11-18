@@ -1,0 +1,6 @@
+nombre=Terminal
+version=1.0
+autor=NightFury
+icono=terminal
+ancho=680
+alto=400

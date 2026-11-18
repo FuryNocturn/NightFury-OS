@@ -1,0 +1,6 @@
+nombre=Explorador de archivos
+version=1.0
+autor=NightFury
+icono=carpeta
+ancho=1040
+alto=540

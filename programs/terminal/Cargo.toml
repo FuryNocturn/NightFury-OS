@@ -1,0 +1,12 @@
+[package]
+name = "terminal"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NightFury: La Terminal del sistema como programa en modo usuario"
+
+[dependencies]
+nf-core = { path = "../../nf-core" }
+nf-app = { path = "../../nf-app" }

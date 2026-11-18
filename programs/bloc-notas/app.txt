@@ -1,0 +1,7 @@
+nombre=Bloc de notas
+version=1.0
+autor=NightFury
+icono=notas
+ancho=640
+alto=420
+abre=txt,md,log,ini,cfg,csv

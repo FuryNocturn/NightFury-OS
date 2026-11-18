@@ -224,7 +224,7 @@ impl Notepad {
     }
 
     fn doc_dir(&self, cx: &mut Ctx) -> String {
-        self.path.as_deref().and_then(files::parent).unwrap_or_else(|| cx.sys.files().std_dir(Std::Documents))
+        self.path.as_deref().and_then(files::parent).unwrap_or_else(|| cx.sys.fs().std_dir(Std::Documents))
     }
 
     /// Ejecuta una acción ya autorizada.
@@ -288,7 +288,7 @@ impl Notepad {
             text.extend(l.iter());
         }
         let now = cx.sys.now();
-        match cx.sys.files().write(path, text.as_bytes(), now) {
+        match cx.sys.fs().write(path, text.as_bytes(), now) {
             Ok(()) => {
                 self.path = Some(String::from(path));
                 self.modified = false;
@@ -304,7 +304,7 @@ impl Notepad {
     }
 
     fn load(&mut self, path: &str, cx: &mut Ctx) {
-        let data = match cx.sys.files().read(path) {
+        let data = match cx.sys.fs().read(path) {
             Ok(d) => d,
             Err(e) => return message(cx, e.message()),
         };
@@ -924,14 +924,14 @@ mod tests {
         let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!("sin Guardar como") };
         assert_eq!((dir.as_str(), name.as_str()), (docs().as_str(), "Sin título.txt"));
         np.dialog_result(ruta(&doc()), &mut cx);
-        assert_eq!(cx.sys.files().read(&doc()).unwrap(), "uno\r\ndos ñx".as_bytes());
+        assert_eq!(cx.sys.fs().read(&doc()).unwrap(), "uno\r\ndos ñx".as_bytes());
         assert!(!np.modified);
         assert_eq!(np.title(), "a.txt: Bloc de notas");
         // Con ruta, Ctrl+S escribe sin diálogo.
         np.key(&ev(Key::Char('y'), Some('y')), &mut cx);
         np.key(&ctrl('s', false), &mut cx);
         assert!(cx.dialog.is_none() && !np.modified);
-        assert_eq!(cx.sys.files().read(&doc()).unwrap(), "uno\r\ndos ñxy".as_bytes());
+        assert_eq!(cx.sys.fs().read(&doc()).unwrap(), "uno\r\ndos ñxy".as_bytes());
         // Guardar como propone el nombre actual en su carpeta.
         np.key(&ctrl('s', true), &mut cx);
         let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!() };
@@ -944,7 +944,7 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(&doc(), "a\tb\nc\r\nd".as_bytes(), now).unwrap();
+        cx.sys.fs().write(&doc(), "a\tb\nc\r\nd".as_bytes(), now).unwrap();
         let mut np = blank();
         np.key(&ctrl('o', false), &mut cx);
         let Some(DialogRequest::Open { dir, .. }) = cx.dialog.take() else { panic!() };
@@ -960,8 +960,8 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(&doc(), &[0xFF, 0xFE, 0x41], now).unwrap();
-        cx.sys.files().write(&files::join(&docs(), "g.txt"),&vec![b'a'; MAX_FILE + 1], now).unwrap();
+        cx.sys.fs().write(&doc(), &[0xFF, 0xFE, 0x41], now).unwrap();
+        cx.sys.fs().write(&files::join(&docs(), "g.txt"),&vec![b'a'; MAX_FILE + 1], now).unwrap();
         let mut np = blank();
         escribe(&mut np.ed, "previo");
         np.open_path(&doc(), &mut cx);
@@ -978,7 +978,7 @@ mod tests {
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let now = cx.sys.now();
-        cx.sys.files().write(&doc(), b"hola", now).unwrap();
+        cx.sys.fs().write(&doc(), b"hola", now).unwrap();
         let mut np = new();
         np.open_path(&doc(), &mut cx);
         assert_eq!(np.title(), "a.txt: Bloc de notas");

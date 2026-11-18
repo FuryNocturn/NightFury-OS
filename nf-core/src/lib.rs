@@ -15,6 +15,7 @@ pub mod bmp;
 pub mod dialogs;
 pub mod files;
 pub mod fs;
+pub mod fsapi;
 pub mod desktop;
 pub mod font;
 pub mod geom;
@@ -30,12 +31,15 @@ pub mod menu;
 pub mod nfx;
 pub mod platform;
 pub mod proc;
+pub mod request;
 pub mod programs;
 pub mod ribbon;
 pub mod scrollbar;
+pub mod service;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod wire;
 
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).
 pub const NAME: &str = "NightFury";

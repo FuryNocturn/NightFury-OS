@@ -259,7 +259,7 @@ fn launchers(sys: &mut dyn Platform) -> Vec<Launcher> {
     let progs = programs::installed(sys);
     let mut v: Vec<Launcher> = APPS
         .iter()
-        .filter(|(_, n, _)| !progs.iter().any(|p| p.name.eq_ignore_ascii_case(n)))
+        .filter(|(k, n, _)| apps::built_in(*k) && !progs.iter().any(|p| p.name.eq_ignore_ascii_case(n)))
         .map(|(k, n, i)| Launcher { name: String::from(*n), icon: *i, pic: None, act: Act::App(*k) })
         .collect();
     v.extend(progs.into_iter().map(|p| Launcher { name: p.name.clone(), icon: p.icon, pic: p.picture.clone(), act: Act::Program(p) }));
@@ -1719,20 +1719,25 @@ impl Desktop {
     }
 
     /// Arranca el programa `p` desde su `.nfx` (`path`). Si no se puede, lo dice en un mensaje.
-    pub fn launch_program(&mut self, p: &Program, path: &str, sys: &mut dyn Platform) {
+    pub fn launch_program(&mut self, p: &Program, path: &str, sys: &mut dyn Platform) -> Option<u32> {
         self.set_start(false);
         self.set_shut(false);
+        // Un programa del sistema que sustituye a una app (v0.10) se trata como ella: el escritorio
+        // reutiliza su ventana del Explorador, trae al frente Configuración, etc.
+        let kind = APPS.iter().find(|(k, n, _)| p.system && *k != AppKind::TaskManager && p.name == *n).map_or(AppKind::Program, |(k, _, _)| *k);
         match programs::open(sys, p, path) {
             Ok(app) => {
                 self.next_size = Some(p.size);
-                let id = self.push_window(AppKind::Program, Box::new(app), None);
+                let id = self.push_window(kind, Box::new(app), None);
                 if let Some(i) = self.pos(id) {
                     self.wins[i].pic = p.picture.clone();
                 }
+                Some(id)
             }
             Err(e) => {
                 let text = format!("No se puede abrir «{}».\n{e}", p.name);
                 self.open_dialog(None, DialogRequest::Message { tag: TAG_INFO, title: p.name.clone(), text, buttons: Buttons::Ok }, sys);
+                None
             }
         }
     }
@@ -1752,7 +1757,7 @@ impl Desktop {
         self.wins.iter().filter(|w| w.dlg.is_some()).count()
     }
 
-    fn launch_id(&mut self, kind: AppKind, _sys: &mut dyn Platform) -> u32 {
+    fn launch_id(&mut self, kind: AppKind, sys: &mut dyn Platform) -> u32 {
         self.set_start(false);
         self.set_shut(false);
         if matches!(kind, AppKind::Settings | AppKind::TaskManager) {
@@ -1760,6 +1765,14 @@ impl Desktop {
                 let id = w.id;
                 self.raise(id);
                 return id;
+            }
+        }
+        // v0.10: si la app está instalada como programa, se abre el programa.
+        if kind != AppKind::TaskManager {
+            if let Some(p) = programs::installed(sys).into_iter().find(|p| p.system && p.name == apps::name(kind)) {
+                if let Some(id) = self.launch_program(&p, &p.binary(), sys) {
+                    return id;
+                }
             }
         }
         self.push_window(kind, apps::create(kind), None)
@@ -1975,7 +1988,11 @@ impl Desktop {
             self.raise(id);
             self.with_app(id, sys, |a, cx| a.open_path(path, cx));
         } else {
-            let id = self.launch_id(AppKind::Notepad, sys);
+            // Con el programa que declara esa extensión (`abre=`); si no hay, en el Bloc de notas.
+            let id = match programs::for_extension(sys, path).and_then(|p| self.launch_program(&p, &p.binary(), sys)) {
+                Some(id) => id,
+                None => self.launch_id(AppKind::Notepad, sys),
+            };
             self.with_app(id, sys, |a, cx| a.open_path(path, cx));
         }
     }

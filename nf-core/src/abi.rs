@@ -59,6 +59,23 @@ pub const SYS_SET_MIN_SIZE: u64 = 9;
 /// escribe con sus permisos. El programa nunca ve la ruta. La respuesta llega como `EV_SAVED`.
 pub const SYS_SAVE_AS: u64 = 10;
 pub const SAVE_MAX: u64 = 32 << 20;
+/// `SERVICE(ptr, len)` (v0.10): petición al sistema codificada con `wire` (archivos, cuentas, datos
+/// del equipo; ver `service`). El programa queda parado hasta que el escritorio la atiende y vuelve
+/// con la longitud de la respuesta (>= 0), que se recoge con `TAKE_REPLY`. Máx. `SERVICE_MAX` bytes.
+pub const SYS_SERVICE: u64 = 11;
+/// `TAKE_REPLY(ptr, cap)` (v0.10): copia la respuesta del último `SERVICE` y la descarta. Devuelve su
+/// longitud; `E_INVAL` si `cap` no llega (la respuesta se conserva) o no hay ninguna.
+pub const SYS_TAKE_REPLY: u64 = 12;
+/// `REQUEST(ptr, len)` (v0.10): petición al escritorio codificada con `wire` (abrir una ruta, un
+/// diálogo, un menú, empezar a arrastrar, cambiar el tema, respuestas de arrastre). No espera: lo que
+/// conteste llega como evento. Máx. `REQUEST_MAX` bytes.
+pub const SYS_REQUEST: u64 = 13;
+/// `EVENT_DATA(ptr, cap)` (v0.10): datos del último evento entregado que los lleve (`d` = su
+/// longitud). Valen hasta el siguiente `WAIT_EVENT`. Devuelve la longitud; `E_INVAL` si `cap` no llega.
+pub const SYS_EVENT_DATA: u64 = 14;
+/// Tamaño máximo de una petición o respuesta de `SERVICE` (cabe un `SAVE_MAX` con su ruta).
+pub const SERVICE_MAX: u64 = SAVE_MAX + (1 << 20);
+pub const REQUEST_MAX: u64 = 1 << 20;
 
 pub const E_INVAL: i64 = -1;
 /// Puntero fuera de la zona del programa o sin mapear.
@@ -95,6 +112,22 @@ pub const EV_TIMER: u32 = 11;
 pub const EV_CLOSE: u32 = 12;
 /// Resultado de `SAVE_AS`: `a` = 1 guardado, 0 cancelado, -1 error.
 pub const EV_SAVED: u32 = 13;
+/// Eventos de la v0.10. Los que llevan datos (`wire`) ponen su longitud en `d` y se leen con
+/// `EVENT_DATA`.
+/// Respuesta a un diálogo pedido con `REQUEST`; datos: `DialogResult`.
+pub const EV_DIALOG: u32 = 14;
+/// Elemento elegido en un menú: `a` = tag, `b` = id.
+pub const EV_MENU: u32 = 15;
+/// Se arrastran archivos sobre la ventana: `a, b` = punto, `c` = 1 dentro / 0 salió o terminó;
+/// datos: las rutas. El programa contesta con `Request::DragAnswer`.
+pub const EV_DRAG_OVER: u32 = 16;
+/// El escritorio pregunta qué se arrastraría con el botón derecho desde `a, b`. Se contesta con
+/// `Request::DragSourceAnswer`.
+pub const EV_DRAG_SOURCE: u32 = 17;
+/// Archivos soltados en `a, b`; `c` = 1 copiar; datos: las rutas.
+pub const EV_DROP: u32 = 18;
+/// Abrir una ruta en esta ventana (`App::open_path`); datos: la ruta.
+pub const EV_OPEN: u32 = 19;
 
 pub const F_SHIFT: u32 = 1;
 pub const F_CTRL: u32 = 2;

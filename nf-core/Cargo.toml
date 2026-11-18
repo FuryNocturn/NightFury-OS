@@ -8,3 +8,9 @@ repository.workspace = true
 description = "NightFury: gráficos, tipografía, escritorio y apps (sin dependencias)"
 
 [dependencies]
+
+[features]
+default = ["apps"]
+# Bloc de notas, Terminal, Configuración, Explorador y Calculadora dentro del binario. El núcleo va
+# sin ella (v0.10: son programas); los programas y las pruebas, con ella.
+apps = []

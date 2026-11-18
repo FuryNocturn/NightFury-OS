@@ -1,10 +1,10 @@
 [workspace]
-members = ["nf-core", "kernel", "tools/nfdisk", "nf-app", "tools/nfpack", "programs/calculadora", "programs/plantilla", "programs/reloj", "programs/paint", "tools/nfprog"]
+members = ["nf-core", "kernel", "tools/nfdisk", "nf-app", "tools/nfpack", "programs/calculadora", "programs/plantilla", "programs/reloj", "programs/paint", "programs/bloc-notas", "programs/terminal", "programs/configuracion", "programs/explorador", "tools/nfprog"]
 default-members = ["nf-core"]
 resolver = "2"
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "GPL-3.0-only"
 authors = ["Tare Fernandez Salas (FuryNocturn)"]

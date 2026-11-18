@@ -3,6 +3,7 @@
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;
+use crate::fsapi::FilesApi;
 use crate::keys::Pool;
 use crate::proc::{ProcInfo, Process};
 use alloc::boxed::Box;
@@ -38,6 +39,11 @@ pub trait Platform {
     fn shutdown(&mut self);
     /// Archivos del sistema (unidad C:).
     fn files(&mut self) -> &mut Files;
+    /// Los archivos como los ven las apps (v0.10): el sistema, `files()`; un programa en modo
+    /// usuario, un cliente que los pide al sistema.
+    fn fs(&mut self) -> &mut dyn FilesApi {
+        self.files()
+    }
     /// 64 bits impredecibles (generador del procesador si existe, mezclado con el reloj fino).
     /// Para sales; las llaves de cifrado mezclan muchas lecturas con otras fuentes.
     fn entropy(&mut self) -> u64;
@@ -55,6 +61,15 @@ pub trait Platform {
     }
     /// Finaliza el programa `id` (queda `Killed(Kill::Ended)`; su ventana se cierra sola).
     fn kill_process(&mut self, _id: u64) {}
+    /// Deja correr a los programas listos hasta que se paren o les toque el turno al escritorio
+    /// (v0.10). `ProcApp` lo usa para atender seguidas las peticiones de un programa sin esperar
+    /// al siguiente tick. Sin programas no hace nada.
+    fn run_programs(&mut self) {}
+    /// `true` si `nfx` es, byte a byte, uno de los programas que trae el sistema (v0.10). Solo
+    /// esos pueden usar las llamadas de cuentas, claves, cifrado, reiniciar y apagar.
+    fn is_system_binary(&self, _nfx: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.

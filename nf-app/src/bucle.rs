@@ -4,15 +4,23 @@
 //! redibujar. No toca hardware: todo lo del núcleo entra por `Llamadas` (la real está en `rt`, la
 //! falsa en las pruebas).
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nf_core::abi::*;
 use nf_core::apps::{App, Ctx};
+use nf_core::proc::lleva_datos;
+use nf_core::request::Request;
+use nf_core::wire::{decode, encode};
 use nf_core::dialogs::{Answer, DialogResult};
 use nf_core::files::{self, Files};
+use nf_core::fsapi::FilesApi;
 use nf_core::keys::Pool;
 use nf_core::platform::{DateTime, MemInfo, Platform};
+use nf_core::service::{Call, RemoteFiles, Transport};
+use nf_core::wire::Wire;
 use nf_core::surface::Surface;
 use nf_core::sync::SpinLock;
 use nf_core::theme::Theme;
@@ -73,19 +81,104 @@ pub trait Llamadas {
     fn log(&mut self, t: &str);
     /// `SAVE_AS`: `>= 0` pedido (la respuesta llega como `EV_SAVED`), `< 0` rechazado.
     fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64;
+    /// `SERVICE` + `TAKE_REPLY`: manda la petición y devuelve la respuesta (vacía si el núcleo la
+    /// rechaza). El programa se para hasta que el escritorio contesta.
+    fn servicio(&mut self, peticion: &[u8]) -> Vec<u8>;
+    /// `REQUEST`: petición ya codificada con `wire`; `< 0` rechazada.
+    fn peticion(&mut self, msg: &[u8]) -> i64;
+    /// `EVENT_DATA`: los `len` bytes de datos del último evento (vacío si falla).
+    fn datos_evento(&mut self, len: usize) -> Vec<u8>;
 }
 
-/// `Platform` de un programa. El reloj y la fecha los refresca el bucle en cada evento.
-/// shortcut: los programas ven una unidad C: en memoria vacía (no el disco), hasta la v0.10.
-struct PlataformaPrograma {
+/// Lo que la app ha dejado pedido en `cx` como peticiones al escritorio.
+fn pedidos(cx: &mut Ctx) -> Vec<Request> {
+    let mut v = Vec::new();
+    v.extend(cx.open.take().map(Request::Open));
+    v.extend(cx.open_new.take().map(Request::OpenNew));
+    v.extend(cx.open_terminal.take().map(Request::OpenTerminal));
+    v.extend(cx.dialog.take().map(Request::Dialog));
+    v.extend(cx.menu.take().map(Request::Menu));
+    v.extend(cx.drag.take().map(|d| Request::Drag(d.paths)));
+    if cx.theme_changed {
+        v.push(Request::SetTheme(*cx.theme));
+    }
+    v
+}
+
+fn enviar(c: &mut impl Llamadas, v: Vec<Request>) {
+    for r in v {
+        let e = c.peticion(&encode(&r));
+        if e < 0 {
+            c.log(&alloc::format!("REQUEST rechazada ({e})"));
+        }
+    }
+}
+
+/// Las `Llamadas` compartidas entre el bucle y la plataforma del programa (que las necesita para
+/// pedir al sistema archivos y datos del equipo). Un solo hilo: el `RefCell` nunca se pide dos veces.
+#[derive(Clone)]
+struct Red<'a>(Rc<RefCell<&'a mut dyn Llamadas>>);
+
+impl Llamadas for Red<'_> {
+    fn esperar(&mut self, timeout_ms: u64) -> WireEvent {
+        self.0.borrow_mut().esperar(timeout_ms)
+    }
+    fn presentar(&mut self, px: &[u32], w: i32, h: i32) {
+        self.0.borrow_mut().presentar(px, w, h)
+    }
+    fn titulo(&mut self, t: &str) {
+        self.0.borrow_mut().titulo(t)
+    }
+    fn tam_min(&mut self, w: i32, h: i32) {
+        self.0.borrow_mut().tam_min(w, h)
+    }
+    fn fecha(&mut self) -> DateTime {
+        self.0.borrow_mut().fecha()
+    }
+    fn log(&mut self, t: &str) {
+        self.0.borrow_mut().log(t)
+    }
+    fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64 {
+        self.0.borrow_mut().guardar(nombre, datos)
+    }
+    fn servicio(&mut self, peticion: &[u8]) -> Vec<u8> {
+        self.0.borrow_mut().servicio(peticion)
+    }
+    fn peticion(&mut self, msg: &[u8]) -> i64 {
+        self.0.borrow_mut().peticion(msg)
+    }
+    fn datos_evento(&mut self, len: usize) -> Vec<u8> {
+        self.0.borrow_mut().datos_evento(len)
+    }
+}
+
+impl Transport for Red<'_> {
+    fn call(&mut self, req: &[u8]) -> Vec<u8> {
+        self.servicio(req)
+    }
+}
+
+/// `Platform` de un programa. El reloj y la fecha los refresca el bucle en cada evento. Los
+/// archivos (`fs`) y los datos del equipo se piden al sistema por `SERVICE`; si no contesta, valen
+/// los valores neutros de `RemoteFiles::ask`.
+struct PlataformaPrograma<'a> {
     ms: u64,
     fecha: DateTime,
+    /// Solo para `Platform::files`, que un programa no tiene: una unidad C: vacía en memoria.
     files: Files,
+    fs: RemoteFiles<Red<'a>>,
+    net: Red<'a>,
     pool: Pool,
     semilla: u64,
 }
 
-impl Platform for PlataformaPrograma {
+impl PlataformaPrograma<'_> {
+    fn pedir<R: Wire>(&self, c: Call, malo: R) -> R {
+        RemoteFiles(self.net.clone()).ask(c, malo)
+    }
+}
+
+impl Platform for PlataformaPrograma<'_> {
     fn now(&mut self) -> DateTime {
         self.fecha
     }
@@ -93,28 +186,36 @@ impl Platform for PlataformaPrograma {
         self.ms
     }
     fn mem(&self) -> MemInfo {
-        MemInfo { total: MAX_MEM, heap_total: MAX_MEM, heap_used: 0 }
+        self.pedir(Call::Mem, MemInfo { total: MAX_MEM, heap_total: MAX_MEM, heap_used: 0 })
     }
     fn cpu(&self) -> String {
-        String::from("Procesador x86-64")
+        self.pedir(Call::Cpu, String::from("Procesador x86-64"))
     }
     fn screen(&self) -> (u32, u32) {
-        (1280, 720)
+        self.pedir(Call::Screen, (1280, 720))
     }
-    // Un programa no puede apagar ni reiniciar el equipo.
-    fn reboot(&mut self) {}
-    fn shutdown(&mut self) {}
+    // Reiniciar y apagar los hace el sistema, y solo si el programa es de los suyos.
+    fn reboot(&mut self) {
+        self.pedir(Call::Reboot, ())
+    }
+    fn shutdown(&mut self) {
+        self.pedir(Call::Shutdown, ())
+    }
     fn files(&mut self) -> &mut Files {
         &mut self.files
     }
-    /// shortcut: xorshift sobre el reloj; vale para sales y azar de juegos, no para llaves.
+    fn fs(&mut self) -> &mut dyn FilesApi {
+        &mut self.fs
+    }
+    /// La entropía la da el sistema; si no contesta, xorshift sobre el reloj.
+    // shortcut: el respaldo local no es criptográfico (vale para azar de juegos, no para llaves); basta mientras `SERVICE` no falle.
     fn entropy(&mut self) -> u64 {
         let mut x = self.semilla ^ self.ms.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.semilla = x;
-        x
+        self.pedir(Call::Entropy, x)
     }
     fn pool(&mut self) -> &mut Pool {
         &mut self.pool
@@ -122,9 +223,9 @@ impl Platform for PlataformaPrograma {
 }
 
 /// Estado del bucle entre eventos.
-struct Bucle {
+struct Bucle<'a> {
     app: Box<dyn App>,
-    plat: PlataformaPrograma,
+    plat: PlataformaPrograma<'a>,
     theme: Theme,
     size: (i32, i32),
     focused: bool,
@@ -139,7 +240,7 @@ struct Bucle {
     guardando: Option<String>,
 }
 
-impl Bucle {
+impl Bucle<'_> {
     fn timeout(&self) -> u64 {
         self.next_tick.map_or(u64::MAX, |t| t.saturating_sub(self.now))
     }
@@ -159,11 +260,13 @@ impl Bucle {
     }
 
     /// Entrega un resultado de diálogo a la app. `true` si ella pide cerrar.
-    fn entregar(&mut self, r: DialogResult) -> bool {
+    fn entregar(&mut self, c: &mut impl Llamadas, r: DialogResult) -> bool {
         let mut cx = Ctx::new(&mut self.plat, &mut self.theme, self.now);
         self.app.dialog_result(r, &mut cx);
         self.dirty |= cx.redraw | cx.theme_changed;
-        cx.close
+        let (cerrar, v) = (cx.close, pedidos(&mut cx));
+        enviar(c, v);
+        cerrar
     }
 
     /// Atiende un evento. `Some(código)` si el programa debe terminar.
@@ -196,11 +299,39 @@ impl Bucle {
         if ev.kind == EV_SAVED {
             if let Some(n) = self.guardando.take() {
                 EN_CURSO.store(false, Ordering::Release);
-                cerrar |= self.entregar(resultado_guardado(ev.a, n));
+                cerrar |= self.entregar(c, resultado_guardado(ev.a, n));
             }
         }
+        // Los datos del evento hay que pedirlos antes de la llamada siguiente al núcleo.
+        let datos = if lleva_datos(ev.kind) { c.datos_evento(ev.d as usize) } else { Vec::new() };
+        let mut respuesta = None;
         let mut cx = Ctx::new(&mut self.plat, &mut self.theme, ev.now_ms);
         match ev.kind {
+            EV_DIALOG => {
+                if let Ok(r) = decode::<DialogResult>(&datos) {
+                    self.app.dialog_result(r, &mut cx);
+                }
+            }
+            EV_MENU => self.app.menu_result(ev.a as u32, ev.b as u32, &mut cx),
+            EV_DROP => {
+                if let Ok(p) = decode::<Vec<String>>(&datos) {
+                    self.app.drop_files(ev.a, ev.b, &p, ev.c != 0, &mut cx);
+                }
+            }
+            EV_OPEN => {
+                if let Ok(p) = decode::<String>(&datos) {
+                    self.app.open_path(&p, &mut cx);
+                }
+            }
+            EV_DRAG_OVER => {
+                if let Ok(p) = decode::<Vec<String>>(&datos) {
+                    let pos = (ev.c != 0).then_some((ev.a, ev.b));
+                    let ok = self.app.drag_over(pos, &p, &mut cx);
+                    // Al salir o terminar el escritorio no espera respuesta.
+                    respuesta = pos.map(|_| Request::DragAnswer(ok));
+                }
+            }
+            EV_DRAG_SOURCE => respuesta = Some(Request::DragSourceAnswer(self.app.drag_source(ev.a, ev.b, &mut cx))),
             EV_KEY => {
                 if let Some(k) = ev.to_key() {
                     self.app.key(&k, &mut cx);
@@ -219,17 +350,10 @@ impl Bucle {
         }
         cerrar |= cx.close;
         self.dirty |= cx.redraw | cx.theme_changed;
-        // v0.8: los programas no tienen diálogos, menús, abrir ni arrastrar; se avisa y se ignora.
-        for (pedido, nombre) in [
-            (cx.dialog.is_some(), "dialog"),
-            (cx.menu.is_some(), "menu"),
-            (cx.open.is_some() || cx.open_new.is_some() || cx.open_terminal.is_some(), "open"),
-            (cx.drag.is_some(), "drag"),
-        ] {
-            if pedido {
-                c.log(&alloc::format!("cx.{nombre} no existe para programas (v0.8): ignorado"));
-            }
-        }
+        // La respuesta de arrastre va primero: el escritorio la está esperando.
+        let mut v: Vec<Request> = respuesta.into_iter().collect();
+        v.extend(pedidos(&mut cx));
+        enviar(c, v);
         // Guardado pedido durante este evento: se envía al núcleo; si lo rechaza, la app lo sabe ya.
         let pedido = PENDIENTE.lock().take();
         if let Some((nombre, datos)) = pedido {
@@ -237,7 +361,7 @@ impl Bucle {
                 self.guardando = Some(nombre);
             } else {
                 EN_CURSO.store(false, Ordering::Release);
-                cerrar |= self.entregar(resultado_guardado(-1, nombre));
+                cerrar |= self.entregar(c, resultado_guardado(-1, nombre));
             }
         }
         if cerrar {
@@ -259,9 +383,19 @@ impl Bucle {
 /// Ejecuta el programa hasta que termine; devuelve el código de salida (el llamador hace `EXIT`).
 /// `tick_ms`: cada cuánto llamar a `App::tick` (`None` = nunca, el programa duerme entre eventos).
 pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) -> i32 {
+    let c: &mut dyn Llamadas = c;
+    let mut red = Red(Rc::new(RefCell::new(c)));
     let mut b = Bucle {
         app,
-        plat: PlataformaPrograma { ms: 0, fecha: DateTime::default(), files: Files::default(), pool: Pool::new(), semilla: 0x2545_F491_4F6C_DD1D },
+        plat: PlataformaPrograma {
+            ms: 0,
+            fecha: DateTime::default(),
+            files: Files::default(),
+            fs: RemoteFiles(red.clone()),
+            net: red.clone(),
+            pool: Pool::new(),
+            semilla: 0x2545_F491_4F6C_DD1D,
+        },
         theme: Theme::default(),
         size: (0, 0),
         focused: false,
@@ -274,11 +408,11 @@ pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) 
         now: 0,
         guardando: None,
     };
-    b.avisar(c);
+    b.avisar(&mut red);
     loop {
         let t = b.timeout();
-        let ev = c.esperar(t);
-        if let Some(code) = b.evento(c, &ev) {
+        let ev = red.esperar(t);
+        if let Some(code) = b.evento(&mut red, &ev) {
             return code;
         }
     }
@@ -290,8 +424,10 @@ mod tests {
     use alloc::rc::Rc;
     use alloc::vec::Vec;
     use core::cell::RefCell;
-    use nf_core::apps::{AppKind, MouseEv};
+    use nf_core::apps::{AppKind, DragRequest, MouseEv};
+    use nf_core::dialogs::DialogRequest;
     use nf_core::input::KeyEvent;
+    use nf_core::menu::{MenuItem, MenuRequest};
 
     /// Núcleo falso: entrega los eventos de la cola (al acabar, pide cerrar) y apunta lo pedido.
     #[derive(Default)]
@@ -304,6 +440,13 @@ mod tests {
         logs: Vec<String>,
         guardados: Vec<(String, Vec<u8>)>,
         rechaza_guardar: bool,
+        /// Peticiones recibidas, ya decodificadas.
+        pedidos: Vec<Request>,
+        /// Datos de los eventos con datos, en el orden en que se piden.
+        datos: Vec<Vec<u8>>,
+        /// Peticiones de `SERVICE` recibidas y lo que se contesta a todas.
+        servicios: Vec<Vec<u8>>,
+        respuesta: Vec<u8>,
     }
     impl Llamadas for Falso {
         fn esperar(&mut self, t: u64) -> WireEvent {
@@ -337,6 +480,19 @@ mod tests {
             } else {
                 0
             }
+        }
+        fn peticion(&mut self, m: &[u8]) -> i64 {
+            self.pedidos.push(decode(m).unwrap());
+            0
+        }
+        fn datos_evento(&mut self, len: usize) -> Vec<u8> {
+            let d = self.datos.remove(0);
+            assert_eq!(d.len(), len);
+            d
+        }
+        fn servicio(&mut self, peticion: &[u8]) -> Vec<u8> {
+            self.servicios.push(peticion.into());
+            self.respuesta.clone()
         }
     }
 
@@ -412,10 +568,10 @@ mod tests {
         assert_eq!(c.frames, vec![(200, 100, 0x123456); 3]);
         assert_eq!(v.teclas, 1);
         assert_eq!(v.ratones, vec![MouseEv::Move { x: 3, y: 4 }, MouseEv::RightDown { x: 1, y: 1 }]);
-        // El título nuevo se avisa una vez; cx.open se ignora con una línea de log.
+        // El título nuevo se avisa una vez; cx.open sale como petición.
         assert_eq!(c.titulos, vec![String::from("teclas 1")]);
-        assert_eq!(c.logs.len(), 1);
-        assert!(c.logs[0].contains("open"));
+        assert!(c.logs.is_empty());
+        assert_eq!(c.pedidos, vec![Request::Open(String::from("C:\\"))]);
     }
 
     #[test]
@@ -460,6 +616,103 @@ mod tests {
         // Perder el foco redibuja.
         assert_eq!(visto.borrow().draws.last().map(|d| d.2), Some(false));
         assert_eq!(visto.borrow().ratones.len(), 1);
+    }
+
+    /// App que apunta lo que le llega y pide cosas con cada tecla.
+    #[derive(Default)]
+    struct Datos {
+        vistos: Vec<String>,
+    }
+    struct DatosApp(Rc<RefCell<Datos>>);
+    impl App for DatosApp {
+        fn kind(&self) -> AppKind {
+            AppKind::Program
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (1, 1)
+        }
+        fn draw(&mut self, _: &mut Surface, _: &Theme, _: &mut dyn Platform, _: bool) {}
+        fn key(&mut self, _: &KeyEvent, cx: &mut Ctx) {
+            cx.dialog = Some(DialogRequest::Input { tag: 4, title: String::from("t"), label: String::new(), value: String::new() });
+            cx.menu = Some(MenuRequest { tag: 5, x: 1, y: 2, items: vec![MenuItem::new(1, "a")] });
+            cx.drag = Some(DragRequest { paths: vec![String::from("C:\\a")] });
+            cx.open_new = Some(String::from("C:\\b"));
+            cx.open_terminal = Some(String::from("C:\\c"));
+            cx.theme.accent = 0x010203;
+            cx.theme_changed = true;
+        }
+        fn mouse(&mut self, _: MouseEv, _: &mut Ctx) {}
+        fn tick(&mut self, _: &mut Ctx) {}
+        fn dialog_result(&mut self, r: DialogResult, _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("dialogo {r:?}"));
+        }
+        fn menu_result(&mut self, tag: u32, id: u32, _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("menu {tag} {id}"));
+        }
+        fn drop_files(&mut self, x: i32, y: i32, p: &[String], copy: bool, _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("drop {x} {y} {p:?} {copy}"));
+        }
+        fn open_path(&mut self, p: &str, _: &mut Ctx) {
+            self.0.borrow_mut().vistos.push(alloc::format!("open {p}"));
+        }
+        fn drag_over(&mut self, pos: Option<(i32, i32)>, p: &[String], _: &mut Ctx) -> bool {
+            self.0.borrow_mut().vistos.push(alloc::format!("over {pos:?} {p:?}"));
+            pos.is_some_and(|(x, _)| x > 0)
+        }
+        fn drag_source(&mut self, x: i32, y: i32, _: &mut Ctx) -> Option<Vec<String>> {
+            self.0.borrow_mut().vistos.push(alloc::format!("origen {x} {y}"));
+            (x > 0).then(|| vec![String::from("C:\\o")])
+        }
+    }
+
+    #[test]
+    fn eventos_con_datos_y_peticiones() {
+        let _g = SERIE.lock();
+        let d = Rc::new(RefCell::new(Datos::default()));
+        let mut c = Falso { cola: arranque(), ..Default::default() };
+        let ponlo = |c: &mut Falso, kind: u32, a, b, cc, data: Vec<u8>| {
+            c.cola.push(WireEvent { kind, a, b, c: cc, d: data.len() as u32, ..Default::default() });
+            c.datos.push(data);
+        };
+        let rutas = vec![String::from("C:\\x")];
+        ponlo(&mut c, EV_DIALOG, 0, 0, 0, encode(&DialogResult::Text { tag: 4, value: Some(String::from("v")) }));
+        c.cola.push(ev(EV_MENU, 5, 9, 0));
+        ponlo(&mut c, EV_DROP, 3, 4, 1, encode(&rutas));
+        ponlo(&mut c, EV_OPEN, 0, 0, 0, encode(&String::from("C:\\z")));
+        ponlo(&mut c, EV_DRAG_OVER, 10, 2, 1, encode(&rutas));
+        ponlo(&mut c, EV_DRAG_OVER, 0, 0, 0, encode(&rutas));
+        c.cola.push(ev(EV_DRAG_SOURCE, 7, 8, 0));
+        c.cola.push(ev(EV_DRAG_SOURCE, 0, 0, 0));
+        // Un mensaje roto no llega a la app ni la tumba.
+        ponlo(&mut c, EV_DROP, 0, 0, 0, vec![1, 2]);
+        c.cola.push(WireEvent { kind: EV_KEY, a: 0, d: 'a' as u32, ..Default::default() });
+        ejecutar(&mut c, Box::new(DatosApp(d.clone())), None);
+        assert_eq!(
+            d.borrow().vistos,
+            [
+                "dialogo Text { tag: 4, value: Some(\"v\") }",
+                "menu 5 9",
+                "drop 3 4 [\"C:\\\\x\"] true",
+                "open C:\\z",
+                "over Some((10, 2)) [\"C:\\\\x\"]",
+                "over None [\"C:\\\\x\"]",
+                "origen 7 8",
+                "origen 0 0",
+            ]
+        );
+        // Respuestas de arrastre (ninguna al salir), y lo que pidió la tecla, tras ellas.
+        let r = &c.pedidos;
+        assert_eq!(r[0], Request::DragAnswer(true));
+        assert_eq!(r[1], Request::DragSourceAnswer(Some(vec![String::from("C:\\o")])));
+        assert_eq!(r[2], Request::DragSourceAnswer(None));
+        assert!(matches!(r[3], Request::OpenNew(_)) && matches!(r[4], Request::OpenTerminal(_)));
+        assert!(matches!(r[5], Request::Dialog(_)) && matches!(r[6], Request::Menu(_)) && matches!(r[7], Request::Drag(_)));
+        assert_eq!(r[8], Request::SetTheme(Theme { accent: 0x010203, wallpaper: 2 }));
+        assert_eq!(r.len(), 9);
+        assert!(c.datos.is_empty());
     }
 
     /// App que guarda con cada tecla y apunta lo que recibe.
@@ -537,5 +790,62 @@ mod tests {
         // Lo pedido y no enviado (la prueba no pasó por el bucle) se limpia para no dejar rastro.
         PENDIENTE.lock().take();
         EN_CURSO.store(false, Ordering::Release);
+    }
+
+    /// App que, con cada tecla, pide al sistema un archivo y datos del equipo, y lo apunta.
+    struct PideApp(Rc<RefCell<Vec<(bool, (u32, u32))>>>);
+    impl App for PideApp {
+        fn kind(&self) -> AppKind {
+            AppKind::Program
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (1, 1)
+        }
+        fn draw(&mut self, _: &mut Surface, _: &Theme, _: &mut dyn Platform, _: bool) {}
+        fn key(&mut self, _: &KeyEvent, cx: &mut Ctx) {
+            let existe = cx.sys.fs().exists(r"C:\a.txt");
+            self.0.borrow_mut().push((existe, cx.sys.screen()));
+        }
+        fn mouse(&mut self, _: MouseEv, _: &mut Ctx) {}
+        fn tick(&mut self, _: &mut Ctx) {}
+    }
+
+    #[test]
+    fn archivos_y_equipo_van_por_el_servicio() {
+        let _g = SERIE.lock();
+        let visto = Rc::new(RefCell::new(Vec::new()));
+        let tecla = WireEvent { kind: EV_KEY, a: 0, d: 'p' as u32, ..Default::default() };
+        // Con respuesta: `0` + valor. Todas las llamadas reciben los mismos bytes, que para un
+        // `bool` (1) valen y para la pantalla (8 bytes) no: ahí sale el valor neutro.
+        let mut c = Falso { cola: arranque(), respuesta: vec![0, 1], ..Default::default() };
+        c.cola.push(tecla);
+        ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
+        assert_eq!(*visto.borrow(), [(true, (1280, 720))]);
+        let pedidas: Vec<Call> = c.servicios.iter().map(|r| nf_core::wire::decode(r).unwrap()).collect();
+        assert!(matches!(&pedidas[0], Call::Exists { path } if path == r"C:\a.txt"));
+        assert!(matches!(pedidas[1], Call::Screen));
+        // Sin respuesta (el núcleo la rechaza): valores neutros, sin pánico.
+        visto.borrow_mut().clear();
+        let mut c = Falso { cola: arranque(), ..Default::default() };
+        c.cola.push(tecla);
+        ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
+        assert_eq!(*visto.borrow(), [(false, (1280, 720))]);
+    }
+
+    #[test]
+    fn configuracion_pide_cambiar_el_fondo() {
+        let _g = SERIE.lock();
+        let mut c = Falso::default();
+        c.cola.push(WireEvent { kind: EV_THEME, a: 0, d: 0x1E78D7, ..Default::default() });
+        c.cola.push(ev(EV_RESIZE, 780, 520, 0));
+        c.cola.push(ev(EV_FOCUS, 1, 0, 0));
+        c.cola.push(ev(EV_MOUSE_MOVE, 444, 120, 1));
+        c.cola.push(ev(EV_MOUSE_DOWN, 444, 120, 2));
+        c.cola.push(ev(EV_MOUSE_UP, 444, 120, 3));
+        ejecutar(&mut c, nf_core::apps::create(AppKind::Settings), None);
+        assert!(c.pedidos.iter().any(|r| matches!(r, Request::SetTheme(t) if t.wallpaper == 1)), "{:?}", c.pedidos);
     }
 }
