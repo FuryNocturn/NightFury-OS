@@ -14,7 +14,7 @@ test = false
 bench = false
 
 [dependencies]
-nf-core = { path = "../nf-core" }
+nf-core = { path = "../nf-core", default-features = false }
 
 [features]
 # Programas de prueba en modo usuario al llegar al escritorio (solo para verificar el núcleo).

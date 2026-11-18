@@ -13,11 +13,20 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+// Las apps que ya son programas (v0.10) solo se compilan con la feature `apps`: el núcleo va sin
+// ella y los programas y las pruebas con ella.
+#[cfg(feature = "apps")]
 mod calc;
+#[cfg(feature = "apps")]
 mod explorer;
+#[cfg(not(feature = "apps"))]
+mod missing;
+#[cfg(feature = "apps")]
 mod notepad;
+#[cfg(feature = "apps")]
 mod settings;
 mod taskmgr;
+#[cfg(feature = "apps")]
 mod terminal;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,14 +166,31 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
     }
 }
 
+/// Nombre visible de una app de `APPS` (también es el nombre de su programa en `C:\Programas`).
+pub fn name(kind: AppKind) -> &'static str {
+    APPS.iter().find(|(k, _, _)| *k == kind).map_or("", |(_, n, _)| n)
+}
+
+/// `true` si la app está dentro de este binario; si no, hay que abrir su programa (v0.10).
+pub fn built_in(kind: AppKind) -> bool {
+    kind == AppKind::TaskManager || cfg!(feature = "apps")
+}
+
 pub fn create(kind: AppKind) -> Box<dyn App> {
     match kind {
-        AppKind::Notepad => notepad::new(),
-        AppKind::Calc => calc::new(),
-        AppKind::Settings => settings::new(),
-        AppKind::Files => explorer::new(),
-        AppKind::Terminal => terminal::new(),
         AppKind::TaskManager => taskmgr::new(),
+        #[cfg(feature = "apps")]
+        AppKind::Notepad => notepad::new(),
+        #[cfg(feature = "apps")]
+        AppKind::Calc => calc::new(),
+        #[cfg(feature = "apps")]
+        AppKind::Settings => settings::new(),
+        #[cfg(feature = "apps")]
+        AppKind::Files => explorer::new(),
+        #[cfg(feature = "apps")]
+        AppKind::Terminal => terminal::new(),
+        #[cfg(not(feature = "apps"))]
+        AppKind::Notepad | AppKind::Calc | AppKind::Settings | AppKind::Files | AppKind::Terminal => missing::new(kind),
         // Los programas los abre el escritorio con `Platform::spawn`; no hay nada que crear aquí.
         AppKind::Program => unreachable!("los programas no se crean con apps::create"),
     }

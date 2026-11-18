@@ -46,6 +46,8 @@ pub struct Program {
     pub picture: Option<Picture>,
     /// Viene con el sistema (`.sistema` en su carpeta).
     pub system: bool,
+    /// Extensiones que abre con doble clic (`abre=txt,md`), en minúsculas y sin punto (v0.10).
+    pub opens: Vec<String>,
 }
 
 impl Program {
@@ -68,7 +70,7 @@ fn icon_named(s: &str) -> Icon {
 
 /// Lee un `app.txt`. `None` si falta `nombre`. Lo demás tiene valores por defecto.
 pub fn parse_manifest(dir: &str, text: &str) -> Option<Program> {
-    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false };
+    let mut p = Program { dir: String::from(dir), name: String::new(), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false, opens: Vec::new() };
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         let Some((k, v)) = line.split_once('=') else { continue };
@@ -81,6 +83,7 @@ pub fn parse_manifest(dir: &str, text: &str) -> Option<Program> {
             "icono" => p.icon = icon_named(v),
             "ancho" => p.size.0 = dim(v).unwrap_or(p.size.0),
             "alto" => p.size.1 = dim(v).unwrap_or(p.size.1),
+            "abre" => p.opens = v.split(',').map(|e| e.trim().trim_start_matches('.').to_lowercase()).filter(|e| !e.is_empty() && e.len() <= 16).take(32).collect(),
             _ => {}
         }
     }
@@ -122,7 +125,7 @@ pub fn for_binary(sys: &mut dyn Platform, path: &str) -> Option<Program> {
         return Some(p);
     }
     let name = file.rsplit_once('.').map_or(file, |(n, _)| n);
-    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false })
+    Some(Program { dir: String::from(dir), name: String::from(name), version: String::new(), author: String::new(), icon: Icon::Logo, size: (480, 360), picture: None, system: false, opens: Vec::new() })
 }
 
 /// Carga el `.nfx` de `path` y lo arranca. `Err` con el motivo para enseñarlo al usuario.
@@ -135,6 +138,16 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
     let data = fs.read(path).map_err(fs_msg)?;
     let proc = sys.spawn(&data, &p.name)?;
     Ok(ProcApp::new(proc, &p.name, Some(p.icon)))
+}
+
+/// Programa instalado que abre los archivos con la extensión de `path` (`abre=` de su `app.txt`).
+/// Si hay varios, gana el primero por nombre, salvo que uno sea del sistema.
+pub fn for_extension(sys: &mut dyn Platform, path: &str) -> Option<Program> {
+    let name = path.rsplit('\\').next().unwrap_or(path);
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).filter(|e| !e.is_empty())?;
+    let mut v: Vec<Program> = installed(sys).into_iter().filter(|p| p.opens.contains(&ext)).collect();
+    v.sort_by_key(|p| !p.system);
+    v.into_iter().next()
 }
 
 /// Comprueba una carpeta con un programa para instalar: `app.txt` con nombre válido y un
@@ -233,6 +246,19 @@ mod tests {
         let p = parse_manifest("C:\\Programas\\Calc", "# hola\nnombre = Calculadora \nicono=calc\nancho=320\nalto=99999\nraro=1\n").unwrap();
         assert_eq!((p.name.as_str(), p.icon, p.size), ("Calculadora", Icon::Calc, (320, 360)));
         assert_eq!(parse_manifest("x", "version=1\n"), None);
+        let p = parse_manifest("x", "nombre=Bloc\nabre= TXT, .md,,log\n").unwrap();
+        assert_eq!(p.opens, ["txt", "md", "log"]);
+    }
+
+    #[test]
+    fn programa_por_extension() {
+        let mut sys = TestPlatform::default();
+        let n = DateTime::default();
+        let f = sys.files();
+        f.install_system_program("Visor", &[(MANIFEST, b"nombre=Visor\nabre=bmp\n"), (BINARY, b"NFX1")], n).unwrap();
+        assert_eq!(for_extension(&mut sys, "C:\\Usuarios\\Usuario\\Imagenes\\Foto.BMP").map(|p| p.name), Some(String::from("Visor")));
+        assert!(for_extension(&mut sys, "C:\\a\\nota.txt").is_none());
+        assert!(for_extension(&mut sys, "C:\\a\\sin_extension").is_none());
     }
 
     #[test]
