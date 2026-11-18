@@ -343,6 +343,9 @@ struct Global {
 }
 
 /// Una `Usage` con página extendida (4 bytes) lleva la página arriba; si no, la página actual.
+/// Tope de campos útiles: un descriptor hostil no puede llenar la memoria del núcleo.
+const MAX_FIELDS: usize = 256;
+
 fn full(page: u32, u: u32) -> (u32, u32) {
     if u > 0xFFFF { (u >> 16, u & 0xFFFF) } else { (page, u) }
 }
@@ -420,14 +423,14 @@ impl Generic {
                                     let us = if !usages.is_empty() {
                                         Some(usages[(k as usize).min(usages.len() - 1)])
                                     } else if let (Some(a), Some(b)) = (umin, umax) {
-                                        Some((a + k).min(b))
+                                        Some(a.saturating_add(k).min(b))
                                     } else {
                                         None
                                     };
                                     let Some(us) = us else { continue };
                                     let (page, usage) = full(g.page, us);
-                                    if let Some(slot) = classify(page, usage) {
-                                        fields.push(Field { rid, bit: off + k * g.size, size: g.size, lmin: g.lmin, lmax: g.lmax, slot });
+                                    if let Some(slot) = classify(page, usage).filter(|_| fields.len() < MAX_FIELDS) {
+                                        fields.push(Field { rid, bit: off.saturating_add(k * g.size), size: g.size, lmin: g.lmin, lmax: g.lmax, slot });
                                     }
                                 }
                             }
@@ -908,6 +911,39 @@ mod tests {
         assert!(Pad::from_descriptor(&GAMEPAD[..9]).is_none());
         assert!(Pad::from_descriptor(&[0xFF; 40]).is_none());
         assert!(Pad::from_descriptor(&[]).is_none());
+    }
+
+    #[test]
+    fn basura_no_hace_caer() {
+        // Descriptores e informes de un dispositivo hostil: nunca pánico.
+        let mut x = 0x1234_5678u32;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x as u8
+        };
+        for n in 0..2000usize {
+            let mut d: Vec<u8> = GAMEPAD.to_vec();
+            for _ in 0..(n % 64) {
+                let i = rnd() as usize % d.len();
+                d[i] = rnd();
+            }
+            d.extend((0..n % 40).map(|_| rnd()));
+            if let Some(mut p) = Pad::from_descriptor(&d) {
+                let r: Vec<u8> = (0..n % 70).map(|_| rnd()).collect();
+                let _ = p.feed(&r, n as u64);
+            }
+        }
+        for k in [PadKind::DualShock4, PadKind::DualSense, PadKind::SwitchPro, PadKind::Xbox360, PadKind::XboxOne] {
+            let mut p = pad(k);
+            let _ = p.start(0);
+            for n in 0..300usize {
+                let r: Vec<u8> = (0..n % 70).map(|_| rnd()).collect();
+                let _ = p.feed(&r, n as u64 * 7);
+                let _ = p.tick(n as u64 * 7);
+            }
+        }
     }
 
     #[test]
