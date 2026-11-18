@@ -60,6 +60,8 @@ pub enum Icon {
     Cuentas,
     /// Disco con candado (cifrado).
     DiscoSeguro,
+    /// Administrador de tareas: panel con barras de uso.
+    Tareas,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -427,6 +429,17 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             cell(s, o, k, (10.0, 7.2, 14.0, 8.2), OSCURO);
             cell(s, o, k, (11.6, 11.8, 12.4, 13.6), OSCURO);
         }
+        Icon::Tareas => {
+            // Panel oscuro con una cabecera azul y barras de uso a distintas alturas.
+            cell(s, o, k, (1.0, 2.0, 15.0, 14.0), OSCURO);
+            cell(s, o, k, (2.0, 3.0, 14.0, 5.0), AZUL);
+            cell(s, o, k, (2.0, 5.0, 14.0, 13.0), rgb(0x23, 0x26, 0x29));
+            cell(s, o, k, (3.5, 10.0, 5.5, 12.0), VERDE);
+            cell(s, o, k, (6.5, 8.0, 8.5, 12.0), VERDE);
+            cell(s, o, k, (9.5, 6.5, 11.5, 12.0), rgb(0xF2, 0xB0, 0x1E));
+            cell(s, o, k, (12.0, 9.0, 13.0, 12.0), ROJO);
+            cell(s, o, k, (3.0, 12.4, 13.0, 12.8), GRIS);
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -443,7 +456,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 43] = [
+    const ALL: [Icon; 44] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -487,6 +500,7 @@ mod tests {
         Icon::Videos,
         Icon::Cuentas,
         Icon::DiscoSeguro,
+        Icon::Tareas,
     ];
     const SENT: u32 = 0x123456;
 

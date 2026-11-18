@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.8)
+# Kit de programas de NightFury (v0.9)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -30,7 +30,8 @@ Nada más: ni Visual Studio ni librerías extra.
    ```
 
    `nombre` es también el nombre de la carpeta de salida. `icono` es el icono del sistema que se
-   usará (`app` si no sabes cuál).
+   usará (`app` si no sabes cuál) cuando el programa no trae uno propio.
+5. (Opcional) Icono propio: un `icono.bmp` en la carpeta del programa (ver "Icono propio").
 
 ## Compilar
 
@@ -38,12 +39,34 @@ Nada más: ni Visual Studio ni librerías extra.
 .\tools\programas.ps1
 ```
 
-Compila todos los de `programs\` y deja, para cada uno, `target\programas\<nombre>\programa.nfx` y su
-`app.txt`. Si algo falla, sale con código distinto de 0. Lo hace `nfpack`, que también comprueba que
+Compila todos los de `programs\` y deja, para cada uno, `target\programas\<nombre>\programa.nfx`, su
+`app.txt` y su `icono.bmp` si lo tiene. Si algo falla, sale con código distinto de 0. Lo hace `nfpack`, que también comprueba que
 el `.nfx` es válido y muestra sus secciones.
 
 > **Instalar en el disco** (copiar la carpeta a NightFury con `nfdisk`) llega en la **v0.9**; en la
 > v0.8 el núcleo ya sabe cargar `.nfx`, pero todavía no hay forma cómoda de meterlos en el disco.
+
+## Icono propio
+
+Si en la carpeta del programa hay un `icono.bmp`, el sistema lo dibuja en el escritorio, el menú Inicio, la
+barra de título y la barra de tareas en vez del icono de `icono=`.
+
+- BMP sin comprimir de **24 o 32 bits**, cuadrado, hasta 256×256 (lo normal: 32×32).
+- En **24 bits** el magenta puro `FF00FF` es transparente. En **32 bits** manda el canal alfa (si es todo cero,
+  la imagen se toma opaca).
+- `tools\programas.ps1` lo copia junto al `.nfx`. Los iconos de Reloj y Paint los dibuja con `nf-core`
+  `cargo run -p nfprog -- iconos` (ver `tools\nfprog\src\main.rs`, sirve de ejemplo para hacer el tuyo).
+- Con `cargo run -p nfprog -- capturas shots` ves cómo quedan Reloj, Paint y el Administrador de tareas sin
+  arrancar el sistema: los programas con su lógica en `src\lib.rs` (y un `main.rs` de tres líneas) se pueden
+  probar y fotografiar en el PC; mira `programs\reloj` y `programs\paint`.
+
+## Multitarea
+
+Cada programa corre por su cuenta: puedes tardar en atender un evento sin congelar el escritorio ni los
+demás programas, así que ya no hace falta volver rápido de cada `key`, `mouse` o `tick`. Pero el sistema
+vigila: si pasan **5 segundos** sin que el programa recoja los eventos que se le envían, su ventana pone
+"(No responde)" en el título y el usuario puede finalizarlo (también desde el Administrador de tareas,
+Ctrl+Mayús+Esc). Para trabajos largos, reparte el trabajo en trozos pequeños entre eventos.
 
 ## Cómo es un programa
 
@@ -66,7 +89,40 @@ nf_app::programa!(Box::new(MiPrograma::new()), None);   // None = sin tick; Some
 
 **No existe todavía para programas** (se ignora con una línea en el registro): diálogos
 (`cx.dialog`), menús (`cx.menu`), abrir rutas (`cx.open*`) y arrastrar archivos (`cx.drag`).
-`cx.sys.files()` es una unidad C: en memoria, **no** el disco real (hasta la v0.10).
+`cx.sys.files()` es una unidad C: en memoria, **no** el disco real (hasta la v0.10). Para guardar un
+archivo en el disco real usa `guardar_como` (siguiente apartado).
+
+## Guardar un archivo (`SAVE_AS`)
+
+```rust
+// Dentro de un `key`/`mouse`/`tick`:
+if !nf_app::guardar_como("dibujo.bmp", &bytes) {
+    // no se pudo pedir: nombre no válido (sin \ / :), más de 32 MiB o ya hay un guardado en curso
+}
+```
+
+El sistema abre el diálogo "Guardar como" (el usuario elige carpeta y nombre; empieza en Imágenes para `.bmp`
+y en Documentos para lo demás) y escribe los datos con los permisos del usuario. **El programa nunca ve la
+ruta.** Solo puede haber un guardado a la vez. La respuesta (`EV_SAVED` en el ABI) llega después a
+`App::dialog_result` con la etiqueta `nf_app::TAG_GUARDADO`:
+
+| Resultado | Significa |
+|---|---|
+| `DialogResult::Path { tag: TAG_GUARDADO, path: Some(nombre) }` | guardado (`nombre` es el propuesto, no la ruta real) |
+| `DialogResult::Path { tag: TAG_GUARDADO, path: None }` | el usuario canceló |
+| `DialogResult::Answer { tag: TAG_GUARDADO, answer: Answer::No }` | error (sin permiso, disco lleno…) |
+
+```rust
+fn dialog_result(&mut self, r: DialogResult, cx: &mut Ctx) {
+    match r {
+        DialogResult::Path { tag: nf_app::TAG_GUARDADO, path: Some(_) } => self.guardado = true,
+        _ => {}
+    }
+}
+```
+
+Para hacer un BMP de 24 bits desde una `Surface` usa `nf_core::bmp::encode`. Paint es el ejemplo completo
+(`programs\paint`).
 
 ## Llamadas al núcleo (por si no usas `nf-app`)
 
@@ -85,6 +141,7 @@ error). Se pierden `rcx` y `r11`. Contrato completo en `nf-core\src\abi.rs`.
 | 7 | `DATETIME(ptr)` | fecha y hora local (8 bytes) |
 | 8 | `SET_TIMER(ms)` | pide un evento de temporizador |
 | 9 | `SET_MIN_SIZE(w, h)` | tamaño mínimo del contenido |
+| 10 | `SAVE_AS(ptr, len, name_ptr, name_len)` | diálogo Guardar como; la respuesta llega como el evento `EV_SAVED` (`a` = 1 guardado, 0 cancelado, -1 error) |
 
 ## Límites
 

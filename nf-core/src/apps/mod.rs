@@ -17,6 +17,7 @@ mod calc;
 mod explorer;
 mod notepad;
 mod settings;
+mod taskmgr;
 mod terminal;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -27,12 +28,15 @@ pub enum AppKind {
     /// Explorador de archivos.
     Files,
     Terminal,
+    /// Administrador de tareas (una sola ventana).
+    TaskManager,
     /// Programa en modo usuario (`proc::ProcApp`). Nunca está en `APPS` ni se crea con `create`.
     Program,
 }
 
 /// Apps instaladas, en orden alfabético: (tipo, nombre visible, icono).
-pub const APPS: [(AppKind, &str, Icon); 5] = [
+pub const APPS: [(AppKind, &str, Icon); 6] = [
+    (AppKind::TaskManager, "Administrador de tareas", Icon::Tareas),
     (AppKind::Notepad, "Bloc de notas", Icon::Notepad),
     (AppKind::Calc, "Calculadora", Icon::Calc),
     (AppKind::Settings, "Configuración", Icon::Settings),
@@ -148,6 +152,7 @@ pub fn default_size(kind: AppKind) -> (i32, i32) {
         AppKind::Settings => (780, 520),
         AppKind::Files => (1040, 540),
         AppKind::Terminal => (680, 400),
+        AppKind::TaskManager => (560, 400),
         AppKind::Program => (480, 360),
     }
 }
@@ -159,6 +164,7 @@ pub fn create(kind: AppKind) -> Box<dyn App> {
         AppKind::Settings => settings::new(),
         AppKind::Files => explorer::new(),
         AppKind::Terminal => terminal::new(),
+        AppKind::TaskManager => taskmgr::new(),
         // Los programas los abre el escritorio con `Platform::spawn`; no hay nada que crear aquí.
         AppKind::Program => unreachable!("los programas no se crean con apps::create"),
     }

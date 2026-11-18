@@ -5,13 +5,52 @@
 //! falsa en las pruebas).
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use nf_core::abi::*;
 use nf_core::apps::{App, Ctx};
-use nf_core::files::Files;
+use nf_core::dialogs::{Answer, DialogResult};
+use nf_core::files::{self, Files};
 use nf_core::keys::Pool;
 use nf_core::platform::{DateTime, MemInfo, Platform};
 use nf_core::surface::Surface;
+use nf_core::sync::SpinLock;
 use nf_core::theme::Theme;
+
+/// Etiqueta con la que llega a `App::dialog_result` el resultado de `guardar_como`.
+pub const TAG_GUARDADO: u32 = u32::MAX;
+
+/// Guardado pedido por la app y aún sin enviar al núcleo; el bucle lo recoge tras cada evento.
+static PENDIENTE: SpinLock<Option<(String, Vec<u8>)>> = SpinLock::new(None);
+/// Hay un guardado pedido o esperando respuesta (el núcleo atiende uno a la vez).
+static EN_CURSO: AtomicBool = AtomicBool::new(false);
+
+/// Pide al sistema guardar `datos` con el nombre propuesto `nombre` (sin `\`, `/` ni `:`): el
+/// usuario elige dónde en el diálogo Guardar y el programa nunca ve la ruta. `false` si no se
+/// puede pedir (nombre no válido, más de `SAVE_MAX` bytes o ya hay otro guardado en curso).
+/// El resultado llega después a `App::dialog_result` con `tag == TAG_GUARDADO`:
+/// `Path { path: Some(nombre) }` = guardado, `Path { path: None }` = cancelado y
+/// `Answer { answer: No }` = error (sin permiso, disco lleno…).
+// shortcut: un guardado a la vez y estado global (un programa = un hilo); si hace falta más, ids por petición.
+pub fn guardar_como(nombre: &str, datos: &[u8]) -> bool {
+    if !files::valid_name(nombre) || nombre.len() > 255 || datos.len() as u64 > SAVE_MAX {
+        return false;
+    }
+    if EN_CURSO.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    *PENDIENTE.lock() = Some((String::from(nombre), datos.to_vec()));
+    true
+}
+
+/// `EV_SAVED` (`a` = 1, 0 o -1) como resultado de diálogo para la app.
+fn resultado_guardado(a: i32, nombre: String) -> DialogResult {
+    match a {
+        1 => DialogResult::Path { tag: TAG_GUARDADO, path: Some(nombre) },
+        0 => DialogResult::Path { tag: TAG_GUARDADO, path: None },
+        _ => DialogResult::Answer { tag: TAG_GUARDADO, answer: Answer::No },
+    }
+}
 
 /// `s` recortado a `max` bytes sin partir un carácter UTF-8 (el núcleo rechaza texto inválido).
 pub fn cortar(s: &str, max: usize) -> &str {
@@ -32,6 +71,8 @@ pub trait Llamadas {
     fn tam_min(&mut self, w: i32, h: i32);
     fn fecha(&mut self) -> DateTime;
     fn log(&mut self, t: &str);
+    /// `SAVE_AS`: `>= 0` pedido (la respuesta llega como `EV_SAVED`), `< 0` rechazado.
+    fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64;
 }
 
 /// `Platform` de un programa. El reloj y la fecha los refresca el bucle en cada evento.
@@ -94,6 +135,8 @@ struct Bucle {
     tick_ms: Option<u64>,
     next_tick: Option<u64>,
     now: u64,
+    /// Nombre del guardado enviado al núcleo y aún sin respuesta.
+    guardando: Option<String>,
 }
 
 impl Bucle {
@@ -113,6 +156,14 @@ impl Bucle {
             c.tam_min(m.0, m.1);
             self.min = m;
         }
+    }
+
+    /// Entrega un resultado de diálogo a la app. `true` si ella pide cerrar.
+    fn entregar(&mut self, r: DialogResult) -> bool {
+        let mut cx = Ctx::new(&mut self.plat, &mut self.theme, self.now);
+        self.app.dialog_result(r, &mut cx);
+        self.dirty |= cx.redraw | cx.theme_changed;
+        cx.close
     }
 
     /// Atiende un evento. `Some(código)` si el programa debe terminar.
@@ -141,8 +192,14 @@ impl Bucle {
             }
             _ => {}
         }
-        let mut cx = Ctx::new(&mut self.plat, &mut self.theme, ev.now_ms);
         let mut cerrar = false;
+        if ev.kind == EV_SAVED {
+            if let Some(n) = self.guardando.take() {
+                EN_CURSO.store(false, Ordering::Release);
+                cerrar |= self.entregar(resultado_guardado(ev.a, n));
+            }
+        }
+        let mut cx = Ctx::new(&mut self.plat, &mut self.theme, ev.now_ms);
         match ev.kind {
             EV_KEY => {
                 if let Some(k) = ev.to_key() {
@@ -171,6 +228,16 @@ impl Bucle {
         ] {
             if pedido {
                 c.log(&alloc::format!("cx.{nombre} no existe para programas (v0.8): ignorado"));
+            }
+        }
+        // Guardado pedido durante este evento: se envía al núcleo; si lo rechaza, la app lo sabe ya.
+        let pedido = PENDIENTE.lock().take();
+        if let Some((nombre, datos)) = pedido {
+            if c.guardar(&nombre, &datos) >= 0 {
+                self.guardando = Some(nombre);
+            } else {
+                EN_CURSO.store(false, Ordering::Release);
+                cerrar |= self.entregar(resultado_guardado(-1, nombre));
             }
         }
         if cerrar {
@@ -205,6 +272,7 @@ pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) 
         tick_ms,
         next_tick: None,
         now: 0,
+        guardando: None,
     };
     b.avisar(c);
     loop {
@@ -234,6 +302,8 @@ mod tests {
         titulos: Vec<String>,
         mins: Vec<(i32, i32)>,
         logs: Vec<String>,
+        guardados: Vec<(String, Vec<u8>)>,
+        rechaza_guardar: bool,
     }
     impl Llamadas for Falso {
         fn esperar(&mut self, t: u64) -> WireEvent {
@@ -260,7 +330,18 @@ mod tests {
         fn log(&mut self, t: &str) {
             self.logs.push(t.into());
         }
+        fn guardar(&mut self, n: &str, d: &[u8]) -> i64 {
+            self.guardados.push((n.into(), d.into()));
+            if self.rechaza_guardar {
+                E_BUSY
+            } else {
+                0
+            }
+        }
     }
+
+    /// Los guardados son estado global: los tests del bucle no pueden correr a la vez.
+    static SERIE: SpinLock<()> = SpinLock::new(());
 
     #[derive(Default)]
     struct Visto {
@@ -315,6 +396,7 @@ mod tests {
 
     #[test]
     fn arranque_dibuja_una_vez_y_traduce_eventos() {
+        let _g = SERIE.lock();
         let visto = Rc::new(RefCell::new(Visto::default()));
         let mut c = Falso { cola: arranque(), ..Default::default() };
         c.cola.push(WireEvent { kind: EV_KEY, a: 0, d: 'a' as u32, ..Default::default() });
@@ -338,6 +420,7 @@ mod tests {
 
     #[test]
     fn tick_con_reloj_y_cierre() {
+        let _g = SERIE.lock();
         let visto = Rc::new(RefCell::new(Visto::default()));
         let mut c = Falso { cola: arranque(), ..Default::default() };
         c.cola.push(ev(EV_NONE, 0, 0, 1000));
@@ -364,6 +447,7 @@ mod tests {
 
     #[test]
     fn sin_tick_duerme_y_close_rechazado_sigue() {
+        let _g = SERIE.lock();
         let visto = Rc::new(RefCell::new(Visto::default()));
         let mut c = Falso { cola: arranque(), ..Default::default() };
         c.cola.push(ev(EV_CLOSE, 0, 0, 0));
@@ -376,5 +460,82 @@ mod tests {
         // Perder el foco redibuja.
         assert_eq!(visto.borrow().draws.last().map(|d| d.2), Some(false));
         assert_eq!(visto.borrow().ratones.len(), 1);
+    }
+
+    /// App que guarda con cada tecla y apunta lo que recibe.
+    #[derive(Default)]
+    struct Guarda {
+        resultados: Vec<DialogResult>,
+        segundo: Vec<bool>,
+    }
+    struct GuardaApp(Rc<RefCell<Guarda>>);
+    impl App for GuardaApp {
+        fn kind(&self) -> AppKind {
+            AppKind::Program
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (1, 1)
+        }
+        fn draw(&mut self, _: &mut Surface, _: &Theme, _: &mut dyn Platform, _: bool) {}
+        fn key(&mut self, _: &KeyEvent, _: &mut Ctx) {
+            let ok = guardar_como("dibujo.bmp", b"BM..");
+            // Con el primero en curso, otro igual se rechaza.
+            let otro = guardar_como("otro.bmp", b"x");
+            let mut g = self.0.borrow_mut();
+            g.segundo.push(ok);
+            g.segundo.push(otro);
+        }
+        fn mouse(&mut self, _: MouseEv, _: &mut Ctx) {}
+        fn tick(&mut self, _: &mut Ctx) {}
+        fn dialog_result(&mut self, r: DialogResult, _: &mut Ctx) {
+            self.0.borrow_mut().resultados.push(r);
+        }
+    }
+
+    #[test]
+    fn guardar_como_ida_y_vuelta() {
+        let _g = SERIE.lock();
+        assert!(!guardar_como(r"a\b", b"x") && !guardar_como("", b"x") && !guardar_como("a:b", b"x"), "el nombre no es una ruta");
+        let g = Rc::new(RefCell::new(Guarda::default()));
+        let tecla = WireEvent { kind: EV_KEY, a: 0, d: 'g' as u32, ..Default::default() };
+        let saved = |a| WireEvent { kind: EV_SAVED, a, ..Default::default() };
+        let mut c = Falso { cola: arranque(), ..Default::default() };
+        // Guardado, cancelado, y otra vez guardado tras el cancelado (el estado se libera).
+        c.cola.extend([tecla, saved(1), tecla, saved(0), tecla, saved(-1)]);
+        ejecutar(&mut c, Box::new(GuardaApp(g.clone())), None);
+        assert_eq!(c.guardados.len(), 3, "solo el primero de cada tecla llega al núcleo");
+        assert_eq!(c.guardados[0], (String::from("dibujo.bmp"), b"BM..".to_vec()));
+        let g = g.borrow();
+        assert_eq!(g.segundo, [true, false, true, false, true, false]);
+        let tag = TAG_GUARDADO;
+        assert_eq!(
+            g.resultados,
+            [
+                DialogResult::Path { tag, path: Some(String::from("dibujo.bmp")) },
+                DialogResult::Path { tag, path: None },
+                DialogResult::Answer { tag, answer: Answer::No },
+            ]
+        );
+        // Un EV_SAVED que nadie esperaba no llega a la app.
+        drop(g);
+        let g = Rc::new(RefCell::new(Guarda::default()));
+        let mut c = Falso { cola: arranque(), ..Default::default() };
+        c.cola.push(saved(1));
+        ejecutar(&mut c, Box::new(GuardaApp(g.clone())), None);
+        assert!(g.borrow().resultados.is_empty());
+        // El núcleo lo rechaza: la app recibe el error enseguida y puede pedir otro.
+        let g = Rc::new(RefCell::new(Guarda::default()));
+        let mut c = Falso { cola: arranque(), rechaza_guardar: true, ..Default::default() };
+        c.cola.extend([tecla, tecla]);
+        ejecutar(&mut c, Box::new(GuardaApp(g.clone())), None);
+        assert_eq!(g.borrow().resultados.len(), 2);
+        assert_eq!(g.borrow().segundo, [true, false, true, false]);
+        assert!(guardar_como("libre.bmp", b"x"), "nada se queda en curso");
+        // Lo pedido y no enviado (la prueba no pasó por el bucle) se limpia para no dejar rastro.
+        PENDIENTE.lock().take();
+        EN_CURSO.store(false, Ordering::Release);
     }
 }
