@@ -114,7 +114,8 @@ fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> 
                     out.push(format!("{}  {:>10}  {}", date, e.size, e.name));
                 }
             }
-            out.push(format!("Archivos: {}, carpetas: {}, {} bytes. Libre: {}", nf, nd, bytes,units(f.space().1)));
+            let free = f.drives().iter().find(|d| p.starts_with(d.letter)).map_or(0, |d| d.free);
+            out.push(format!("Archivos: {}, carpetas: {}, {} bytes. Libre: {}", nf, nd, bytes, units(free)));
             Ok(out)
         })(),
         "lista" | "dir" => uso("lista [ruta]"),
@@ -161,8 +162,12 @@ fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> 
             }
             if cmd == "copiar" {
                 f.copy(&src, &dst, now)?;
-            } else {
+            } else if src.as_bytes()[0] == dst.as_bytes()[0] {
                 f.rename(&src, &dst)?;
+            } else {
+                // Entre unidades no hay renombrado: se copia y se borra el origen.
+                f.copy(&src, &dst, now)?;
+                f.delete(&src)?;
             }
             Ok(Vec::new())
         })(),
