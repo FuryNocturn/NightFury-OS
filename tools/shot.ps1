@@ -9,7 +9,8 @@ param(
     [switch]$NoBuild,
     [string]$Disk = 'disco.img',
     [switch]$NoDisk,
-    [string[]]$Usb = @()   # imágenes de pendrive (`nfdisk usb`), como usb-storage del xHCI
+    [string[]]$Usb = @(),  # imágenes de pendrive (`nfdisk usb`), como usb-storage del xHCI
+    [string[]]$Device = @()  # dispositivos USB extra del xHCI (p. ej. usb-tablet)
 )
 $ErrorActionPreference = 'Stop'
 $Commands = @($Commands | ForEach-Object { $_ -split "," })  # con -File, una lista llega como una sola cadena con comas
@@ -49,6 +50,9 @@ foreach ($u in @($Usb | ForEach-Object { $_ -split ',' } | Where-Object { $_ }))
     $img = if ([System.IO.Path]::IsPathRooted($u)) { $u } else { [System.IO.Path]::GetFullPath((Join-Path $root $u)) }
     $q += @('-drive', "if=none,id=usb$n,format=raw,file=$img", '-device', "usb-storage,bus=xhci.0,drive=usb$n")
     $n++
+}
+foreach ($d in @($Device | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+    $q += @('-device', "$d,bus=xhci.0")
 }
 if ($Serial) {
     $s = [System.IO.Path]::GetFullPath((Join-Path $root $Serial))
