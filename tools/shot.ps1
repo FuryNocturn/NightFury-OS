@@ -34,6 +34,7 @@ $q = @(
     '-drive', '"if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd"',
     '-drive', 'format=raw,file=fat:rw:esp',
     '-rtc', 'base=localtime', '-vga', 'std',
+    '-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0',
     '-display', 'none',
     '-monitor', "tcp:127.0.0.1:$Port,server,nowait"
 )

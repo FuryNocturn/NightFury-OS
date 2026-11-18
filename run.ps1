@@ -18,7 +18,8 @@ $q = @(
     '-drive', 'if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd',
     '-drive', 'format=raw,file=fat:rw:esp',
     '-drive', "id=datos,if=none,format=raw,file=$Disk", '-device', 'ide-hd,drive=datos,bus=ide.1',
-    '-rtc', 'base=localtime', '-vga', 'std'
+    '-rtc', 'base=localtime', '-vga', 'std',
+    '-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0'
 )
 if ($Whpx) { $q += @('-accel', 'whpx') }
 & "C:\Program Files\qemu\qemu-system-x86_64.exe" @q

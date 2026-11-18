@@ -19,6 +19,7 @@ mod ps2;
 mod rtc;
 mod serial;
 mod uefi;
+mod usb;
 mod user;
 
 use alloc::boxed::Box;
@@ -305,6 +306,10 @@ extern "C" fn kmain() -> ! {
 
     pantalla_de_arranque(&fb);
     let con_rueda = ps2::init();
+    let n_usb = usb::init();
+    if TRAZA {
+        traza!("NF usb: {} controlador(es) xHCI iniciado(s)", n_usb);
+    }
 
     let disco = elegir_disco();
     let files = Files::probe(disco, rtc::now());
@@ -341,6 +346,8 @@ extern "C" fn kmain() -> ! {
     let mut teclado = Keyboard::new();
     let mut raton = Ps2Mouse::new();
     raton.set_wheel(con_rueda);
+    let mut usb_teclado: Vec<u8> = Vec::new();
+    let mut usb_raton: Vec<nf_core::input::MousePacket> = Vec::new();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
     loop {
@@ -369,6 +376,16 @@ extern "C" fn kmain() -> ! {
             if let Some(p) = raton.feed(b) {
                 desk.event(Event::Mouse(p), &mut plat);
             }
+        }
+        // USB: sondeo del xHCI; el teclado entra por el mismo decodificador que el PS/2.
+        usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton);
+        for b in usb_teclado.drain(..) {
+            if let Some(k) = teclado.feed(b) {
+                desk.event(Event::Key(k), &mut plat);
+            }
+        }
+        for p in usb_raton.drain(..) {
+            desk.event(Event::Mouse(p), &mut plat);
         }
         let t = arch::TICKS.load(Relaxed);
         if t != ultimo {
