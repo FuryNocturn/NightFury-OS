@@ -13,6 +13,7 @@ pub mod cryptdev;
 pub mod crypto;
 pub mod bmp;
 pub mod dialogs;
+pub mod drives;
 pub mod files;
 pub mod fs;
 pub mod fsapi;

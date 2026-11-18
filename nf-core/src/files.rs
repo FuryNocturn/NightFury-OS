@@ -2686,6 +2686,49 @@ fn lower(s: &str) -> String {
     s.chars().flat_map(char::to_lowercase).collect()
 }
 
+// ---- Unidades extraíbles D:, E:… (contrato v0.11; ver `drives`) ----
+
+impl Files {
+    /// Conecta un volumen montado de la partición del disco `disk` en la primera letra libre
+    /// (D..Z). `None` si no quedan letras.
+    pub fn attach(&mut self, _disk: u32, _device: &str, _vol: Box<dyn crate::vol::Volume>) -> Option<char> {
+        todo!()
+    }
+    /// Como `attach`, para un volumen NightFury cifrado que espera contraseña.
+    pub fn attach_locked(&mut self, _locked: crate::drives::Locked) -> Option<char> {
+        todo!()
+    }
+    /// El disco `disk` se ha quitado: sus letras desaparecen sin escribir nada (ya no está).
+    pub fn detach(&mut self, _disk: u32) {
+        todo!()
+    }
+    /// C: y las unidades conectadas, por letra.
+    pub fn drives(&mut self) -> Vec<crate::drives::DriveInfo> {
+        todo!()
+    }
+    /// Abre una unidad cifrada con su contraseña o con el código de recuperación.
+    pub fn unlock_drive(&mut self, _letter: char, _secret: &str, _recovery: bool) -> Result<(), KeyError> {
+        todo!()
+    }
+    /// Pide expulsar, formatear o cifrar el disco de la unidad `letter` (solo programas del sistema;
+    /// lo comprueba el servicio). Lo ejecuta el núcleo con `take_drive_actions`.
+    pub fn request_drive_action(&mut self, _letter: char, _action: crate::drives::FormatRequest) -> Result<(), FsError> {
+        todo!()
+    }
+    /// Acciones pendientes, para el núcleo.
+    pub fn take_drive_actions(&mut self) -> Vec<crate::drives::DriveAction> {
+        todo!()
+    }
+    /// El núcleo terminó la última acción: `Ok(Some(código))` al cifrar, `Ok(None)` en el resto.
+    pub fn set_drive_result(&mut self, _r: Result<Option<String>, FsError>) {
+        todo!()
+    }
+    /// Resultado de la última acción, una sola vez (lo consulta el programa que la pidió).
+    pub fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
+        todo!()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

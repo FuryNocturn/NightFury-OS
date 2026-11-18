@@ -158,6 +158,8 @@ pub fn format(dev: &mut dyn SectorDev, kind: FsKind, label: &str, now: DateTime)
 pub mod exfat;
 pub mod fat;
 pub mod iso;
+pub mod nfvol;
+pub use nfvol::LockedDrive;
 pub mod part;
 pub mod udf;
 
