@@ -24,6 +24,7 @@ use crate::icons::{self, Icon};
 use crate::input::KeyEvent;
 use crate::keys::{self, Pool};
 use crate::platform::{DateTime, Platform};
+use crate::programs::{self, Program};
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::{render_wallpaper, Theme, ACCENTS, WALLPAPERS};
@@ -36,10 +37,17 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 4] = [("Personalización", Icon::Palette), ("Cuentas", Icon::Cuentas), ("Disco", Icon::DiscoSeguro), ("Acerca de", Icon::Info)];
+const SECTIONS: [(&str, Icon); 5] = [
+    ("Personalización", Icon::Palette),
+    ("Cuentas", Icon::Cuentas),
+    ("Aplicaciones", Icon::VistaIconosGrandes),
+    ("Disco", Icon::DiscoSeguro),
+    ("Acerca de", Icon::Info),
+];
 const PAGE_ACCOUNTS: usize = 1;
-const PAGE_DISK: usize = 2;
-const PAGE_ABOUT: usize = 3;
+const PAGE_APPS: usize = 2;
+const PAGE_DISK: usize = 3;
+const PAGE_ABOUT: usize = 4;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -64,6 +72,10 @@ const T_WEAK: u32 = 54;
 const T_ENT: u32 = 55;
 const T_CODE: u32 = 56;
 const T_ASK_HOME: u32 = 57;
+/// Aplicaciones (v0.9): carpeta a instalar, reemplazar una ya instalada, confirmar desinstalar.
+const T_APP_DIR: u32 = 60;
+const T_APP_REPLACE: u32 = 61;
+const T_APP_DEL: u32 = 62;
 const NO_MATCH: &str = "Las claves no coinciden.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +95,9 @@ enum Act {
     DiskDec,
     DiskChange,
     DiskCode,
+    AppInstall,
+    /// Índice en `Settings::apps`.
+    AppUninstall(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -158,6 +173,10 @@ struct Settings {
     job: Option<Job>,
     /// Botón de la página Cuentas bajo el puntero.
     hover_hit: Option<Act>,
+    /// Programas instalados tal como se vieron al dibujar la página Aplicaciones.
+    apps: Vec<Program>,
+    /// Programa a instalar (reemplazo) o a desinstalar mientras se pregunta.
+    pending_app: Option<Program>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -179,6 +198,8 @@ fn init() -> Settings {
         others: Vec::new(),
         job: None,
         hover_hit: None,
+        apps: Vec::new(),
+        pending_app: None,
     }
 }
 
@@ -511,8 +532,59 @@ impl Settings {
         self.content_h = y + self.scroll + 16;
     }
 
+    fn apps_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if s.h < 440 { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, "Aplicaciones", 18, false, TEXT);
+        y += font::line_h(18) + 12;
+        let admin = sys.files().is_admin();
+        if admin {
+            let mut at = (x0, y);
+            self.button(s, &mut at, x0, right, "Instalar programa…", Act::AppInstall, theme);
+            y = at.1 + BTN_H + 6;
+            y = note(s, x0, y, right - x0, "Elige una carpeta que tenga app.txt y programa.nfx (por ejemplo, de Descargas).");
+        } else {
+            y = note(s, x0, y, right - x0, "Solo un administrador puede instalar o desinstalar programas.");
+        }
+        y += 10;
+        self.apps = programs::installed(sys);
+        if self.apps.is_empty() {
+            font::draw(s, x0, y, "No hay programas instalados.", 9, false, GRAY);
+            y += 24;
+        }
+        for i in 0..self.apps.len() {
+            let p = self.apps[i].clone();
+            match &p.picture {
+                Some(pic) => pic.draw(s, x0, y + 2, 32),
+                None => icons::draw(s, p.icon, x0, y + 2, 32, TEXT),
+            }
+            let tx = x0 + 44;
+            font::draw(s, tx, y, &p.name, 10, true, TEXT);
+            let mut info = String::new();
+            if !p.version.is_empty() {
+                info = format!("Versión {}", p.version);
+            }
+            if !p.author.is_empty() {
+                info = if info.is_empty() { p.author.clone() } else { format!("{info} · {}", p.author) };
+            }
+            if p.system {
+                info = if info.is_empty() { String::from("Del sistema") } else { format!("{info} · Del sistema") };
+            }
+            font::draw(s, tx, y + font::line_h(10) + 2, &info, 9, false, GRAY);
+            let mut at = (tx, y + font::line_h(10) + font::line_h(9) + 8);
+            if admin && !p.system {
+                self.button(s, &mut at, tx, right, "Desinstalar", Act::AppUninstall(i), theme);
+                y = at.1 + BTN_H + 14;
+            } else {
+                y = at.1 + 8;
+            }
+        }
+        self.content_h = y + self.scroll + 16;
+    }
+
     fn scrolls(&self) -> bool {
-        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK
+        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS
     }
 
     fn metrics(&self) -> Metrics {
@@ -527,6 +599,21 @@ impl Settings {
 // ---- Página Cuentas: operaciones ----
 impl Settings {
     fn start(&mut self, act: Act, cx: &mut Ctx) {
+        match act {
+            Act::AppInstall => {
+                let dir = cx.sys.files().std_dir(crate::files::Std::Downloads);
+                cx.dialog = Some(DialogRequest::Folder { tag: T_APP_DIR, title: String::from("Instalar programa"), dir });
+                return;
+            }
+            Act::AppUninstall(i) => {
+                let Some(p) = self.apps.get(i).cloned() else { return };
+                let text = format!("¿Desinstalar «{}»?\nSu carpeta irá a la Papelera.", p.name);
+                cx.dialog = Some(DialogRequest::Message { tag: T_APP_DEL, title: String::from("Aplicaciones"), text, buttons: Buttons::YesNo });
+                self.pending_app = Some(p);
+                return;
+            }
+            _ => {}
+        }
         let crypto = match act {
             Act::HomeEnc => Some(Op::HomeEnc),
             Act::HomeDec => Some(Op::HomeDec),
@@ -557,7 +644,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -874,6 +961,7 @@ impl App for Settings {
                 0 => self.personalization(s, theme),
                 PAGE_ACCOUNTS => self.accounts_page(s, theme, sys),
                 PAGE_DISK => self.disk_page(s, theme, sys),
+                PAGE_APPS => self.apps_page(s, theme, sys),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
@@ -960,6 +1048,20 @@ impl App for Settings {
     fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
         cx.redraw = true;
         match result {
+            DialogResult::Path { tag: T_APP_DIR, path: Some(src) } => self.app_source(&src, cx),
+            DialogResult::Answer { tag: T_APP_REPLACE | T_APP_DEL, answer } => {
+                let Some(p) = self.pending_app.take() else { return };
+                if answer != Answer::Yes {
+                    return;
+                }
+                let now = cx.sys.now();
+                let r = if p.dir.to_lowercase().starts_with(&crate::files::PROGRAMS_DIR.to_lowercase()) {
+                    programs::uninstall(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha desinstalado.", p.name))
+                } else {
+                    programs::install(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name))
+                };
+                app_message(cx, &r.unwrap_or_else(|e| e));
+            }
             DialogResult::Text { tag, value } => self.step_text(tag, value.map(Secret), cx),
             DialogResult::Answer { tag, answer } => self.step_answer(tag, answer, cx),
             DialogResult::Path { .. } => {}
@@ -989,6 +1091,33 @@ impl App for Settings {
     }
 }
 
+impl Settings {
+    /// Carpeta elegida para instalar: se comprueba y, si ya hay uno con ese nombre, se pregunta.
+    fn app_source(&mut self, src: &str, cx: &mut Ctx) {
+        let p = match programs::check_source(cx.sys.files(), src) {
+            Ok(p) => p,
+            Err(e) => return app_message(cx, &format!("No se puede instalar.\n{e}")),
+        };
+        match programs::installed_as(cx.sys.files(), &p.name) {
+            Some(true) => app_message(cx, &format!("«{}» es un programa del sistema y no se puede reemplazar.", p.name)),
+            Some(false) => {
+                let text = format!("Ya hay un programa «{}» instalado.\n¿Reemplazarlo por esta versión?", p.name);
+                cx.dialog = Some(DialogRequest::Message { tag: T_APP_REPLACE, title: String::from("Aplicaciones"), text, buttons: Buttons::YesNo });
+                self.pending_app = Some(p);
+            }
+            None => {
+                let now = cx.sys.now();
+                let r = programs::install(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name));
+                app_message(cx, &r.unwrap_or_else(|e| e));
+            }
+        }
+    }
+}
+
+fn app_message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_MSG, title: String::from("Aplicaciones"), text: String::from(text), buttons: Buttons::Ok });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1131,42 @@ mod tests {
         changed: bool,
         /// Último diálogo pedido por la app (se queda hasta que se coge con `take`).
         dialog: Option<DialogRequest>,
+    }
+
+    #[test]
+    fn aplicaciones_instalar_reemplazar_y_desinstalar() {
+        use crate::nfx::{encode, Kind, Section};
+        let mut b = Banco::new();
+        b.app.page = PAGE_APPS;
+        let n = b.sys.now();
+        let base = crate::abi::USER_BASE + 0x40_0000;
+        let nfx = encode(base, &[Section { kind: Kind::Code, vaddr: base, memsz: 4, data: &[0x90; 4] }]);
+        let src = String::from("C:\\Usuarios\\Usuario\\Descargas\\Juego");
+        b.sys.files.mkdir(&src, n).unwrap();
+        b.sys.files.write(&format!("{src}\\app.txt"), b"nombre=Juego\nversion=1.0\nautor=Ana\n", n).unwrap();
+        b.sys.files.write(&format!("{src}\\programa.nfx"), &nfx, n).unwrap();
+        // Instalar: elegir carpeta y listo.
+        b.pulsa(Act::AppInstall);
+        assert!(matches!(b.dialog.take(), Some(DialogRequest::Folder { tag: T_APP_DIR, .. })));
+        b.responde(DialogResult::Path { tag: T_APP_DIR, path: Some(src.clone()) });
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { text, .. }) if text.contains("se ha instalado")));
+        b.dibuja(780, 520);
+        assert_eq!(b.app.apps.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Juego"]);
+        // Otra vez: pregunta si se reemplaza.
+        b.responde(DialogResult::Path { tag: T_APP_DIR, path: Some(src.clone()) });
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_APP_REPLACE, .. })));
+        b.respuesta(T_APP_REPLACE, Answer::No);
+        assert!(b.dialog.is_none());
+        // Una carpeta que no es un programa.
+        b.responde(DialogResult::Path { tag: T_APP_DIR, path: Some(String::from("C:\\Usuarios\\Usuario\\Documentos")) });
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { text, .. }) if text.contains("app.txt")));
+        // Desinstalar con confirmación.
+        b.pulsa(Act::AppUninstall(0));
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_APP_DEL, .. })));
+        b.respuesta(T_APP_DEL, Answer::Yes);
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { text, .. }) if text.contains("desinstalado")));
+        b.dibuja(780, 520);
+        assert!(b.app.apps.is_empty());
     }
 
     impl Banco {

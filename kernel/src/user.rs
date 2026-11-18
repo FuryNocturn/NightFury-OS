@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Programas en modo usuario (ring 3): espacio de direcciones propio, entrada y salida con
-//! `syscall`/`iretq`, y el `Process` que usa el escritorio.
+//! Programas en modo usuario (ring 3) y multitarea (v0.9): cada programa es una tarea con su
+//! espacio de direcciones, su pila de núcleo y su área `fxsave`; la tarea 0 es el bucle del
+//! núcleo (escritorio) sobre la pila de arranque. Un solo procesador.
 //!
-//! Modelo (v0.8, sin planificador): `run` entra al programa con `nf_run_user`, que guarda el
-//! contexto del núcleo; cada `syscall`, excepción o aviso de cuelgue vuelve a ese contexto
-//! (`nf_leave`) con un código. `run` atiende la llamada con `dispatch` y reentra, o devuelve el
-//! control al escritorio cuando el programa espera, termina o lo matan.
+//! Reglas del reparto:
+//! - La tarea 0 nunca se interrumpe para dar paso a un programa (el montón y el escritorio no son
+//!   reentrantes): solo cede en `arch::idle` (`correr`). Por eso un programa solo está en ring 3 o
+//!   en una llamada mientras la tarea 0 duerme dentro de `correr`.
+//! - Un programa vuelve a la tarea 0 cuando el temporizador lo pilla en ring 3 (`tick_en_usuario`,
+//!   sigue listo), cuando duerme en `WAIT_EVENT` o cuando termina o falla. Las llamadas corren con
+//!   IF=0 y no se expropian.
+//! - Todos los cambios de tarea pasan por `nf_switch` con IF=0 y cargan antes el CR3 del destino.
 //!
 //! Siempre se vuelve al programa con `iretq` (no `sysretq`): así un `rcx` no canónico no puede
 //! provocar el fallo conocido de `sysret` en modo núcleo; además se exige que el RIP y el RSP
@@ -19,14 +24,13 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use core::ptr::{addr_of_mut, null_mut};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
 use nf_core::abi::*;
 use nf_core::nfx::{self, NfxError};
-use nf_core::proc::{dispatch, Kill, Process, Regions, RunEnd, Sys, SysState, UserMem};
+use nf_core::proc::{dispatch, Kill, ProcInfo, Process, Regions, Status, Sys, SysState, UserMem};
 
 const KSTACK: usize = 32 << 10;
-/// Un programa que lleva tanto sin esperar (ticks de 10 ms = 2 s) se considera colgado.
-const HUNG_TICKS: u64 = 200;
 const EFER: u32 = 0xC000_0080;
 const STAR: u32 = 0xC000_0081;
 const LSTAR: u32 = 0xC000_0082;
@@ -37,7 +41,7 @@ const USER_SS: u64 = 0x1B;
 /// RFLAGS que se conservan del programa: CF PF AF ZF SF DF OF (IF siempre 1, TF/AC/IOPL nunca).
 const FLAGS_USER: u64 = 0xCD5;
 
-/// Registros del programa tal como los deja `syscall_entry` y los espera `nf_run_user`
+/// Registros del programa tal como los deja `syscall_entry` y los espera `nf_user_return`
 /// (de abajo arriba de la pila: orden de `pop`, y al final el marco de `iretq`).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -70,71 +74,58 @@ const _: () = assert!(core::mem::size_of::<Regs>() == 160);
 struct Fx([u8; 512]);
 
 // ---------- Estado global (un solo núcleo) ----------
-// Los usan las rutinas de ensamblador de abajo por su nombre.
-#[no_mangle]
-static mut NF_KRSP: u64 = 0;
+// SEGURIDAD de todo este bloque: solo lo tocan la tarea 0 y el programa que ella ha puesto en
+// marcha (nunca a la vez: la tarea 0 duerme dentro de `correr` mientras corre un programa) y las
+// interrupciones con IF=0. Por eso no hace falta bloqueo.
 #[no_mangle]
 static mut NF_URSP: u64 = 0;
 #[no_mangle]
 static mut NF_KTOP: u64 = 0;
-#[no_mangle]
-static mut NF_UFX: u64 = 0;
-#[no_mangle]
-static mut NF_KFX: u64 = 0;
-static mut KFX: Fx = Fx([0; 512]);
-
-/// Hay un programa ejecutándose en ring 3 (o a punto de).
-static IN_USER: AtomicBool = AtomicBool::new(false);
-/// Tick en el que empezó el `run` actual.
-static RUN_START: AtomicU64 = AtomicU64::new(0);
-/// Datos del fallo de CPU en ring 3 (los rellena `fallo`, los lee `run`).
-static F_VEC: AtomicU64 = AtomicU64::new(0);
-static F_RIP: AtomicU64 = AtomicU64::new(0);
-static F_CR2: AtomicU64 = AtomicU64::new(0);
+/// Pila de núcleo guardada de la tarea 0 y su estado de coma flotante.
+static mut T0_KSP: u64 = 0;
+static mut T0_FX: Fx = Fx([0; 512]);
+/// Tabla de procesos: un `Box` por programa (su dirección no cambia aunque crezca el `Vec`). Una
+/// entrada vive hasta que el escritorio suelta su `Handle`, aunque el programa ya haya terminado
+/// (así `SysState` sigue accesible).
+static mut PROCS: Vec<Box<Proc>> = Vec::new();
+/// Programa en marcha (null = tarea 0).
+static mut CUR: *mut Proc = null_mut();
+/// Dónde empieza la búsqueda del siguiente programa listo (turno rotatorio).
+static RR: AtomicUsize = AtomicUsize::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// Motivos con los que `nf_run_user` vuelve al núcleo.
-const WHY_SYSCALL: u64 = 0;
-const WHY_FAULT: u64 = 1;
-const WHY_HUNG: u64 = 2;
-
 extern "sysv64" {
-    /// Guarda el contexto del núcleo y salta al programa con los registros de `regs` y el estado
-    /// de coma flotante `ufx`; el estado del núcleo va a `kfx`. Vuelve (con el motivo) cuando
-    /// alguien llama a `nf_leave`.
-    fn nf_run_user(regs: *mut Regs, ufx: *mut Fx, kfx: *mut Fx) -> u64;
-    fn nf_leave(why: u64) -> !;
+    /// Cambio de tarea: guarda el contexto actual (registros del núcleo y `fxsave` en `old_fx`),
+    /// deja su pila en `*old_rsp` y sigue con la tarea de `new_rsp` y `new_fx`. IF=0 al llamar.
+    fn nf_switch(old_rsp: *mut u64, new_rsp: u64, old_fx: *mut Fx, new_fx: *mut Fx);
+    /// `iretq` a ring 3 con los registros de `regs` (no vuelve).
+    fn nf_to_user(regs: *mut Regs) -> !;
+    /// Cola de `nf_to_user`; también es la dirección de retorno del marco inicial de un programa.
+    fn nf_user_return();
     fn syscall_entry();
 }
 
 global_asm!(
-    ".global nf_run_user",
-    "nf_run_user:",
+    ".global nf_switch",
+    "nf_switch:",
     "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
-    "mov [rip + NF_KRSP], rsp",
-    "mov [rip + NF_UFX], rsi",
-    "mov [rip + NF_KFX], rdx",
-    "cli",
     "fxsave64 [rdx]",
-    "fxrstor64 [rsi]",
+    "fxrstor64 [rcx]",
+    "mov [rdi], rsp",
+    "mov rsp, rsi",
+    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
+    "ret",
+    ".global nf_to_user",
+    "nf_to_user:",
     "mov rsp, rdi",
+    ".global nf_user_return",
+    "nf_user_return:",
     "pop r15", "pop r14", "pop r13", "pop r12", "pop r11", "pop r10", "pop r9", "pop r8",
     "pop rbp", "pop rdi", "pop rsi", "pop rdx", "pop rcx", "pop rbx", "pop rax",
     "iretq",
-    // Vuelve al contexto del núcleo guardado en `nf_run_user`; rdi = motivo.
-    ".global nf_leave",
-    "nf_leave:",
-    "cld",
-    "mov rax, [rip + NF_UFX]",
-    "fxsave64 [rax]",
-    "mov rax, [rip + NF_KFX]",
-    "fxrstor64 [rax]",
-    "mov rax, rdi",
-    "mov rsp, [rip + NF_KRSP]",
-    "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
-    "ret",
     // Entrada de `syscall`: rcx = rip, r11 = rflags. Un solo núcleo: el rsp del programa va a una
-    // variable global. Guarda el marco de `Regs` en lo alto de la pila de núcleo del proceso.
+    // variable global. Guarda el marco de `Regs` en lo alto de la pila de núcleo del programa y
+    // sigue en Rust (`syscall_main`), que nunca vuelve aquí.
     ".global syscall_entry",
     "syscall_entry:",
     "mov [rip + NF_URSP], rsp",
@@ -146,8 +137,10 @@ global_asm!(
     "push rcx",
     "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi", "push rbp",
     "push r8", "push r9", "push r10", "push r11", "push r12", "push r13", "push r14", "push r15",
-    "xor edi, edi",
-    "jmp nf_leave",
+    "cld",
+    "mov rdi, rsp", // alineada a 16: el marco son 160 bytes bajo lo alto de una pila alineada
+    "call syscall_main",
+    "ud2",
 );
 
 /// Activa `syscall`/`sysret` (tras `init_gdt` y `paging::init`).
@@ -162,97 +155,54 @@ pub fn init_syscall() {
     }
 }
 
-/// Lo llama el temporizador cuando interrumpe a un programa: si lleva 2 s sin esperar, lo corta.
-pub fn tick_en_usuario() {
-    if IN_USER.load(Relaxed) && TICKS.load(Relaxed).wrapping_sub(RUN_START.load(Relaxed)) >= HUNG_TICKS {
-        // Estamos en la pila del núcleo del proceso, con el CPU en ring 0 y `IN_USER` verdadero:
-        // el contexto guardado por `nf_run_user` es válido.
-        unsafe { nf_leave(WHY_HUNG) }
-    }
-}
+// ---------- Procesos ----------
 
-/// Excepción de la CPU en ring 3: anota qué pasó y vuelve al núcleo (nunca sigue en el programa).
-pub fn fallo(vector: u64, rip: u64) -> ! {
-    let cr2: u64;
-    // Leer CR2 no tiene efectos.
-    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-    F_VEC.store(vector, Relaxed);
-    F_RIP.store(rip, Relaxed);
-    F_CR2.store(cr2, Relaxed);
-    // `IN_USER` es verdadero (ring 3 solo ocurre dentro de `nf_run_user`), así que el contexto es válido.
-    unsafe { nf_leave(WHY_FAULT) }
-}
-
-fn mensaje_fallo() -> String {
-    let (v, rip, cr2) = (F_VEC.load(Relaxed), F_RIP.load(Relaxed), F_CR2.load(Relaxed));
-    let mut s = String::new();
-    let _ = match v {
-        0 => write!(s, "división por cero (rip {rip:#x})"),
-        6 => write!(s, "instrucción no válida (rip {rip:#x})"),
-        13 => write!(s, "protección general (rip {rip:#x})"),
-        14 => write!(s, "fallo de página en {cr2:#x} (rip {rip:#x})"),
-        _ => write!(s, "excepción {v} del procesador (rip {rip:#x})"),
-    };
-    s
-}
-
-// ---------- Proceso ----------
-
-struct Proc {
-    id: u64,
-    entry: u64,
+/// Espacio de direcciones del programa: tablas, zonas y los bloques que hay que devolver.
+struct Mem {
     /// PML4 propia (primer elemento de `bloques`).
     pml4: *mut u64,
     /// Todo lo que hay que devolver al montón: tablas, imagen, pila, montón del programa.
     bloques: Vec<(*mut u8, Layout)>,
     regions: Regions,
+}
+
+struct Proc {
+    id: u64,
+    name: String,
+    /// Lo comparte con el escritorio (`Handle::state`).
+    st: SysState,
+    mm: Mem,
+    /// Pila de núcleo (null una vez liberada) y la pila guardada mientras la tarea no corre.
     kstack: *mut u8,
+    ksp: u64,
     fx: Box<Fx>,
-    started: bool,
-    /// Evento de la primera ejecución: se entrega en la primera espera.
-    pending_ev: Option<WireEvent>,
-    /// Dónde escribir el evento de la espera en curso.
-    wait_ptr: Option<u64>,
-    done: bool,
+    /// Dormido en `WAIT_EVENT`: dónde escribir el evento y el plazo.
+    wait: Option<(u64, Option<u64>)>,
+    /// Tics (10 ms) que el temporizador ha pillado al programa en ring 3.
+    cpu_ticks: u64,
 }
 
 fn kstack_layout() -> Layout {
     Layout::from_size_align(KSTACK, 16).unwrap()
 }
 
-impl Proc {
-    fn new(entry: u64) -> Result<Proc, String> {
-        let sin_mem = || String::from("Sin memoria para cargar el programa");
-        // Estado de coma flotante limpio: FCW por defecto y MXCSR con las excepciones enmascaradas.
-        let mut fx = Box::new(Fx([0; 512]));
-        fx.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
-        fx.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
-        // Montón del núcleo inicializado; tamaño y alineación válidos.
-        let kstack = unsafe { alloc::alloc::alloc(kstack_layout()) };
-        if kstack.is_null() {
-            return Err(sin_mem());
-        }
-        let mut p = Proc {
-            id: NEXT_ID.fetch_add(1, Relaxed),
-            entry,
-            pml4: core::ptr::null_mut(),
-            bloques: Vec::new(),
-            regions: Regions::default(),
-            kstack,
-            fx,
-            started: false,
-            pending_ev: None,
-            wait_ptr: None,
-            done: false,
-        };
-        let pml4 = p.alloc(1).ok_or_else(sin_mem)? as *mut u64;
-        // Se comparten las entradas del núcleo (sin bit U: solo supervisor); la 32 queda a cero.
-        // Ambas tablas son de 512 entradas y no se solapan.
-        unsafe { core::ptr::copy_nonoverlapping(paging::kernel_cr3() as *const u64, pml4, 512) };
-        p.pml4 = pml4;
-        Ok(p)
-    }
+fn procs() -> &'static mut Vec<Box<Proc>> {
+    // Ver "SEGURIDAD" del estado global: nunca se usa a la vez desde dos sitios.
+    unsafe { &mut *addr_of_mut!(PROCS) }
+}
 
+fn find(id: u64) -> Option<&'static mut Proc> {
+    procs().iter_mut().find(|p| p.id == id).map(|p| &mut **p)
+}
+
+/// El programa en marcha. Solo se llama desde ring 3 (interrupción, excepción, llamada) o desde
+/// código que corre en su tarea.
+fn cur() -> &'static mut Proc {
+    // `CUR` no es nulo mientras corre un programa; se pone antes del cambio de tarea.
+    unsafe { &mut *CUR }
+}
+
+impl Mem {
     /// `n` páginas a cero del montón, anotadas para devolverlas.
     fn alloc(&mut self, n: usize) -> Option<*mut u8> {
         let (p, l) = alloc_pages(n);
@@ -305,39 +255,18 @@ impl Proc {
         true
     }
 
-    fn regs(&self) -> *mut Regs {
-        (self.kstack as u64 + KSTACK as u64 - core::mem::size_of::<Regs>() as u64) as *mut Regs
-    }
-
-    fn ktop(&self) -> u64 {
-        self.kstack as u64 + KSTACK as u64
-    }
-
-    /// Devuelve al montón todo lo del proceso. Solo con CR3 del núcleo.
+    /// Devuelve al montón tablas y páginas. Solo con el CR3 del núcleo cargado; idempotente.
     fn release(&mut self) {
-        self.done = true;
         for (p, l) in self.bloques.drain(..) {
-            // Vienen de `alloc_pages`/`alloc` con ese mismo layout y no se liberan dos veces.
+            // Vienen de `alloc_pages` con ese mismo layout y no se liberan dos veces (`drain`).
             unsafe { dealloc(p, l) };
         }
-        if !self.kstack.is_null() {
-            unsafe { dealloc(self.kstack, kstack_layout()) };
-            self.kstack = core::ptr::null_mut();
-        }
+        self.pml4 = null_mut();
         self.regions = Regions::default();
     }
 }
 
-impl Drop for Proc {
-    fn drop(&mut self) {
-        if !self.done {
-            // Si su espacio estuviera activo no se podría soltar; `run` siempre vuelve al del núcleo.
-            self.release();
-        }
-    }
-}
-
-impl UserMem for Proc {
+impl UserMem for Mem {
     fn check(&self, addr: u64, len: u64, write: bool) -> bool {
         paging::cr3() == self.pml4 as u64 && self.regions.check(addr, len, write)
     }
@@ -366,93 +295,93 @@ impl UserMem for Proc {
     }
 }
 
-impl Process for Proc {
-    fn run(&mut self, ev: &WireEvent, st: &mut SysState) -> RunEnd {
-        if self.done {
-            return RunEnd::Exited(-1);
+impl Proc {
+    fn new(name: &str) -> Result<Proc, String> {
+        let sin_mem = || String::from("Sin memoria para cargar el programa");
+        // Estado de coma flotante limpio: FCW por defecto y MXCSR con las excepciones enmascaradas.
+        let mut fx = Box::new(Fx([0; 512]));
+        fx.0[0..2].copy_from_slice(&0x037Fu16.to_le_bytes());
+        fx.0[24..28].copy_from_slice(&0x1F80u32.to_le_bytes());
+        // Montón del núcleo inicializado; tamaño y alineación válidos.
+        let kstack = unsafe { alloc::alloc::alloc(kstack_layout()) };
+        if kstack.is_null() {
+            return Err(sin_mem());
         }
-        let regs = self.regs();
-        // Espacio y pila de núcleo de este proceso (un solo núcleo: variables globales).
-        unsafe {
-            paging::set_cr3(self.pml4 as u64);
-            NF_KTOP = self.ktop();
-        }
-        arch::set_rsp0(self.ktop());
-        RUN_START.store(TICKS.load(Relaxed), Relaxed);
-        if !self.started {
-            self.started = true;
-            self.pending_ev = Some(*ev);
-            // Entrada: punto de entrada, pila arriba del todo, IF=1. `regs` es el hueco reservado en la pila de núcleo.
-            unsafe { regs.write(Regs { rip: self.entry, rsp: STACK_TOP, rflags: 0x202, ..Default::default() }) };
-        } else if let Some(ptr) = self.wait_ptr.take() {
-            if !self.write(ptr, &ev.to_bytes()) {
-                return self.fin(RunEnd::Killed(Kill::Fault(String::from("el evento no cabe en su memoria"))), st);
-            }
-            unsafe { (*regs).rax = 0 };
-        }
-        let end = loop {
-            // Comprobaciones antes de `iretq`: RIP en la zona del programa, RSP canónico.
-            let r = unsafe { &mut *regs };
-            if !(USER_BASE..USER_TOP).contains(&r.rip) || r.rsp >> 47 != 0 {
-                break RunEnd::Killed(Kill::Fault(String::from("dirección de retorno no válida")));
-            }
-            r.rcx = r.rip;
-            r.r11 = r.rflags;
-            r.rflags = r.rflags & FLAGS_USER | 0x202;
-            r.cs = USER_CS;
-            r.ss = USER_SS;
-            IN_USER.store(true, Release);
-            // Pila, TSS y espacio ya preparados; `regs` y `fx` son de este proceso.
-            let why = unsafe { nf_run_user(regs, &mut *self.fx, core::ptr::addr_of_mut!(KFX)) };
-            IN_USER.store(false, Release);
-            match why {
-                WHY_SYSCALL => {
-                    let r = unsafe { &mut *regs };
-                    st.now_ms = TICKS.load(Relaxed) * 10;
-                    let args = [r.rdi, r.rsi, r.rdx, r.r10, r.r8];
-                    let sys = dispatch(r.rax, args, self, st);
-                    saca_log(st);
-                    match sys {
-                        Sys::Ret(v) => r.rax = v as u64,
-                        Sys::Exit(c) => break RunEnd::Exited(c),
-                        Sys::Wait { ptr, timeout_ms } => {
-                            if let Some(e) = self.pending_ev.take() {
-                                if !self.write(ptr, &e.to_bytes()) {
-                                    break RunEnd::Killed(Kill::Fault(String::from("el evento no cabe en su memoria")));
-                                }
-                                r.rax = 0;
-                            } else {
-                                self.wait_ptr = Some(ptr);
-                                let deadline = (timeout_ms != u64::MAX).then(|| st.now_ms.saturating_add(timeout_ms));
-                                break RunEnd::Waiting { deadline };
-                            }
-                        }
-                    }
-                }
-                WHY_FAULT => break RunEnd::Killed(Kill::Fault(mensaje_fallo())),
-                _ => break RunEnd::Killed(Kill::Hung),
-            }
+        let mut p = Proc {
+            id: NEXT_ID.fetch_add(1, Relaxed),
+            name: String::from(name),
+            st: SysState::new(0),
+            mm: Mem { pml4: null_mut(), bloques: Vec::new(), regions: Regions::default() },
+            kstack,
+            ksp: 0,
+            fx,
+            wait: None,
+            cpu_ticks: 0,
         };
-        self.fin(end, st)
+        let pml4 = p.mm.alloc(1).ok_or_else(sin_mem)? as *mut u64;
+        // Se comparten las entradas del núcleo (sin bit U: solo supervisor); la 32 queda a cero.
+        // Ambas tablas son de 512 entradas y no se solapan.
+        unsafe { core::ptr::copy_nonoverlapping(paging::kernel_cr3() as *const u64, pml4, 512) };
+        p.mm.pml4 = pml4;
+        Ok(p)
+    }
+
+    fn ktop(&self) -> u64 {
+        self.kstack as u64 + KSTACK as u64
+    }
+
+    /// Prepara el primer arranque: en lo alto de la pila de núcleo, los registros de ring 3 y
+    /// debajo un marco de `nf_switch` que "retorna" a `nf_user_return`.
+    fn marco_inicial(&mut self, entry: u64) {
+        let regs = (self.ktop() - core::mem::size_of::<Regs>() as u64) as *mut Regs;
+        // Pila de núcleo propia y recién reservada; caben los 160 bytes de `Regs` y los 7 qwords de debajo.
+        unsafe {
+            regs.write(Regs { rip: entry, rcx: entry, rsp: STACK_TOP, rflags: 0x202, r11: 0x202, cs: USER_CS, ss: USER_SS, ..Default::default() });
+            let sw = (regs as *mut u64).sub(7);
+            for i in 0..6 {
+                sw.add(i).write(0); // r15 r14 r13 r12 rbx rbp
+            }
+            sw.add(6).write(nf_user_return as *const () as u64);
+            self.ksp = sw as u64;
+        }
+    }
+
+    /// Libera la pila de núcleo. Solo si no se está ejecutando sobre ella.
+    fn libera_kstack(&mut self) {
+        if !self.kstack.is_null() {
+            // Viene de `alloc` con ese layout y se anula para no liberarla dos veces.
+            unsafe { dealloc(self.kstack, kstack_layout()) };
+            self.kstack = null_mut();
+        }
+    }
+
+    fn vivo(&self) -> bool {
+        self.st.status == Status::Alive
+    }
+
+    /// ¿Puede correr ahora? Listo = no duerme en `WAIT_EVENT`, o duerme pero ya tiene algo que recibir.
+    fn listo(&self, now: u64) -> bool {
+        self.vivo()
+            && match self.wait {
+                None => true,
+                Some((_, d)) => !self.st.queue.is_empty() || self.st.wake_at(d).is_some_and(|w| now >= w),
+            }
+    }
+
+    fn mem(&self) -> u64 {
+        if self.vivo() {
+            self.st.fixed_mem + self.st.brk - HEAP_BASE
+        } else {
+            0
+        }
     }
 }
 
-impl Proc {
-    /// Vuelve al espacio del núcleo; si el programa ha terminado o lo han matado, lo libera.
-    fn fin(&mut self, end: RunEnd, st: &mut SysState) -> RunEnd {
-        // CR3 del núcleo antes de soltar nada; las interrupciones se habían cerrado en `nf_run_user`.
-        unsafe {
-            paging::set_cr3(paging::kernel_cr3());
-            asm!("sti", options(nomem, nostack));
-        }
-        saca_log(st);
-        if !matches!(end, RunEnd::Waiting { .. }) {
-            if crate::TRAZA {
-                crate::serial::traza!("NF proc: programa {} terminado: {:?}", self.id, end);
-            }
-            self.release();
-        }
-        end
+impl Drop for Proc {
+    fn drop(&mut self) {
+        // Solo se suelta desde la tarea 0 (CR3 del núcleo) y con el programa parado.
+        self.mm.release();
+        self.libera_kstack();
     }
 }
 
@@ -465,8 +394,226 @@ fn saca_log(st: &mut SysState) {
     }
 }
 
-/// Carga un `.nfx` y devuelve el proceso y su memoria fija (imagen + pila).
-pub fn spawn(file: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
+fn traza_fin(p: &Proc) {
+    if crate::TRAZA {
+        crate::serial::traza!("NF proc: programa {} terminado: {:?}", p.id, p.st.status);
+    }
+}
+
+// ---------- Cambios de tarea ----------
+
+/// Tarea 0 → siguiente programa listo (por turnos). Lo llama `arch::idle` con IF=0. Devuelve
+/// `true` si ha corrido alguno (la tarea 0 ha recuperado el control), `false` si no había ninguno.
+pub fn correr() -> bool {
+    let now = TICKS.load(Relaxed) * 10;
+    let v = procs();
+    let n = v.len();
+    let ini = RR.load(Relaxed);
+    let Some(i) = (0..n).map(|k| (ini + k) % n).find(|&i| v[i].listo(now)) else { return false };
+    RR.store(i + 1, Relaxed);
+    let p: *mut Proc = &mut *v[i];
+    // `p` es un programa vivo y parado; la tarea 0 es la única que corre. Cargamos su espacio y
+    // sus pilas antes de saltar; las interrupciones siguen cerradas hasta su `iretq`.
+    unsafe {
+        CUR = p;
+        NF_KTOP = (*p).ktop();
+        arch::set_rsp0((*p).ktop());
+        paging::set_cr3((*p).mm.pml4 as u64);
+        nf_switch(addr_of_mut!(T0_KSP), (*p).ksp, addr_of_mut!(T0_FX), addr_of_mut!(*(*p).fx));
+    }
+    // De vuelta en la tarea 0 (quien nos devolvió el control cargó el CR3 del núcleo). Los
+    // programas que han terminado sobre su pila de núcleo la dejan para ahora.
+    for p in procs().iter_mut().filter(|p| !p.vivo()) {
+        p.libera_kstack();
+    }
+    true
+}
+
+/// Programa actual → tarea 0, guardando su contexto; vuelve cuando la tarea 0 lo reanude.
+/// Siempre con IF=0 (interrupción, llamada o excepción).
+fn a_tarea0() {
+    // El estado del programa se lee de `CUR` aquí y no se pasa como `&mut`: la tarea 0 lo toca
+    // mientras tanto. `T0_KSP` lo dejó `correr`.
+    unsafe {
+        let p = CUR;
+        CUR = null_mut();
+        paging::set_cr3(paging::kernel_cr3());
+        nf_switch(addr_of_mut!((*p).ksp), T0_KSP, addr_of_mut!(*(*p).fx), addr_of_mut!(T0_FX));
+    }
+}
+
+/// Lo llama el temporizador cuando interrumpe a un programa en ring 3: lo anota y devuelve el
+/// procesador a la tarea 0 (el programa sigue listo y entrará de nuevo por turnos).
+pub fn tick_en_usuario() {
+    if unsafe { CUR }.is_null() {
+        return;
+    }
+    // shortcut: el tiempo de CPU se cuenta por muestreo (un tic por cada vez que el temporizador
+    // pilla al programa), no con el reloj fino; cuando haga falta exactitud, leer el TSC al entrar y salir.
+    cur().cpu_ticks += 1;
+    a_tarea0();
+}
+
+/// Termina el programa actual con ese estado: libera su memoria al momento (con el CR3 del
+/// núcleo) y pasa a la tarea 0 para siempre. La pila de núcleo, en la que seguimos, la libera
+/// `correr` al volver.
+fn morir(estado: Status) -> ! {
+    // Se cambia a la tabla del núcleo antes de devolver las del programa; la pila de núcleo está
+    // en el montón y se ve en cualquier espacio.
+    unsafe { paging::set_cr3(paging::kernel_cr3()) };
+    let p = cur();
+    p.st.status = estado;
+    p.wait = None;
+    saca_log(&mut p.st);
+    traza_fin(p);
+    p.mm.release();
+    a_tarea0();
+    // Un programa terminado no está listo, así que la tarea 0 no lo vuelve a entrar.
+    unreachable!("un programa terminado ha vuelto a correr")
+}
+
+/// Excepción de la CPU en ring 3: el programa muere con el motivo y el sistema sigue.
+pub fn fallo(vector: u64, rip: u64) -> ! {
+    let cr2: u64;
+    // Leer CR2 no tiene efectos.
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    let mut s = String::new();
+    let _ = match vector {
+        0 => write!(s, "división por cero (rip {rip:#x})"),
+        6 => write!(s, "instrucción no válida (rip {rip:#x})"),
+        13 => write!(s, "protección general (rip {rip:#x})"),
+        14 => write!(s, "fallo de página en {cr2:#x} (rip {rip:#x})"),
+        _ => write!(s, "excepción {vector} del procesador (rip {rip:#x})"),
+    };
+    // Ring 3 solo ocurre con un programa en marcha (`CUR` válido).
+    morir(Status::Killed(Kill::Fault(s)))
+}
+
+/// Duerme al programa actual hasta tener algo que entregarle en `ptr` y lo escribe. `false` si ya
+/// no cabe en su memoria. No guarda en pila nada que posea memoria (se perdería al matarlo dormido).
+fn esperar(ptr: u64, deadline: Option<u64>) -> bool {
+    loop {
+        let p = cur();
+        let now = TICKS.load(Relaxed) * 10;
+        p.st.now_ms = now;
+        if let Some(e) = p.st.next_event(now, deadline) {
+            p.wait = None;
+            return p.mm.write(ptr, &e.to_bytes());
+        }
+        p.wait = Some((ptr, deadline));
+        a_tarea0();
+    }
+}
+
+/// Vuelve a ring 3 con los registros de `regs` tras comprobarlos: RIP en la zona del programa,
+/// RSP canónico, RFLAGS saneado y selectores de usuario.
+unsafe fn a_usuario(regs: *mut Regs) -> ! {
+    let r = &mut *regs;
+    if !(USER_BASE..USER_TOP).contains(&r.rip) || r.rsp >> 47 != 0 {
+        morir(Status::Killed(Kill::Fault(String::from("dirección de retorno no válida"))));
+    }
+    r.rcx = r.rip;
+    r.r11 = r.rflags;
+    r.rflags = r.rflags & FLAGS_USER | 0x202;
+    r.cs = USER_CS;
+    r.ss = USER_SS;
+    // Pila, TSS y espacio ya son los de este programa; IF vuelve a 1 con el `iretq`.
+    nf_to_user(regs)
+}
+
+/// Atiende una `syscall` (la llama `syscall_entry`, con IF=0 y `regs` en lo alto de la pila de núcleo).
+#[no_mangle]
+extern "sysv64" fn syscall_main(regs: *mut Regs) -> ! {
+    // `regs` es el marco que acaba de guardar `syscall_entry`; se accede siempre por el puntero
+    // porque la tarea puede dormir y la 0 correr entre medias.
+    let (nr, args) = unsafe { ((*regs).rax, [(*regs).rdi, (*regs).rsi, (*regs).rdx, (*regs).r10, (*regs).r8]) };
+    let p = cur();
+    p.st.now_ms = TICKS.load(Relaxed) * 10;
+    // Leer el reloj CMOS son muchos accesos a puertos: solo cuando el programa lo pide.
+    if nr == SYS_DATETIME {
+        p.st.datetime = crate::rtc::now();
+    }
+    let sys = dispatch(nr, args, &mut p.mm, &mut p.st);
+    saca_log(&mut p.st);
+    match sys {
+        Sys::Ret(v) => unsafe { (*regs).rax = v as u64 },
+        Sys::Exit(c) => morir(Status::Exited(c)),
+        Sys::Wait { ptr, timeout_ms } => {
+            let now = TICKS.load(Relaxed) * 10;
+            let deadline = (timeout_ms != u64::MAX).then(|| now.saturating_add(timeout_ms));
+            if !esperar(ptr, deadline) {
+                morir(Status::Killed(Kill::Fault(String::from("el evento no cabe en su memoria"))));
+            }
+            unsafe { (*regs).rax = 0 };
+        }
+    }
+    unsafe { a_usuario(regs) }
+}
+
+// ---------- Lo que ve el escritorio ----------
+
+/// Asa del escritorio a un programa de la tabla. Soltarla lo termina y lo quita de la tabla.
+struct Handle(u64);
+
+/// Termina el programa si vive y libera todo, pila de núcleo incluida. Solo desde la tarea 0: el
+/// programa está dormido o expropiado, nunca en medio de una llamada ni con su espacio cargado.
+fn matar(p: &mut Proc) {
+    if p.vivo() {
+        p.st.status = Status::Killed(Kill::Ended);
+        saca_log(&mut p.st);
+        traza_fin(p);
+    }
+    p.wait = None;
+    p.mm.release();
+    p.libera_kstack();
+}
+
+impl Process for Handle {
+    fn id(&self) -> u64 {
+        self.0
+    }
+    fn state(&mut self) -> &mut SysState {
+        // La entrada existe mientras exista el `Handle` (solo su `Drop` la quita).
+        &mut find(self.0).expect("proceso fuera de la tabla").st
+    }
+    fn kill(&mut self) {
+        if let Some(p) = find(self.0) {
+            matar(p);
+        }
+    }
+    fn mem(&self) -> u64 {
+        find(self.0).map_or(0, |p| p.mem())
+    }
+    fn cpu_ms(&self) -> u64 {
+        find(self.0).map_or(0, |p| p.cpu_ticks * 10)
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.kill();
+        procs().retain(|p| p.id != self.0);
+    }
+}
+
+/// Programas vivos, para el Administrador de tareas.
+pub fn lista() -> Vec<ProcInfo> {
+    let now = TICKS.load(Relaxed) * 10;
+    procs()
+        .iter()
+        .filter(|p| p.vivo())
+        .map(|p| ProcInfo { id: p.id, name: p.name.clone(), mem: p.mem(), cpu_ms: p.cpu_ticks * 10, responding: !p.st.not_responding(now) })
+        .collect()
+}
+
+pub fn finalizar(id: u64) {
+    if let Some(p) = find(id) {
+        matar(p);
+    }
+}
+
+/// Carga un `.nfx`, lo deja listo para correr y devuelve su asa.
+pub fn spawn(file: &[u8], name: &str) -> Result<Box<dyn Process>, String> {
     if !paging::NX_OK.load(Relaxed) {
         return Err(String::from("Este procesador no admite NX: no se pueden ejecutar programas"));
     }
@@ -478,19 +625,26 @@ pub fn spawn(file: &[u8]) -> Result<(Box<dyn Process>, u64), String> {
             NfxError::TooBig => "El programa necesita demasiada memoria",
         })
     })?;
-    let mut p = Proc::new(img.entry)?;
+    if !(USER_BASE..USER_TOP).contains(&img.entry) {
+        return Err(String::from("Programa dañado"));
+    }
+    let mut p = Box::new(Proc::new(name)?);
     let sin_mem = || String::from("Sin memoria para cargar el programa");
     let mut fixed = STACK_SIZE;
     for s in &img.sections {
         let (start, end) = (s.vaddr, (s.vaddr + s.memsz).div_ceil(PAGE) * PAGE);
         fixed += end - start;
-        if !p.map_range(start, end, s.data, s.kind.writable(), s.kind.executable()) {
+        if !p.mm.map_range(start, end, s.data, s.kind.writable(), s.kind.executable()) {
             return Err(sin_mem());
         }
     }
     // Pila: debajo de STACK_TOP; las páginas de guarda de abajo y de arriba quedan sin mapear.
-    if !p.map_range(STACK_TOP - STACK_SIZE, STACK_TOP, &[], true, false) {
+    if !p.mm.map_range(STACK_TOP - STACK_SIZE, STACK_TOP, &[], true, false) {
         return Err(sin_mem());
     }
-    Ok((Box::new(p), fixed))
+    p.st = SysState::new(fixed);
+    p.marco_inicial(img.entry);
+    let id = p.id;
+    procs().push(p);
+    Ok(Box::new(Handle(id)))
 }

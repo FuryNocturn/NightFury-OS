@@ -12,38 +12,63 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-app"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "nfdisk"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfpack"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
+name = "nfprog"
+version = "0.9.0"
+dependencies = [
+ "nf-core",
+ "paint",
+ "reloj",
+]
+
+[[package]]
+name = "paint"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
 name = "plantilla"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
+name = "reloj"
 version = "1.0.0"
 dependencies = [
  "nf-app",

@@ -1330,6 +1330,11 @@ impl Files {
         let dir = join_rel(PROGRAMS, folder);
         mk(&mut self.fs, &dir, now);
         let mut changed = false;
+        // Marca de programa del sistema (`programs::SYSTEM_MARK`): no se desinstala ni se reemplaza.
+        let mark = join_rel(&dir, ".sistema");
+        if self.fs.stat(&mark).is_err() {
+            self.fs.write(&mark, b"", now)?;
+        }
         for (name, data) in items {
             let p = join_rel(&dir, name);
             if self.fs.read(&p).ok().as_deref() != Some(*data) {

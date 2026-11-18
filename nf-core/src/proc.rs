@@ -1,20 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Programas en modo usuario vistos desde el escritorio (F3, v0.8). CONTRATO: `Regions`,
-//! `UserMem`, `SysState`, `Outbox`, `Sys`, `dispatch`, `Process`, `RunEnd`, `Kill` y `ProcApp`.
+//! Programas en modo usuario vistos desde el escritorio (F3, v0.9). CONTRATO: `Regions`,
+//! `UserMem`, `SysState` (y sus `post`, `next_event`, `wake_at`, `not_responding`), `Outbox`,
+//! `Sys`, `dispatch`, `Process`, `Status`, `Kill`, `ProcInfo` y `ProcApp`.
 //!
-//! Reparto: el núcleo crea el proceso (tablas de páginas, carga del `.nfx`) e implementa
-//! `Process`; cada `syscall` que no sea de espera la atiende llamando a `dispatch`. `ProcApp` es
-//! la ventana del escritorio: convierte cada evento de `App` en un `WireEvent`, se lo pasa al
-//! programa con `Process::run` y aplica lo que el programa pidió (imagen, título, cerrar).
+//! Reparto (v0.9, multitarea): el núcleo crea el proceso e implementa `Process`; el programa corre
+//! por su cuenta y cada `syscall` la atiende `dispatch`. `WAIT_EVENT` la resuelve el núcleo con
+//! `SysState::next_event`: si no hay nada, el programa se duerme hasta `wake_at` o hasta que llegue
+//! un evento. `ProcApp` es la ventana: deja eventos en la cola (`SysState::post`) y en cada tick
+//! recoge lo que el programa pidió (imagen, título, guardar) y su `status`.
 use crate::abi::*;
 use crate::apps::{App, AppKind, Ctx, MouseEv};
+use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
+use crate::files::{self, Std};
+use crate::geom::Rect;
 use crate::icons::Icon;
 use crate::input::KeyEvent;
 use crate::platform::{DateTime, Platform};
-use crate::surface::Surface;
+use crate::surface::{blend, Surface};
 use crate::theme::Theme;
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -77,6 +84,8 @@ pub struct Outbox {
     pub min_size: Option<(i32, i32)>,
     /// Líneas de `LOG`; el núcleo las saca por el puerto serie y las vacía.
     pub log: Vec<String>,
+    /// `SAVE_AS`: nombre propuesto y contenido. La ventana enseña el diálogo Guardar.
+    pub save: Option<(String, Vec<u8>)>,
 }
 
 /// Estado de un programa que necesitan las llamadas.
@@ -91,11 +100,58 @@ pub struct SysState {
     /// `SET_TIMER`: cuándo toca el siguiente `EV_TIMER`.
     pub timer_at: Option<u64>,
     pub out: Outbox,
+    /// Eventos que el escritorio ha dejado y el programa no ha recogido (`now_ms` = cuándo llegó).
+    pub queue: VecDeque<WireEvent>,
+    pub status: Status,
 }
+
+/// Eventos que caben en la cola de un programa; lo que llega con la cola llena se descarta.
+pub const QUEUE_MAX: usize = 256;
 
 impl SysState {
     pub fn new(fixed_mem: u64) -> Self {
         SysState { brk: HEAP_BASE, fixed_mem, ..Default::default() }
+    }
+
+    /// Deja un evento para el programa. Los movimientos de ratón seguidos se juntan en uno.
+    pub fn post(&mut self, ev: WireEvent) {
+        if let Some(last) = self.queue.back_mut() {
+            if last.kind == EV_MOUSE_MOVE && ev.kind == EV_MOUSE_MOVE {
+                *last = WireEvent { now_ms: last.now_ms, ..ev };
+                return;
+            }
+        }
+        // shortcut: con la cola llena se pierde lo nuevo; si molesta, descartar solo movimientos.
+        if self.queue.len() < QUEUE_MAX {
+            self.queue.push_back(ev);
+        }
+    }
+
+    /// Lo siguiente que recibe un `WAIT_EVENT` en el instante `now` con ese plazo: un evento de la
+    /// cola, `EV_TIMER` si ha vencido el temporizador, `EV_NONE` si ha vencido el plazo. `None` =
+    /// hay que dormir (hasta `wake_at` o hasta que llegue un evento).
+    pub fn next_event(&mut self, now: u64, deadline: Option<u64>) -> Option<WireEvent> {
+        if let Some(e) = self.queue.pop_front() {
+            return Some(e);
+        }
+        if self.timer_at.is_some_and(|t| now >= t) {
+            self.timer_at = None;
+            return Some(WireEvent::new(EV_TIMER, now));
+        }
+        deadline.filter(|&d| now >= d).map(|_| WireEvent::new(EV_NONE, now))
+    }
+
+    /// Cuándo hay que despertar a un programa dormido en `WAIT_EVENT` aunque no lleguen eventos.
+    pub fn wake_at(&self, deadline: Option<u64>) -> Option<u64> {
+        match (self.timer_at, deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// ¿Lleva `HUNG_MS` o más sin recoger el evento más viejo?
+    pub fn not_responding(&self, now: u64) -> bool {
+        self.queue.front().is_some_and(|e| now.saturating_sub(e.now_ms) >= HUNG_MS)
     }
 }
 
@@ -104,9 +160,9 @@ impl SysState {
 pub enum Sys {
     /// Volver al programa con este valor en `rax`.
     Ret(i64),
-    /// `WAIT_EVENT`: el puntero ya está validado para escribir `WIRE_EVENT_SIZE` bytes. El
-    /// núcleo vuelve a quien llamó a `run`; el siguiente `run` escribe ahí el evento y vuelve al
-    /// programa con `rax = 0`.
+    /// `WAIT_EVENT`: el puntero ya está validado para escribir `WIRE_EVENT_SIZE` bytes. El núcleo
+    /// usa `SysState::next_event` (plazo = `now + timeout_ms` salvo `u64::MAX`); escribe ahí el
+    /// evento y vuelve con `rax = 0`, o duerme al programa hasta tener uno.
     Wait { ptr: u64, timeout_ms: u64 },
     Exit(i32),
 }
@@ -140,6 +196,7 @@ pub fn dispatch(nr: u64, args: [u64; 5], mem: &mut dyn UserMem, st: &mut SysStat
             Err(e) => e,
         },
         SYS_PRESENT => present(mem, st, a0, a1, a2, a3),
+        SYS_SAVE_AS => save_as(mem, st, a0, a1, a2, a3),
         SYS_MEM_GROW => mem_grow(mem, st, a0),
         SYS_UPTIME => st.now_ms as i64,
         SYS_DATETIME => {
@@ -205,6 +262,32 @@ fn present(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, w: u64, h: u64, s
     0
 }
 
+fn save_as(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, len: u64, name_ptr: u64, name_len: u64) -> i64 {
+    if st.out.save.is_some() {
+        return E_BUSY;
+    }
+    if len > SAVE_MAX {
+        return E_INVAL;
+    }
+    let name = match read_text(mem, name_ptr, name_len, 255) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !files::valid_name(&name) {
+        return E_INVAL;
+    }
+    // Validado antes de reservar en el núcleo.
+    if !mem.check(ptr, len, false) {
+        return E_FAULT;
+    }
+    let mut data = vec![0u8; len as usize];
+    if !mem.read(ptr, &mut data) {
+        return E_FAULT;
+    }
+    st.out.save = Some((name, data));
+    0
+}
+
 fn mem_grow(mem: &mut dyn UserMem, st: &mut SysState, bytes: u64) -> i64 {
     let old = st.brk;
     if bytes == 0 {
@@ -226,34 +309,57 @@ fn mem_grow(mem: &mut dyn UserMem, st: &mut SysState, bytes: u64) -> i64 {
 pub enum Kill {
     /// Fallo del procesador en modo usuario (p. ej. "fallo de página en 0x…").
     Fault(String),
-    /// Ha usado el procesador demasiado tiempo sin volver a esperar.
-    Hung,
+    /// Lo ha finalizado el usuario (Administrador de tareas o "no responde").
+    Ended,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum RunEnd {
-    /// Espera el siguiente evento (`WAIT_EVENT`). `deadline` = cuándo vence la espera
-    /// (`now_ms + timeout_ms`), o `None` sin límite.
-    Waiting { deadline: Option<u64> },
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum Status {
+    #[default]
+    Alive,
     Exited(i32),
     /// El núcleo lo ha terminado; su memoria ya está liberada.
     Killed(Kill),
 }
 
-/// Un programa cargado, visto desde el escritorio. Lo implementa el núcleo (modo usuario real)
-/// y las pruebas (un programa simulado).
-pub trait Process {
-    /// Entrega `ev` como resultado de la espera pendiente y ejecuta el programa hasta que vuelve
-    /// a esperar, termina o lo matan. La primera vez arranca desde el punto de entrada y entrega
-    /// `ev` en su primera espera. Usa `st` y `dispatch` para las llamadas. Tras `Exited` o
-    /// `Killed` no se vuelve a llamar.
-    fn run(&mut self, ev: &WireEvent, st: &mut SysState) -> RunEnd;
+/// Datos de un programa para el Administrador de tareas.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProcInfo {
+    pub id: u64,
+    pub name: String,
+    /// Memoria que ocupa (imagen, pila y montón).
+    pub mem: u64,
+    /// Tiempo de procesador usado desde que arrancó.
+    pub cpu_ms: u64,
+    pub responding: bool,
 }
+
+/// Un programa en marcha, visto desde el escritorio (v0.9: se ejecuta por su cuenta). Lo
+/// implementa el núcleo y las pruebas. El escritorio y el programa comparten `SysState`: el
+/// núcleo garantiza que no se usa a la vez (un solo procesador; el escritorio no se interrumpe
+/// para dar paso a un programa y las llamadas corren con las interrupciones cerradas).
+/// Soltar el `Process` termina el programa si sigue vivo.
+pub trait Process {
+    fn id(&self) -> u64;
+    /// Estado compartido: cola de eventos (`post`), lo pedido (`out`) y `status`.
+    fn state(&mut self) -> &mut SysState;
+    /// Termina el programa ya (queda `Killed(Kill::Ended)`) y libera su memoria. Sin efecto si ya terminó.
+    fn kill(&mut self);
+    /// Memoria que ocupa ahora.
+    fn mem(&self) -> u64;
+    fn cpu_ms(&self) -> u64;
+}
+
+/// Tiempo sin recoger eventos a partir del cual un programa "no responde".
+pub const HUNG_MS: u64 = 5000;
+
+const T_SAVE: u32 = 1;
+const T_CRASH: u32 = 2;
+const T_HUNG: u32 = 3;
 
 /// Ventana de un programa dentro del escritorio.
 pub struct ProcApp {
     proc: Box<dyn Process>,
-    st: SysState,
     name: String,
     title: String,
     icon: Option<Icon>,
@@ -263,19 +369,18 @@ pub struct ProcApp {
     sent_size: Option<(i32, i32)>,
     sent_focus: Option<bool>,
     sent_theme: Option<Theme>,
-    deadline: Option<u64>,
-    /// `Some` cuando el programa ha terminado (código) o lo han matado.
-    end: Option<RunEnd>,
+    /// Ya se ha avisado del fin (fallo) y se espera a que el usuario acepte.
+    noticed: bool,
     close_asked: bool,
-    /// Cerrar en el próximo evento con `Ctx` (cuando el programa termina dentro de `draw`).
-    close_pending: bool,
+    hung: bool,
+    /// Datos de un `SAVE_AS` mientras el diálogo Guardar está abierto.
+    saving: Option<Vec<u8>>,
 }
 
 impl ProcApp {
-    pub fn new(proc: Box<dyn Process>, fixed_mem: u64, name: &str, icon: Option<Icon>) -> Self {
+    pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>) -> Self {
         ProcApp {
             proc,
-            st: SysState::new(fixed_mem),
             name: String::from(name),
             title: String::from(name),
             icon,
@@ -284,72 +389,68 @@ impl ProcApp {
             sent_size: None,
             sent_focus: None,
             sent_theme: None,
-            deadline: None,
-            end: None,
+            noticed: false,
             close_asked: false,
-            close_pending: false,
+            hung: false,
+            saving: None,
         }
     }
 
-    /// Cómo terminó el programa (`None` si sigue vivo).
-    pub fn ended(&self) -> Option<&RunEnd> {
-        self.end.as_ref()
+    /// Nombre del programa (de su `app.txt`), aunque el título cambie.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Entrega un evento. Devuelve `true` si el programa ha terminado.
-    fn deliver(&mut self, mut ev: WireEvent, sys: &mut dyn Platform) -> bool {
-        if self.end.is_some() {
-            return true;
-        }
-        self.st.now_ms = sys.uptime_ms();
-        self.st.datetime = sys.now();
-        ev.now_ms = self.st.now_ms;
-        let r = self.proc.run(&ev, &mut self.st);
-        if let Some(f) = self.st.out.frame.take() {
+    pub fn status(&mut self) -> Status {
+        self.proc.state().status.clone()
+    }
+
+    fn post(&mut self, mut ev: WireEvent, now: u64) {
+        ev.now_ms = now;
+        self.proc.state().post(ev);
+    }
+
+    /// Recoge lo que el programa ha pedido y mira si sigue vivo y respondiendo.
+    fn poll(&mut self, cx: &mut Ctx) {
+        let now = cx.now_ms;
+        let st = self.proc.state();
+        let out = core::mem::take(&mut st.out);
+        let status = st.status.clone();
+        let hung = st.status == Status::Alive && st.not_responding(now);
+        if let Some(f) = out.frame {
             self.frame = Some(f);
+            cx.redraw = true;
         }
-        if let Some(t) = self.st.out.title.take() {
+        if let Some(t) = out.title {
             self.title = t;
         }
-        if let Some(m) = self.st.out.min_size.take() {
+        if let Some(m) = out.min_size {
             self.min = m;
         }
-        match r {
-            RunEnd::Waiting { deadline } => {
-                self.deadline = deadline;
-                false
+        if hung != self.hung {
+            self.hung = hung;
+            cx.redraw = true;
+        }
+        if let Some((name, data)) = out.save {
+            if self.saving.is_none() && cx.dialog.is_none() {
+                let dir = cx.sys.files().std_dir(if name.to_lowercase().ends_with(".bmp") { Std::Pictures } else { Std::Documents });
+                cx.dialog = Some(DialogRequest::Save { tag: T_SAVE, title: String::from("Guardar como"), dir, name });
+                self.saving = Some(data);
+            } else {
+                self.post(WireEvent { kind: EV_SAVED, a: -1, ..Default::default() }, now);
             }
-            other => {
-                self.end = Some(other);
-                true
+        }
+        match status {
+            Status::Alive => {}
+            Status::Exited(_) | Status::Killed(Kill::Ended) => cx.close = true,
+            Status::Killed(Kill::Fault(why)) => {
+                if !self.noticed && cx.dialog.is_none() {
+                    self.noticed = true;
+                    let text = format!("«{}» dejó de funcionar y se ha cerrado.\nMotivo: {why}", self.name);
+                    cx.dialog = Some(DialogRequest::Message { tag: T_CRASH, title: self.name.clone(), text, buttons: Buttons::Ok });
+                }
             }
         }
-    }
-
-    /// Envía tema, tamaño y foco si han cambiado.
-    fn sync(&mut self, w: i32, h: i32, theme: &Theme, focused: bool, sys: &mut dyn Platform) -> bool {
-        let mut done = false;
-        if self.sent_theme != Some(*theme) {
-            self.sent_theme = Some(*theme);
-            let ev = WireEvent { kind: EV_THEME, a: theme.wallpaper as i32, d: theme.accent, ..Default::default() };
-            done |= self.deliver(ev, sys);
-        }
-        if self.sent_size != Some((w, h)) {
-            self.sent_size = Some((w, h));
-            done |= self.deliver(WireEvent { kind: EV_RESIZE, a: w, b: h, ..Default::default() }, sys);
-        }
-        if self.sent_focus != Some(focused) {
-            self.sent_focus = Some(focused);
-            done |= self.deliver(WireEvent { kind: EV_FOCUS, a: focused as i32, ..Default::default() }, sys);
-        }
-        done
-    }
-
-    fn after(&mut self, ended: bool, cx: &mut Ctx) {
-        if ended || self.close_pending {
-            cx.close = true;
-        }
-        cx.redraw = true;
     }
 }
 
@@ -358,7 +459,11 @@ impl App for ProcApp {
         AppKind::Program
     }
     fn title(&self) -> String {
-        self.title.clone()
+        if self.hung {
+            format!("{} (No responde)", self.title)
+        } else {
+            self.title.clone()
+        }
     }
     fn icon(&self) -> Option<Icon> {
         self.icon
@@ -367,54 +472,89 @@ impl App for ProcApp {
         self.min
     }
     fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, focused: bool) {
-        if self.sync(s.w, s.h, theme, focused, sys) {
-            self.close_pending = true;
+        let now = sys.uptime_ms();
+        if self.sent_theme != Some(*theme) {
+            self.sent_theme = Some(*theme);
+            self.post(WireEvent { kind: EV_THEME, a: theme.wallpaper as i32, d: theme.accent, ..Default::default() }, now);
         }
-        s.fill_rect(crate::geom::Rect::new(0, 0, s.w, s.h), 0xFFFFFF);
+        if self.sent_size != Some((s.w, s.h)) {
+            self.sent_size = Some((s.w, s.h));
+            self.post(WireEvent { kind: EV_RESIZE, a: s.w, b: s.h, ..Default::default() }, now);
+        }
+        if self.sent_focus != Some(focused) {
+            self.sent_focus = Some(focused);
+            self.post(WireEvent { kind: EV_FOCUS, a: focused as i32, ..Default::default() }, now);
+        }
+        s.fill_rect(Rect::new(0, 0, s.w, s.h), 0xFFFFFF);
         if let Some(f) = &self.frame {
             s.blit(f, 0, 0);
         }
+        // Sin respuesta, el contenido se ve apagado (como en Windows).
+        if self.hung || self.noticed {
+            for p in s.px.iter_mut() {
+                *p = blend(*p, 0xFFFFFF, 140);
+            }
+        }
     }
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
-        let e = self.deliver(WireEvent::key(ev, 0), cx.sys);
-        self.after(e, cx);
+        self.post(WireEvent::key(ev, 0), cx.now_ms);
     }
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
-        let e = self.deliver(WireEvent::mouse(ev, 0), cx.sys);
-        self.after(e, cx);
+        self.post(WireEvent::mouse(ev, 0), cx.now_ms);
     }
     fn tick(&mut self, cx: &mut Ctx) {
-        if self.close_pending || self.end.is_some() {
-            cx.close = true;
-            return;
-        }
-        let now = cx.now_ms;
-        if self.st.timer_at.is_some_and(|t| now >= t) {
-            self.st.timer_at = None;
-            let e = self.deliver(WireEvent::new(EV_TIMER, 0), cx.sys);
-            self.after(e, cx);
-        } else if self.deadline.is_some_and(|t| now >= t) {
-            self.deadline = None;
-            let e = self.deliver(WireEvent::new(EV_NONE, 0), cx.sys);
-            self.after(e, cx);
+        self.poll(cx);
+    }
+    fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
+        match result {
+            DialogResult::Path { tag: T_SAVE, path } => {
+                let data = self.saving.take().unwrap_or_default();
+                let a = match path {
+                    None => 0,
+                    Some(p) => {
+                        let now = cx.sys.now();
+                        match cx.sys.files().write(&p, &data, now) {
+                            Ok(()) => 1,
+                            Err(e) => {
+                                let text = format!("No se puede guardar «{}».\n{}", files::file_name(&p), e.message());
+                                cx.dialog = Some(DialogRequest::Message { tag: 0, title: self.name.clone(), text, buttons: Buttons::Ok });
+                                -1
+                            }
+                        }
+                    }
+                };
+                self.post(WireEvent { kind: EV_SAVED, a, ..Default::default() }, cx.now_ms);
+            }
+            DialogResult::Answer { tag: T_CRASH, .. } => cx.close = true,
+            DialogResult::Answer { tag: T_HUNG, answer: Answer::Yes } => {
+                self.proc.kill();
+                cx.close = true;
+            }
+            _ => {}
         }
     }
     fn request_close(&mut self, cx: &mut Ctx) -> bool {
-        // Segunda vez (el programa no se ha cerrado) o ya terminado: se cierra la ventana sin más.
-        if self.close_asked || self.end.is_some() {
+        if self.proc.state().status != Status::Alive {
+            return true;
+        }
+        if self.hung {
+            let text = format!("«{}» no responde.\n¿Quieres finalizarlo? Se perderá lo que no esté guardado.", self.name);
+            cx.dialog = Some(DialogRequest::Message { tag: T_HUNG, title: self.name.clone(), text, buttons: Buttons::YesNo });
+            return false;
+        }
+        // Segunda vez sin que el programa se haya cerrado: se cierra la ventana (y el programa con ella).
+        if self.close_asked {
             return true;
         }
         self.close_asked = true;
-        let e = self.deliver(WireEvent::new(EV_CLOSE, 0), cx.sys);
-        self.after(e, cx);
-        e
+        self.post(WireEvent::new(EV_CLOSE, 0), cx.now_ms);
+        false
     }
 }
 
-impl ProcApp {
-    /// Nombre del programa (de su `app.txt`), aunque el título cambie.
-    pub fn name(&self) -> &str {
-        &self.name
+impl Drop for ProcApp {
+    fn drop(&mut self) {
+        self.proc.kill();
     }
 }
 
@@ -542,87 +682,208 @@ pub(crate) mod tests {
         assert_eq!(st.brk, HEAP_BASE + PAGE, "los fallos no mueven el final");
     }
 
-    /// Programa simulado: guarda los eventos que recibe y reacciona como le digan.
+    /// Programa simulado: el estado compartido sin nada que lo ejecute; la prueba hace de programa.
     struct Fake {
-        seen: alloc::rc::Rc<core::cell::RefCell<Vec<WireEvent>>>,
-        mem: FakeMem,
+        st: alloc::rc::Rc<core::cell::RefCell<SysState>>,
+        killed: alloc::rc::Rc<core::cell::Cell<bool>>,
     }
 
     impl Process for Fake {
-        fn run(&mut self, ev: &WireEvent, st: &mut SysState) -> RunEnd {
-            self.seen.borrow_mut().push(*ev);
-            match ev.kind {
-                EV_RESIZE => {
-                    let w = ev.a.min(4) as u64;
-                    let px = vec![0x11u8; (w * 4) as usize];
-                    self.mem.write(D, &px);
-                    assert_eq!(dispatch(SYS_PRESENT, [D, w, 1, w, 0], &mut self.mem, st), Sys::Ret(0));
-                    RunEnd::Waiting { deadline: None }
-                }
-                EV_KEY => {
-                    self.mem.write(D, b"Nuevo");
-                    dispatch(SYS_SET_TITLE, [D, 5, 0, 0, 0], &mut self.mem, st);
-                    dispatch(SYS_SET_TIMER, [50, 0, 0, 0, 0], &mut self.mem, st);
-                    RunEnd::Waiting { deadline: None }
-                }
-                EV_MOUSE_DOWN => RunEnd::Killed(Kill::Fault(String::from("fallo de página"))),
-                EV_CLOSE => RunEnd::Exited(0),
-                _ => RunEnd::Waiting { deadline: None },
+        fn id(&self) -> u64 {
+            1
+        }
+        fn state(&mut self) -> &mut SysState {
+            // Solo en pruebas: la prueba y la ventana se turnan, nunca a la vez.
+            unsafe { &mut *self.st.as_ptr() }
+        }
+        fn kill(&mut self) {
+            self.killed.set(true);
+            let mut st = self.st.borrow_mut();
+            if st.status == Status::Alive {
+                st.status = Status::Killed(Kill::Ended);
             }
+        }
+        fn mem(&self) -> u64 {
+            0
+        }
+        fn cpu_ms(&self) -> u64 {
+            0
         }
     }
 
-    fn fake() -> (ProcApp, alloc::rc::Rc<core::cell::RefCell<Vec<WireEvent>>>) {
-        let seen = alloc::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
-        let p = Fake { seen: seen.clone(), mem: mem() };
-        (ProcApp::new(Box::new(p), 0, "Prueba", None), seen)
+    type Shared = alloc::rc::Rc<core::cell::RefCell<SysState>>;
+
+    fn fake() -> (ProcApp, Shared, alloc::rc::Rc<core::cell::Cell<bool>>) {
+        let st: Shared = Default::default();
+        let killed = alloc::rc::Rc::new(core::cell::Cell::new(false));
+        let p = Fake { st: st.clone(), killed: killed.clone() };
+        (ProcApp::new(Box::new(p), "Prueba", None), st, killed)
+    }
+
+    fn kinds(st: &Shared) -> Vec<u32> {
+        st.borrow().queue.iter().map(|e| e.kind).collect()
+    }
+
+    #[test]
+    fn cola_de_eventos() {
+        let mut st = SysState::default();
+        for i in 0..3 {
+            st.post(WireEvent { kind: EV_MOUSE_MOVE, a: i, now_ms: 10, ..Default::default() });
+        }
+        assert_eq!(st.queue.len(), 1, "los movimientos seguidos se juntan");
+        assert_eq!(st.queue[0].a, 2);
+        st.post(WireEvent { kind: EV_KEY, now_ms: 20, ..Default::default() });
+        assert!(!st.not_responding(10 + HUNG_MS - 1));
+        assert!(st.not_responding(10 + HUNG_MS), "el evento más viejo lleva 5 s sin recoger");
+        assert_eq!(st.next_event(30, None).unwrap().kind, EV_MOUSE_MOVE);
+        assert_eq!(st.next_event(30, None).unwrap().kind, EV_KEY);
+        assert!(!st.not_responding(1 << 40), "cola vacía: responde");
+        // Temporizador y plazo de la espera.
+        st.timer_at = Some(100);
+        assert_eq!(st.next_event(99, Some(200)), None);
+        assert_eq!(st.next_event(100, Some(200)).unwrap().kind, EV_TIMER);
+        assert_eq!(st.timer_at, None);
+        assert_eq!(st.next_event(150, Some(200)), None);
+        assert_eq!(st.next_event(200, Some(200)).unwrap().kind, EV_NONE);
+        assert_eq!(st.wake_at(Some(500)), Some(500));
+        st.timer_at = Some(300);
+        assert_eq!(st.wake_at(Some(500)), Some(300));
+        // Cola llena: lo nuevo se descarta, sin crecer.
+        for _ in 0..QUEUE_MAX + 10 {
+            st.post(WireEvent { kind: EV_KEY, ..Default::default() });
+        }
+        assert_eq!(st.queue.len(), QUEUE_MAX);
+    }
+
+    #[test]
+    fn guardar_como_con_dialogo() {
+        let mut m = mem();
+        let mut st = SysState::default();
+        m.write(D, b"hola");
+        m.write(D + 100, b"dibujo.bmp");
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, 4, D + 100, 10, 0], &mut m, &mut st), Sys::Ret(0));
+        assert_eq!(st.out.save, Some((String::from("dibujo.bmp"), b"hola".to_vec())));
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, 4, D + 100, 3, 0], &mut m, &mut st), Sys::Ret(E_BUSY), "uno a la vez");
+        st.out.save = None;
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, 4, D + 100, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL), "sin nombre");
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, 4, D + 100, 4, 0], &mut m, &mut st), Sys::Ret(0));
+        st.out.save = None;
+        m.write(D + 100, b"a\\b");
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, 4, D + 100, 3, 0], &mut m, &mut st), Sys::Ret(E_INVAL), "el nombre no es una ruta");
+        assert_eq!(dispatch(SYS_SAVE_AS, [D, SAVE_MAX + 1, D + 100, 4, 0], &mut m, &mut st), Sys::Ret(E_INVAL));
+        m.write(D + 100, b"abcd");
+        assert_eq!(dispatch(SYS_SAVE_AS, [D + 0x4FF0, 0x100, D + 100, 4, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+
+        // La ventana enseña el diálogo y escribe con los permisos de la sesión.
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        sh.borrow_mut().out.save = Some((String::from("dibujo.bmp"), b"BM..".to_vec()));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 5);
+        app.tick(&mut cx);
+        let Some(DialogRequest::Save { dir, name, .. }) = cx.dialog.take() else { panic!("sin diálogo") };
+        assert!(dir.ends_with("Imágenes") && name == "dibujo.bmp");
+        let p = format!("{dir}\\dibujo.bmp");
+        app.dialog_result(DialogResult::Path { tag: T_SAVE, path: Some(p.clone()) }, &mut cx);
+        drop(cx);
+        assert_eq!(sys.files.read(&p).unwrap(), b"BM..");
+        assert_eq!(sh.borrow().queue.back().map(|e| (e.kind, e.a)), Some((EV_SAVED, 1)));
+        // Cancelar: el programa recibe 0. Sin permiso: -1 y un mensaje.
+        let mut cx = Ctx::new(&mut sys, &mut theme, 6);
+        app.dialog_result(DialogResult::Path { tag: T_SAVE, path: None }, &mut cx);
+        assert_eq!(sh.borrow().queue.back().map(|e| e.a), Some(0));
+        app.dialog_result(DialogResult::Path { tag: T_SAVE, path: Some(String::from("C:\\Usuarios\\x.bmp")) }, &mut cx);
+        assert_eq!(sh.borrow().queue.back().map(|e| e.a), Some(-1));
+        assert!(cx.dialog.is_some());
     }
 
     #[test]
     fn ventana_de_programa() {
-        let (mut app, seen) = fake();
+        let (mut app, sh, killed) = fake();
         let mut sys = TestPlatform::default();
         let mut theme = Theme::default();
         let mut s = Surface::new(10, 5, 0);
         app.draw(&mut s, &theme, &mut sys, true);
-        let kinds: Vec<u32> = seen.borrow().iter().map(|e| e.kind).collect();
-        assert_eq!(kinds, [EV_THEME, EV_RESIZE, EV_FOCUS]);
-        assert_eq!(seen.borrow()[1].a, 10);
-        assert_eq!(&s.px[..5], &[0x111111, 0x111111, 0x111111, 0x111111, 0xFFFFFF], "imagen del programa y fondo");
-        // Mismo tamaño y foco: no se reenvía nada.
+        assert_eq!(kinds(&sh), [EV_THEME, EV_RESIZE, EV_FOCUS]);
         app.draw(&mut s, &theme, &mut sys, true);
-        assert_eq!(seen.borrow().len(), 3);
-        // Tecla: cambia el título y pide temporizador.
-        let k = KeyEvent { key: crate::input::Key::Char('a'), ch: Some('a'), down: true, shift: false, ctrl: false, alt: false };
-        let mut cx = Ctx::new(&mut sys, &mut theme, 0);
-        app.key(&k, &mut cx);
+        assert_eq!(sh.borrow().queue.len(), 3, "sin cambios no se reenvía nada");
+        // El "programa" recoge los eventos y presenta una imagen y un título.
+        sh.borrow_mut().queue.clear();
+        sh.borrow_mut().out.frame = Some(Surface::new(4, 1, 0x111111));
+        sh.borrow_mut().out.title = Some(String::from("Nuevo"));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 10);
+        app.tick(&mut cx);
         assert!(cx.redraw && !cx.close);
         assert_eq!(app.title(), "Nuevo");
         drop(cx);
-        sys.ms = 10;
-        let mut cx = Ctx::new(&mut sys, &mut theme, 10);
+        app.draw(&mut s, &theme, &mut sys, true);
+        assert_eq!(&s.px[..5], &[0x111111, 0x111111, 0x111111, 0x111111, 0xFFFFFF]);
+        // Teclas y ratón van a la cola.
+        let k = KeyEvent { key: crate::input::Key::Char('a'), ch: Some('a'), down: true, shift: false, ctrl: false, alt: false };
+        let mut cx = Ctx::new(&mut sys, &mut theme, 20);
+        app.key(&k, &mut cx);
+        app.mouse(MouseEv::Down { x: 1, y: 2 }, &mut cx);
+        assert_eq!(kinds(&sh), [EV_KEY, EV_MOUSE_DOWN]);
+        assert_eq!(sh.borrow().queue[0].now_ms, 20);
+        // Cerrar: se le pide al programa; cuando sale, se cierra la ventana.
+        assert!(!app.request_close(&mut cx));
+        assert_eq!(sh.borrow().queue.back().unwrap().kind, EV_CLOSE);
+        sh.borrow_mut().status = Status::Exited(0);
         app.tick(&mut cx);
-        assert_eq!(seen.borrow().len(), 4, "aún no toca el temporizador");
+        assert!(cx.close);
         drop(cx);
-        sys.ms = 60;
-        let mut cx = Ctx::new(&mut sys, &mut theme, 60);
-        app.tick(&mut cx);
-        assert_eq!(seen.borrow().last().unwrap().kind, EV_TIMER);
-        // Cerrar: el programa sale por sí mismo.
-        assert!(app.request_close(&mut cx), "ha salido al pedírselo: se cierra ya");
-        assert_eq!(app.ended(), Some(&RunEnd::Exited(0)));
+        drop(app);
+        assert!(killed.get(), "al cerrar la ventana se suelta el programa");
     }
 
     #[test]
-    fn programa_que_falla_cierra_su_ventana() {
-        let (mut app, _) = fake();
+    fn no_responde_y_finalizar() {
+        let (mut app, _, killed) = fake();
         let mut sys = TestPlatform::default();
         let mut theme = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut theme, 0);
-        app.mouse(MouseEv::Down { x: 1, y: 1 }, &mut cx);
+        app.key(&KeyEvent { key: crate::input::Key::Enter, ch: None, down: true, shift: false, ctrl: false, alt: false }, &mut cx);
+        drop(cx);
+        let mut cx = Ctx::new(&mut sys, &mut theme, HUNG_MS + 1);
+        app.tick(&mut cx);
+        assert_eq!(app.title(), "Prueba (No responde)");
+        assert!(!app.request_close(&mut cx));
+        assert!(matches!(cx.dialog.take(), Some(DialogRequest::Message { tag: T_HUNG, .. })));
+        app.dialog_result(DialogResult::Answer { tag: T_HUNG, answer: Answer::Yes }, &mut cx);
+        assert!(cx.close && killed.get());
+        // Vuelve a recoger eventos: deja de estar marcado.
+        let (mut app, sh, _) = fake();
+        let mut cx = Ctx::new(&mut sys, &mut theme, 0);
+        app.mouse(MouseEv::Down { x: 0, y: 0 }, &mut cx);
+        drop(cx);
+        let mut cx = Ctx::new(&mut sys, &mut theme, HUNG_MS + 1);
+        app.tick(&mut cx);
+        assert!(app.title().ends_with("(No responde)"));
+        sh.borrow_mut().next_event(HUNG_MS + 2, None);
+        app.tick(&mut cx);
+        assert_eq!(app.title(), "Prueba");
+    }
+
+    #[test]
+    fn programa_que_falla_avisa() {
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        sh.borrow_mut().status = Status::Killed(Kill::Fault(String::from("fallo de página en 0x0")));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 0);
+        app.tick(&mut cx);
+        assert!(!cx.close, "la ventana espera a que se lea el aviso");
+        let Some(DialogRequest::Message { tag, text, .. }) = cx.dialog.take() else { panic!() };
+        assert!(tag == T_CRASH && text.contains("dejó de funcionar") && text.contains("fallo de página"));
+        app.tick(&mut cx);
+        assert!(cx.dialog.is_none(), "un solo aviso");
+        app.dialog_result(DialogResult::Answer { tag: T_CRASH, answer: Answer::Ok }, &mut cx);
         assert!(cx.close);
-        assert!(matches!(app.ended(), Some(RunEnd::Killed(Kill::Fault(_)))));
-        // Ya no se le entrega nada más y cerrar no espera.
-        assert!(app.request_close(&mut cx));
+        // Finalizado desde el Administrador de tareas: se cierra sin aviso.
+        let (mut app, sh, _) = fake();
+        sh.borrow_mut().status = Status::Killed(Kill::Ended);
+        let mut cx = Ctx::new(&mut sys, &mut theme, 0);
+        app.tick(&mut cx);
+        assert!(cx.close && cx.dialog.is_none());
     }
 }

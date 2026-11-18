@@ -1,0 +1,6 @@
+nombre=Reloj
+version=1.0
+autor=NightFury
+icono=app
+ancho=420
+alto=360
