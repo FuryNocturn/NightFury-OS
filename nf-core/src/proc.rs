@@ -18,6 +18,7 @@ use crate::icons::Icon;
 use crate::input::KeyEvent;
 use crate::platform::{DateTime, Platform};
 use crate::request::Request;
+use crate::service::serve;
 use crate::surface::{blend, Surface};
 use crate::theme::Theme;
 use crate::wire::{decode, encode};
@@ -97,6 +98,9 @@ pub const REQUESTS_MAX: usize = 64;
 /// Los programas pueden pedir diálogos con cualquier etiqueta salvo las que tienen este bit: el
 /// escritorio lo usa para distinguir los diálogos del programa de los suyos.
 const TAG_PROGRAMA: u32 = 1 << 31;
+/// Una petición `SERVICE` espera respuesta: tiempo que `ProcApp::tick` dedica como máximo a atender
+/// peticiones seguidas antes de devolver el turno al escritorio.
+const SERVICE_SLICE_MS: u64 = 8;
 
 /// Estado de un programa que necesitan las llamadas.
 #[derive(Default)]
@@ -117,6 +121,10 @@ pub struct SysState {
     /// Datos del último evento entregado (`EVENT_DATA`).
     pub event_data: Vec<u8>,
     pub status: Status,
+    /// `SERVICE` sin atender (el programa está parado esperando) y la respuesta que el escritorio
+    /// deja para despertarlo; `TAKE_REPLY` la recoge.
+    pub service: Option<Vec<u8>>,
+    pub reply: Option<Vec<u8>>,
 }
 
 /// ¿Este evento lleva datos (su `d` es la longitud)?
@@ -196,6 +204,9 @@ pub enum Sys {
     /// usa `SysState::next_event` (plazo = `now + timeout_ms` salvo `u64::MAX`); escribe ahí el
     /// evento y vuelve con `rax = 0`, o duerme al programa hasta tener uno.
     Wait { ptr: u64, timeout_ms: u64 },
+    /// `SERVICE`: la petición ya está en `SysState::service`. El núcleo duerme al programa hasta que
+    /// haya `SysState::reply` y vuelve con `rax` = su longitud.
+    WaitReply,
     Exit(i32),
 }
 
@@ -239,6 +250,11 @@ pub fn dispatch(nr: u64, args: [u64; 5], mem: &mut dyn UserMem, st: &mut SysStat
                 E_FAULT
             }
         }
+        SYS_SERVICE => match service(mem, st, a0, a1) {
+            Ok(()) => return Sys::WaitReply,
+            Err(e) => e,
+        },
+        SYS_TAKE_REPLY => take_reply(mem, st, a0, a1),
         SYS_MEM_GROW => mem_grow(mem, st, a0),
         SYS_UPTIME => st.now_ms as i64,
         SYS_DATETIME => {
@@ -373,6 +389,39 @@ fn tag_resultado(r: &mut DialogResult) -> &mut u32 {
     }
 }
 
+fn service(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, len: u64) -> Result<(), i64> {
+    if st.service.is_some() {
+        return Err(E_BUSY);
+    }
+    if len > SERVICE_MAX {
+        return Err(E_INVAL);
+    }
+    // Validado antes de reservar en el núcleo.
+    if !mem.check(ptr, len, false) {
+        return Err(E_FAULT);
+    }
+    let mut req = vec![0u8; len as usize];
+    if !mem.read(ptr, &mut req) {
+        return Err(E_FAULT);
+    }
+    st.reply = None;
+    st.service = Some(req);
+    Ok(())
+}
+
+fn take_reply(mem: &mut dyn UserMem, st: &mut SysState, ptr: u64, cap: u64) -> i64 {
+    let Some(r) = &st.reply else { return E_INVAL };
+    let len = r.len() as u64;
+    if len > cap {
+        return E_INVAL;
+    }
+    if !mem.check(ptr, len, true) || !mem.write(ptr, r) {
+        return E_FAULT;
+    }
+    st.reply = None;
+    len as i64
+}
+
 fn mem_grow(mem: &mut dyn UserMem, st: &mut SysState, bytes: u64) -> i64 {
     let old = st.brk;
     if bytes == 0 {
@@ -469,6 +518,9 @@ pub struct ProcApp {
     over_ans: Option<bool>,
     src_ans: Option<Option<Vec<String>>>,
     last_over: bool,
+    /// Es uno de los programas que trae el sistema (`Platform::is_system_binary`): solo ellos
+    /// pueden usar las llamadas de cuentas, claves, cifrado, reiniciar y apagar de `SERVICE`.
+    system: bool,
 }
 
 /// Cuánto espera `drag_over`/`drag_source` la respuesta del programa, y cuántas veces como mucho
@@ -477,7 +529,7 @@ const DRAG_WAIT_MS: u64 = 5;
 const DRAG_SPINS: u32 = 100_000;
 
 impl ProcApp {
-    pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>) -> Self {
+    pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>, system: bool) -> Self {
         ProcApp {
             proc,
             name: String::from(name),
@@ -497,6 +549,7 @@ impl ProcApp {
             over_ans: None,
             src_ans: None,
             last_over: false,
+            system,
         }
     }
 
@@ -586,6 +639,24 @@ impl ProcApp {
             }
         }
         false
+    }
+
+    /// Atiende las peticiones `SERVICE` del programa: contesta, deja correr a los programas para que
+    /// se despierte y repite si pide otra, hasta `SERVICE_SLICE_MS` (el resto, en el siguiente tick).
+    fn serve(&mut self, cx: &mut Ctx) {
+        let t0 = cx.sys.uptime_ms();
+        while self.proc.state().status == Status::Alive {
+            let Some(req) = self.proc.state().service.take() else { break };
+            let mut r = serve(cx.sys, &req, self.system);
+            if r.len() as u64 > SERVICE_MAX {
+                r = vec![1];
+            }
+            self.proc.state().reply = Some(r);
+            cx.sys.run_programs();
+            if cx.sys.uptime_ms().saturating_sub(t0) >= SERVICE_SLICE_MS {
+                break;
+            }
+        }
     }
 
     /// Recoge lo que el programa ha pedido y mira si sigue vivo y respondiendo.
@@ -693,6 +764,7 @@ impl App for ProcApp {
         }
     }
     fn tick(&mut self, cx: &mut Ctx) {
+        self.serve(cx);
         self.poll(cx);
     }
     fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
@@ -948,10 +1020,143 @@ pub(crate) mod tests {
     type Shared = alloc::rc::Rc<core::cell::RefCell<SysState>>;
 
     fn fake() -> (ProcApp, Shared, alloc::rc::Rc<core::cell::Cell<bool>>) {
+        fake_con(false)
+    }
+
+    fn fake_con(system: bool) -> (ProcApp, Shared, alloc::rc::Rc<core::cell::Cell<bool>>) {
         let st: Shared = Default::default();
         let killed = alloc::rc::Rc::new(core::cell::Cell::new(false));
         let p = Fake { st: st.clone(), killed: killed.clone() };
-        (ProcApp::new(Box::new(p), "Prueba", None), st, killed)
+        (ProcApp::new(Box::new(p), "Prueba", None, system), st, killed)
+    }
+
+    /// `TestPlatform` donde cada vez que se deja correr a los programas pasan 5 ms y el programa
+    /// pide otra cosa (mientras le queden `pide`).
+    struct Corre {
+        inner: TestPlatform,
+        sh: Shared,
+        pide: u32,
+        corridas: u32,
+    }
+
+    impl Platform for Corre {
+        fn now(&mut self) -> DateTime {
+            self.inner.now()
+        }
+        fn uptime_ms(&self) -> u64 {
+            self.inner.ms
+        }
+        fn mem(&self) -> crate::platform::MemInfo {
+            self.inner.mem()
+        }
+        fn cpu(&self) -> String {
+            self.inner.cpu()
+        }
+        fn screen(&self) -> (u32, u32) {
+            self.inner.screen()
+        }
+        fn reboot(&mut self) {
+            self.inner.reboot()
+        }
+        fn shutdown(&mut self) {
+            self.inner.shutdown()
+        }
+        fn files(&mut self) -> &mut files::Files {
+            self.inner.files()
+        }
+        fn entropy(&mut self) -> u64 {
+            self.inner.entropy()
+        }
+        fn pool(&mut self) -> &mut crate::keys::Pool {
+            self.inner.pool()
+        }
+        fn run_programs(&mut self) {
+            self.corridas += 1;
+            self.inner.ms += 5;
+            if self.pide > 0 {
+                self.pide -= 1;
+                let mut st = self.sh.borrow_mut();
+                st.reply = None;
+                st.service = Some(crate::wire::encode(&crate::service::Call::Cpu));
+            }
+        }
+    }
+
+    #[test]
+    fn service_valida_y_espera_respuesta() {
+        let mut m = mem();
+        let mut st = SysState::default();
+        let req = crate::wire::encode(&crate::service::Call::Cpu);
+        m.write(D, &req);
+        let n = req.len() as u64;
+        assert_eq!(dispatch(SYS_SERVICE, [D, n, 0, 0, 0], &mut m, &mut st), Sys::WaitReply);
+        assert_eq!(st.service.as_deref(), Some(&req[..]));
+        assert_eq!(dispatch(SYS_SERVICE, [D, n, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_BUSY), "una a la vez");
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [D, 64, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL), "aún sin respuesta");
+        st.service = None;
+        assert_eq!(dispatch(SYS_SERVICE, [D, SERVICE_MAX + 1, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL));
+        assert_eq!(dispatch(SYS_SERVICE, [0x1000, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert_eq!(dispatch(SYS_SERVICE, [D + 0x4FF0, 0x100, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert!(st.service.is_none(), "lo rechazado no queda pendiente");
+        // TAKE_REPLY: poco sitio y memoria de solo lectura no la gastan; bien, la recoge.
+        st.reply = Some(vec![0, 1, 2, 3]);
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [D, 3, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL));
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [D + 0x4000, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [0x1000, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_FAULT));
+        assert!(st.reply.is_some());
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [D + 8, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(4));
+        let mut got = [0u8; 4];
+        m.read(D + 8, &mut got);
+        assert_eq!(got, [0, 1, 2, 3]);
+        assert!(st.reply.is_none());
+        assert_eq!(dispatch(SYS_TAKE_REPLY, [D, 4, 0, 0, 0], &mut m, &mut st), Sys::Ret(E_INVAL), "ya recogida");
+    }
+
+    #[test]
+    fn la_ventana_atiende_el_servicio() {
+        use crate::service::Call;
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        sh.borrow_mut().service = Some(crate::wire::encode(&Call::Cpu));
+        app.tick(&mut Ctx::new(&mut sys, &mut theme, 5));
+        let mut esperada = vec![0];
+        esperada.extend(crate::wire::encode(&String::from("CPU de pruebas")));
+        assert_eq!(sh.borrow().reply, Some(esperada));
+        assert!(sh.borrow().service.is_none());
+        // Una petición rota recibe el error de siempre; no entra en pánico.
+        sh.borrow_mut().service = Some(vec![250]);
+        app.tick(&mut Ctx::new(&mut sys, &mut theme, 6));
+        assert_eq!(sh.borrow().reply, Some(vec![1]));
+        // Reiniciar solo para los programas del sistema (marcados al abrirlos, no por el programa).
+        let (mut ajeno, sh, _) = fake_con(false);
+        sh.borrow_mut().service = Some(crate::wire::encode(&Call::Reboot));
+        ajeno.tick(&mut Ctx::new(&mut sys, &mut theme, 7));
+        assert!(!sys.rebooted);
+        let (mut propio, sh, _) = fake_con(true);
+        sh.borrow_mut().service = Some(crate::wire::encode(&Call::Reboot));
+        propio.tick(&mut Ctx::new(&mut sys, &mut theme, 8));
+        assert!(sys.rebooted);
+        assert_eq!(sh.borrow().reply, Some(vec![0]));
+    }
+
+    #[test]
+    fn el_servicio_repite_con_tope_de_tiempo() {
+        use crate::service::Call;
+        let (mut app, sh, _) = fake();
+        let mut theme = Theme::default();
+        // El programa pide una vez más: se atienden las dos seguidas, y al final no queda nada.
+        let mut sys = Corre { inner: TestPlatform::default(), sh: sh.clone(), pide: 1, corridas: 0 };
+        sh.borrow_mut().service = Some(crate::wire::encode(&Call::Cpu));
+        app.tick(&mut Ctx::new(&mut sys, &mut theme, 5));
+        assert_eq!(sys.corridas, 2);
+        assert!(sh.borrow().service.is_none() && sh.borrow().reply.is_some());
+        // Si no para de pedir, se corta a los 8 ms (2 vueltas de 5 ms) y lo demás espera al siguiente tick.
+        let mut sys = Corre { inner: TestPlatform::default(), sh: sh.clone(), pide: 1000, corridas: 0 };
+        sh.borrow_mut().service = Some(crate::wire::encode(&Call::Cpu));
+        app.tick(&mut Ctx::new(&mut sys, &mut theme, 6));
+        assert_eq!(sys.corridas, 2);
+        assert!(sh.borrow().service.is_some(), "pendiente para el siguiente tick");
     }
 
     fn kinds(st: &Shared) -> Vec<u32> {

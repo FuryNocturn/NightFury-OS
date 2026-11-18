@@ -4,8 +4,10 @@
 //! redibujar. No toca hardware: todo lo del núcleo entra por `Llamadas` (la real está en `rt`, la
 //! falsa en las pruebas).
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nf_core::abi::*;
 use nf_core::apps::{App, Ctx};
@@ -14,8 +16,11 @@ use nf_core::request::Request;
 use nf_core::wire::{decode, encode};
 use nf_core::dialogs::{Answer, DialogResult};
 use nf_core::files::{self, Files};
+use nf_core::fsapi::FilesApi;
 use nf_core::keys::Pool;
 use nf_core::platform::{DateTime, MemInfo, Platform};
+use nf_core::service::{Call, RemoteFiles, Transport};
+use nf_core::wire::Wire;
 use nf_core::surface::Surface;
 use nf_core::sync::SpinLock;
 use nf_core::theme::Theme;
@@ -76,6 +81,9 @@ pub trait Llamadas {
     fn log(&mut self, t: &str);
     /// `SAVE_AS`: `>= 0` pedido (la respuesta llega como `EV_SAVED`), `< 0` rechazado.
     fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64;
+    /// `SERVICE` + `TAKE_REPLY`: manda la petición y devuelve la respuesta (vacía si el núcleo la
+    /// rechaza). El programa se para hasta que el escritorio contesta.
+    fn servicio(&mut self, peticion: &[u8]) -> Vec<u8>;
     /// `REQUEST`: petición ya codificada con `wire`; `< 0` rechazada.
     fn peticion(&mut self, msg: &[u8]) -> i64;
     /// `EVENT_DATA`: los `len` bytes de datos del último evento (vacío si falla).
@@ -106,17 +114,71 @@ fn enviar(c: &mut impl Llamadas, v: Vec<Request>) {
     }
 }
 
-/// `Platform` de un programa. El reloj y la fecha los refresca el bucle en cada evento.
-/// shortcut: los programas ven una unidad C: en memoria vacía (no el disco), hasta la v0.10.
-struct PlataformaPrograma {
+/// Las `Llamadas` compartidas entre el bucle y la plataforma del programa (que las necesita para
+/// pedir al sistema archivos y datos del equipo). Un solo hilo: el `RefCell` nunca se pide dos veces.
+#[derive(Clone)]
+struct Red<'a>(Rc<RefCell<&'a mut dyn Llamadas>>);
+
+impl Llamadas for Red<'_> {
+    fn esperar(&mut self, timeout_ms: u64) -> WireEvent {
+        self.0.borrow_mut().esperar(timeout_ms)
+    }
+    fn presentar(&mut self, px: &[u32], w: i32, h: i32) {
+        self.0.borrow_mut().presentar(px, w, h)
+    }
+    fn titulo(&mut self, t: &str) {
+        self.0.borrow_mut().titulo(t)
+    }
+    fn tam_min(&mut self, w: i32, h: i32) {
+        self.0.borrow_mut().tam_min(w, h)
+    }
+    fn fecha(&mut self) -> DateTime {
+        self.0.borrow_mut().fecha()
+    }
+    fn log(&mut self, t: &str) {
+        self.0.borrow_mut().log(t)
+    }
+    fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64 {
+        self.0.borrow_mut().guardar(nombre, datos)
+    }
+    fn servicio(&mut self, peticion: &[u8]) -> Vec<u8> {
+        self.0.borrow_mut().servicio(peticion)
+    }
+    fn peticion(&mut self, msg: &[u8]) -> i64 {
+        self.0.borrow_mut().peticion(msg)
+    }
+    fn datos_evento(&mut self, len: usize) -> Vec<u8> {
+        self.0.borrow_mut().datos_evento(len)
+    }
+}
+
+impl Transport for Red<'_> {
+    fn call(&mut self, req: &[u8]) -> Vec<u8> {
+        self.servicio(req)
+    }
+}
+
+/// `Platform` de un programa. El reloj y la fecha los refresca el bucle en cada evento. Los
+/// archivos (`fs`) y los datos del equipo se piden al sistema por `SERVICE`; si no contesta, valen
+/// los valores neutros de `RemoteFiles::ask`.
+struct PlataformaPrograma<'a> {
     ms: u64,
     fecha: DateTime,
+    /// Solo para `Platform::files`, que un programa no tiene: una unidad C: vacía en memoria.
     files: Files,
+    fs: RemoteFiles<Red<'a>>,
+    net: Red<'a>,
     pool: Pool,
     semilla: u64,
 }
 
-impl Platform for PlataformaPrograma {
+impl PlataformaPrograma<'_> {
+    fn pedir<R: Wire>(&self, c: Call, malo: R) -> R {
+        RemoteFiles(self.net.clone()).ask(c, malo)
+    }
+}
+
+impl Platform for PlataformaPrograma<'_> {
     fn now(&mut self) -> DateTime {
         self.fecha
     }
@@ -124,28 +186,36 @@ impl Platform for PlataformaPrograma {
         self.ms
     }
     fn mem(&self) -> MemInfo {
-        MemInfo { total: MAX_MEM, heap_total: MAX_MEM, heap_used: 0 }
+        self.pedir(Call::Mem, MemInfo { total: MAX_MEM, heap_total: MAX_MEM, heap_used: 0 })
     }
     fn cpu(&self) -> String {
-        String::from("Procesador x86-64")
+        self.pedir(Call::Cpu, String::from("Procesador x86-64"))
     }
     fn screen(&self) -> (u32, u32) {
-        (1280, 720)
+        self.pedir(Call::Screen, (1280, 720))
     }
-    // Un programa no puede apagar ni reiniciar el equipo.
-    fn reboot(&mut self) {}
-    fn shutdown(&mut self) {}
+    // Reiniciar y apagar los hace el sistema, y solo si el programa es de los suyos.
+    fn reboot(&mut self) {
+        self.pedir(Call::Reboot, ())
+    }
+    fn shutdown(&mut self) {
+        self.pedir(Call::Shutdown, ())
+    }
     fn files(&mut self) -> &mut Files {
         &mut self.files
     }
-    /// shortcut: xorshift sobre el reloj; vale para sales y azar de juegos, no para llaves.
+    fn fs(&mut self) -> &mut dyn FilesApi {
+        &mut self.fs
+    }
+    /// La entropía la da el sistema; si no contesta, xorshift sobre el reloj.
+    // shortcut: el respaldo local no es criptográfico (vale para azar de juegos, no para llaves); basta mientras `SERVICE` no falle.
     fn entropy(&mut self) -> u64 {
         let mut x = self.semilla ^ self.ms.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.semilla = x;
-        x
+        self.pedir(Call::Entropy, x)
     }
     fn pool(&mut self) -> &mut Pool {
         &mut self.pool
@@ -153,9 +223,9 @@ impl Platform for PlataformaPrograma {
 }
 
 /// Estado del bucle entre eventos.
-struct Bucle {
+struct Bucle<'a> {
     app: Box<dyn App>,
-    plat: PlataformaPrograma,
+    plat: PlataformaPrograma<'a>,
     theme: Theme,
     size: (i32, i32),
     focused: bool,
@@ -170,7 +240,7 @@ struct Bucle {
     guardando: Option<String>,
 }
 
-impl Bucle {
+impl Bucle<'_> {
     fn timeout(&self) -> u64 {
         self.next_tick.map_or(u64::MAX, |t| t.saturating_sub(self.now))
     }
@@ -313,9 +383,19 @@ impl Bucle {
 /// Ejecuta el programa hasta que termine; devuelve el código de salida (el llamador hace `EXIT`).
 /// `tick_ms`: cada cuánto llamar a `App::tick` (`None` = nunca, el programa duerme entre eventos).
 pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) -> i32 {
+    let c: &mut dyn Llamadas = c;
+    let mut red = Red(Rc::new(RefCell::new(c)));
     let mut b = Bucle {
         app,
-        plat: PlataformaPrograma { ms: 0, fecha: DateTime::default(), files: Files::default(), pool: Pool::new(), semilla: 0x2545_F491_4F6C_DD1D },
+        plat: PlataformaPrograma {
+            ms: 0,
+            fecha: DateTime::default(),
+            files: Files::default(),
+            fs: RemoteFiles(red.clone()),
+            net: red.clone(),
+            pool: Pool::new(),
+            semilla: 0x2545_F491_4F6C_DD1D,
+        },
         theme: Theme::default(),
         size: (0, 0),
         focused: false,
@@ -328,11 +408,11 @@ pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) 
         now: 0,
         guardando: None,
     };
-    b.avisar(c);
+    b.avisar(&mut red);
     loop {
         let t = b.timeout();
-        let ev = c.esperar(t);
-        if let Some(code) = b.evento(c, &ev) {
+        let ev = red.esperar(t);
+        if let Some(code) = b.evento(&mut red, &ev) {
             return code;
         }
     }
@@ -364,6 +444,9 @@ mod tests {
         pedidos: Vec<Request>,
         /// Datos de los eventos con datos, en el orden en que se piden.
         datos: Vec<Vec<u8>>,
+        /// Peticiones de `SERVICE` recibidas y lo que se contesta a todas.
+        servicios: Vec<Vec<u8>>,
+        respuesta: Vec<u8>,
     }
     impl Llamadas for Falso {
         fn esperar(&mut self, t: u64) -> WireEvent {
@@ -406,6 +489,10 @@ mod tests {
             let d = self.datos.remove(0);
             assert_eq!(d.len(), len);
             d
+        }
+        fn servicio(&mut self, peticion: &[u8]) -> Vec<u8> {
+            self.servicios.push(peticion.into());
+            self.respuesta.clone()
         }
     }
 
@@ -703,5 +790,48 @@ mod tests {
         // Lo pedido y no enviado (la prueba no pasó por el bucle) se limpia para no dejar rastro.
         PENDIENTE.lock().take();
         EN_CURSO.store(false, Ordering::Release);
+    }
+
+    /// App que, con cada tecla, pide al sistema un archivo y datos del equipo, y lo apunta.
+    struct PideApp(Rc<RefCell<Vec<(bool, (u32, u32))>>>);
+    impl App for PideApp {
+        fn kind(&self) -> AppKind {
+            AppKind::Program
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn min_size(&self) -> (i32, i32) {
+            (1, 1)
+        }
+        fn draw(&mut self, _: &mut Surface, _: &Theme, _: &mut dyn Platform, _: bool) {}
+        fn key(&mut self, _: &KeyEvent, cx: &mut Ctx) {
+            let existe = cx.sys.fs().exists(r"C:\a.txt");
+            self.0.borrow_mut().push((existe, cx.sys.screen()));
+        }
+        fn mouse(&mut self, _: MouseEv, _: &mut Ctx) {}
+        fn tick(&mut self, _: &mut Ctx) {}
+    }
+
+    #[test]
+    fn archivos_y_equipo_van_por_el_servicio() {
+        let _g = SERIE.lock();
+        let visto = Rc::new(RefCell::new(Vec::new()));
+        let tecla = WireEvent { kind: EV_KEY, a: 0, d: 'p' as u32, ..Default::default() };
+        // Con respuesta: `0` + valor. Todas las llamadas reciben los mismos bytes, que para un
+        // `bool` (1) valen y para la pantalla (8 bytes) no: ahí sale el valor neutro.
+        let mut c = Falso { cola: arranque(), respuesta: vec![0, 1], ..Default::default() };
+        c.cola.push(tecla);
+        ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
+        assert_eq!(*visto.borrow(), [(true, (1280, 720))]);
+        let pedidas: Vec<Call> = c.servicios.iter().map(|r| nf_core::wire::decode(r).unwrap()).collect();
+        assert!(matches!(&pedidas[0], Call::Exists { path } if path == r"C:\a.txt"));
+        assert!(matches!(pedidas[1], Call::Screen));
+        // Sin respuesta (el núcleo la rechaza): valores neutros, sin pánico.
+        visto.borrow_mut().clear();
+        let mut c = Falso { cola: arranque(), ..Default::default() };
+        c.cola.push(tecla);
+        ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
+        assert_eq!(*visto.borrow(), [(false, (1280, 720))]);
     }
 }

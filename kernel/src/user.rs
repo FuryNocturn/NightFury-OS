@@ -178,6 +178,8 @@ struct Proc {
     fx: Box<Fx>,
     /// Dormido en `WAIT_EVENT`: dónde escribir el evento y el plazo.
     wait: Option<(u64, Option<u64>)>,
+    /// Dormido en `SERVICE`: espera que el escritorio deje la respuesta en `st.reply`.
+    service: bool,
     /// Tics (10 ms) que el temporizador ha pillado al programa en ring 3.
     cpu_ticks: u64,
 }
@@ -316,6 +318,7 @@ impl Proc {
             ksp: 0,
             fx,
             wait: None,
+            service: false,
             cpu_ticks: 0,
         };
         let pml4 = p.mm.alloc(1).ok_or_else(sin_mem)? as *mut u64;
@@ -359,12 +362,17 @@ impl Proc {
         self.st.status == Status::Alive
     }
 
-    /// ¿Puede correr ahora? Listo = no duerme en `WAIT_EVENT`, o duerme pero ya tiene algo que recibir.
+    /// ¿Puede correr ahora? Listo = no duerme en `WAIT_EVENT` ni en `SERVICE`, o duerme pero ya
+    /// tiene algo que recibir (un evento o la respuesta).
     fn listo(&self, now: u64) -> bool {
         self.vivo()
-            && match self.wait {
-                None => true,
-                Some((_, d)) => !self.st.queue.is_empty() || self.st.wake_at(d).is_some_and(|w| now >= w),
+            && if self.service {
+                self.st.reply.is_some()
+            } else {
+                match self.wait {
+                    None => true,
+                    Some((_, d)) => !self.st.queue.is_empty() || self.st.wake_at(d).is_some_and(|w| now >= w),
+                }
             }
     }
 
@@ -505,6 +513,20 @@ fn esperar(ptr: u64, deadline: Option<u64>) -> bool {
     }
 }
 
+/// Duerme al programa actual hasta que el escritorio deje la respuesta a su `SERVICE`; devuelve su
+/// longitud (la respuesta se recoge con `TAKE_REPLY`). Sin nada en la pila que posea memoria.
+fn esperar_respuesta() -> i64 {
+    loop {
+        let p = cur();
+        if let Some(r) = &p.st.reply {
+            p.service = false;
+            return r.len() as i64;
+        }
+        p.service = true;
+        a_tarea0();
+    }
+}
+
 /// Vuelve a ring 3 con los registros de `regs` tras comprobarlos: RIP en la zona del programa,
 /// RSP canónico, RFLAGS saneado y selectores de usuario.
 unsafe fn a_usuario(regs: *mut Regs) -> ! {
@@ -545,6 +567,10 @@ extern "sysv64" fn syscall_main(regs: *mut Regs) -> ! {
                 morir(Status::Killed(Kill::Fault(String::from("el evento no cabe en su memoria"))));
             }
             unsafe { (*regs).rax = 0 };
+        }
+        Sys::WaitReply => {
+            let n = esperar_respuesta();
+            unsafe { (*regs).rax = n as u64 };
         }
     }
     unsafe { a_usuario(regs) }

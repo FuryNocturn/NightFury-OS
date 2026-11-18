@@ -134,7 +134,7 @@ pub fn lanzar(desk: &mut Desktop, plat: &mut dyn Platform) {
     };
     for (nombre, bytes) in progs {
         match plat.spawn(&bytes, nombre) {
-            Ok(p) => desk.launch_app(Box::new(ProcApp::new(p, nombre, None)), plat),
+            Ok(p) => desk.launch_app(Box::new(ProcApp::new(p, nombre, None, false)), plat),
             Err(e) => crate::serial::traza!("NF demo: {nombre}: {e}"),
         }
     }
