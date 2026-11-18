@@ -13,7 +13,7 @@ mod dev;
 mod xhci;
 
 use crate::arch::{inb, outb};
-use crate::pci;
+use crate::{paging, pci};
 use crate::serial::traza;
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::vec::Vec;
@@ -141,8 +141,8 @@ pub fn init() -> usize {
         if (b0 >> 1) & 3 == 2 {
             base |= (pci::leer(bus, dev, fun, 0x14) as u64) << 32;
         }
-        // shortcut: solo BAR por debajo de 4 GiB (es lo que mapea paging.rs), mapear más cuando haga falta.
-        if b0 & 1 != 0 || base == 0 || base + 0x10000 > 4 << 30 {
+        // Se mapea 1 MiB desde la BAR sin caché (paging.rs solo cubre la RAM y los primeros 4 GiB).
+        if b0 & 1 != 0 || base == 0 || base >= 1 << 46 || !paging::mapear_mmio(base, 0x10_0000) {
             traza!("NF usb: {:02x}:{:02x}.{} {:04x}:{:04x} BAR0 inutilizable ({:#x}), se salta", bus, dev, fun, id & 0xFFFF, id >> 16, base);
             continue;
         }
