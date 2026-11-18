@@ -1125,7 +1125,7 @@ impl Explorer {
         cx.dialog = Some(DialogRequest::Password {
             tag: TAG_DRV_PW,
             title: String::from("Desbloquear unidad"),
-            label: format!("Contraseña de {} (si la has olvidado, déjala vacía y pulsa Aceptar para usar el código de recuperación):", d.name()),
+            label: format!("Contraseña de {} (vacía: usar el código de recuperación):", d.name()),
         });
         cx.redraw = true;
     }
@@ -1921,7 +1921,7 @@ impl Explorer {
         let (tx, tw) = (body.x + 56, body.w - 64);
         clipped(s, Rect::new(tx, body.y + 6, tw, 18), &d.name(), TEXT, Align::Left);
         if d.locked {
-            clipped(s, Rect::new(tx, body.y + 28, tw, 36), "Cifrada: doble clic para desbloquearla", GRAY, Align::Left);
+            clipped(s, Rect::new(tx, body.y + 28, tw, 36), "Cifrada (bloqueada)", GRAY, Align::Left);
             return;
         }
         let bar = Rect::new(tx, body.y + 30, tw, 10);
