@@ -15,7 +15,7 @@
 //! - no hay llamada para instalar programas del sistema;
 //! - la fecha, la sal y el acumulador de aleatoriedad los pone siempre el sistema.
 use crate::accounts::{salt_from, Account, AccountError};
-use crate::files::{in_system, Files, TrashItem};
+use crate::files::{in_system, resolve, Files, TrashItem, PROGRAMS_DIR};
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
@@ -289,9 +289,19 @@ fn gate<T: Wire>(ok: bool, deny: T, f: impl FnOnce() -> T) -> Vec<u8> {
     encode(&if ok { f() } else { deny })
 }
 
-/// Ninguna de las rutas está en `C:\Sistema`.
-fn outside(paths: &[&str]) -> bool {
-    !paths.iter().any(|p| in_system(p))
+/// Ninguna de las rutas está en `C:\Sistema` (ni, para un programa de terceros, en `C:\Programas`).
+fn outside(system: bool, paths: &[&str]) -> bool {
+    !paths.iter().any(|p| blocked(system, p))
+}
+
+/// Ruta que el programa no puede cambiar: `C:\Sistema` para todos; `C:\Programas` también para
+/// los de terceros (instalar o sustituir programas es cosa de Configuración).
+pub(crate) fn blocked(system: bool, path: &str) -> bool {
+    in_system(path) || (!system && in_programs(path))
+}
+
+fn in_programs(path: &str) -> bool {
+    resolve("C:\\", path).is_ok_and(|c| c[3..].split('\\').next().is_some_and(|t| t.eq_ignore_ascii_case(&PROGRAMS_DIR[3..])))
 }
 
 fn with_pool<R>(sys: &mut dyn Platform, f: impl FnOnce(&mut Files, &mut Pool) -> R) -> R {
@@ -323,27 +333,28 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         List { dir } => encode(&sys.files().list(&dir)),
         Stat { path } => encode(&sys.files().stat(&path)),
         Exists { path } => encode(&sys.files().exists(&path)),
-        Read { path } => encode(&sys.files().read(&path).map(Blob)),
+        // Un programa de terceros no lee `C:\Sistema` (con sesión de administrador vería las cuentas).
+        Read { path } => gate(system || !in_system(&path), Err(denied), || sys.files().read(&path).map(Blob)),
         Write { path, data } => {
             let now = sys.now();
-            gate(outside(&[&path]), Err(denied), || sys.files().write(&path, &data.0, now))
+            gate(outside(system, &[&path]), Err(denied), || sys.files().write(&path, &data.0, now))
         }
         Mkdir { path } => {
             let now = sys.now();
-            gate(outside(&[&path]), Err(denied), || sys.files().mkdir(&path, now))
+            gate(outside(system, &[&path]), Err(denied), || sys.files().mkdir(&path, now))
         }
-        Rename { from, to } => gate(outside(&[&from, &to]), Err(denied), || sys.files().rename(&from, &to)),
+        Rename { from, to } => gate(outside(system, &[&from, &to]), Err(denied), || sys.files().rename(&from, &to)),
         Copy { from, to } => {
             let now = sys.now();
-            gate(outside(&[&from, &to]), Err(denied), || sys.files().copy(&from, &to, now))
+            gate(outside(system, &[&from, &to]), Err(denied), || sys.files().copy(&from, &to, now))
         }
-        Delete { path } => gate(outside(&[&path]), Err(denied), || sys.files().delete(&path)),
+        Delete { path } => gate(outside(system, &[&path]), Err(denied), || sys.files().delete(&path)),
         FreeName { dir, name } => encode(&sys.files().free_name(&dir, &name)),
         TrashList => encode(&sys.files().trash_list()),
         Restore { id } => {
             // Restaura donde estaba: si estaba en el sistema, no.
             let files = sys.files();
-            let into_system = files.trash_list().is_ok_and(|l| l.iter().any(|t| t.id == id && in_system(&t.original)));
+            let into_system = files.trash_list().is_ok_and(|l| l.iter().any(|t| t.id == id && blocked(system, &t.original)));
             gate(!into_system, Err(denied), || files.restore(&id))
         }
         EmptyTrash => encode(&sys.files().empty_trash()),
@@ -352,22 +363,22 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         PasteAll { dir } => {
             let now = sys.now();
             let files = sys.files();
-            let from_system = files.clip_paths().0.iter().any(|p| in_system(p));
-            gate(outside(&[&dir]) && !from_system, Err(denied), || files.paste_all(&dir, now))
+            let from_system = files.clip_paths().0.iter().any(|p| blocked(system, p));
+            gate(outside(system, &[&dir]) && !from_system, Err(denied), || files.paste_all(&dir, now))
         }
         Transfer { paths, dir, mv } => {
             let now = sys.now();
-            let ok = outside(&[&dir]) && !paths.iter().any(|p| in_system(p));
+            let ok = outside(system, &[&dir]) && !paths.iter().any(|p| blocked(system, p));
             gate(ok, Err(denied), || sys.files().transfer(&paths, &dir, mv, now))
         }
-        UserRename { from, to } => gate(outside(&[&from, &to]), Err(denied), || sys.files().user_rename(&from, &to)),
+        UserRename { from, to } => gate(outside(system, &[&from, &to]), Err(denied), || sys.files().user_rename(&from, &to)),
         UserTrashMany { paths } => {
             let now = sys.now();
-            gate(!paths.iter().any(|p| in_system(p)), Err(denied), || sys.files().user_trash_many(&paths, now))
+            gate(!paths.iter().any(|p| blocked(system, p)), Err(denied), || sys.files().user_trash_many(&paths, now))
         }
         UserCreate { path, dir } => {
             let now = sys.now();
-            gate(outside(&[&path]), Err(denied), || sys.files().user_create(&path, dir, now))
+            gate(outside(system, &[&path]), Err(denied), || sys.files().user_create(&path, dir, now))
         }
         Undo => {
             let now = sys.now();
@@ -875,13 +886,43 @@ mod tests {
         // Restaurar algo que estaba en el sistema.
         let id = f.trash_list().unwrap()[0].id.clone();
         assert_eq!(f.restore(&id), Err(d));
-        // Nada de eso cambió el disco; leer sí se puede, y lo suyo también.
-        assert_eq!(f.read("C:\\Sistema\\config\\ajuste").unwrap(), b"1");
+        // Nada de eso cambió el disco. Leer el sistema tampoco se puede (con sesión de
+        // administrador vería las cuentas); lo suyo, sí.
+        assert_eq!(f.read("C:\\Sistema\\config\\ajuste"), Err(d));
+        assert_eq!(f.read("c:/sistema/config/../config/ajuste"), Err(d));
         assert!(!f.exists("C:\\Sistema\\config\\nuevo") && !f.exists(&format!("{DOCS}\\b")));
         assert_eq!(f.write(&format!("{DOCS}\\c.txt"), b"c", NOW), Ok(()));
         assert_eq!(f.rename(&format!("{DOCS}\\c.txt"), &format!("{DOCS}\\d.txt")), Ok(()));
         assert_eq!(f.transfer(&[format!("{DOCS}\\d.txt")], PICS, false, NOW).unwrap().len(), 1);
         assert!(real.borrow_mut().files.exists(&format!("{PICS}\\d.txt")));
+    }
+
+    #[test]
+    fn solo_el_sistema_toca_los_programas_y_lee_el_sistema() {
+        let (real, mut p) = prog(false);
+        real.borrow_mut().files.write("C:\\Sistema\\config\\ajuste", b"1", NOW).unwrap();
+        let _ = real.borrow_mut().files.mkdir("C:\\Programas", NOW);
+        real.borrow_mut().files.mkdir("C:\\Programas\\Reloj", NOW).unwrap();
+        real.borrow_mut().files.write("C:\\Programas\\Reloj\\programa.nfx", b"bin", NOW).unwrap();
+        let d = FsError::Denied;
+        let f = p.fs();
+        for pr in ["C:\\Programas\\Reloj\\programa.nfx", "c:/PROGRAMAS/Reloj/x", "C:\\Usuarios\\..\\Programas\\Nuevo"] {
+            assert_eq!(f.write(pr, b"troyano", NOW), Err(d), "{pr}");
+            assert_eq!(f.delete(pr), Err(d), "{pr}");
+            assert_eq!(f.user_trash_many(&[s(pr)], NOW), Err(d), "{pr}");
+        }
+        assert_eq!(f.read("C:\\Programas\\Reloj\\programa.nfx").unwrap(), b"bin", "leer programas sí");
+        // Un nombre que solo empieza igual no es la carpeta de programas.
+        assert_eq!(f.write(&format!("{DOCS}\\Programas.txt"), b"x", NOW), Ok(()));
+        assert!(!blocked(false, "C:\\ProgramasX\\a") && blocked(true, "C:\\Sistema\\a") && !blocked(true, "C:\\Programas\\a"));
+        // Un programa del sistema (Configuración instala) sí.
+        let (real, mut p) = prog(true);
+        real.borrow_mut().files.write("C:\\Sistema\\config\\ajuste", b"1", NOW).unwrap();
+        let f = p.fs();
+        let _ = f.mkdir("C:\\Programas", NOW);
+        assert_eq!(f.mkdir("C:\\Programas\\Nuevo", NOW), Ok(()));
+        assert_eq!(f.write("C:\\Programas\\Nuevo\\app.txt", b"nombre=Nuevo", NOW), Ok(()));
+        assert_eq!(f.read("C:\\Sistema\\config\\ajuste").unwrap(), b"1");
     }
 
     #[test]

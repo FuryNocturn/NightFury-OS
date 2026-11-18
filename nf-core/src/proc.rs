@@ -581,7 +581,10 @@ impl ProcApp {
             }
             match st.out.requests.pop_front() {
                 Some(Request::DragAnswer(b)) => self.over_ans = Some(b),
-                Some(Request::DragSourceAnswer(v)) => self.src_ans = Some(v),
+                Some(Request::DragSourceAnswer(v)) => {
+                    let sys = self.system;
+                    self.src_ans = Some(v.map(|v| v.into_iter().filter(|p| !crate::service::blocked(sys, p)).collect()));
+                }
                 Some(r) => self.pend.push_back(r),
                 None => {}
             }
@@ -614,7 +617,14 @@ impl ProcApp {
                     cx.dialog = Some(d);
                 }
                 Some(Request::Menu(m)) => cx.menu = Some(m),
-                Some(Request::Drag(paths)) => cx.drag = Some(DragRequest { paths }),
+                Some(Request::Drag(paths)) => {
+                    // Un programa de terceros no arrastra lo que no podría mover él (el escritorio
+                    // lo movería con sus permisos).
+                    let paths: Vec<String> = paths.into_iter().filter(|p| !crate::service::blocked(self.system, p)).collect();
+                    if !paths.is_empty() {
+                        cx.drag = Some(DragRequest { paths });
+                    }
+                }
                 Some(Request::SetTheme(t)) => {
                     *cx.theme = t;
                     cx.theme_changed = true;
@@ -1291,6 +1301,20 @@ pub(crate) mod tests {
 
     fn dialogo(tag: u32) -> Request {
         Request::Dialog(DialogRequest::Input { tag, title: String::from("t"), label: String::new(), value: String::new() })
+    }
+
+    #[test]
+    fn un_programa_de_terceros_no_arrastra_el_sistema() {
+        let (mut app, sh, _) = fake();
+        let mut sys = TestPlatform::default();
+        let mut theme = Theme::default();
+        let doc = String::from("C:\\Usuarios\\Usuario\\Documentos\\a.txt");
+        sh.borrow_mut().out.requests.push_back(Request::Drag(vec![String::from("c:/sistema/config/cuentas")]));
+        sh.borrow_mut().out.requests.push_back(Request::Drag(vec![String::from("C:\\Programas\\Reloj"), doc.clone()]));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 1);
+        app.tick(&mut cx);
+        // El primero se queda sin rutas y no arrastra nada; del segundo solo queda lo del usuario.
+        assert_eq!(cx.drag.map(|d| d.paths), Some(vec![doc]));
     }
 
     #[test]
