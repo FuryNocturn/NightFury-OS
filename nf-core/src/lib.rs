@@ -36,6 +36,7 @@ pub mod scrollbar;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod wire;
 
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).
 pub const NAME: &str = "NightFury";
