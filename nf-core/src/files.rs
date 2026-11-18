@@ -43,6 +43,8 @@ use alloc::vec::Vec;
 
 /// Ubicación especial que el Explorador muestra como la Papelera (no es una ruta de disco).
 pub const TRASH: &str = "Papelera";
+/// Ubicación especial que el Explorador muestra como «Este equipo» (las unidades; no es una ruta).
+pub const COMPUTER: &str = "Este equipo";
 
 // ---- Estructura del disco (v0.5.0). Ningún otro módulo escribe estas rutas a mano. ----
 pub const USERS_DIR: &str = "C:\\Usuarios";
