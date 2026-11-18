@@ -46,6 +46,43 @@ impl Io {
     }
 }
 
+/// Lee los clusters `cl` de un área de datos que empieza en el sector `start` (juntando los
+/// contiguos en una sola lectura). Comparte código con exFAT.
+pub(super) fn read_cl(io: &mut Io, start: u64, spc: u64, cl: &[u32]) -> Result<Vec<u8>, FsError> {
+    let cs = spc as usize * io.ss;
+    let mut out = Vec::new();
+    out.try_reserve_exact(cl.len() * cs).map_err(|_| FsError::NoSpace)?;
+    let mut i = 0;
+    while i < cl.len() {
+        let mut j = i + 1;
+        while j < cl.len() && cl[j] == cl[j - 1] + 1 {
+            j += 1;
+        }
+        let sec = (cl[i] as u64).checked_sub(2).ok_or(FsError::Corrupt)? * spc + start;
+        out.extend_from_slice(&io.read(sec, (j - i) * spc as usize)?);
+        i = j;
+    }
+    Ok(out)
+}
+
+/// Escribe `data` (rellenando con ceros el último cluster) en los clusters `cl`.
+pub(super) fn write_cl(io: &mut Io, start: u64, spc: u64, cl: &[u32], data: &[u8]) -> Result<(), FsError> {
+    let cs = spc as usize * io.ss;
+    let mut i = 0;
+    while i < cl.len() {
+        let mut j = i + 1;
+        while j < cl.len() && cl[j] == cl[j - 1] + 1 {
+            j += 1;
+        }
+        let mut buf = data[i * cs..(j * cs).min(data.len())].to_vec();
+        buf.resize((j - i) * cs, 0);
+        let sec = (cl[i] as u64).checked_sub(2).ok_or(FsError::Corrupt)? * spc + start;
+        io.write(sec, &buf)?;
+        i = j;
+    }
+    Ok(())
+}
+
 /// Escribe ceros en `n` sectores desde `lba` (absoluto del disco).
 pub(super) fn zero_sectors(dev: &mut dyn SectorDev, lba: u64, n: u64) -> Result<(), FsError> {
     let ss = dev.sector_size();
@@ -207,7 +244,7 @@ impl Geo {
             return Err(FsError::Corrupt);
         }
         let count = (total - overhead) / spc;
-        if count > 0x0FFF_FFF5 {
+        if count == 0 || count > 0x0FFF_FFF5 {
             return Err(FsError::Corrupt);
         }
         let kind = if count < 4085 {
@@ -639,36 +676,12 @@ impl Fat {
         Ok(())
     }
 
-    /// Lee los clusters `cl` (juntando los contiguos en una sola lectura).
     fn read_clusters(&mut self, cl: &[u32]) -> Result<Vec<u8>, FsError> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(cl.len() * self.cs).map_err(|_| FsError::NoSpace)?;
-        let mut i = 0;
-        while i < cl.len() {
-            let mut j = i + 1;
-            while j < cl.len() && cl[j] == cl[j - 1] + 1 {
-                j += 1;
-            }
-            let b = self.io.read(self.csec(cl[i]), (j - i) * self.g.spc as usize)?;
-            out.extend_from_slice(&b);
-            i = j;
-        }
-        Ok(out)
+        read_cl(&mut self.io, self.g.data_start(), self.g.spc, cl)
     }
 
     fn write_clusters(&mut self, cl: &[u32], data: &[u8]) -> Result<(), FsError> {
-        let mut i = 0;
-        while i < cl.len() {
-            let mut j = i + 1;
-            while j < cl.len() && cl[j] == cl[j - 1] + 1 {
-                j += 1;
-            }
-            let mut buf = data[i * self.cs..(j * self.cs).min(data.len())].to_vec();
-            buf.resize((j - i) * self.cs, 0);
-            self.io.write(self.csec(cl[i]), &buf)?;
-            i = j;
-        }
-        Ok(())
+        write_cl(&mut self.io, self.g.data_start(), self.g.spc, cl, data)
     }
 
     fn load(&mut self, dir: u32) -> Result<DirBuf, FsError> {
@@ -1012,8 +1025,8 @@ impl Volume for Fat {
         let it = self.scan(&fb.data).0.into_iter().find(|i| same_name(&i.name, fname)).ok_or(FsError::NotFound)?;
         let first = self.first_of(&it);
         // Una carpeta no puede entrar en sí misma ni en sus descendientes.
-        if it.dir() && tdirs.contains(&first) {
-            return Err(FsError::Invalid);
+        if it.dir() && (first < 2 || tdirs.contains(&first)) {
+            return Err(if first < 2 { FsError::Corrupt } else { FsError::Invalid });
         }
         let same = fd == td;
         if same && fname == tname {
@@ -1054,6 +1067,9 @@ impl Volume for Fat {
         let mut buf = self.load(*dirs.last().unwrap())?;
         let it = self.scan(&buf.data).0.into_iter().find(|i| same_name(&i.name, name)).ok_or(FsError::NotFound)?;
         let first = self.first_of(&it);
+        if it.dir() && first < 2 {
+            return Err(FsError::Corrupt);
+        }
         if it.dir() && !self.scan_dir(first)?.0.is_empty() {
             return Err(FsError::NotEmpty);
         }
