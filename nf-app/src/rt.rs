@@ -4,6 +4,7 @@
 //! Solo se compila para `x86_64-unknown-none`; lo demás (el bucle) se prueba en el PC.
 use crate::bucle::{cortar, ejecutar, Llamadas};
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt::Write;
 use nf_core::abi::*;
@@ -151,6 +152,16 @@ impl Llamadas for Nucleo {
     }
     fn guardar(&mut self, nombre: &str, datos: &[u8]) -> i64 {
         syscall(SYS_SAVE_AS, datos.as_ptr() as u64, datos.len() as u64, nombre.as_ptr() as u64, nombre.len() as u64, 0)
+    }
+    fn peticion(&mut self, msg: &[u8]) -> i64 {
+        syscall(SYS_REQUEST, msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0)
+    }
+    fn datos_evento(&mut self, len: usize) -> Vec<u8> {
+        let mut b = alloc::vec![0u8; len];
+        if syscall(SYS_EVENT_DATA, b.as_mut_ptr() as u64, len as u64, 0, 0, 0) != len as i64 {
+            b.clear();
+        }
+        b
     }
 }
 
