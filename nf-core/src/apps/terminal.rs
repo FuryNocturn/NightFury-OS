@@ -93,7 +93,7 @@ fn lower(s: &str) -> String {
 /// Órdenes de archivos; `None` si `cmd` no es una de ellas.
 fn archivos(cmd: &str, args: &str, sys: &mut dyn Platform, cwd: &mut String) -> Option<Vec<String>> {
     let now = sys.now();
-    let f = sys.files();
+    let f = sys.fs();
     let a = tokens(args);
     let uso = |s: &str| Ok(vec![format!("Uso: {}", s)]);
     let r: Result<Vec<String>, FsError> = match cmd {
@@ -237,7 +237,7 @@ fn mb(bytes: u64) -> String {
 /// ¿Modifica la orden algo dentro de `C:\Sistema`? Solo se pregunta a un administrador (a los
 /// demás `Files` les deniega el acceso sin más). Mira el origen y el destino.
 fn modifies_system(line: &str, sys: &mut dyn Platform, cwd: &str) -> bool {
-    if !sys.files().is_admin() {
+    if !sys.fs().is_admin() {
         return false;
     }
     let line = line.trim();
@@ -355,7 +355,7 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
             let name = tokens(args).into_iter().next().unwrap_or_default();
             let by_name = programs::installed(sys).into_iter().find(|p| p.name.eq_ignore_ascii_case(&name)).map(|p| p.binary());
             match by_name.or_else(|| resolve(cwd, &name).ok().filter(|p| p.to_lowercase().ends_with(".nfx"))) {
-                Some(p) if sys.files().stat(&p).is_ok_and(|e| !e.dir) => {
+                Some(p) if sys.fs().stat(&p).is_ok_and(|e| !e.dir) => {
                     act = Action::Open(p);
                     Vec::new()
                 }
@@ -460,7 +460,7 @@ impl Terminal {
     /// La carpeta de partida es la del usuario de la sesión.
     fn ready(&mut self, sys: &mut dyn Platform) {
         if self.cwd.is_empty() {
-            self.cwd = sys.files().home();
+            self.cwd = sys.fs().home();
         }
     }
 
@@ -515,7 +515,7 @@ impl App for Terminal {
 
     /// "Abrir Terminal aquí": si la ruta es una carpeta existente pasa a ser la actual.
     fn open_path(&mut self, path: &str, cx: &mut Ctx) {
-        if cx.sys.files().stat(path).is_ok_and(|e| e.dir) {
+        if cx.sys.fs().stat(path).is_ok_and(|e| e.dir) {
             self.cwd = String::from(path);
             cx.redraw = true;
         }
@@ -755,7 +755,7 @@ mod tests {
     fn open_path_cambia_la_carpeta_solo_si_existe() {
         let mut sys = TestPlatform::default();
         let now = sys.now();
-        sys.files().write(&h("a.txt"), b"x", now).unwrap();
+        sys.fs().write(&h("a.txt"), b"x", now).unwrap();
         let mut th = Theme::default();
         let mut cx = Ctx::new(&mut sys, &mut th, 0);
         let mut t = Terminal::new();
@@ -943,23 +943,23 @@ mod tests {
         let conf = String::from(CONFIRM);
         // Con "si" se ejecuta.
         assert_eq!(teclea(&mut t, &mut cx, "carpeta C:\\Sistema\\temp\\prueba"), [conf.clone()]);
-        assert!(!cx.sys.files().exists("C:\\Sistema\\temp\\prueba"));
+        assert!(!cx.sys.fs().exists("C:\\Sistema\\temp\\prueba"));
         assert!(teclea(&mut t, &mut cx, "si").is_empty());
-        assert!(cx.sys.files().exists("C:\\Sistema\\temp\\prueba"));
+        assert!(cx.sys.fs().exists("C:\\Sistema\\temp\\prueba"));
         // Con otra cosa se cancela y esa otra cosa no se ejecuta como orden.
         assert_eq!(teclea(&mut t, &mut cx, "escribir C:\\Sistema\\temp\\n.txt hola"), [conf.clone()]);
         assert_eq!(teclea(&mut t, &mut cx, "eco hola"), ["Cancelado."]);
-        assert!(!cx.sys.files().exists("C:\\Sistema\\temp\\n.txt"));
+        assert!(!cx.sys.fs().exists("C:\\Sistema\\temp\\n.txt"));
         // Tras cancelar, el siguiente comando va normal.
         assert_eq!(teclea(&mut t, &mut cx, "eco x"), ["x"]);
         // Origen o destino dentro de Sistema, y renombrar y borrar.
         let docs = join(&t.cwd, "Documentos");
-        cx.sys.files().write(&join(&docs, "a.txt"), b"x", DateTime::default()).unwrap();
+        cx.sys.fs().write(&join(&docs, "a.txt"), b"x", DateTime::default()).unwrap();
         for orden in ["copiar Documentos\\a.txt C:\\Sistema\\temp", "copiar C:\\Sistema\\config\\cuentas Documentos\\c.txt", "mover Documentos\\a.txt C:\\Sistema\\temp", "borrar /todo C:\\Sistema\\temp\\prueba", "renombrar C:\\Sistema\\temp\\prueba otra"] {
             assert_eq!(teclea(&mut t, &mut cx, orden), [conf.clone()], "{orden}");
             assert_eq!(teclea(&mut t, &mut cx, "no"), ["Cancelado."]);
         }
-        assert!(cx.sys.files().exists("C:\\Sistema\\temp\\prueba") && cx.sys.files().exists(&join(&docs, "a.txt")));
+        assert!(cx.sys.fs().exists("C:\\Sistema\\temp\\prueba") && cx.sys.fs().exists(&join(&docs, "a.txt")));
         // Escape también cancela.
         teclea(&mut t, &mut cx, "borrar C:\\Sistema\\temp\\prueba");
         t.key(&ev(Key::Escape, None), &mut cx);

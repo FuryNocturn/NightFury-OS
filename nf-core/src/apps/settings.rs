@@ -17,7 +17,7 @@ use crate::accounts::{salt_from, AccountError, MIN_PASSWORD};
 use crate::crypto::{ct_eq, wipe};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
-use crate::files::Files;
+use crate::fsapi::FilesApi;
 use crate::fs::same;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
@@ -283,12 +283,12 @@ impl Settings {
         let mb = |b: u64| b / (1 << 20);
         let up = sys.uptime_ms() / 60_000;
         let (sw, sh) = sys.screen();
-        let (total, free) = sys.files().space();
+        let (total, free) = sys.fs().space();
         let disk = format!(
             "{} libres de {}{}",
             super::terminal::units(free),
             super::terminal::units(total),
-            if sys.files().persistent() { "" } else { " (en memoria)" }
+            if sys.fs().persistent() { "" } else { " (en memoria)" }
         );
         let rows = [
             ("Procesador", sys.cpu()),
@@ -350,9 +350,9 @@ fn confirm(cx: &mut Ctx, text: &str) {
 
 /// Llama a `f` con el sistema de archivos y el acumulador de aleatoriedad del sistema. El
 /// acumulador se saca de `sys` (son dos préstamos del mismo objeto) y SIEMPRE se devuelve.
-fn with_pool<R>(cx: &mut Ctx, f: impl FnOnce(&mut Files, &mut Pool) -> R) -> R {
+fn with_pool<R>(cx: &mut Ctx, f: impl FnOnce(&mut dyn FilesApi, &mut Pool) -> R) -> R {
     let mut pool = core::mem::take(cx.sys.pool());
-    let r = f(cx.sys.files(), &mut pool);
+    let r = f(cx.sys.fs(), &mut pool);
     *cx.sys.pool() = pool;
     r
 }
@@ -408,22 +408,22 @@ impl Settings {
         font::draw(s, x0, y, TITLE, 18, false, TEXT);
         y += font::line_h(18) + if compact { 6 } else { 12 };
         self.others.clear();
-        if !sys.files().persistent() {
+        if !sys.fs().persistent() {
             font::draw(s, x0, y, "Sin disco no hay cuentas que guardar.", 9, false, GRAY);
             self.content_h = y + self.scroll + font::line_h(9) + 16;
             return;
         }
-        let me = String::from(sys.files().user().unwrap_or(""));
-        let admin = sys.files().is_admin();
-        let has_pwd = sys.files().has_password();
-        let list = sys.files().accounts();
+        let me = sys.fs().user().unwrap_or_default();
+        let admin = sys.fs().is_admin();
+        let has_pwd = sys.fs().has_password();
+        let list = sys.fs().accounts();
         font::draw(s, x0, y, "Mi cuenta", 11, true, TEXT);
         y += font::line_h(11) + 6;
-        let busy = sys.files().home_conversion();
+        let busy = sys.fs().home_conversion();
         let crypt = match busy {
             Some((_, _, true)) => "Cifrando…",
             Some((_, _, false)) => "Descifrando…",
-            None if sys.files().home_encrypted() => "Sí",
+            None if sys.fs().home_encrypted() => "Sí",
             None => "No",
         };
         for (label, value) in [
@@ -445,7 +445,7 @@ impl Settings {
             self.button(s, &mut at, x0, right, "Poner clave", Act::SetPwd, theme);
         }
         if has_pwd {
-            let (enc, on) = (sys.files().home_encrypted(), busy.is_none());
+            let (enc, on) = (sys.fs().home_encrypted(), busy.is_none());
             if !enc {
                 self.button_if(s, &mut at, x0, right, "Cifrar mi carpeta", Act::HomeEnc, on, theme);
             } else {
@@ -489,16 +489,16 @@ impl Settings {
         let mut y = if compact { 14 } else { 24 } - self.scroll;
         font::draw(s, x0, y, "Disco", 18, false, TEXT);
         y += font::line_h(18) + if compact { 6 } else { 12 };
-        if !sys.files().persistent() {
+        if !sys.fs().persistent() {
             font::draw(s, x0, y, "Sin disco no hay nada que cifrar.", 9, false, GRAY);
             self.content_h = y + self.scroll + font::line_h(9) + 16;
             return;
         }
         let units = super::terminal::units;
-        let (total, free) = sys.files().space();
-        let admin = sys.files().is_admin();
-        let enc = sys.files().disk_encrypted();
-        let busy = sys.files().disk_conversion();
+        let (total, free) = sys.fs().space();
+        let admin = sys.fs().is_admin();
+        let enc = sys.fs().disk_encrypted();
+        let busy = sys.fs().disk_conversion();
         let state = match busy {
             Some((done, all, encrypting)) => format!("{}… {} %", if encrypting { "Cifrando" } else { "Descifrando" }, if all == 0 { 0 } else { (done.min(all) * 100 / all) as u32 }),
             None => String::from(if enc { "Sí" } else { "No" }),
@@ -538,7 +538,7 @@ impl Settings {
         let mut y = if s.h < 440 { 14 } else { 24 } - self.scroll;
         font::draw(s, x0, y, "Aplicaciones", 18, false, TEXT);
         y += font::line_h(18) + 12;
-        let admin = sys.files().is_admin();
+        let admin = sys.fs().is_admin();
         if admin {
             let mut at = (x0, y);
             self.button(s, &mut at, x0, right, "Instalar programa…", Act::AppInstall, theme);
@@ -601,7 +601,7 @@ impl Settings {
     fn start(&mut self, act: Act, cx: &mut Ctx) {
         match act {
             Act::AppInstall => {
-                let dir = cx.sys.files().std_dir(crate::files::Std::Downloads);
+                let dir = cx.sys.fs().std_dir(crate::files::Std::Downloads);
                 cx.dialog = Some(DialogRequest::Folder { tag: T_APP_DIR, title: String::from("Instalar programa"), dir });
                 return;
             }
@@ -627,7 +627,7 @@ impl Settings {
         if let Some(op) = crypto {
             return self.start_crypto(op, cx);
         }
-        if act == Act::RemovePwd && cx.sys.files().home_encrypted() {
+        if act == Act::RemovePwd && cx.sys.fs().home_encrypted() {
             return message(cx, AccountError::Encrypted.text());
         }
         let other = |i: usize| self.others.get(i).cloned();
@@ -648,7 +648,7 @@ impl Settings {
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
-                if let Err(e) = cx.sys.files().set_admin(&n, !is_admin, now) {
+                if let Err(e) = cx.sys.fs().set_admin(&n, !is_admin, now) {
                     message(cx, e.text());
                 }
                 cx.redraw = true;
@@ -733,10 +733,10 @@ impl Settings {
     /// Termina la operación de clave con la clave nueva ya repetida (`None` = quitarla).
     fn finish_password(&mut self, mut job: Job, new: Option<&str>, cx: &mut Ctx) {
         let (now, salt) = (cx.sys.now(), salt(cx));
-        let r = cx.sys.files().set_password(&job.old.0, new, salt, now);
+        let r = cx.sys.fs().set_password(&job.old.0, new, salt, now);
         if r.is_ok() && job.op == Op::SetPwd {
             // Recién puesta la clave: se ofrece cifrar la carpeta con ella, sin volver a pedirla.
-            job.new = Secret(String::from(new.unwrap_or("")));
+            job.new = Secret(String::from(new.unwrap_or_default()));
             cx.dialog = Some(DialogRequest::Message {
                 tag: T_ASK_HOME,
                 title: String::from(TITLE),
@@ -764,7 +764,7 @@ impl Settings {
         let Some(v) = value else { return };
         match tag {
             T_PW_OLD => {
-                if !cx.sys.files().verify_password(&v.0) {
+                if !cx.sys.fs().verify_password(&v.0) {
                     return message(cx, AccountError::WrongPassword.text());
                 }
                 if job.op == Op::RemovePwd {
@@ -800,7 +800,7 @@ impl Settings {
                 job.old = v;
                 match job.op {
                     Op::HomeEnc | Op::HomeDec | Op::HomeCode => {
-                        if !cx.sys.files().verify_password(&job.old.0) {
+                        if !cx.sys.fs().verify_password(&job.old.0) {
                             return message(cx, AccountError::WrongPassword.text());
                         }
                         return if job.op == Op::HomeDec { self.run_crypto(job, cx) } else { self.entropy(job, cx) };
@@ -841,7 +841,7 @@ impl Settings {
                 if !crate::accounts::valid_user_name(&v.0) {
                     return message(cx, AccountError::BadName.text());
                 }
-                if cx.sys.files().accounts().iter().any(|a| same(&a.name, &v.0)) {
+                if cx.sys.fs().accounts().iter().any(|a| same(&a.name, &v.0)) {
                     return message(cx, AccountError::Exists.text());
                 }
                 job.name = v.0.clone();
@@ -849,7 +849,7 @@ impl Settings {
             }
             T_REN => {
                 let now = cx.sys.now();
-                if let Err(e) = cx.sys.files().rename_account(&job.name, &v.0, now) {
+                if let Err(e) = cx.sys.fs().rename_account(&job.name, &v.0, now) {
                     message(cx, e.text());
                 }
                 return;
@@ -877,7 +877,7 @@ impl Settings {
 
     fn delete(&mut self, name: &str, keep: bool, cx: &mut Ctx) {
         let now = cx.sys.now();
-        match cx.sys.files().delete_account(name, keep, now) {
+        match cx.sys.fs().delete_account(name, keep, now) {
             Ok(()) => message(cx, if keep { "Cuenta eliminada. Su carpeta se ha conservado." } else { "Cuenta eliminada junto con sus archivos." }),
             Err(e) => message(cx, e.text()),
         }
@@ -914,7 +914,7 @@ impl Settings {
             T_ADD_ADMIN => {
                 let (now, salt) = (cx.sys.now(), salt(cx));
                 let pw = Some(job.new.0.as_str()).filter(|p| !p.is_empty());
-                if let Err(e) = cx.sys.files().create_account(&job.name, pw, answer == Answer::Yes, salt, now) {
+                if let Err(e) = cx.sys.fs().create_account(&job.name, pw, answer == Answer::Yes, salt, now) {
                     message(cx, e.text());
                 }
             }
@@ -1056,9 +1056,9 @@ impl App for Settings {
                 }
                 let now = cx.sys.now();
                 let r = if p.dir.to_lowercase().starts_with(&crate::files::PROGRAMS_DIR.to_lowercase()) {
-                    programs::uninstall(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha desinstalado.", p.name))
+                    programs::uninstall(cx.sys.fs(), &p, now).map(|_| format!("«{}» se ha desinstalado.", p.name))
                 } else {
-                    programs::install(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name))
+                    programs::install(cx.sys.fs(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name))
                 };
                 app_message(cx, &r.unwrap_or_else(|e| e));
             }
@@ -1081,7 +1081,7 @@ impl App for Settings {
         // El avance de las conversiones de cifrado también cambia solo.
         let moving = match self.page {
             PAGE_ABOUT | PAGE_DISK => true,
-            PAGE_ACCOUNTS => cx.sys.files().home_conversion().is_some(),
+            PAGE_ACCOUNTS => cx.sys.fs().home_conversion().is_some(),
             _ => false,
         };
         if moving && sec != self.last_sec {
@@ -1094,11 +1094,11 @@ impl App for Settings {
 impl Settings {
     /// Carpeta elegida para instalar: se comprueba y, si ya hay uno con ese nombre, se pregunta.
     fn app_source(&mut self, src: &str, cx: &mut Ctx) {
-        let p = match programs::check_source(cx.sys.files(), src) {
+        let p = match programs::check_source(cx.sys.fs(), src) {
             Ok(p) => p,
             Err(e) => return app_message(cx, &format!("No se puede instalar.\n{e}")),
         };
-        match programs::installed_as(cx.sys.files(), &p.name) {
+        match programs::installed_as(cx.sys.fs(), &p.name) {
             Some(true) => app_message(cx, &format!("«{}» es un programa del sistema y no se puede reemplazar.", p.name)),
             Some(false) => {
                 let text = format!("Ya hay un programa «{}» instalado.\n¿Reemplazarlo por esta versión?", p.name);
@@ -1107,7 +1107,7 @@ impl Settings {
             }
             None => {
                 let now = cx.sys.now();
-                let r = programs::install(cx.sys.files(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name));
+                let r = programs::install(cx.sys.fs(), &p, now).map(|_| format!("«{}» se ha instalado. Está en el menú Inicio.", p.name));
                 app_message(cx, &r.unwrap_or_else(|e| e));
             }
         }
@@ -1574,7 +1574,7 @@ mod tests {
         let s = b.dibuja(780, 520);
         assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
         assert!(s.px.iter().any(|&p| p != 0xFFFFFF));
-        assert!(!b.sys.files().persistent());
+        assert!(!b.sys.fs().persistent());
         // Un clic donde estaría un botón no hace nada.
         b.clic(PANEL_W + 40, 200);
         assert!(b.dialog.is_none());

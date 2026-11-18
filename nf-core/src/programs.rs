@@ -13,7 +13,8 @@
 //! ancho=320
 //! alto=470
 //! ```
-use crate::files::{self, Files, PROGRAMS_DIR};
+use crate::files::{self, PROGRAMS_DIR};
+use crate::fsapi::FilesApi;
 use crate::fs::FsError;
 use crate::bmp::{self, Picture};
 use crate::icons::Icon;
@@ -139,7 +140,7 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
 
 /// Comprueba una carpeta con un programa para instalar: `app.txt` con nombre válido y un
 /// `programa.nfx` que se puede cargar. Devuelve el programa (con `dir` = la carpeta de origen).
-pub fn check_source(fs: &mut Files, src: &str) -> Result<Program, String> {
+pub fn check_source(fs: &mut dyn FilesApi, src: &str) -> Result<Program, String> {
     if src.to_lowercase().starts_with(&PROGRAMS_DIR.to_lowercase()) {
         return Err(String::from("Esa carpeta ya está dentro de C:\\Programas"));
     }
@@ -165,7 +166,7 @@ pub fn check_source(fs: &mut Files, src: &str) -> Result<Program, String> {
 }
 
 /// `Some(es_del_sistema)` si ya hay un programa instalado con ese nombre.
-pub fn installed_as(fs: &mut Files, name: &str) -> Option<bool> {
+pub fn installed_as(fs: &mut dyn FilesApi, name: &str) -> Option<bool> {
     let dir = files::join(PROGRAMS_DIR, name);
     fs.stat(&dir).ok().filter(|e| e.dir)?;
     Some(fs.stat(&files::join(&dir, SYSTEM_MARK)).is_ok())
@@ -174,7 +175,7 @@ pub fn installed_as(fs: &mut Files, name: &str) -> Option<bool> {
 /// Copia el programa `src` (de `check_source`) a `C:\Programas\<nombre>`, reemplazando el que
 /// hubiera con ese nombre salvo si es del sistema. Solo copia `app.txt`, `programa.nfx` e
 /// `icono.bmp`. Necesita una sesión de administrador (lo hacen cumplir los permisos).
-pub fn install(fs: &mut Files, src: &Program, now: DateTime) -> Result<String, String> {
+pub fn install(fs: &mut dyn FilesApi, src: &Program, now: DateTime) -> Result<String, String> {
     if installed_as(fs, &src.name) == Some(true) {
         return Err(format!("«{}» es un programa del sistema y no se puede reemplazar", src.name));
     }
@@ -199,11 +200,11 @@ pub fn install(fs: &mut Files, src: &Program, now: DateTime) -> Result<String, S
 }
 
 /// Manda el programa a la Papelera (los del sistema no se desinstalan).
-pub fn uninstall(fs: &mut Files, p: &Program, now: DateTime) -> Result<(), String> {
+pub fn uninstall(fs: &mut dyn FilesApi, p: &Program, now: DateTime) -> Result<(), String> {
     if p.system || installed_as(fs, &p.name) == Some(true) {
         return Err(format!("«{}» viene con el sistema y no se puede desinstalar", p.name));
     }
-    fs.user_trash(&p.dir, now).map_err(install_msg)?;
+    fs.user_trash_many(&[p.dir.clone()], now).map_err(install_msg)?;
     fs.log(&format!("Programa desinstalado: {}", p.name), now);
     Ok(())
 }
