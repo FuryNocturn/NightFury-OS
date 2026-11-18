@@ -27,7 +27,7 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
   nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
-  nfdisk usb <imagen> <fat32|exfat> <MiB>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
+  nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>  | nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
   nfdisk usb-ver <imagen>\n\
   nfdisk ayuda\n\
 Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
