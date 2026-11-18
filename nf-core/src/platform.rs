@@ -55,6 +55,15 @@ pub trait Platform {
     }
     /// Finaliza el programa `id` (queda `Killed(Kill::Ended)`; su ventana se cierra sola).
     fn kill_process(&mut self, _id: u64) {}
+    /// Deja correr a los programas listos hasta que se paren o les toque el turno al escritorio
+    /// (v0.10). `ProcApp` lo usa para atender seguidas las peticiones de un programa sin esperar
+    /// al siguiente tick. Sin programas no hace nada.
+    fn run_programs(&mut self) {}
+    /// `true` si `nfx` es, byte a byte, uno de los programas que trae el sistema (v0.10). Solo
+    /// esos pueden usar las llamadas de cuentas, claves, cifrado, reiniciar y apagar.
+    fn is_system_binary(&self, _nfx: &[u8]) -> bool {
+        false
+    }
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.

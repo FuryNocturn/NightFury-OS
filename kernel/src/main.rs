@@ -182,6 +182,17 @@ impl Platform for Plat {
     fn kill_process(&mut self, id: u64) {
         user::finalizar(id)
     }
+    fn run_programs(&mut self) {
+        // `correr` exige las interrupciones cerradas, como en `arch::idle`.
+        unsafe {
+            core::arch::asm!("cli", options(nomem, nostack));
+            user::correr();
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+    fn is_system_binary(&self, nfx: &[u8]) -> bool {
+        PROGRAMAS_SISTEMA.iter().flat_map(|(_, items)| items.iter()).any(|(n, b)| *n == "programa.nfx" && *b == nfx)
+    }
     fn entropy(&mut self) -> u64 {
         use core::arch::x86_64::{__cpuid, _rdtsc};
         // Contador de ciclos del procesador y reloj del sistema: siempre disponibles.
