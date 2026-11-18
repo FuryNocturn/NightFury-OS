@@ -69,12 +69,12 @@ impl Unidades {
             (None, Some(p)) => nfvol::format(dev, label, Some((p, pool)), now).map_err(clave_a_fs),
             _ => Err(FsError::Invalid),
         };
-        let code = code?;
         let Some(dev) = usb::abrir_disco(disk) else { return Err(FsError::Disk) };
         // Un volumen recién cifrado queda bloqueado: se abre con la misma contraseña para que el
-        // usuario no tenga que escribirla otra vez.
+        // usuario no tenga que escribirla otra vez. Si falló (p. ej. contraseña débil, que se
+        // comprueba antes de escribir), se vuelve a montar lo que había para que no desaparezca.
         conectar(files, disk, &nombre, dev, password);
-        Ok(code)
+        code
     }
 }
 
