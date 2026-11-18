@@ -19,6 +19,7 @@ mod ps2;
 mod rtc;
 mod serial;
 mod uefi;
+mod unidades;
 mod usb;
 mod user;
 
@@ -286,51 +287,6 @@ fn elegir_disco() -> Option<Box<dyn BlockDev>> {
     elegido
 }
 
-// ---------- Discos USB (prueba; las letras D:, E:… y el Explorador son otro encargo) ----------
-
-/// Escribe `NF-PRUEBA.TXT` en cada volumen USB escribible al montarlo y lo vuelve a leer.
-const PRUEBA_USB_ESCRITURA: bool = false;
-
-type VolumenesUsb = Vec<(u32, Vec<Box<dyn nf_core::vol::Volume>>)>;
-
-fn discos_usb(vols: &mut VolumenesUsb) {
-    for c in usb::cambios_discos() {
-        match c {
-            usb::CambioDisco::Conectado { id, nombre, mut dev } => {
-                traza!("NF usb: disco {} «{}»: {} sectores de {} bytes{}", id, nombre, dev.sectors(), dev.sector_size(), if dev.read_only() { ", solo lectura" } else { "" });
-                let mut montados = Vec::new();
-                match nf_core::vol::partitions(dev.as_mut()) {
-                    Err(e) => traza!("NF usb: disco {}: no se leen las particiones ({:?})", id, e),
-                    Ok(ps) => {
-                        for (i, p) in ps.iter().enumerate() {
-                            // `mount` se queda con el dispositivo: cada partición pide su propio manejador.
-                            let Some(d) = usb::abrir_disco(id) else { break };
-                            match nf_core::vol::mount(d, p) {
-                                Err(e) => traza!("NF usb: disco {} partición {} ({:?}, {} sectores desde {}): no se monta ({:?})", id, i, p.kind, p.sectors, p.start, e),
-                                Ok(mut v) => {
-                                    let (total, libre) = v.space();
-                                    let raiz: Vec<String> = v.list("").map(|l| l.iter().take(24).map(|e| if e.dir { alloc::format!("{}\\", e.name) } else { e.name.clone() }).collect()).unwrap_or_default();
-                                    traza!("NF usb: disco {} partición {}: {:?} «{}» {} MiB, {} MiB libres{}; raíz: {}", id, i, v.kind(), v.label(), total >> 20, libre >> 20, if v.read_only() { ", solo lectura" } else { "" }, raiz.join(", "));
-                                    if PRUEBA_USB_ESCRITURA && !v.read_only() {
-                                        let r = v.write("NF-PRUEBA.TXT", b"escrito por NightFury\r\n", rtc::now()).and_then(|_| v.flush()).and_then(|_| v.read("NF-PRUEBA.TXT"));
-                                        traza!("NF usb: disco {} partición {}: escritura de prueba -> {:?}", id, i, r.map(|d| d.len()));
-                                    }
-                                    montados.push(v);
-                                }
-                            }
-                        }
-                    }
-                }
-                vols.push((id, montados));
-            }
-            usb::CambioDisco::Quitado { id } => {
-                vols.retain(|v| v.0 != id);
-                traza!("NF usb: disco {} quitado", id);
-            }
-        }
-    }
-}
-
 // ---------- Núcleo ----------
 
 #[no_mangle]
@@ -393,7 +349,7 @@ extern "C" fn kmain() -> ! {
     raton.set_wheel(con_rueda);
     let mut usb_teclado: Vec<u8> = Vec::new();
     let mut usb_raton: Vec<nf_core::input::MousePacket> = Vec::new();
-    let mut volumenes_usb: VolumenesUsb = Vec::new();
+    let mut unidades = unidades::Unidades::default();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
     loop {
@@ -425,7 +381,7 @@ extern "C" fn kmain() -> ! {
         }
         // USB: sondeo del xHCI; el teclado entra por el mismo decodificador que el PS/2.
         usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton);
-        discos_usb(&mut volumenes_usb);
+        unidades.sondear(&mut plat.files, &mut plat.pool);
         for b in usb_teclado.drain(..) {
             if let Some(k) = teclado.feed(b) {
                 desk.event(Event::Key(k), &mut plat);
