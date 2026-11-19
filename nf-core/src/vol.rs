@@ -186,4 +186,104 @@ mod tests {
         }
         assert_eq!(v.read("grande.bin").unwrap().len(), 300_000);
     }
+
+    /// Recorre y modifica todo lo que se pueda de un volumen dañado: lo único que se exige es que no
+    /// haya pánico ni bucle sin fin (un pendrive es entrada no fiable).
+    fn recorrer(v: &mut dyn Volume, now: DateTime) {
+        let _ = (v.label(), v.space());
+        let mut pend = alloc::vec![String::new()];
+        let mut vistos = 0;
+        while let Some(d) = pend.pop() {
+            let Ok(es) = v.list(&d) else { continue };
+            for e in es.into_iter().take(64) {
+                vistos += 1;
+                if vistos > 400 {
+                    return;
+                }
+                let ruta = if d.is_empty() { e.name.clone() } else { alloc::format!("{d}\\{}", e.name) };
+                let _ = v.stat(&ruta);
+                if e.dir {
+                    if d.matches('\\').count() < 6 {
+                        pend.push(ruta);
+                    }
+                } else {
+                    let _ = v.read(&ruta);
+                }
+            }
+        }
+        let _ = v.write("nuevo.txt", b"hola", now);
+        let _ = v.mkdir("Dir nueva", now);
+        let _ = v.write("Dir nueva\\dentro con nombre largo.txt", &[7; 5000], now);
+        let _ = v.rename("nuevo.txt", "renombrado.txt");
+        let _ = v.delete("Carpeta\\a.txt");
+        let _ = v.delete("Carpeta");
+        let _ = v.flush();
+    }
+
+    /// Disco en memoria que sigue siendo accesible después de dárselo a un volumen.
+    struct Comp(alloc::rc::Rc<core::cell::RefCell<MemSectors>>);
+    impl SectorDev for Comp {
+        fn sector_size(&self) -> usize {
+            512
+        }
+        fn sectors(&self) -> u64 {
+            self.0.borrow().sectors()
+        }
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().read(lba, buf)
+        }
+        fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().write(lba, buf)
+        }
+    }
+
+    #[test]
+    fn imagenes_danadas_no_hacen_caer() {
+        let now = DateTime { year: 2026, month: 11, day: 19, hour: 2, minute: 0, second: 0 };
+        let mut x = 0x9E37_79B9u32;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        // (formato, MiB, vueltas): FAT12/16 en discos pequeños, FAT32 desde 64 MiB y exFAT.
+        for (kind, mib, vueltas) in [(FsKind::Fat32, 4u64, 300), (FsKind::Fat32, 16, 200), (FsKind::Fat32, 64, 60), (FsKind::ExFat, 8, 300)] {
+            let disco = alloc::rc::Rc::new(core::cell::RefCell::new(MemSectors::new(mib << 11, 512)));
+            format(&mut Comp(disco.clone()), kind, "PRUEBA", now).unwrap();
+            let p = partitions(&mut Comp(disco.clone())).unwrap();
+            {
+                let mut v = mount(Box::new(Comp(disco.clone())), &p[0]).unwrap();
+                v.mkdir("Carpeta", now).unwrap();
+                v.mkdir("Carpeta\\Sub", now).unwrap();
+                for i in 0..20 {
+                    v.write(&alloc::format!("Carpeta\\archivo con nombre largo {i}.txt"), &alloc::vec![i as u8; 700 * i], now).unwrap();
+                }
+                v.write("Carpeta\\a.txt", b"a", now).unwrap();
+                v.write("Carpeta\\Sub\\b.bin", &[1; 40_000], now).unwrap();
+                v.flush().unwrap();
+            }
+            let base = disco.borrow().data.clone();
+            // Los metadatos (arranque, FAT/bitmap, directorios) están al principio del volumen.
+            let zona = base.len().min(1 << 20);
+            let mut montados = 0;
+            for n in 0..vueltas {
+                let mut d = MemSectors { data: base.clone(), sector: 512, ro: false };
+                for _ in 0..1 + n % 24 {
+                    let i = rnd() as usize % zona;
+                    d.data[i] = rnd() as u8;
+                }
+                let Ok(ps) = partitions(&mut d) else { continue };
+                for p in ps.iter().take(4) {
+                    let dev = MemSectors { data: d.data.clone(), sector: 512, ro: false };
+                    if let Ok(mut v) = mount(Box::new(dev), p) {
+                        montados += 1;
+                        recorrer(&mut *v, now);
+                    }
+                }
+            }
+            // La mayoría de los daños caen en datos: si casi nada monta, la prueba no prueba nada.
+            assert!(montados > vueltas / 3, "{kind:?} {mib} MiB: solo {montados} de {vueltas}");
+        }
+    }
 }
