@@ -1665,6 +1665,25 @@ mod tests {
         }
     }
 
+    /// Para mirar la vista «Probar mando» sin mando: `NF_CAPTURA=<carpeta> cargo test -p nf-core captura_probar_mando -- --ignored`.
+    #[test]
+    #[ignore]
+    fn captura_probar_mando() {
+        let dir = std::env::var("NF_CAPTURA").unwrap_or_else(|_| String::from("."));
+        let mut b = Banco::new();
+        b.pagina(PAGE_DEVICES);
+        let todos = [PadKind::Xbox360, PadKind::DualSense, PadKind::SwitchPro, PadKind::Generic];
+        let lista: Vec<PadInfo> = todos.iter().enumerate().map(|(i, k)| mando(i as u32, *k)).collect();
+        b.mandos(&lista);
+        std::fs::write(format!("{dir}/mandos-lista.bmp"), crate::bmp::encode(&b.dibuja(780, 520))).unwrap();
+        for i in 0..lista.len() {
+            b.pulsa(Act::PadTest(i));
+            b.estado(i as u32, PadState { buttons: BTN_SOUTH | BTN_UP | BTN_L1 | BTN_START, axes: [-20000, 0, 12000, 25000, 0, 30000] });
+            std::fs::write(format!("{dir}/mando-{i}.bmp"), crate::bmp::encode(&b.dibuja(780, 520))).unwrap();
+            b.pulsa(Act::PadBack);
+        }
+    }
+
     #[test]
     fn sticks_y_etiquetas_por_familia() {
         assert_eq!(stick_dot(0, 0), (0.0, 0.0));
