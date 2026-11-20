@@ -37,7 +37,7 @@ pub(super) struct Dhcp {
 }
 
 #[derive(Clone, Default)]
-struct Msg {
+pub(super) struct Msg {
     ty: u8,
     yiaddr: Ipv4,
     mask: Option<Ipv4>,
@@ -93,7 +93,7 @@ fn build(ty: u8, xid: u32, mac: [u8; 6], ciaddr: Ipv4, req: Option<Ipv4>, srv: O
 }
 
 /// Lee una respuesta del servidor; `None` si no es para nosotros o está mal formada.
-fn parse(d: &[u8], xid: u32, mac: [u8; 6]) -> Option<Msg> {
+pub(super) fn parse(d: &[u8], xid: u32, mac: [u8; 6]) -> Option<Msg> {
     if d.len() < 240 || d[0] != 2 || d[1] != 1 || d[2] != 6 || rd32(d, 4) != xid || d[28..34] != mac || d[236..240] != MAGIC {
         return None;
     }

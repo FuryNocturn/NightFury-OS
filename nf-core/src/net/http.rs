@@ -98,7 +98,7 @@ enum Stage {
 }
 
 #[derive(PartialEq, Eq)]
-enum ChunkState {
+pub(super) enum ChunkState {
     Size,
     Data,
     DataEnd,
@@ -107,7 +107,7 @@ enum ChunkState {
 }
 
 /// Decodificador de `Transfer-Encoding: chunked` (RFC 9112, 7.1), alimentado a trozos.
-struct Chunked {
+pub(super) struct Chunked {
     st: ChunkState,
     line: Vec<u8>,
     left: u64,
@@ -115,8 +115,12 @@ struct Chunked {
 }
 
 impl Chunked {
+    pub(super) fn new() -> Chunked {
+        Chunked { st: ChunkState::Size, line: Vec::new(), left: 0, trailers: 0 }
+    }
+
     /// Añade a `out` el contenido útil; `Ok(true)` cuando termina (tras el último bloque y los trailers).
-    fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
+    pub(super) fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
         let mut i = 0;
         while i < data.len() && self.st != ChunkState::End {
             if self.st == ChunkState::Data {
@@ -209,7 +213,7 @@ fn header<'a>(h: &'a [(String, String)], name: &str) -> impl Iterator<Item = &'a
 }
 
 /// «HTTP/1.x código motivo» y las cabeceras (sin la línea en blanco final).
-fn parse_head(h: &[u8]) -> Result<(u16, String, Vec<(String, String)>), NetError> {
+pub(super) fn parse_head(h: &[u8]) -> Result<(u16, String, Vec<(String, String)>), NetError> {
     let bad = |m| NetError::Protocol(m);
     let mut lines = h.split(|&c| c == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let first = lines.next().unwrap_or(&[]);
@@ -445,7 +449,7 @@ impl HttpGet {
         }
         let no_body = self.head_only || status == 204 || status == 304;
         self.mode = match (chunked, len) {
-            (true, _) => Mode::Chunked(Chunked { st: ChunkState::Size, line: Vec::new(), left: 0, trailers: 0 }),
+            (true, _) => Mode::Chunked(Chunked::new()),
             (false, Some(n)) => Mode::Length(n),
             _ => Mode::Close,
         };

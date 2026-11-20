@@ -155,12 +155,14 @@ pub struct Srv {
     pub syns: Vec<u64>,
     pub ignore_syn: u32,
     pub rst_seen: u32,
+    /// Peticiones completas recibidas (las conexiones abortadas se borran de `conns`).
+    pub reqs: Vec<Vec<u8>>,
     iss_next: u32,
 }
 
 impl Srv {
     fn new() -> Srv {
-        Srv { scripts: Vec::new(), conns: Vec::new(), win: 8192, swin: 8 * 1460, syns: Vec::new(), ignore_syn: 0, rst_seen: 0, iss_next: 0xFFFF_F000 }
+        Srv { scripts: Vec::new(), conns: Vec::new(), win: 8192, swin: 8 * 1460, syns: Vec::new(), ignore_syn: 0, rst_seen: 0, reqs: Vec::new(), iss_next: 0xFFFF_F000 }
     }
 
     pub fn listen(&mut self, port: u16, reply: &[u8], close: bool, echo: bool) {
@@ -246,6 +248,7 @@ impl Srv {
             } else if !c.replied && c.got.ends_with(b"\r\n\r\n") {
                 c.out = script.reply.clone();
                 c.replied = true;
+                self.reqs.push(c.got.clone());
                 c.close = script.close;
             }
             if t.flags & FIN != 0 {
