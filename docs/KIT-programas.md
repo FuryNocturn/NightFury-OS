@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.11)
+# Kit de programas de NightFury (v0.11.1)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -121,6 +121,10 @@ Configuración y Explorador), que el sistema reconoce por su binario exacto.
   etiqueta, formato, tamaño, libre, `read_only`, `removable`, `locked`). Las ISO y UDF son de solo lectura
   (al escribir, `FsError::Denied`) y una unidad cifrada sin desbloquear no se puede abrir. Si el usuario quita el
   pendrive, las llamadas sobre esa letra fallan: trátalo como cualquier error de disco.
+- **Discos internos y formatos de solo lectura (v0.11.1).** Las particiones de los discos SATA y NVMe del PC
+  también salen como letras (`removable` a `false`) y son de solo lectura, igual que NTFS y ext2/3/4 en
+  cualquier unidad: escribir da `FsError::Denied`. Una unidad con BitLocker sale con `locked` y no se abre.
+  `list()` devuelve también los archivos ocultos y de sistema; el Explorador los esconde por su cuenta.
 - Formatear, expulsar, cifrar y desbloquear unidades es solo para los programas del sistema.
 - **Mandos**: `App::gamepads(&[PadInfo], cx)` llega al abrir la ventana y cada vez que se conecta o quita
   uno (`id`, `kind`: genérico, DualShock 4, DualSense, Switch Pro, Xbox 360, Xbox One, y `name`).

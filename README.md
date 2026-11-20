@@ -11,8 +11,8 @@
 | ![Explorador](docs/img/explorador.png) | ![Terminal](docs/img/terminal.png) |
 
 ## Estado / Status
-Versión 0.11, en desarrollo: USB propio (teclado, ratón, pendrives FAT/exFAT/ISO/UDF y mandos). Probado en QEMU; en hardware real todavía no.
-Version 0.11, work in progress: native USB (keyboard, mouse, FAT/exFAT/ISO/UDF drives and gamepads). Tested in QEMU; not yet on real hardware.
+Versión 0.11.1, en desarrollo: USB propio (teclado, ratón, pendrives FAT/exFAT/ISO/UDF y mandos) y lectura de discos de Windows (NTFS) y de Linux (ext2/3/4), también los discos internos SATA y NVMe en solo lectura. Probado en QEMU; en hardware real todavía no.
+Version 0.11.1, work in progress: native USB (keyboard, mouse, FAT/exFAT/ISO/UDF drives and gamepads) and read-only Windows (NTFS) and Linux (ext2/3/4) disks, including internal SATA and NVMe drives. Tested in QEMU; not yet on real hardware.
 
 > **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS) es una implementación propia **no auditada**. No protejas con ella nada importante.
 > The cryptography is a custom, **unaudited** implementation. Do not rely on it for anything important.

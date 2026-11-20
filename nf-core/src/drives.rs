@@ -46,18 +46,22 @@ pub enum FormatKind {
 pub enum DriveAction {
     /// Escribir lo pendiente y desmontar todas las particiones del disco.
     Eject { disk: u32 },
-    /// Borrar el disco entero y crear una partición con el formato y la etiqueta dados.
-    Format { disk: u32, kind: FormatKind, label: String },
+    /// USB: borrar el disco entero y crear una partición con el formato y la etiqueta dados.
+    /// Disco interno: formatear solo la partición que empieza en el sector `part` (en USB vale 0).
+    Format { disk: u32, part: u64, kind: FormatKind, label: String },
     /// Borrar el disco entero y crear un volumen NightFury cifrado con la contraseña dada. El código
-    /// de recuperación se devuelve al programa con `Files::drive_result`.
-    Encrypt { disk: u32, label: String, password: String },
+    /// de recuperación se devuelve al programa con `Files::drive_result`. En un disco interno, solo
+    /// la partición que empieza en el sector `part`.
+    Encrypt { disk: u32, part: u64, label: String, password: String },
 }
 
 impl DriveInfo {
-    /// Nombre que ven los usuarios: «Disco local (C:)», «Etiqueta (D:)» o «Unidad USB (D:)».
+    /// Nombre que ven los usuarios: «Disco local (C:)», «Etiqueta (D:)» o «Unidad USB (D:)». Un disco
+    /// interno con etiqueta se llama por ella, como en Windows; C: siempre es «Disco local».
     pub fn name(&self) -> String {
         let l = self.letter;
         match (self.removable, self.label.is_empty()) {
+            (false, false) if l != 'C' => alloc::format!("{} ({l}:)", self.label),
             (false, _) => alloc::format!("Disco local ({l}:)"),
             (true, true) => alloc::format!("Unidad USB ({l}:)"),
             (true, false) => alloc::format!("{} ({l}:)", self.label),
@@ -75,6 +79,9 @@ pub fn kind_name(k: FsKind) -> &'static str {
         FsKind::Iso9660 => "ISO 9660",
         FsKind::Udf => "UDF",
         FsKind::NightFury => "NightFury",
+        FsKind::Ntfs => "NTFS",
+        FsKind::Ext => "ext",
+        FsKind::BitLocker => "BitLocker",
         FsKind::Unknown => "Formato no compatible",
     }
 }
@@ -82,6 +89,10 @@ pub fn kind_name(k: FsKind) -> &'static str {
 /// Unidad cifrada esperando contraseña (la guarda `Files`).
 pub struct Locked {
     pub disk: u32,
+    /// Primer sector de la partición (solo importa en los discos internos).
+    pub part: u64,
+    /// `false` si es una partición de un disco interno.
+    pub removable: bool,
     pub device: String,
     pub drive: LockedDrive,
 }

@@ -12,6 +12,7 @@ use crate::files::{self, file_name, join, parent, valid_name, Std};
 use crate::fsapi::FilesApi;
 use crate::font::{self, Align};
 use crate::fs::FsError;
+use crate::vol::FsKind;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
@@ -132,6 +133,8 @@ const TAG_DRV_PW2: u32 = 14;
 const TAG_DRV_REC: u32 = 15;
 const TAG_DRV_MSG: u32 = 16;
 const TAG_DRV_WARN: u32 = 17;
+/// Segunda confirmación al formatear o cifrar una partición de un disco interno.
+const TAG_DRV_INT: u32 = 18;
 /// Tarjeta de unidad en «Este equipo»: (ancho, alto, icono, nombre a la derecha).
 const CARD: (i32, i32, i32, bool) = (264, 80, 40, true);
 /// Menús: sobre un elemento / sobre la zona vacía / de la cinta (Archivo y Ordenar por).
@@ -197,6 +200,7 @@ const R_V_LIST: u32 = 23;
 const R_V_DETAILS: u32 = 24;
 const R_SORT: u32 = 25;
 const R_EXT: u32 = 26;
+const R_HIDDEN: u32 = 27;
 /// Botón de cinta -> orden, para los que se activan o desactivan según el contexto.
 const RIB_CMDS: [(u32, Cmd); 16] = [
     (R_COPY, Cmd::Copy),
@@ -302,6 +306,8 @@ struct DrvJob {
     /// Modelo y tamaño de la unidad al empezar: si al confirmar la letra es de otra, no se hace nada.
     /// shortcut: dos pendrives del mismo modelo y tamaño no se distinguen; pasar el id del disco en `DriveInfo` si hiciera falta.
     dev: (String, u64),
+    /// Partición de un disco interno del equipo: pide una segunda confirmación.
+    internal: bool,
     name: String,
     op: DrvOp,
     kind: FormatKind,
@@ -387,6 +393,8 @@ struct Explorer {
     sort: Sort,
     desc: bool,
     show_ext: bool,
+    /// «Elementos ocultos» marcado (lo oculto lo quita `list_view`; esto es solo la casilla).
+    show_hidden: bool,
     /// Archivo de preferencias ya leído (cambia con la cuenta de la sesión).
     prefs_for: String,
     /// Se puede crear y pegar en la carpeta actual (permisos de la sesión).
@@ -456,7 +464,11 @@ fn build_ribbon(trash: bool) -> Ribbon {
             ],
         },
         Group { title: "Vista actual", items: vec![item(R_SORT, "Ordenar por", Icon::Ordenar).large().dropdown()] },
-        Group { title: "Mostrar u ocultar", items: vec![item(R_EXT, "Extensiones de nombre de archivo", Icon::FileBlank).checkbox()] },
+        Group { title: "Mostrar u ocultar", items: vec![
+                item(R_EXT, "Extensiones de nombre de archivo", Icon::FileBlank).checkbox(),
+                item(R_HIDDEN, "Elementos ocultos", Icon::FileBlank).checkbox(),
+            ],
+        },
     ];
     Ribbon::new(Some("Archivo"), vec![Tab { title: "Inicio", groups: inicio }, Tab { title: "Vista", groups: vista }])
 }
@@ -490,6 +502,7 @@ fn make() -> Explorer {
         sort: Sort::Name,
         desc: false,
         show_ext: true,
+        show_hidden: false,
         prefs_for: String::new(),
         can_create: true,
         pending_sys: None,
@@ -1039,7 +1052,9 @@ impl Explorer {
         self.gen = f.generation();
         (self.press, self.mq) = (None, None);
         let prefs = f.explorer_prefs();
-        self.show_ext = f.read(&prefs).map_or(true, |d| !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"));
+        let p = f.read(&prefs).map(|d| String::from_utf8_lossy(&d).into_owned());
+        self.show_ext = p.as_ref().map_or(true, |d| !d.lines().any(|l| l.trim() == "extensiones=no"));
+        self.show_hidden = p.as_ref().is_ok_and(|d| d.lines().any(|l| l.trim() == "ocultos=si"));
         self.rows.clear();
         self.drives = f.drives();
         // La unidad ya no está (o se cerró): se vuelve a «Este equipo».
@@ -1061,7 +1076,7 @@ impl Explorer {
             }
         } else {
             loop {
-                match f.list(&self.cwd) {
+                match f.list_view(&self.cwd) {
                     Ok(v) => {
                         for e in v {
                             self.rows.push(Row {
@@ -1124,7 +1139,7 @@ impl Explorer {
 
     /// Pide la contraseña de una unidad cifrada (vacía + Aceptar = usar el código de recuperación).
     fn ask_unlock(&mut self, d: DriveInfo, cx: &mut Ctx) {
-        self.job = Some(DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
+        self.job = Some(DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), internal: !d.removable, name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
         cx.dialog = Some(DialogRequest::Password {
             tag: TAG_DRV_PW,
             title: String::from("Desbloquear unidad"),
@@ -1136,19 +1151,21 @@ impl Explorer {
     /// Empieza Formatear (con `kind`), Cifrar o Expulsar sobre la unidad de la fila seleccionada.
     fn drive_cmd(&mut self, id: u32, cx: &mut Ctx) {
         let Some(d) = self.sel.and_then(|i| self.row_drive(i)).cloned() else { return };
-        if !d.removable {
+        if d.letter == 'C' {
             return;
         }
-        let job = |op, kind| DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), name: d.name(), op, kind, label: String::new(), pw: String::new() };
+        // Las particiones ajenas de un disco interno (NTFS, ext, BitLocker) son de solo lectura y se formatean igual.
+        let can = !d.read_only || !d.removable;
+        let job = |op, kind| DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), internal: !d.removable, name: d.name(), op, kind, label: String::new(), pw: String::new() };
         match id {
-            M_EJECT => match cx.sys.fs().request_drive_action(d.letter, FormatRequest::Eject) {
+            M_EJECT if d.removable => match cx.sys.fs().request_drive_action(d.letter, FormatRequest::Eject) {
                 Ok(()) => {
                     self.reload(cx.sys);
                     self.drive_msg("Expulsar", format!("Ya puedes quitar la unidad ({}:).", d.letter), cx);
                 }
                 Err(e) => self.fail(e, cx),
             },
-            M_FMT_FAT32 | M_FMT_EXFAT | M_FMT_NF if !d.read_only => {
+            M_FMT_FAT32 | M_FMT_EXFAT | M_FMT_NF if can => {
                 let kind = match id {
                     M_FMT_FAT32 => FormatKind::Fat32,
                     M_FMT_EXFAT => FormatKind::ExFat,
@@ -1162,7 +1179,7 @@ impl Explorer {
                     value: d.label.clone(),
                 });
             }
-            M_ENCRYPT if !d.read_only && !d.locked => {
+            M_ENCRYPT if can && !d.locked => {
                 self.job = Some(job(DrvOp::Encrypt, FormatKind::NightFury));
                 cx.dialog = Some(DialogRequest::Message {
                     tag: TAG_DRV_WARN,
@@ -1177,6 +1194,25 @@ impl Explorer {
             _ => {}
         }
         cx.redraw = true;
+    }
+
+    fn ask_password(&self, j: &DrvJob, cx: &mut Ctx) {
+        cx.dialog = Some(DialogRequest::Password {
+            tag: TAG_DRV_PW,
+            title: format!("Cifrar {}", j.name),
+            label: format!("Elige una contraseña para la unidad (al menos {} caracteres):", MIN_PASSWORD),
+        });
+    }
+
+    /// Segunda confirmación para una partición de un disco interno (también si es de Windows o de Linux).
+    fn ask_internal(&self, encrypt: bool, j: &DrvJob, cx: &mut Ctx) {
+        let model = if j.dev.0.is_empty() { "disco sin nombre" } else { j.dev.0.as_str() };
+        cx.dialog = Some(DialogRequest::Message {
+            tag: TAG_DRV_INT,
+            title: String::from("Disco interno"),
+            text: format!("Esta partición está en un disco interno del equipo: {model}, {}. Se borrará todo lo que contiene, también si es de Windows o de Linux. ¿Seguro que quieres continuar?", fmt_size(j.dev.1)),
+            buttons: if encrypt { Buttons::EncryptCancel } else { Buttons::FormatCancel },
+        });
     }
 
     /// Manda formatear o cifrar y queda a la espera del resultado.
@@ -1232,9 +1268,16 @@ impl Explorer {
     fn go(&mut self, path: &str, push: bool, cx: &mut Ctx) {
         if path != files::TRASH && path != files::COMPUTER {
             let l = path.chars().next().map(|c| c.to_ascii_uppercase());
-            if let Some(d) = cx.sys.fs().drives().into_iter().find(|d| Some(d.letter) == l && d.locked) {
-                self.ask_unlock(d, cx);
-                return;
+            let found = cx.sys.fs().drives().into_iter().find(|d| Some(d.letter) == l);
+            if let Some(d) = found {
+                if d.locked {
+                    self.ask_unlock(d, cx);
+                    return;
+                }
+                if d.kind == FsKind::BitLocker {
+                    self.drive_msg(&d.name(), String::from("Cifrada con BitLocker: no se puede abrir en NightFury."), cx);
+                    return;
+                }
             }
             if let Err(e) = cx.sys.fs().list(path) {
                 self.fail(e, cx);
@@ -1543,6 +1586,7 @@ impl Explorer {
             self.rib.set_checked(id, self.view == v);
         }
         self.rib.set_checked(R_EXT, self.show_ext);
+        self.rib.set_checked(R_HIDDEN, self.show_hidden);
     }
 
     fn rib_pick(&mut self, id: u32, cx: &mut Ctx) {
@@ -1569,6 +1613,11 @@ impl Explorer {
             R_EXT => {
                 let v = if self.show_ext { "no" } else { "si" };
                 Self::write_prefs(cx.sys, &[("extensiones", v.into())]);
+                self.reload(cx.sys);
+            }
+            R_HIDDEN => {
+                let v = if self.show_hidden { "no" } else { "si" };
+                Self::write_prefs(cx.sys, &[("ocultos", v.into())]);
                 self.reload(cx.sys);
             }
             _ => {}
@@ -1648,11 +1697,14 @@ impl Explorer {
         let n = MenuItem::new;
         let Some(d) = self.sel.and_then(|i| self.row_drive(i)) else { return vec![n(M_REFRESH, "Actualizar")] };
         let mut v = vec![n(M_OPEN, "Abrir").bold()];
-        if d.removable {
-            v.push(n(M_EJECT, "Expulsar"));
+        if d.letter != 'C' {
+            let off = d.read_only && d.removable;
+            if d.removable {
+                v.push(n(M_EJECT, "Expulsar"));
+            }
             let fmt = vec![n(M_FMT_FAT32, "FAT32"), n(M_FMT_EXFAT, "exFAT"), n(M_FMT_NF, "NightFury")];
-            v.push(MenuItem::submenu("Formatear…", fmt).disabled(d.read_only));
-            v.push(n(M_ENCRYPT, "Cifrar…").disabled(d.read_only || d.locked));
+            v.push(MenuItem::submenu("Formatear…", fmt).disabled(off));
+            v.push(n(M_ENCRYPT, "Cifrar…").disabled(off || d.locked));
         }
         v.extend([MenuItem::sep(), n(M_PROPS, "Propiedades")]);
         v
@@ -2057,7 +2109,8 @@ impl Explorer {
         if self.computer() {
             return;
         }
-        let (total, free) = match self.cwd_drive().filter(|d| d.removable) {
+        // Todas las unidades menos C: (los discos internos tampoco son extraíbles pero tienen su propio espacio).
+        let (total, free) = match self.cwd_drive().filter(|d| d.letter != 'C') {
             Some(d) => (d.total, d.free),
             None => sys.fs().space(),
         };
@@ -2471,18 +2524,25 @@ impl App for Explorer {
                 }
             }
             DialogResult::Answer { tag: TAG_DRV_SURE, answer } => match (answer, self.job.take()) {
+                (Answer::Yes, Some(j)) if j.internal => {
+                    self.ask_internal(false, &j, cx);
+                    self.job = Some(j);
+                }
                 (Answer::Yes, Some(j)) => self.drive_request(j.letter, &j.dev, FormatRequest::Format { kind: j.kind, label: j.label }, cx),
                 _ => {}
             },
             DialogResult::Answer { tag: TAG_DRV_WARN, answer } => match (answer, self.job.as_ref()) {
-                (Answer::Yes, Some(j)) => {
-                    cx.dialog = Some(DialogRequest::Password {
-                        tag: TAG_DRV_PW,
-                        title: format!("Cifrar {}", j.name),
-                        label: format!("Elige una contraseña para la unidad (al menos {} caracteres):", MIN_PASSWORD),
-                    });
-                }
+                (Answer::Yes, Some(j)) if j.internal => self.ask_internal(true, j, cx),
+                (Answer::Yes, Some(j)) => self.ask_password(j, cx),
                 _ => self.drop_job(),
+            },
+            DialogResult::Answer { tag: TAG_DRV_INT, answer } => match (answer, self.job.take()) {
+                (Answer::Yes, Some(j)) if j.op == DrvOp::Encrypt => {
+                    self.ask_password(&j, cx);
+                    self.job = Some(j);
+                }
+                (Answer::Yes, Some(j)) => self.drive_request(j.letter, &j.dev, FormatRequest::Format { kind: j.kind, label: j.label }, cx),
+                _ => {}
             },
             DialogResult::Text { tag: TAG_DRV_PW, value: Some(mut pw) } => {
                 match self.job.as_ref().map(|j| j.op) {
@@ -3791,6 +3851,18 @@ mod tests {
     }
 
     #[test]
+    fn casilla_de_elementos_ocultos() {
+        let mut t = T::new();
+        t.tab(1);
+        t.rib(R_HIDDEN);
+        assert!(t.e.show_hidden && t.sys.files.show_hidden());
+        let p = String::from_utf8(t.sys.files.read(&prefs()).unwrap()).unwrap();
+        assert!(p.contains("ocultos=si"), "{p}");
+        t.rib(R_HIDDEN);
+        assert!(!t.e.show_hidden && !t.sys.files.show_hidden());
+    }
+
+    #[test]
     fn casilla_de_extensiones_y_cambiar_nombre() {
         let mut t = T::new();
         t.view(M_VIEW_ICONS);
@@ -4740,7 +4812,7 @@ mod tests {
         t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
         t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("COPIAS")) });
         t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::Yes });
-        assert_eq!(t.sys.files.take_drive_actions(), [crate::drives::DriveAction::Format { disk: 1, kind: FormatKind::ExFat, label: String::from("COPIAS") }]);
+        assert_eq!(t.sys.files.take_drive_actions(), [crate::drives::DriveAction::Format { disk: 1, part: 0, kind: FormatKind::ExFat, label: String::from("COPIAS") }]);
         assert_eq!(t.e.waiting, Some(('D', false)));
         // Hasta que llega el resultado no hay aviso; luego, «formateada».
         let (_, d, _) = t.cx(|e, cx| e.tick(cx));
@@ -4795,7 +4867,7 @@ mod tests {
         t.answer(pw(TAG_DRV_PW2, "secreto1"));
         assert_eq!(
             t.sys.files.take_drive_actions(),
-            [crate::drives::DriveAction::Encrypt { disk: 1, label: String::from("DATOS"), password: String::from("secreto1") }]
+            [crate::drives::DriveAction::Encrypt { disk: 1, part: 0, label: String::from("DATOS"), password: String::from("secreto1") }]
         );
         assert_eq!(t.e.waiting, Some(('D', true)));
         t.sys.files.set_drive_result(Ok(Some(String::from("AAAA-BBBB"))));
@@ -4847,5 +4919,85 @@ mod tests {
         let (_, _, _) = t.cx(|e, cx| e.tick(cx));
         assert_eq!(t.e.cwd, files::COMPUTER);
         assert_eq!(t.rows(), ["C:"]);
+    }
+
+    // ---- discos internos (v0.11.1) ----
+
+    const INTERNO: u32 = 1 << 31;
+
+    /// C: más una partición interna de solo lectura («Samsung 970», 64 MiB) y otra con BitLocker.
+    fn con_interna() -> T {
+        use crate::vol::{self, FsKind, MemSectors, Partition};
+        let mut t = T::new();
+        let v = vol::ReadOnly(usb("WIN"));
+        assert_eq!(t.sys.files.attach_part(INTERNO, 2048, "Samsung 970", Box::new(v), false), Some('D'));
+        let bl = vol::mount(Box::new(MemSectors::new(4096, 512)), &Partition { start: 0, sectors: 4096, kind: FsKind::BitLocker }).unwrap();
+        assert_eq!(t.sys.files.attach_part(INTERNO, 900_000, "Samsung 970", bl, false), Some('E'));
+        t.open(files::COMPUTER);
+        t
+    }
+
+    #[test]
+    fn interna_no_ofrece_expulsar_y_formatear_pide_doble_confirmacion() {
+        let mut t = con_interna();
+        let m = t.right_row("D:");
+        assert_eq!(texts(&m.items), ["Abrir", "Formatear… >", "Cifrar…", "-", "Propiedades"]);
+        // Expulsar a la fuerza tampoco hace nada.
+        let (d, _) = t.pick(TAG_MENU_ITEM, M_EJECT);
+        assert!(d.is_none() && t.sys.files.take_drive_actions().is_empty());
+        // Formatear: etiqueta, confirmación normal y, además, la de disco interno.
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("NUEVA")) });
+        let d = t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::Yes });
+        match d {
+            Some(DialogRequest::Message { tag: TAG_DRV_INT, title, text, buttons }) => {
+                assert_eq!(title, "Disco interno");
+                assert_eq!(text, "Esta partición está en un disco interno del equipo: Samsung 970, 62.8 MB. Se borrará todo lo que contiene, también si es de Windows o de Linux. ¿Seguro que quieres continuar?");
+                assert_eq!(buttons, Buttons::FormatCancel);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(t.sys.files.take_drive_actions().is_empty(), "antes de la segunda confirmación no se hace nada");
+        // Cancelar la segunda: nada.
+        t.answer(DialogResult::Answer { tag: TAG_DRV_INT, answer: Answer::Cancel });
+        assert!(t.sys.files.take_drive_actions().is_empty() && t.e.job.is_none() && t.e.waiting.is_none());
+        // Aceptarla: se pide formatear solo esa partición.
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("NUEVA")) });
+        t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::Yes });
+        t.answer(DialogResult::Answer { tag: TAG_DRV_INT, answer: Answer::Yes });
+        assert_eq!(t.sys.files.take_drive_actions(), [crate::drives::DriveAction::Format { disk: INTERNO, part: 2048, kind: FormatKind::ExFat, label: String::from("NUEVA") }]);
+        assert_eq!(t.e.waiting, Some(('D', false)));
+        assert_eq!(t.rows(), ["C:", "E:"], "la otra partición sigue montada");
+    }
+
+    #[test]
+    fn interna_cifrar_pide_las_dos_confirmaciones_antes_de_la_contrasena() {
+        let mut t = con_interna();
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_ENCRYPT);
+        let d = t.answer(DialogResult::Answer { tag: TAG_DRV_WARN, answer: Answer::Yes });
+        assert!(matches!(d, Some(DialogRequest::Message { tag: TAG_DRV_INT, buttons: Buttons::EncryptCancel, .. })));
+        let d = t.answer(DialogResult::Answer { tag: TAG_DRV_INT, answer: Answer::Yes });
+        assert!(matches!(d, Some(DialogRequest::Password { tag: TAG_DRV_PW, .. })));
+        t.answer(DialogResult::Text { tag: TAG_DRV_PW, value: Some(String::from("secreto1")) });
+        t.answer(DialogResult::Text { tag: TAG_DRV_PW2, value: Some(String::from("secreto1")) });
+        assert_eq!(
+            t.sys.files.take_drive_actions(),
+            [crate::drives::DriveAction::Encrypt { disk: INTERNO, part: 2048, label: String::from("WIN"), password: String::from("secreto1") }]
+        );
+    }
+
+    #[test]
+    fn bitlocker_sale_con_letra_no_se_abre_y_se_puede_formatear() {
+        let mut t = con_interna();
+        assert_eq!(t.rows(), ["C:", "D:", "E:"]);
+        let d = t.cx(|e, cx| e.open_path("E:\\", cx)).1;
+        assert_eq!(msg(d).1, "Cifrada con BitLocker: no se puede abrir en NightFury.");
+        assert_eq!(t.e.cwd, files::COMPUTER, "no entra");
+        let m = t.right_row("E:");
+        assert_eq!(texts(&m.items), ["Abrir", "Formatear… >", "Cifrar…", "-", "Propiedades"]);
     }
 }

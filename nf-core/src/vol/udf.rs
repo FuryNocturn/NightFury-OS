@@ -447,7 +447,7 @@ impl Udf {
 }
 
 fn entry_of(name: String, n: &Node) -> Entry {
-    Entry { name, dir: n.dir, size: if n.dir { 0 } else { n.size }, modified: n.date }
+    Entry { name, dir: n.dir, size: if n.dir { 0 } else { n.size }, modified: n.date, hidden: false }
 }
 
 impl Volume for Udf {

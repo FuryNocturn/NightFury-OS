@@ -234,6 +234,15 @@ pub fn open(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Opened, FsError> {
 /// contraseña. La etiqueta se guarda dentro del volumen. Devuelve el código de recuperación si se
 /// cifró.
 pub fn format(dev: Box<dyn SectorDev>, label: &str, encrypt: Option<(&str, &mut Pool)>, now: DateTime) -> Result<Option<String>, KeyError> {
+    format_at(dev, label, encrypt, now, true)
+}
+
+/// Como `format`, pero el dispositivo es ya una partición: el volumen ocupa todo y no se toca la tabla.
+pub fn format_in(dev: Box<dyn SectorDev>, label: &str, encrypt: Option<(&str, &mut Pool)>, now: DateTime) -> Result<Option<String>, KeyError> {
+    format_at(dev, label, encrypt, now, false)
+}
+
+fn format_at(dev: Box<dyn SectorDev>, label: &str, encrypt: Option<(&str, &mut Pool)>, now: DateTime, table: bool) -> Result<Option<String>, KeyError> {
     if label.chars().count() > LABEL_MAX || label.chars().any(|c| c.is_control()) {
         return Err(KeyError::Fs(FsError::BadName));
     }
@@ -246,7 +255,7 @@ pub fn format(dev: Box<dyn SectorDev>, label: &str, encrypt: Option<(&str, &mut 
         }
     }
     let mut dev = dev;
-    let (start, sectors) = part::prepare(&mut *dev)?;
+    let (start, sectors) = if table { part::prepare(&mut *dev)? } else { part::whole(&mut *dev)? };
     let mut blocks = SectorBlocks { dev, start, sectors };
     let n = blocks.blocks();
     // Mínimos: el NFFS pide 64 bloques y el cifrado reserva dos más.
@@ -259,7 +268,9 @@ pub fn format(dev: Box<dyn SectorDev>, label: &str, encrypt: Option<(&str, &mut 
         blocks.write(b, &zero).map_err(cryptdev::disk_err)?;
     }
     // La tabla de particiones va antes de mover el disco al volumen.
-    part::write_mbr(&mut *blocks.dev, start, sectors, PTYPE)?;
+    if table {
+        part::write_mbr(&mut *blocks.dev, start, sectors, PTYPE)?;
+    }
     let (dev, code): (Box<dyn BlockDev>, Option<String>) = match encrypt {
         None => (Box::new(blocks), None),
         Some((password, pool)) => {

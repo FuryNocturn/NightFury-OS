@@ -58,6 +58,8 @@ pub const SYS_DRIVERS_DIR: &str = "C:\\Sistema\\drivers";
 pub const SYS_LOGS_DIR: &str = "C:\\Sistema\\logs";
 /// Cuentas de usuario (formato en `accounts.rs`).
 pub const ACCOUNTS_FILE: &str = "C:\\Sistema\\config\\cuentas";
+/// Particiones internas que NightFury formateó y puede escribir (una línea `serie|inicio`).
+const UNITS_FILE: &str = "C:\\Sistema\\unidades.cfg";
 pub const LOG_FILE: &str = "C:\\Sistema\\logs\\sistema.log";
 /// Cuenta de la unidad en memoria (sin disco no hay cuentas que guardar).
 pub const DEFAULT_USER: &str = "Usuario";
@@ -397,6 +399,10 @@ pub struct Files {
 struct XDrive {
     letter: char,
     disk: u32,
+    /// Primer sector de la partición en su disco (identifica la partición de un disco interno).
+    part: u64,
+    /// `false` en las particiones de los discos internos (SATA, NVMe).
+    removable: bool,
     device: String,
     vol: Option<Box<dyn Volume>>,
     locked: Option<LockedDrive>,
@@ -407,6 +413,12 @@ struct XDrives {
     list: Vec<XDrive>,
     actions: Vec<DriveAction>,
     result: Option<Result<Option<String>, FsError>>,
+}
+
+/// Línea de `unidades.cfg`: la serie sin saltos de línea ni `|`.
+fn units_line(serie: &str, start: u64) -> String {
+    let s: String = serie.trim().chars().map(|c| if c.is_control() || c == '|' { '_' } else { c }).collect();
+    format!("{s}|{start}")
 }
 
 impl Default for Files {
@@ -570,6 +582,17 @@ impl Files {
     /// Cambia cada vez que se modifica algo; sirve para saber cuándo refrescar una vista.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Como `list`, pero sin lo oculto o de sistema salvo que el usuario marcara «Elementos
+    /// ocultos». Es lo que enseñan el Explorador, el escritorio y los diálogos; copiar, mover y
+    /// borrar usan `list` para no dejarse nada.
+    pub fn list_view(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
+        let mut v = self.list(dir)?;
+        if v.iter().any(|e| e.hidden) && !self.show_hidden() {
+            v.retain(|e| !e.hidden);
+        }
+        Ok(v)
     }
 
     /// Entradas de una carpeta: carpetas primero, luego por nombre sin distinguir mayúsculas.
@@ -1102,6 +1125,12 @@ impl Files {
     }
 
     // ---- Extensiones de nombre de archivo (Explorador y escritorio) ----
+
+    /// `true` si el usuario pidió ver los elementos ocultos (`ocultos=si` en `explorer_prefs()`).
+    pub fn show_hidden(&mut self) -> bool {
+        let prefs = self.explorer_prefs();
+        self.read(&prefs).is_ok_and(|d| String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "ocultos=si"))
+    }
 
     /// `false` si el usuario ocultó las extensiones (`extensiones=no` en `explorer_prefs()`).
     pub fn show_ext(&mut self) -> bool {
@@ -2407,7 +2436,7 @@ impl Files {
                 Some(i) => join_rel(&f.parent, &i.raw),
             }
         };
-        Ok(self.items(&raw)?.into_iter().map(|i| Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified }).collect())
+        Ok(self.items(&raw)?.into_iter().map(|i| Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified, hidden: false }).collect())
     }
 
     fn r_stat(&mut self, r: &str) -> Result<Entry, FsError> {
@@ -2415,7 +2444,7 @@ impl Files {
             return self.fs.stat(r);
         }
         let i = self.find_enc(r)?.item.ok_or(FsError::NotFound)?;
-        Ok(Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified })
+        Ok(Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified, hidden: false })
     }
 
     fn r_read(&mut self, r: &str) -> Result<Vec<u8>, FsError> {
@@ -2788,7 +2817,7 @@ impl Files {
     fn v_stat(&mut self, l: char, r: &str) -> Result<Entry, FsError> {
         let v = self.vol(l)?;
         if r.is_empty() {
-            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default() });
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
         }
         v.stat(r)
     }
@@ -2894,8 +2923,19 @@ impl Files {
     /// Conecta un volumen montado de la partición del disco `disk` en la primera letra libre
     /// (D..Z). `None` si no quedan letras.
     pub fn attach(&mut self, disk: u32, device: &str, vol: Box<dyn Volume>) -> Option<char> {
+        self.attach_as(disk, device, vol, true)
+    }
+
+    /// Como `attach`, diciendo si la unidad es extraíble (USB) o una partición de un disco interno.
+    /// Las internas no se expulsan; si no son de NightFury, el núcleo las monta en solo lectura.
+    pub fn attach_as(&mut self, disk: u32, device: &str, vol: Box<dyn Volume>, removable: bool) -> Option<char> {
+        self.attach_part(disk, 0, device, vol, removable)
+    }
+
+    /// Como `attach_as`, diciendo en qué sector empieza la partición (para formatearla sola).
+    pub fn attach_part(&mut self, disk: u32, part: u64, device: &str, vol: Box<dyn Volume>, removable: bool) -> Option<char> {
         let letter = self.free_letter()?;
-        self.xd.list.push(XDrive { letter, disk, device: String::from(device), vol: Some(vol), locked: None });
+        self.xd.list.push(XDrive { letter, disk, part, removable, device: String::from(device), vol: Some(vol), locked: None });
         self.generation += 1;
         Some(letter)
     }
@@ -2903,7 +2943,7 @@ impl Files {
     /// Como `attach`, para un volumen NightFury cifrado que espera contraseña.
     pub fn attach_locked(&mut self, locked: Locked) -> Option<char> {
         let letter = self.free_letter()?;
-        self.xd.list.push(XDrive { letter, disk: locked.disk, device: locked.device, vol: None, locked: Some(locked.drive) });
+        self.xd.list.push(XDrive { letter, disk: locked.disk, part: locked.part, removable: locked.removable, device: locked.device, vol: None, locked: Some(locked.drive) });
         self.generation += 1;
         Some(letter)
     }
@@ -2946,14 +2986,46 @@ impl Files {
             .map(|d| match d.vol.as_mut() {
                 Some(vol) => {
                     let (total, free) = vol.space();
-                    DriveInfo { letter: d.letter, label: vol.label(), device: d.device.clone(), kind: vol.kind(), total, free, read_only: vol.read_only(), removable: true, locked: false }
+                    DriveInfo { letter: d.letter, label: vol.label(), device: d.device.clone(), kind: vol.kind(), total, free, read_only: vol.read_only(), removable: d.removable, locked: false }
                 }
-                None => DriveInfo { letter: d.letter, label: String::new(), device: d.device.clone(), kind: crate::vol::FsKind::NightFury, total: 0, free: 0, read_only: false, removable: true, locked: true },
+                None => DriveInfo { letter: d.letter, label: String::new(), device: d.device.clone(), kind: crate::vol::FsKind::NightFury, total: 0, free: 0, read_only: false, removable: d.removable, locked: true },
             })
             .collect();
         rest.sort_by_key(|d| d.letter);
         v.append(&mut rest);
         v
+    }
+
+    /// Aviso del volumen de la unidad `letter` (p. ej. un ext con el diario a medias), si lo hay.
+    pub fn drive_notice(&self, letter: char) -> Option<&'static str> {
+        let letter = letter.to_ascii_uppercase();
+        self.xd.list.iter().find(|d| d.letter == letter)?.vol.as_ref()?.notice()
+    }
+
+    /// ¿Escribe NightFury en la partición interna (`serie` del disco, sector `start`) tras reiniciar?
+    /// Lo dice `C:\Sistema\unidades.cfg`: una línea `serie|inicio` por partición que NightFury formateó.
+    pub fn internal_writable(&mut self, serie: &str, start: u64) -> bool {
+        // Sin número de serie no se distingue un disco de otro: nunca se da por nuestro.
+        if serie.trim().is_empty() {
+            return false;
+        }
+        let line = units_line(serie, start);
+        self.fs.read(rel(UNITS_FILE)).is_ok_and(|b| String::from_utf8_lossy(&b).lines().any(|l| l == line))
+    }
+
+    /// Apunta (`on`) o quita la partición interna de `unidades.cfg`. Sin sesión y sin pasar por `guard`
+    /// (lo llama el núcleo); no hace nada si ya está como se pide.
+    pub fn set_internal_writable(&mut self, serie: &str, start: u64, on: bool, now: DateTime) -> Result<(), FsError> {
+        let line = units_line(serie, start);
+        let old = self.fs.read(rel(UNITS_FILE)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        if old.lines().any(|l| l == line) == on {
+            return Ok(());
+        }
+        let mut new: String = old.lines().filter(|l| *l != line).map(|l| format!("{l}\n")).collect();
+        if on {
+            new += &format!("{line}\n");
+        }
+        Ok(self.fs.write(rel(UNITS_FILE), new.as_bytes(), now)?)
     }
 
     /// Abre una unidad cifrada con su contraseña o con el código de recuperación.
@@ -2982,16 +3054,23 @@ impl Files {
         if letter == 'C' {
             return Err(FsError::Invalid);
         }
-        let disk = self.xd.list.iter().find(|d| d.letter == letter).ok_or(FsError::BadPath)?.disk;
+        let x = self.xd.list.iter().find(|d| d.letter == letter).ok_or(FsError::BadPath)?;
+        let (disk, part, internal) = (x.disk, x.part, !x.removable);
         let eject = req == FormatRequest::Eject;
-        for d in self.xd.list.iter_mut().filter(|d| d.disk == disk) {
+        // Un disco interno nunca se expulsa, y formatear o cifrar toca solo su partición (las demás siguen montadas).
+        if internal && eject {
+            return Err(FsError::Denied);
+        }
+        let mine = |d: &XDrive| d.disk == disk && (!internal || d.part == part);
+        for d in self.xd.list.iter_mut().filter(|d| mine(d)) {
             if let Some(v) = d.vol.as_mut() {
-                if !eject && v.read_only() {
+                // Las internas ajenas (NTFS, ext…) son de solo lectura y se pueden formatear igualmente.
+                if !eject && !internal && v.read_only() {
                     return Err(FsError::Denied);
                 }
             }
         }
-        for d in self.xd.list.iter_mut().filter(|d| d.disk == disk) {
+        for d in self.xd.list.iter_mut().filter(|d| mine(d)) {
             if let Some(v) = d.vol.as_mut() {
                 // Al formatear se pierde todo igualmente; al expulsar, un fallo impide quitarla.
                 if let (Err(e), true) = (v.flush(), eject) {
@@ -2999,14 +3078,14 @@ impl Files {
                 }
             }
         }
-        self.xd.list.retain(|d| d.disk != disk);
+        self.xd.list.retain(|d| !mine(d));
         self.generation += 1;
         self.forget_gone();
         self.xd.result = None;
         self.xd.actions.push(match req {
             FormatRequest::Eject => DriveAction::Eject { disk },
-            FormatRequest::Format { kind, label } => DriveAction::Format { disk, kind, label },
-            FormatRequest::Encrypt { label, password } => DriveAction::Encrypt { disk, label, password },
+            FormatRequest::Format { kind, label } => DriveAction::Format { disk, part, kind, label },
+            FormatRequest::Encrypt { label, password } => DriveAction::Encrypt { disk, part, label, password },
         });
         Ok(())
     }
@@ -5566,6 +5645,35 @@ mod drive_tests {
     }
 
     #[test]
+    fn ocultos_y_unidades_internas() {
+        let s = stick(FsKind::Fat32, "");
+        let mut v = mount(&s);
+        v.write("visto.txt", b"1", NOW).unwrap();
+        v.write("oculto.txt", b"2", NOW).unwrap();
+        v.flush().unwrap();
+        drop(v);
+        let mut f = Files::default();
+        // Atributo «oculto» (0x02) puesto a mano en la entrada corta de la raíz.
+        {
+            let mut m = s.0.borrow_mut();
+            let i = m.data.windows(11).position(|w| w == b"OCULTO  TXT").unwrap();
+            m.data[i + 11] |= 0x02;
+        }
+        let d = f.attach_as(1, "Disco interno", Box::new(vol::ReadOnly(mount(&s))), false).unwrap();
+        let path = alloc::format!("{d}:\\");
+        let view = |f: &mut Files| f.list_view(&path).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(view(&mut f), ["visto.txt"]);
+        assert_eq!(names(&mut f, &path).len(), 2, "list (copiar, mover) lo ve todo");
+        let prefs = f.explorer_prefs();
+        f.write(&prefs, b"ocultos=si\n", NOW).unwrap();
+        assert_eq!(view(&mut f).len(), 2);
+        // Interna y de solo lectura: no es extraíble y no se escribe.
+        let info = f.drives().into_iter().find(|i| i.letter == d).unwrap();
+        assert!(!info.removable && info.read_only);
+        assert_eq!(f.write(&alloc::format!("{d}:\\x.txt"), b"x", NOW), Err(FsError::Denied));
+    }
+
+    #[test]
     fn letras_lectura_y_escritura() {
         let (mut f, d, e) = two();
         assert_eq!((d, e), ('D', 'E'));
@@ -5711,11 +5819,57 @@ mod drive_tests {
         // El disco expulsado se puede volver a conectar y formatear.
         f.attach(7, "Pendrive", v).unwrap();
         f.request_drive_action('D', FormatRequest::Format { kind: FormatKind::ExFat, label: String::from("NUEVA") }).unwrap();
-        assert_eq!(f.take_drive_actions(), [DriveAction::Format { disk: 7, kind: FormatKind::ExFat, label: String::from("NUEVA") }]);
+        assert_eq!(f.take_drive_actions(), [DriveAction::Format { disk: 7, part: 0, kind: FormatKind::ExFat, label: String::from("NUEVA") }]);
         assert_eq!(f.drive_result(), None);
         f.set_drive_result(Ok(Some(String::from("codigo"))));
         assert_eq!(f.drive_result(), Some(Ok(Some(String::from("codigo")))));
         assert_eq!(f.drive_result(), None);
+    }
+
+    /// Dos particiones internas del mismo disco: una de solo lectura (ajena) y otra NightFury.
+    fn internas() -> (Files, char, char) {
+        let mut f = Files::default();
+        let a = f.attach_part(INTERNO, 2048, "Disco", Box::new(vol::ReadOnly(mount(&stick(FsKind::Fat32, "A")))), false).unwrap();
+        let b = f.attach_part(INTERNO, 900_000, "Disco", mount(&stick(FsKind::ExFat, "B")), false).unwrap();
+        (f, a, b)
+    }
+    const INTERNO: u32 = 1 << 31;
+
+    #[test]
+    fn internas_no_se_expulsan_y_formatear_toca_solo_su_particion() {
+        let (mut f, a, b) = internas();
+        assert_eq!(f.request_drive_action(a, FormatRequest::Eject), Err(FsError::Denied));
+        assert_eq!(f.request_drive_action(b, FormatRequest::Eject), Err(FsError::Denied));
+        assert!(f.take_drive_actions().is_empty());
+        assert_eq!(f.drives().len(), 3, "denegar no desmonta nada");
+        // La de solo lectura (Windows, Linux) sí se puede formatear; la otra partición sigue montada.
+        f.request_drive_action(a, FormatRequest::Format { kind: FormatKind::ExFat, label: String::from("N") }).unwrap();
+        assert_eq!(f.take_drive_actions(), [DriveAction::Format { disk: INTERNO, part: 2048, kind: FormatKind::ExFat, label: String::from("N") }]);
+        let l: Vec<char> = f.drives().iter().map(|d| d.letter).collect();
+        assert_eq!(l, ['C', b]);
+        f.request_drive_action(b, FormatRequest::Encrypt { label: String::new(), password: String::from("secreto12") }).unwrap();
+        assert_eq!(f.take_drive_actions(), [DriveAction::Encrypt { disk: INTERNO, part: 900_000, label: String::new(), password: String::from("secreto12") }]);
+        // En USB, expulsar sigue valiendo.
+        let mut g = Files::default();
+        let d = g.attach(1, "USB", mount(&stick(FsKind::Fat32, ""))).unwrap();
+        g.request_drive_action(d, FormatRequest::Eject).unwrap();
+    }
+
+    #[test]
+    fn unidades_cfg_apunta_particiones_y_las_apps_no_lo_leen() {
+        let mut f = Files::default();
+        assert!(!f.internal_writable("SER|1", 2048));
+        f.set_internal_writable("SER|1", 2048, true, NOW).unwrap();
+        f.set_internal_writable("SER|1", 2048, true, NOW).unwrap();
+        f.set_internal_writable("SER|1", 4096, true, NOW).unwrap();
+        f.set_internal_writable("OTRO", 2048, true, NOW).unwrap();
+        assert!(f.internal_writable("SER|1", 2048) && f.internal_writable("SER|1", 4096) && f.internal_writable("OTRO", 2048));
+        assert!(!f.internal_writable("SER|1", 1) && !f.internal_writable("SER", 2048));
+        f.set_internal_writable("SER|1", 2048, false, NOW).unwrap();
+        assert!(!f.internal_writable("SER|1", 2048) && f.internal_writable("SER|1", 4096));
+        assert_eq!(f.read("C:\\Sistema\\unidades.cfg").unwrap().iter().filter(|&&c| c == b'\n').count(), 2);
+        // Un programa de terceros no lo lee ni lo escribe (el servicio bloquea C:\Sistema).
+        assert!(crate::service::blocked(false, "C:\\Sistema\\unidades.cfg"));
     }
 
     #[test]

@@ -91,8 +91,14 @@ pub enum FsKind {
     Udf,
     /// El formato propio (NFFS), en claro o cifrado: lo monta `files`, no este módulo.
     NightFury,
-    /// NTFS, ext, HFS+, APFS…: se ve la unidad pero sale «Formato no compatible» (v0.11).
+    /// HFS+, APFS…: no se monta.
     Unknown,
+    /// NTFS (Windows), en solo lectura (v0.11.1).
+    Ntfs,
+    /// ext2, ext3 y ext4 (Linux), en solo lectura (v0.11.1).
+    Ext,
+    /// Cifrada con BitLocker: se ve bloqueada y no se abre.
+    BitLocker,
 }
 
 /// Partición encontrada en el disco (o el disco entero si no hay tabla).
@@ -125,6 +131,10 @@ pub trait Volume {
     fn delete(&mut self, path: &str) -> Result<(), FsError>;
     /// Escribe lo pendiente y deja el volumen limpio (antes de expulsar).
     fn flush(&mut self) -> Result<(), FsError>;
+    /// Aviso para mostrar al conectar la unidad (p. ej. un ext con el diario a medias).
+    fn notice(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Lee la tabla de particiones (GPT, si no MBR; si no hay, el disco entero es una partición) y
@@ -141,6 +151,9 @@ pub fn mount(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Box<dyn Volume>, 
         FsKind::ExFat => exfat::mount(dev, p),
         FsKind::Iso9660 => iso::mount(dev, p),
         FsKind::Udf => udf::mount(dev, p),
+        FsKind::Ntfs => ntfs::mount(dev, p),
+        FsKind::Ext => ext::mount(dev, p),
+        FsKind::BitLocker => Ok(Box::new(Sealed { kind: FsKind::BitLocker, bytes: p.sectors * dev.sector_size() as u64 })),
         FsKind::NightFury | FsKind::Unknown => Err(FsError::Corrupt),
     }
 }
@@ -155,10 +168,166 @@ pub fn format(dev: &mut dyn SectorDev, kind: FsKind, label: &str, now: DateTime)
     }
 }
 
+/// Formatea el dispositivo entero, que ya es una partición (p. ej. una `Window`), sin crear ni tocar
+/// ninguna tabla de particiones. Mismos formatos que `format`.
+pub fn format_in(dev: &mut dyn SectorDev, kind: FsKind, label: &str, now: DateTime) -> Result<(), FsError> {
+    match kind {
+        FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 => fat::format_in(dev, label, now),
+        FsKind::ExFat => exfat::format_in(dev, label, now),
+        _ => Err(FsError::Invalid),
+    }
+}
+
+/// Ajusta el tipo de la partición que empieza en `start` a lo que contiene (ver `part::set_type`).
+pub fn set_partition_type(dev: &mut dyn SectorDev, start: u64, kind: FsKind) -> Result<(), FsError> {
+    part::set_type(dev, start, kind)
+}
+
+/// Ventana `[start, start+sectors)` de otro dispositivo: nada de lo que se lea o escriba por ella
+/// puede salirse de la partición. Así formatear una partición interna no puede tocar las demás.
+pub struct Window {
+    dev: Box<dyn SectorDev>,
+    start: u64,
+    sectors: u64,
+}
+
+impl Window {
+    pub fn new(dev: Box<dyn SectorDev>, start: u64, sectors: u64) -> Window {
+        let sectors = sectors.min(dev.sectors().saturating_sub(start));
+        Window { dev, start, sectors }
+    }
+    fn check(&self, lba: u64, len: usize) -> Result<(), FsError> {
+        let ss = self.dev.sector_size();
+        if len % ss != 0 || lba.checked_add((len / ss) as u64).map_or(true, |x| x > self.sectors) {
+            return Err(FsError::Disk);
+        }
+        Ok(())
+    }
+}
+
+impl SectorDev for Window {
+    fn sector_size(&self) -> usize {
+        self.dev.sector_size()
+    }
+    fn sectors(&self) -> u64 {
+        self.sectors
+    }
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.check(lba, buf.len())?;
+        self.dev.read(self.start + lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), FsError> {
+        self.check(lba, buf.len())?;
+        self.dev.write(self.start + lba, buf)
+    }
+    fn flush(&mut self) -> Result<(), FsError> {
+        self.dev.flush()
+    }
+    fn read_only(&self) -> bool {
+        self.dev.read_only()
+    }
+}
+
+/// Unidad que se ve pero no se abre (BitLocker): sin contenido y sin escritura.
+struct Sealed {
+    kind: FsKind,
+    bytes: u64,
+}
+
+impl Volume for Sealed {
+    fn kind(&self) -> FsKind {
+        self.kind
+    }
+    fn label(&self) -> String {
+        String::new()
+    }
+    fn space(&mut self) -> (u64, u64) {
+        (self.bytes, 0)
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn list(&mut self, _: &str) -> Result<Vec<Entry>, FsError> {
+        Err(FsError::Denied)
+    }
+    fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
+        if path.trim_matches('\\').is_empty() {
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
+        }
+        Err(FsError::Denied)
+    }
+    fn read(&mut self, _: &str) -> Result<Vec<u8>, FsError> {
+        Err(FsError::Denied)
+    }
+    fn write(&mut self, _: &str, _: &[u8], _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn mkdir(&mut self, _: &str, _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn rename(&mut self, _: &str, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn delete(&mut self, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn flush(&mut self) -> Result<(), FsError> {
+        Ok(())
+    }
+}
+
+/// Envoltorio de solo lectura: las particiones internas que no son de NightFury se montan así, para
+/// que ningún fallo pueda escribir en el Windows o el Linux del PC.
+pub struct ReadOnly(pub Box<dyn Volume>);
+
+impl Volume for ReadOnly {
+    fn kind(&self) -> FsKind {
+        self.0.kind()
+    }
+    fn label(&self) -> String {
+        self.0.label()
+    }
+    fn space(&mut self) -> (u64, u64) {
+        self.0.space()
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
+        self.0.list(dir)
+    }
+    fn notice(&self) -> Option<&'static str> {
+        self.0.notice()
+    }
+    fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
+        self.0.stat(path)
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
+        self.0.read(path)
+    }
+    fn write(&mut self, _: &str, _: &[u8], _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn mkdir(&mut self, _: &str, _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn rename(&mut self, _: &str, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn delete(&mut self, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn flush(&mut self) -> Result<(), FsError> {
+        Ok(())
+    }
+}
+
 pub mod exfat;
+pub mod ext;
 pub mod fat;
 pub mod iso;
 pub mod nfvol;
+pub mod ntfs;
 pub use nfvol::LockedDrive;
 pub mod part;
 pub mod udf;
@@ -235,6 +404,57 @@ mod tests {
         fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), FsError> {
             self.0.borrow_mut().write(lba, buf)
         }
+    }
+
+    /// Formatear dentro de una ventana deja intacto todo el disco fuera de ella (tabla y otras particiones).
+    #[test]
+    fn formatear_en_ventana_no_toca_lo_demas() {
+        let now = DateTime { year: 2026, month: 11, day: 20, hour: 2, minute: 0, second: 0 };
+        let (ini, len) = (4_000u64, 143_360u64);
+        for k in 0..3 {
+            let mut m = MemSectors::new(160_000, 512);
+            m.data.fill(0xA5);
+            let disco = alloc::rc::Rc::new(core::cell::RefCell::new(m));
+            let antes = disco.borrow().data.clone();
+            let mut w = Window::new(Box::new(Comp(disco.clone())), ini, len);
+            let kind = match k {
+                0 => {
+                    format_in(&mut w, FsKind::Fat32, "FAT", now).unwrap();
+                    FsKind::Fat32
+                }
+                1 => {
+                    format_in(&mut w, FsKind::ExFat, "EXF", now).unwrap();
+                    FsKind::ExFat
+                }
+                _ => {
+                    nfvol::format_in(Box::new(w), "NF", None, now).unwrap();
+                    FsKind::NightFury
+                }
+            };
+            let d = disco.borrow();
+            let (a, b) = (ini as usize * 512, (ini + len) as usize * 512);
+            assert!(d.data[..a] == antes[..a] && d.data[b..] == antes[b..], "{kind:?}: escribió fuera de la ventana");
+            assert!(d.data[a..b] != antes[a..b]);
+            drop(d);
+            // Se monta como partición y funciona.
+            let p = Partition { start: ini, sectors: len, kind };
+            assert_eq!(partitions(&mut Window::new(Box::new(Comp(disco.clone())), ini, len)).unwrap()[0].kind, kind);
+            let dev: Box<dyn SectorDev> = Box::new(Comp(disco.clone()));
+            let mut v = match kind {
+                FsKind::NightFury => match nfvol::open(dev, &p).unwrap() {
+                    nfvol::Opened::Ready(v) => v,
+                    _ => panic!("cifrado"),
+                },
+                _ => mount(dev, &p).unwrap(),
+            };
+            v.write("a.txt", b"hola", now).unwrap();
+            assert_eq!(v.read("a.txt").unwrap(), b"hola");
+        }
+        // La ventana rechaza lo que se sale.
+        let mut w = Window::new(Box::new(MemSectors::new(100, 512)), 10, 20);
+        assert_eq!(w.sectors(), 20);
+        assert_eq!(w.write(19, &[0; 1024]), Err(FsError::Disk));
+        assert_eq!(w.read(20, &mut [0; 512]), Err(FsError::Disk));
     }
 
     #[test]

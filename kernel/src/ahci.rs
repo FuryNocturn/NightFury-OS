@@ -4,6 +4,7 @@
 use crate::serial::traza;
 use alloc::alloc::{alloc_zeroed, Layout};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use nf_core::block::{BlockDev, DiskError, BLOCK};
@@ -20,6 +21,8 @@ pub struct Disco {
     tabla: *mut u8,
     buf: *mut u8, // búfer intermedio de BLOCK bytes alineado a 4096
     sectores: u64,
+    modelo: String,
+    serie: String,
 }
 
 /// Memoria propia alineada y a cero.
@@ -123,6 +126,49 @@ impl Disco {
     pub fn puerto(&self) -> u32 {
         self.puerto
     }
+    /// Modelo y número de serie (IDENTIFY, ya sin relleno).
+    pub fn modelo(&self) -> &str {
+        &self.modelo
+    }
+    pub fn serie(&self) -> &str {
+        &self.serie
+    }
+    /// Sectores de 512 bytes del disco.
+    pub fn sectores(&self) -> u64 {
+        self.sectores
+    }
+
+    /// Lee `buf.len() / 512` sectores desde `lba` (el llamador comprueba el rango).
+    pub fn leer_sectores(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), DiskError> {
+        let mut l = lba;
+        for c in buf.chunks_mut(BLOCK) {
+            self.orden(0x25, l, (c.len() / 512) as u16, c.len(), false)?;
+            c.copy_from_slice(unsafe { core::slice::from_raw_parts(self.buf, c.len()) });
+            l += (c.len() / 512) as u64;
+        }
+        Ok(())
+    }
+
+    /// Escribe sectores de 512 bytes desde `lba` (el llamador comprueba el rango).
+    pub fn escribir_sectores(&mut self, lba: u64, buf: &[u8]) -> Result<(), DiskError> {
+        let mut l = lba;
+        for c in buf.chunks(BLOCK) {
+            unsafe { core::slice::from_raw_parts_mut(self.buf, c.len()) }.copy_from_slice(c);
+            self.orden(0x35, l, (c.len() / 512) as u16, c.len(), true)?;
+            l += (c.len() / 512) as u64;
+        }
+        Ok(())
+    }
+
+    pub fn vaciar(&mut self) -> Result<(), DiskError> {
+        self.orden(0xEA, 0, 0, 0, false)
+    }
+}
+
+/// Texto de IDENTIFY: cada palabra trae sus dos caracteres al revés y el campo va relleno de espacios.
+fn texto(w: &[u16]) -> String {
+    let b: String = w.iter().flat_map(|x| [(x >> 8) as u8, *x as u8]).map(|c| if (0x20..0x7F).contains(&c) { c as char } else { ' ' }).collect();
+    String::from(b.trim())
 }
 
 impl BlockDev for Disco {
@@ -183,7 +229,7 @@ fn iniciar(hba: usize, p: u32, c64: bool) -> Option<Disco> {
     wr(b + IE, 0);
     wr(b + CMD, rd(b + CMD) | CMD_FRE);
     wr(b + CMD, rd(b + CMD) | CMD_ST);
-    let mut d = Disco { puerto: p, base: b, lista, tabla, buf, sectores: 0 };
+    let mut d = Disco { puerto: p, base: b, lista, tabla, buf, sectores: 0, modelo: String::new(), serie: String::new() };
     // IDENTIFY DEVICE
     if d.orden(0xEC, 0, 0, 512, false).is_err() {
         traza!("AHCI puerto {}: IDENTIFY falla, descartado", p);
@@ -194,6 +240,8 @@ fn iniciar(hba: usize, p: u32, c64: bool) -> Option<Disco> {
         traza!("AHCI puerto {}: sin LBA de 48 bits, descartado", p);
         return None;
     }
+    d.modelo = texto(&w[27..47]);
+    d.serie = texto(&w[10..20]);
     d.sectores = (w[100] as u64) | (w[101] as u64) << 16 | (w[102] as u64) << 32 | (w[103] as u64) << 48;
     if w[106] & 0xC000 == 0x4000 && w[106] & (1 << 12) != 0 {
         traza!("AHCI puerto {}: sectores lógicos que no son de 512 bytes, descartado", p);
