@@ -121,7 +121,7 @@ pub fn ip_build(src: Ipv4, dst: Ipv4, proto: u8, ttl: u8, id: u16, payload: &[u8
 /// Valida versión, IHL, longitudes y suma de la cabecera. Descarta fragmentos (no se reensambla).
 // shortcut: sin reensamblado de fragmentos IP, un datagrama fragmentado se pierde; hace falta si algún
 // servidor lo envía (poco habitual con MTU de 1500 y TCP/DNS cortos).
-pub fn parse_ip(p: &[u8]) -> Option<Ip<'_>> {
+pub fn parse_packet(p: &[u8]) -> Option<Ip<'_>> {
     if p.len() < 20 || p[0] >> 4 != 4 {
         return None;
     }

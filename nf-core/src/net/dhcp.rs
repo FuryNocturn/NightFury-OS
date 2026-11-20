@@ -205,7 +205,9 @@ impl Net {
         let now = self.now;
         let (lease, since) = self.cfg.as_ref().map_or((0, 0), |c| (c.lease_s, c.since));
         if matches!(self.dhcp.st, DState::Bound | DState::Renew | DState::Rebind) && lease != u32::MAX && now >= since + lease as u64 * 1000 {
-            self.dhcp_restart();
+            // caducó: otra vez sin dirección, con el plazo de `NoInternet` desde ahora
+            self.lose_config();
+            self.dhcp_start();
         }
         if self.dhcp.st == DState::Bound && now >= since.saturating_add(self.dhcp.t1_ms) {
             self.dhcp.st = DState::Renew;
@@ -267,7 +269,11 @@ impl Net {
                 }
                 self.dhcp_bind(from, m);
             }
-            (6, DState::Request | DState::Renew | DState::Rebind) => self.dhcp_restart(),
+            (6, DState::Request) => self.dhcp_restart(),
+            (6, DState::Renew | DState::Rebind) => {
+                self.lose_config();
+                self.dhcp_start();
+            }
             _ => {}
         }
     }

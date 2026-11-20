@@ -15,29 +15,29 @@ const ARP_GAP_MS: u64 = 1_000;
 /// Tras fallar la puerta de enlace, se vuelve a probar a los 5 s.
 const GW_RETRY_MS: u64 = 5_000;
 
-struct ArpEntry {
+pub(super) struct ArpEntry {
     ip: Ipv4,
     mac: [u8; 6],
     expires: u64,
 }
 
-struct ArpReq {
+pub(super) struct ArpReq {
     ip: Ipv4,
     tries: u8,
     next: u64,
 }
 
 /// Paquete IP esperando la MAC de su siguiente salto.
-struct Held {
+pub(super) struct Held {
     hop: Ipv4,
     pkt: Vec<u8>,
 }
 
 #[derive(Default)]
 pub(super) struct ArpState {
-    cache: Vec<ArpEntry>,
-    reqs: Vec<ArpReq>,
-    held: Vec<Held>,
+    pub(super) cache: Vec<ArpEntry>,
+    pub(super) reqs: Vec<ArpReq>,
+    pub(super) held: Vec<Held>,
     /// La puerta de enlace ha contestado a ARP alguna vez con esta concesión.
     pub gw_ok: bool,
     /// Se agotaron los reintentos de ARP hacia la puerta de enlace.
@@ -202,7 +202,7 @@ impl Net {
     }
 
     fn ip_input(&mut self, p: &[u8]) {
-        let Some(ip) = parse_ip(p) else { return };
+        let Some(ip) = parse_packet(p) else { return };
         match &self.cfg {
             Some(c) => {
                 if ip.dst != c.ip && !self.is_bcast(ip.dst) {
