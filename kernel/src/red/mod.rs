@@ -10,6 +10,7 @@ use alloc::boxed::Box;
 use core::ptr::{read_volatile, write_volatile};
 use nf_core::net::NetDev;
 
+mod intel;
 mod virtio;
 
 /// Lectura y escritura MMIO de las tarjetas, sobre regiones que cada controlador ha mapeado.
@@ -30,7 +31,11 @@ pub fn sondear() -> Option<Box<dyn NetDev>> {
     for (bus, dev, fun) in pci::buscar(0x02_00_00) {
         let id = pci::leer(bus, dev, fun, 0);
         let (v, d) = (id as u16, (id >> 16) as u16);
-        let iniciar = if virtio::soporta(v, d) { virtio::iniciar } else { continue };
+        let iniciar = match () {
+            _ if virtio::soporta(v, d) => virtio::iniciar,
+            _ if intel::soporta(v, d) => intel::iniciar,
+            _ => continue,
+        };
         let Some(mut tarjeta) = iniciar(bus, dev, fun) else {
             traza!("NF red: {:02x}:{:02x}.{} {:04x}:{:04x} no arranca, se salta", bus, dev, fun, v, d);
             continue;
