@@ -1188,8 +1188,18 @@ fn pref_spc(kind: FsKind, bytes: u64, ss: u64) -> u64 {
 /// Formatea el disco entero: una partición MBR alineada a 1 MiB con FAT32 (si caben ≥ 64 MiB), si no
 /// FAT16, si no FAT12. Solo se escriben las estructuras; el área de datos no se borra.
 pub fn format(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(), FsError> {
+    format_at(dev, label, now, true)
+}
+
+/// Formatea el dispositivo entero SIN tabla de particiones (el dispositivo es ya una partición).
+pub fn format_in(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(), FsError> {
+    format_at(dev, label, now, false)
+}
+
+/// `table`: disco entero con MBR propio (USB) o solo el sistema de archivos (partición interna).
+fn format_at(dev: &mut dyn SectorDev, label: &str, now: DateTime, table: bool) -> Result<(), FsError> {
     let lab = label_bytes(label)?;
-    let (start, total) = part::prepare(dev)?;
+    let (start, total) = if table { part::prepare(dev)? } else { part::whole(dev)? };
     let ss = dev.sector_size() as u64;
     let kinds: &[FsKind] = if total * ss >= 64 << 20 { &[FsKind::Fat32, FsKind::Fat16, FsKind::Fat12] } else { &[FsKind::Fat16, FsKind::Fat12] };
     let pick = kinds.iter().find_map(|&k| {
@@ -1282,11 +1292,13 @@ pub fn format(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(),
         dev.write(start + 6, &b)?;
         dev.write(start + 7, &i)?;
     }
-    part::write_mbr(dev, start, total, match kind {
-        FsKind::Fat32 => 0x0C,
-        FsKind::Fat16 => 0x0E,
-        _ => 0x01,
-    })?;
+    if table {
+        part::write_mbr(dev, start, total, match kind {
+            FsKind::Fat32 => 0x0C,
+            FsKind::Fat16 => 0x0E,
+            _ => 0x01,
+        })?;
+    }
     dev.flush()
 }
 

@@ -885,11 +885,20 @@ fn upcase_table() -> Vec<u8> {
 
 /// Formatea el disco entero: una partición MBR tipo 0x07 alineada a 1 MiB que lo ocupa, con exFAT.
 pub fn format(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(), FsError> {
+    format_at(dev, label, now, true)
+}
+
+/// Formatea el dispositivo entero SIN tabla de particiones (el dispositivo es ya una partición).
+pub fn format_in(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(), FsError> {
+    format_at(dev, label, now, false)
+}
+
+fn format_at(dev: &mut dyn SectorDev, label: &str, now: DateTime, table: bool) -> Result<(), FsError> {
     let units: Vec<u16> = label.encode_utf16().collect();
     if units.len() > 11 || label.chars().any(|c| c < ' ' || "\"*/:<>?\\|".contains(c)) {
         return Err(FsError::BadName);
     }
-    let (start, total) = part::prepare(dev)?;
+    let (start, total) = if table { part::prepare(dev)? } else { part::whole(dev)? };
     let ss = dev.sector_size() as u64;
     let cb = cluster_bytes(total * ss).max(ss);
     let spc = cb / ss;
@@ -983,7 +992,9 @@ pub fn format(dev: &mut dyn SectorDev, label: &str, now: DateTime) -> Result<(),
     rb[(k + 1) * 32 + 20..(k + 1) * 32 + 24].copy_from_slice(&(up_first as u32).to_le_bytes());
     rb[(k + 1) * 32 + 24..(k + 1) * 32 + 32].copy_from_slice(&(up.len() as u64).to_le_bytes());
     at(dev, heap + (root - 2) * spc, &rb)?;
-    part::write_mbr(dev, start, total, 0x07)?;
+    if table {
+        part::write_mbr(dev, start, total, 0x07)?;
+    }
     dev.flush()
 }
 

@@ -46,11 +46,13 @@ pub enum FormatKind {
 pub enum DriveAction {
     /// Escribir lo pendiente y desmontar todas las particiones del disco.
     Eject { disk: u32 },
-    /// Borrar el disco entero y crear una partición con el formato y la etiqueta dados.
-    Format { disk: u32, kind: FormatKind, label: String },
+    /// USB: borrar el disco entero y crear una partición con el formato y la etiqueta dados.
+    /// Disco interno: formatear solo la partición que empieza en el sector `part` (en USB vale 0).
+    Format { disk: u32, part: u64, kind: FormatKind, label: String },
     /// Borrar el disco entero y crear un volumen NightFury cifrado con la contraseña dada. El código
-    /// de recuperación se devuelve al programa con `Files::drive_result`.
-    Encrypt { disk: u32, label: String, password: String },
+    /// de recuperación se devuelve al programa con `Files::drive_result`. En un disco interno, solo
+    /// la partición que empieza en el sector `part`.
+    Encrypt { disk: u32, part: u64, label: String, password: String },
 }
 
 impl DriveInfo {
@@ -85,6 +87,8 @@ pub fn kind_name(k: FsKind) -> &'static str {
 /// Unidad cifrada esperando contraseña (la guarda `Files`).
 pub struct Locked {
     pub disk: u32,
+    /// Primer sector de la partición (solo importa en los discos internos).
+    pub part: u64,
     /// `false` si es una partición de un disco interno.
     pub removable: bool,
     pub device: String,

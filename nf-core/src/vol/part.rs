@@ -54,7 +54,7 @@ fn rd(dev: &mut dyn SectorDev, base: u64, bytes: u64, off: u64, len: usize) -> O
 
 /// ¿Es el sector 0 el arranque de un sistema de archivos (y no una tabla de particiones)?
 fn fs_boot(s0: &[u8], ss: usize) -> bool {
-    fat::detect(s0, ss).is_some() || &s0[3..11] == b"EXFAT   " || &s0[0..4] == b"NFFS"
+    fat::detect(s0, ss).is_some() || matches!(&s0[3..11], b"EXFAT   " | b"NTFS    " | b"-FVE-FS-") || &s0[0..4] == b"NFFS"
 }
 
 /// Qué hay dentro de la partición `[start, start+sectors)`.
@@ -115,8 +115,8 @@ fn detect_kind(dev: &mut dyn SectorDev, start: u64, sectors: u64) -> FsKind {
     FsKind::Unknown
 }
 
-/// Particiones de una tabla GPT con cabecera en `lba`: (primer, último) sectores. `None` si no es válida.
-fn gpt(dev: &mut dyn SectorDev, lba: u64) -> Option<Vec<(u64, u64)>> {
+/// Cabecera GPT en `lba` y su tabla de entradas, si las dos son válidas (CRC incluidos).
+fn gpt_raw(dev: &mut dyn SectorDev, lba: u64) -> Option<(Vec<u8>, Vec<u8>)> {
     let ss = dev.sector_size() as u64;
     let n = dev.sectors();
     let h = read_bytes(dev, lba * ss, 92).ok()?;
@@ -124,10 +124,10 @@ fn gpt(dev: &mut dyn SectorDev, lba: u64) -> Option<Vec<(u64, u64)>> {
     if &h[0..8] != b"EFI PART" || hsize < 92 || hsize as u64 > ss {
         return None;
     }
-    let mut h = read_bytes(dev, lba * ss, hsize).ok()?;
-    let crc = u32le(&h, 16);
-    h[16..20].fill(0);
-    if crc32(&h) != crc || u64le(&h, 24) != lba {
+    let h = read_bytes(dev, lba * ss, hsize).ok()?;
+    let mut z = h.clone();
+    z[16..20].fill(0);
+    if crc32(&z) != u32le(&h, 16) || u64le(&h, 24) != lba {
         return None;
     }
     let (tlba, num, esz) = (u64le(&h, 72), u32le(&h, 80) as u64, u32le(&h, 84) as u64);
@@ -138,11 +138,15 @@ fn gpt(dev: &mut dyn SectorDev, lba: u64) -> Option<Vec<(u64, u64)>> {
         return None;
     }
     let t = read_bytes(dev, tlba * ss, (num * esz) as usize).ok()?;
-    if crc32(&t) != u32le(&h, 88) {
-        return None;
-    }
+    (crc32(&t) == u32le(&h, 88)).then_some((h, t))
+}
+
+/// Particiones de una tabla GPT con cabecera en `lba`: (primer, último) sectores. `None` si no es válida.
+fn gpt(dev: &mut dyn SectorDev, lba: u64) -> Option<Vec<(u64, u64)>> {
+    let n = dev.sectors();
+    let (h, t) = gpt_raw(dev, lba)?;
     let mut out = Vec::new();
-    for e in t.chunks(esz as usize) {
+    for e in t.chunks(u32le(&h, 84) as usize) {
         let (f, l) = (u64le(e, 32), u64le(e, 40));
         if e[..16].iter().any(|&b| b != 0) && f <= l && l < n && !NOT_DATA_GPT.iter().any(|g| guid(g) == e[..16]) {
             out.push((f, l));
@@ -273,6 +277,108 @@ pub(super) fn prepare(dev: &mut dyn SectorDev) -> Result<(u64, u64), FsError> {
     dev.write(1, &zero)?;
     dev.write(n - 1, &zero)?;
     Ok((start, (n - start).min(u32::MAX as u64 - start)))
+}
+
+/// Tipo GPT «Basic data» (el de las particiones de Windows y de los pendrives).
+const BASIC_DATA: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+
+/// Ajusta el tipo de la partición que empieza en `start` a lo que ahora contiene (`kind`), sin tocar
+/// nada más de la tabla: en MBR el byte de tipo (0x0C FAT32, 0x0E FAT16, 0x01 FAT12, 0x07 exFAT y
+/// NightFury); en GPT el GUID «Basic data», con los CRC de la tabla y de las dos cabeceras rehechos.
+/// Si el disco no tiene tabla o no hay partición que empiece ahí, no hace nada.
+pub fn set_type(dev: &mut dyn SectorDev, start: u64, kind: FsKind) -> Result<(), FsError> {
+    let ss = dev.sector_size() as u64;
+    let n = dev.sectors();
+    let mut gpt_found = false;
+    for lba in [1, n.saturating_sub(1)] {
+        let Some((mut h, mut t)) = gpt_raw(dev, lba) else { continue };
+        gpt_found = true;
+        let esz = u32le(&h, 84) as usize;
+        let mut changed = false;
+        for e in t.chunks_mut(esz) {
+            if e[..16].iter().any(|&b| b != 0) && u64le(e, 32) == start {
+                e[..16].copy_from_slice(&guid(BASIC_DATA));
+                changed = true;
+            }
+        }
+        if changed {
+            let tlba = u64le(&h, 72);
+            h[88..92].copy_from_slice(&crc32(&t).to_le_bytes());
+            h[16..20].fill(0);
+            let c = crc32(&h);
+            h[16..20].copy_from_slice(&c.to_le_bytes());
+            // Primero la tabla, luego la cabecera: un corte deja la cabecera vieja, que no cuadra y se ignora.
+            write_bytes(dev, tlba * ss, &t)?;
+            write_bytes(dev, lba * ss, &h)?;
+        }
+    }
+    if gpt_found {
+        return dev.flush();
+    }
+    let t = match kind {
+        FsKind::Fat32 => 0x0C,
+        FsKind::Fat16 => 0x0E,
+        FsKind::Fat12 => 0x01,
+        _ => 0x07,
+    };
+    let mut s0 = read_bytes(dev, 0, ss as usize)?;
+    if fs_boot(&s0, ss as usize) || s0[510] != 0x55 || s0[511] != 0xAA {
+        return Ok(());
+    }
+    for i in 0..4 {
+        let o = 446 + 16 * i;
+        if s0[o + 4] != 0 && !is_ext(s0[o + 4]) && u32le(&s0, o + 8) as u64 == start {
+            s0[o + 4] = t;
+            dev.write(0, &s0)?;
+            return dev.flush();
+        }
+    }
+    // Lógicas: cadena de EBR como en `mbr`.
+    let base = (0..4).find_map(|i| (is_ext(s0[446 + 16 * i + 4])).then(|| u32le(&s0, 446 + 16 * i + 8) as u64));
+    let mut lba = base.unwrap_or(n);
+    for _ in 0..128 {
+        if lba >= n {
+            break;
+        }
+        let mut b = read_bytes(dev, lba * ss, ss as usize)?;
+        if b[510] != 0x55 || b[511] != 0xAA {
+            break;
+        }
+        if b[450] != 0 && lba + u32le(&b, 454) as u64 == start {
+            b[450] = t;
+            dev.write(lba, &b)?;
+            return dev.flush();
+        }
+        let s2 = u32le(&b, 470) as u64;
+        if !is_ext(b[466]) || s2 == 0 || base.unwrap_or(0) + s2 <= lba {
+            break;
+        }
+        lba = base.unwrap_or(0) + s2;
+    }
+    Ok(())
+}
+
+/// Escribe `data` desde el byte `off` (alineado a sector) rellenando el último sector con lo que había.
+fn write_bytes(dev: &mut dyn SectorDev, off: u64, data: &[u8]) -> Result<(), FsError> {
+    let ss = dev.sector_size() as u64;
+    let secs = (data.len() as u64).div_ceil(ss);
+    let mut buf = read_bytes(dev, off, (secs * ss) as usize)?;
+    buf[..data.len()].copy_from_slice(data);
+    dev.write(off / ss, &buf)
+}
+
+/// Como `prepare` pero para formatear DENTRO de una partición (el dispositivo ya es una ventana):
+/// ocupa todo y no toca ninguna tabla.
+/// shortcut: FAT y MBR limitan a 2^32 sectores; una partición mayor se queda en esos sectores.
+pub(super) fn whole(dev: &mut dyn SectorDev) -> Result<(u64, u64), FsError> {
+    if dev.read_only() {
+        return Err(FsError::Denied);
+    }
+    let n = dev.sectors();
+    if n <= 16 {
+        return Err(FsError::NoSpace);
+    }
+    Ok((0, n.min(u32::MAX as u64)))
 }
 
 /// Escribe un MBR con una única partición.
@@ -431,6 +537,58 @@ mod tests {
             let last = (n as usize - 1) * ss;
             d.data[last + 20] ^= 1;
             assert!(partitions(&mut d).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn set_type_mbr_solo_cambia_el_byte_de_tipo() {
+        let mut d = MemSectors::new(1000, 512);
+        put_mbr(&mut d, 0, 0x07, 10, 100);
+        put_mbr(&mut d, 1, 0x83, 200, 50);
+        put_mbr(&mut d, 2, 0x07, 300, 600);
+        let antes = d.data[..512].to_vec();
+        set_type(&mut d, 200, FsKind::Fat32).unwrap();
+        set_type(&mut d, 300, FsKind::ExFat).unwrap();
+        assert_eq!(d.data[446 + 16 + 4], 0x0C);
+        assert_eq!(d.data[446 + 32 + 4], 0x07);
+        // Nada más cambió: solo ese byte.
+        let ahora = d.data[..512].to_vec();
+        let dif: Vec<usize> = (0..512).filter(|&i| antes[i] != ahora[i]).collect();
+        assert_eq!(dif, vec![446 + 16 + 4]);
+        // Una partición que no existe no cambia nada.
+        set_type(&mut d, 999, FsKind::Fat32).unwrap();
+        assert_eq!(&d.data[..512], &ahora[..]);
+    }
+
+    #[test]
+    fn set_type_logica() {
+        let mut d = MemSectors::new(1000, 512);
+        put_mbr(&mut d, 0, 0x05, 300, 600);
+        let e = 300 * 512;
+        d.data[e + 446 + 4] = 0x83;
+        d.data[e + 446 + 8..e + 446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        d.data[e + 446 + 12..e + 446 + 16].copy_from_slice(&20u32.to_le_bytes());
+        d.data[e + 510] = 0x55;
+        d.data[e + 511] = 0xAA;
+        set_type(&mut d, 301, FsKind::Fat32).unwrap();
+        assert_eq!(d.data[e + 446 + 4], 0x0C);
+        assert_eq!(d.data[446 + 4], 0x05);
+    }
+
+    #[test]
+    fn set_type_gpt_rehace_los_crc() {
+        for ss in [512usize, 4096] {
+            let n = 400;
+            let mut d = make_gpt(&[(40, 99), (100, 199)], ss, n);
+            set_type(&mut d, 100, FsKind::ExFat).unwrap();
+            // Las dos cabeceras y tablas siguen siendo válidas y la segunda partición es «Basic data».
+            for lba in [1, n - 1] {
+                let (h, t) = gpt_raw(&mut d, lba).expect("CRC válido");
+                let esz = u32le(&h, 84) as usize;
+                assert_eq!(&t[esz..esz + 16], &guid(BASIC_DATA));
+                assert_eq!(t[0], 0xAF, "la primera partición no cambia");
+            }
+            assert_eq!(partitions(&mut d).unwrap().len(), 2);
         }
     }
 

@@ -985,6 +985,13 @@ impl Desktop {
         self.drv_gen = g;
         let now = sys.files().drives();
         let mut new = Vec::new();
+        // Al arrancar, UN globo por la primera unidad interna con aviso (p. ej. un ext con el diario a medias).
+        if self.drv.is_none() {
+            let first = now.iter().filter(|d| !d.removable && d.letter != 'C').find_map(|d| sys.files().drive_notice(d.letter).map(|n| (d.letter, d.name(), n)));
+            if let Some((l, name, n)) = first {
+                self.set_tip(format!("{name}: {n}"), Some(l));
+            }
+        }
         if let Some(old) = &self.drv {
             new = now.iter().filter(|d| d.removable && !old.iter().any(|o| o.letter == d.letter)).map(|d| (d.letter, d.locked)).collect();
         }
@@ -996,7 +1003,7 @@ impl Desktop {
         }
         // shortcut: con varias unidades nuevas a la vez, el globo es el de la última; subir si hace falta una cola.
         if let Some(&(l, locked)) = new.last() {
-            let text = if locked { format!("Unidad USB ({l}:) está cifrada. Haz clic para desbloquearla.") } else { format!("Unidad USB ({l}:) conectada. Haz clic para abrirla.") };
+            let text = if locked { format!("Unidad USB ({l}:) está cifrada. Haz clic para desbloquearla.") } else { format!("Unidad USB ({l}:) conectada. {}", sys.files().drive_notice(l).unwrap_or("Haz clic para abrirla.")) };
             self.set_tip(text, Some(l));
         }
     }
@@ -3757,6 +3764,40 @@ mod tests {
         // Al quitarse, queda solo la E: y su entrada.
         d.tick(9000, &mut sys);
         assert_eq!(d.removable().iter().map(|x| x.letter).collect::<Vec<_>>(), ['E']);
+    }
+
+    /// Volumen de prueba con aviso (como un ext con el diario a medias).
+    struct ConAviso(Box<dyn crate::vol::Volume>);
+    impl crate::vol::Volume for ConAviso {
+        fn kind(&self) -> crate::vol::FsKind { self.0.kind() }
+        fn label(&self) -> String { self.0.label() }
+        fn space(&mut self) -> (u64, u64) { self.0.space() }
+        fn read_only(&self) -> bool { true }
+        fn list(&mut self, d: &str) -> Result<Vec<crate::fs::Entry>, crate::fs::FsError> { self.0.list(d) }
+        fn stat(&mut self, p: &str) -> Result<crate::fs::Entry, crate::fs::FsError> { self.0.stat(p) }
+        fn read(&mut self, p: &str) -> Result<Vec<u8>, crate::fs::FsError> { self.0.read(p) }
+        fn write(&mut self, _: &str, _: &[u8], _: DateTime) -> Result<(), crate::fs::FsError> { Err(crate::fs::FsError::Denied) }
+        fn mkdir(&mut self, _: &str, _: DateTime) -> Result<(), crate::fs::FsError> { Err(crate::fs::FsError::Denied) }
+        fn rename(&mut self, _: &str, _: &str) -> Result<(), crate::fs::FsError> { Err(crate::fs::FsError::Denied) }
+        fn delete(&mut self, _: &str) -> Result<(), crate::fs::FsError> { Err(crate::fs::FsError::Denied) }
+        fn flush(&mut self) -> Result<(), crate::fs::FsError> { Ok(()) }
+        fn notice(&self) -> Option<&'static str> { Some("Diario sin cerrar: se muestra como estaba.") }
+    }
+
+    #[test]
+    fn el_aviso_del_volumen_sale_en_el_globo_de_usb_y_una_vez_al_arrancar_en_las_internas() {
+        let (mut d, mut sys) = setup(1280, 800);
+        // Interna con aviso ya al arrancar: un globo con su nombre.
+        sys.files.attach_as(1 << 31, "Disco", Box::new(ConAviso(usb_vol("LINUX"))), false);
+        sys.files.attach_as(1 << 31, "Disco", Box::new(ConAviso(usb_vol("OTRO"))), false);
+        d.tick(1000, &mut sys);
+        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("Disco local (D:): Diario sin cerrar: se muestra como estaba."));
+        assert_eq!(d.tip.as_ref().and_then(|t| t.letter), Some('D'));
+        // Un USB con aviso: el globo lo lleva y el clic sigue abriéndola.
+        sys.files.attach(2, "Pendrive", Box::new(ConAviso(usb_vol("USB"))));
+        d.tick(1100, &mut sys);
+        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("Unidad USB (F:) conectada. Diario sin cerrar: se muestra como estaba."));
+        assert_eq!(d.tip.as_ref().and_then(|t| t.letter), Some('F'));
     }
 
     #[test]

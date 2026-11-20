@@ -2,7 +2,8 @@
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Unidades extraíbles: engancha los discos USB que aparecen y desaparecen a `Files` (letras D:, E:…)
 //! y ejecuta las acciones sobre el disco entero que piden los programas del sistema (expulsar,
-//! formatear, cifrar), que solo puede hacer el núcleo.
+//! formatear, cifrar), que solo puede hacer el núcleo. En los discos internos formatear y cifrar
+//! tocan solo una partición (por una `Window`); lo demás del disco queda intacto.
 use crate::{ahci, nvme, rtc, usb};
 use crate::serial::traza;
 use alloc::boxed::Box;
@@ -15,7 +16,7 @@ use nf_core::drives::{DriveAction, FormatKind, Locked};
 use nf_core::files::Files;
 use nf_core::fs::FsError;
 use nf_core::keys::{KeyError, Pool};
-use nf_core::vol::{self, nfvol, FsKind, SectorDev};
+use nf_core::vol::{self, nfvol, FsKind, SectorDev, Window};
 
 /// Los discos internos (SATA y NVMe) llevan este bit en su id para no chocar con los de USB.
 const INTERNO: u32 = 1 << 31;
@@ -49,7 +50,7 @@ struct Interno {
     fis: Rc<RefCell<Fisico>>,
 }
 
-/// Manejador de una partición de un disco interno; `ro` lo deja de solo lectura (todo lo que no es NightFury).
+/// Manejador de un disco interno; `ro` lo deja de solo lectura (todo lo que no es NightFury ni FAT/exFAT que NightFury formateó).
 struct Manejador {
     fis: Rc<RefCell<Fisico>>,
     ro: bool,
@@ -129,15 +130,17 @@ impl Unidades {
             self.internos.push(Interno { id, nombre, serie, fis: Rc::new(RefCell::new(f)) });
         }
         for k in 0..self.internos.len() {
-            self.montar_interno(files, k);
+            let it = &self.internos[k];
+            traza!("NF interno: disco {} «{}» serie «{}»: {} sectores de {} bytes", it.id & !INTERNO, it.nombre, it.serie, it.fis.borrow().sectors(), it.fis.borrow().sector_size());
+            self.montar_interno(files, k, None);
         }
     }
 
-    fn montar_interno(&self, files: &mut Files, k: usize) {
+    /// Monta las particiones del disco interno `k`, o solo la que empieza en `solo`.
+    fn montar_interno(&self, files: &mut Files, k: usize, solo: Option<u64>) {
         let it = &self.internos[k];
-        traza!("NF interno: disco {} «{}» serie «{}»: {} sectores de {} bytes", it.id & !INTERNO, it.nombre, it.serie, it.fis.borrow().sectors(), it.fis.borrow().sector_size());
         let abrir = |ro| Some(Box::new(Manejador { fis: it.fis.clone(), ro }) as Box<dyn SectorDev>);
-        conectar(files, it.id, &it.nombre, abrir, None);
+        conectar(files, it.id, &it.nombre, abrir, None, solo, &it.serie);
     }
 
     /// Altas y bajas de discos y acciones pendientes. Se llama en cada vuelta del bucle principal.
@@ -148,7 +151,7 @@ impl Unidades {
                     traza!("NF usb: disco {} «{}»: {} sectores de {} bytes{}", id, nombre, dev.sectors(), dev.sector_size(), if dev.read_only() { ", solo lectura" } else { "" });
                     self.nombres.retain(|n| n.0 != id);
                     self.nombres.push((id, nombre.clone()));
-                    conectar(files, id, &nombre, |_| usb::abrir_disco(id), None);
+                    conectar(files, id, &nombre, |_| usb::abrir_disco(id), None, None, "");
                 }
                 usb::CambioDisco::Quitado { id } => {
                     self.nombres.retain(|n| n.0 != id);
@@ -162,12 +165,16 @@ impl Unidades {
                 DriveAction::Eject { disk } | DriveAction::Format { disk, .. } | DriveAction::Encrypt { disk, .. } => *disk,
             };
             if disk & INTERNO != 0 {
-                // `Files` ya quitó las letras del disco: se vuelve a montar tal cual. Formatear internos vendrá después.
-                traza!("NF interno: disco {}: acción rechazada", disk & !INTERNO);
-                if let Some(k) = self.internos.iter().position(|i| i.id == disk) {
-                    self.montar_interno(files, k);
+                // `Files` ya quitó solo la letra de esa partición. Expulsar un interno no llega (lo deniega `Files`).
+                let r = match a {
+                    DriveAction::Format { disk, part, kind, label } => self.rehacer_interno(files, disk, part, Some(kind), &label, None, pool),
+                    DriveAction::Encrypt { disk, part, label, password } => self.rehacer_interno(files, disk, part, None, &label, Some(&password), pool),
+                    DriveAction::Eject { .. } => Err(FsError::Denied),
+                };
+                if let Err(e) = &r {
+                    traza!("NF interno: acción sobre la partición fallida: {:?}", e);
                 }
-                files.set_drive_result(Err(FsError::Denied));
+                files.set_drive_result(r);
                 continue;
             }
             let r = match a {
@@ -176,8 +183,8 @@ impl Unidades {
                     traza!("NF usb: disco {} expulsado", disk);
                     Ok(None)
                 }
-                DriveAction::Format { disk, kind, label } => self.rehacer(files, disk, Some(kind), &label, None, pool),
-                DriveAction::Encrypt { disk, label, password } => self.rehacer(files, disk, None, &label, Some(&password), pool),
+                DriveAction::Format { disk, kind, label, .. } => self.rehacer(files, disk, Some(kind), &label, None, pool),
+                DriveAction::Encrypt { disk, label, password, .. } => self.rehacer(files, disk, None, &label, Some(&password), pool),
             };
             if let Err(e) = &r {
                 traza!("NF usb: acción sobre la unidad fallida: {:?}", e);
@@ -206,8 +213,42 @@ impl Unidades {
         // Un volumen recién cifrado queda bloqueado: se abre con la misma contraseña para que el
         // usuario no tenga que escribirla otra vez. Si falló (p. ej. contraseña débil, que se
         // comprueba antes de escribir), se vuelve a montar lo que había para que no desaparezca.
-        conectar(files, disk, &nombre, |_| usb::abrir_disco(disk), password);
+        conectar(files, disk, &nombre, |_| usb::abrir_disco(disk), password, None, "");
         code
+    }
+
+    /// Formatea (`kind`, o NightFury cifrado si hay `password`) SOLO la partición interna que empieza en
+    /// `part`: escribe dentro de sus sectores y, en la tabla, únicamente el tipo de partición. Después
+    /// vuelve a montar esa partición. Si falla, vuelve a montar lo que hubiera.
+    fn rehacer_interno(&self, files: &mut Files, disk: u32, part: u64, kind: Option<FormatKind>, label: &str, password: Option<&str>, pool: &mut Pool) -> Result<Option<String>, FsError> {
+        // Defensa: solo discos de la lista de internos. El del sistema (C:) nunca está en ella (`elegir_disco` lo aparta).
+        let k = self.internos.iter().position(|i| i.id == disk).ok_or(FsError::NotFound)?;
+        let it = &self.internos[k];
+        let man = |ro| Manejador { fis: it.fis.clone(), ro };
+        let r = (|| {
+            let p = vol::partitions(&mut man(true))?.into_iter().find(|p| p.start == part).ok_or(FsError::NotFound)?;
+            let win = || Box::new(Window::new(Box::new(man(false)), p.start, p.sectors)) as Box<dyn SectorDev>;
+            let now = rtc::now();
+            let code = match (kind, password) {
+                (Some(FormatKind::Fat32), None) => vol::format_in(&mut *win(), FsKind::Fat32, label, now).map(|()| None),
+                (Some(FormatKind::ExFat), None) => vol::format_in(&mut *win(), FsKind::ExFat, label, now).map(|()| None),
+                (Some(FormatKind::NightFury), None) => nfvol::format_in(win(), label, None, now).map_err(clave_a_fs),
+                (None, Some(pw)) => nfvol::format_in(win(), label, Some((pw, pool)), now).map_err(clave_a_fs),
+                _ => Err(FsError::Invalid),
+            }?;
+            // Tipo de partición según lo que quedó dentro; NightFury siempre escribe, FAT/exFAT desde ahora también.
+            let nuevo = vol::partitions(&mut man(true))?.into_iter().find(|q| q.start == p.start).map_or(FsKind::Unknown, |q| q.kind);
+            if let Err(e) = vol::set_partition_type(&mut man(false), p.start, nuevo) {
+                traza!("NF interno: disco {}: no se pudo ajustar el tipo de partición ({:?})", disk & !INTERNO, e);
+            }
+            let escribible = matches!(nuevo, FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 | FsKind::ExFat);
+            if let Err(e) = files.set_internal_writable(&it.serie, p.start, escribible, now) {
+                traza!("NF interno: no se pudo anotar unidades.cfg ({:?})", e);
+            }
+            Ok(code)
+        })();
+        self.montar_interno(files, k, Some(part));
+        r
     }
 }
 
@@ -220,8 +261,10 @@ fn clave_a_fs(e: KeyError) -> FsError {
 
 /// Monta cada partición del disco y la conecta a `files`. `clave` abre las cifradas. `abrir(ro)` da un
 /// manejador nuevo del disco (cada montaje se queda con el suyo); `ro` pide uno de solo lectura.
-/// Los discos internos (bit `INTERNO`) no son extraíbles y solo NightFury se monta con escritura.
-fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Option<Box<dyn SectorDev>>, clave: Option<&str>) {
+/// Los discos internos (bit `INTERNO`) no son extraíbles y solo se montan con escritura NightFury y las
+/// FAT/exFAT apuntadas en `unidades.cfg` (las que NightFury formateó; `serie` identifica el disco).
+/// `solo`: monta únicamente la partición que empieza en ese sector.
+fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Option<Box<dyn SectorDev>>, clave: Option<&str>, solo: Option<u64>, serie: &str) {
     let interno = id & INTERNO != 0;
     let t = if interno { "interno" } else { "usb" };
     let id = id & !INTERNO;
@@ -235,9 +278,13 @@ fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Op
     };
     drop(dev);
     for (i, p) in ps.iter().enumerate() {
+        if solo.is_some_and(|s| s != p.start) {
+            continue;
+        }
         // Cada partición pide su propio manejador: `mount` y `open` se quedan con el dispositivo.
         let disk = if interno { id | INTERNO } else { id };
-        let Some(d) = abrir(interno && p.kind != FsKind::NightFury) else { break };
+        let rw = !interno || p.kind == FsKind::NightFury || (matches!(p.kind, FsKind::Fat12 | FsKind::Fat16 | FsKind::Fat32 | FsKind::ExFat) && files.internal_writable(serie, p.start));
+        let Some(d) = abrir(!rw) else { break };
         let v = match p.kind {
             FsKind::NightFury => match nfvol::open(d, p) {
                 Ok(nfvol::Opened::Ready(v)) => v,
@@ -245,7 +292,7 @@ fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Op
                     let drive = match clave {
                         Some(c) => match drive.unlock(c, false) {
                             Ok(v) => {
-                                attach(files, disk, nombre, i, v);
+                                attach(files, disk, p.start, nombre, i, v);
                                 continue;
                             }
                             Err((drive, e)) => {
@@ -255,7 +302,7 @@ fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Op
                         },
                         None => drive,
                     };
-                    let letra = files.attach_locked(Locked { disk, removable: !interno, device: String::from(nombre), drive });
+                    let letra = files.attach_locked(Locked { disk, part: p.start, removable: !interno, device: String::from(nombre), drive });
                     traza!("NF {}: disco {} partición {}: NightFury cifrada -> {:?}", t, id, i, letra);
                     continue;
                 }
@@ -271,7 +318,7 @@ fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Op
             }
             _ => match vol::mount(d, p) {
                 // El dispositivo ya es de solo lectura; el envoltorio cubre además los volúmenes que no lo respetan.
-                Ok(v) if interno => Box::new(vol::ReadOnly(v)),
+                Ok(v) if interno && !rw => Box::new(vol::ReadOnly(v)),
                 Ok(v) => v,
                 Err(e) => {
                     traza!("NF {}: disco {} partición {} ({:?}, {} sectores desde {}): no se monta ({:?})", t, id, i, p.kind, p.sectors, p.start, e);
@@ -279,11 +326,11 @@ fn conectar(files: &mut Files, id: u32, nombre: &str, abrir: impl Fn(bool) -> Op
                 }
             },
         };
-        attach(files, disk, nombre, i, v);
+        attach(files, disk, p.start, nombre, i, v);
     }
 }
 
-fn attach(files: &mut Files, disk: u32, nombre: &str, i: usize, mut v: Box<dyn vol::Volume>) {
+fn attach(files: &mut Files, disk: u32, start: u64, nombre: &str, i: usize, mut v: Box<dyn vol::Volume>) {
     let interno = disk & INTERNO != 0;
     let t = if interno { "interno" } else { "usb" };
     let (total, libre) = v.space();
@@ -293,6 +340,6 @@ fn attach(files: &mut Files, disk: u32, nombre: &str, i: usize, mut v: Box<dyn v
     if let Some(aviso) = v.notice() {
         traza!("NF {}: disco {} partición {}: {}", t, disk & !INTERNO, i, aviso);
     }
-    let letra = files.attach_as(disk, nombre, v, !interno);
+    let letra = files.attach_part(disk, start, nombre, v, !interno);
     traza!("NF {}: disco {} partición {}: {:?} «{}» {} MiB, {} MiB libres{} -> {:?}", t, disk & !INTERNO, i, kind, etiqueta, total >> 20, libre >> 20, if ro { ", solo lectura" } else { "" }, letra);
 }

@@ -73,6 +73,8 @@ impl Wire for Buttons {
             1 => Buttons::OkCancel,
             2 => Buttons::YesNo,
             3 => Buttons::YesNoCancel,
+            4 => Buttons::FormatCancel,
+            5 => Buttons::EncryptCancel,
             _ => return Err(Bad),
         })
     }

@@ -31,6 +31,10 @@ pub enum Buttons {
     YesNo,
     /// "Sí", "No" y "Cancelar".
     YesNoCancel,
+    /// "Formatear" (`Answer::Yes`) y "Cancelar"; empieza en «Cancelar» (borra datos de verdad). Va al final: no cambia los números del protocolo.
+    FormatCancel,
+    /// "Cifrar" (`Answer::Yes`) y "Cancelar"; empieza en «Cancelar».
+    EncryptCancel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -349,7 +353,12 @@ impl Dialog {
                     Buttons::OkCancel => vec![("Aceptar", Answer::Ok), ("Cancelar", Answer::Cancel)],
                     Buttons::YesNo => vec![("Sí", Answer::Yes), ("No", Answer::No)],
                     Buttons::YesNoCancel => vec![("Sí", Answer::Yes), ("No", Answer::No), ("Cancelar", Answer::Cancel)],
+                    Buttons::FormatCancel => vec![("Formatear", Answer::Yes), ("Cancelar", Answer::Cancel)],
+                    Buttons::EncryptCancel => vec![("Cifrar", Answer::Yes), ("Cancelar", Answer::Cancel)],
                 };
+                if matches!(buttons, Buttons::FormatCancel | Buttons::EncryptCancel) {
+                    d.focus = 1;
+                }
                 d.lines = wrap(&text, FS, d.w - 2 * PAD);
                 d.lines.truncate(14);
                 d.h = PAD + d.lines.len() as i32 * lh + 24 + BTN_H + 16;
@@ -1067,6 +1076,8 @@ mod tests {
             (Buttons::OkCancel, Answer::Ok, Answer::Cancel),
             (Buttons::YesNo, Answer::Yes, Answer::No),
             (Buttons::YesNoCancel, Answer::Yes, Answer::Cancel),
+            (Buttons::FormatCancel, Answer::Cancel, Answer::Cancel),
+            (Buttons::EncryptCancel, Answer::Cancel, Answer::Cancel),
         ] {
             let (mut d, mut sys) = msg(b);
             assert_eq!(press(&mut d, &mut sys, Key::Enter), ans(enter));
