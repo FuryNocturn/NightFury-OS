@@ -56,10 +56,12 @@ pub enum DriveAction {
 }
 
 impl DriveInfo {
-    /// Nombre que ven los usuarios: «Disco local (C:)», «Etiqueta (D:)» o «Unidad USB (D:)».
+    /// Nombre que ven los usuarios: «Disco local (C:)», «Etiqueta (D:)» o «Unidad USB (D:)». Un disco
+    /// interno con etiqueta se llama por ella, como en Windows; C: siempre es «Disco local».
     pub fn name(&self) -> String {
         let l = self.letter;
         match (self.removable, self.label.is_empty()) {
+            (false, false) if l != 'C' => alloc::format!("{} ({l}:)", self.label),
             (false, _) => alloc::format!("Disco local ({l}:)"),
             (true, true) => alloc::format!("Unidad USB ({l}:)"),
             (true, false) => alloc::format!("{} ({l}:)", self.label),

@@ -27,6 +27,15 @@ emule PS/2:
   lectura, y pendrives NightFury (en claro o cifrados). Al conectarlos sale un aviso; se expulsan desde la
   bandeja o el menú contextual, y se formatean o cifran desde el Explorador (**formatear y cifrar borran el
   pendrive**). Lo borrado en una unidad extraíble no va a la Papelera.
+- **NTFS (Windows) y ext2/3/4 (Linux)** en lectura, tanto en USB como en los discos internos (v0.11.1).
+  Una unidad con BitLocker aparece bloqueada.
+
+### Discos internos (v0.11.1)
+Los demás discos SATA y los NVMe del PC se ven como unidades **de solo lectura**, sea cual sea su formato.
+No salen las particiones que no son de datos (sistema EFI, MSR, recuperación, swap de Linux). Se pueden
+formatear o cifrar desde el Explorador, con doble confirmación, y entonces sí pasan a ser escribibles:
+**se borra todo lo que tenga la partición, también si es de Windows o de Linux.** Solo se ven los discos que
+hay al arrancar.
 - **Mandos**: PlayStation (DualShock 4, DualSense), Nintendo Switch Pro, Xbox 360/One y mandos HID genéricos.
   Se prueban en Configuración › Dispositivos › Probar mando.
 

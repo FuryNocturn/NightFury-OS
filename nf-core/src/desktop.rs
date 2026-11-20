@@ -3791,7 +3791,7 @@ mod tests {
         sys.files.attach_as(1 << 31, "Disco", Box::new(ConAviso(usb_vol("LINUX"))), false);
         sys.files.attach_as(1 << 31, "Disco", Box::new(ConAviso(usb_vol("OTRO"))), false);
         d.tick(1000, &mut sys);
-        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("Disco local (D:): Diario sin cerrar: se muestra como estaba."));
+        assert_eq!(d.tip.as_ref().map(|t| t.text.as_str()), Some("LINUX (D:): Diario sin cerrar: se muestra como estaba."));
         assert_eq!(d.tip.as_ref().and_then(|t| t.letter), Some('D'));
         // Un USB con aviso: el globo lo lleva y el clic sigue abriéndola.
         sys.files.attach(2, "Pendrive", Box::new(ConAviso(usb_vol("USB"))));

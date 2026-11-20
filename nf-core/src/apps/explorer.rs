@@ -2109,7 +2109,8 @@ impl Explorer {
         if self.computer() {
             return;
         }
-        let (total, free) = match self.cwd_drive().filter(|d| d.removable) {
+        // Todas las unidades menos C: (los discos internos tampoco son extraíbles pero tienen su propio espacio).
+        let (total, free) = match self.cwd_drive().filter(|d| d.letter != 'C') {
             Some(d) => (d.total, d.free),
             None => sys.fs().space(),
         };

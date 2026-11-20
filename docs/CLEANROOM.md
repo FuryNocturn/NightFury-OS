@@ -24,7 +24,7 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `kernel/src/arch.rs` | GDT, IDT, PIC, PIT, puertos | Intel SDM vol. 3; hojas de datos 8259 y 8254 |
 | `kernel/src/ps2.rs` | Teclado y ratón | Interfaz del controlador 8042 y protocolo PS/2; ratón con rueda (secuencia de frecuencias 200-100-80, identificador 3, cuarto byte con signo) según la descripción pública del protocolo |
 | `kernel/src/rtc.rs` | Fecha y hora | Registros del MC146818 |
-| `kernel/src/pci.rs`, `ahci.rs` | Configuración PCI y disco SATA (AHCI) por sondeo | PCI Local Bus Specification (acceso por 0xCF8/0xCFC); Serial ATA AHCI 1.3.1; ATA/ATAPI Command Set (IDENTIFY, READ/WRITE DMA EXT, FLUSH CACHE EXT) |
+| `kernel/src/pci.rs`, `ahci.rs` | Configuración PCI y disco SATA (AHCI) por sondeo | PCI Local Bus Specification (acceso por 0xCF8/0xCFC); Serial ATA AHCI 1.3.1; ATA/ATAPI Command Set (IDENTIFY con modelo y número de serie, READ/WRITE DMA EXT, FLUSH CACHE EXT); todos los controladores y puertos |
 | `nf-core/src/input.rs` | Códigos de tecla y distribución ES | Tabla pública "scan code set 1"; distribución de teclado española |
 | `nf-core/src/glyphs.rs` | Tipografía | Diseño propio, trazo a trazo |
 | `nf-core/src/icons.rs`, `theme.rs` | Iconos, logo, fondos | Diseño propio, generado por código |
@@ -40,7 +40,33 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/vol/exfat.rs` | exFAT | Microsoft exFAT File System Specification (publicada en 2019) |
 | `nf-core/src/vol/iso.rs`, `udf.rs` | CD/DVD de solo lectura | ECMA-119 (ISO 9660) y Joliet; ECMA-167 y OSTA UDF 1.02–2.50 |
 | `nf-core/src/vol/nfvol.rs`, `vol.rs` | NightFury en pendrives (en claro o cifrado), montaje | Diseño propio sobre NFFS y el cifrado anterior |
+| `kernel/src/nvme.rs` | Discos NVMe por sondeo, una pareja de colas | NVM Express Base Specification 2.0 y NVM Command Set Specification (registros, Identify, Create I/O Queue, Read, Write, Flush, listas PRP) |
+| `nf-core/src/vol/ntfs.rs` | NTFS en solo lectura (MFT, índices, listas de atributos, LZNT1) | Especificación de sala limpia «ntfs» (ver abajo) |
+| `nf-core/src/vol/ext.rs` | ext2, ext3 y ext4 en solo lectura | Especificación de sala limpia «ext4» (ver abajo) |
+| `nf-core/src/vol/part.rs` (BitLocker) | Reconocer una unidad cifrada con BitLocker | Solo la firma `-FVE-FS-` del sector de arranque, según la documentación pública de libbde |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
+
+## Sala limpia en dos equipos (desde v0.11.1)
+Para los formatos que no tienen una especificación pública completa se separa quién lee y quién programa:
+
+1. **Analista.** Lee el código abierto y la documentación pública del formato y escribe una especificación
+   en prosa: estructuras, campos, reglas de validación, casos raros y pruebas. La especificación no lleva
+   código, ni nombres de funciones o variables del original. Aparte anota sus fuentes (repositorio, commit,
+   licencia y qué sección sale de cada una), para poder auditarla.
+2. **Programador.** Escribe el código a partir de la especificación y nada más. Nunca ve el código original
+   ni la lista de fuentes.
+3. **Revisión.** Se comprueba que la especificación no contiene código y que el resultado no se parece al
+   original más de lo que obliga el formato.
+
+Especificaciones escritas así:
+
+| Especificación | Fuentes que leyó el analista |
+|---|---|
+| ntfs | ntfs-3g (commit 7f0f841, GPL-2.0/LGPL-2.1); driver ntfs3 de Linux (`fs/ntfs3`, commit 65e4fd9, GPL-2.0); documentación Linux-NTFS (Russon y Fledel); Microsoft [MS-FSCC] (etiquetas de reparse y atributos) y [MS-XCA] (LZNT1); documentación pública de WOF; documento de formato de libbde (solo la firma de BitLocker) |
+| ext4 | Documentación de ext4 del kernel Linux (`Documentation/filesystems/ext4`); código de Linux `fs/ext4`, `fs/jbd2` y `fs/crypto` (commit 65e4fd9, GPL-2.0); e2fsprogs (commit 8fd7952, GPL-2.0/LGPL-2.0) |
+
+Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas con discos reales usan
+`mkfs.ext4` y `mkntfs` solo como herramientas: se ejecutan, no se lee su código.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa
