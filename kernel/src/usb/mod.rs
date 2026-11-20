@@ -88,6 +88,20 @@ fn evento_mando(e: PadEvent) {
     unsafe { &mut *MANDOS.0.get() }.push(e);
 }
 
+/// Teclas soltadas y ratón soltado de los dispositivos quitados, para `poll`.
+struct Sueltas(UnsafeCell<(Vec<u8>, bool)>);
+// Un solo núcleo; solo el sondeo (bucle principal) la toca.
+unsafe impl Sync for Sueltas {}
+static SUELTAS: Sueltas = Sueltas(UnsafeCell::new((Vec::new(), false)));
+
+fn soltar_teclas() -> &'static mut Vec<u8> {
+    unsafe { &mut (*SUELTAS.0.get()).0 }
+}
+
+fn soltar_raton() {
+    unsafe { (*SUELTAS.0.get()).1 = true };
+}
+
 impl Uso {
     /// Clase, subclase y protocolo de una interfaz -> driver que la reclama.
     fn de(clase: u8, sub: u8, proto: u8) -> Option<Uso> {
@@ -207,6 +221,11 @@ pub fn poll(now_ms: u64, teclado: &mut Vec<u8>, raton: &mut Vec<MousePacket>, ma
         dev::servir(x, now_ms, teclado, raton);
     }
     mandos.append(unsafe { &mut *MANDOS.0.get() });
+    let s = unsafe { &mut *SUELTAS.0.get() };
+    teclado.append(&mut s.0);
+    if core::mem::take(&mut s.1) {
+        raton.push(MousePacket { dx: 0, dy: 0, buttons: 0, dz: 0 });
+    }
 }
 
 // ---------- Discos (almacenamiento masivo) ----------

@@ -102,18 +102,19 @@ pub fn abrir(id: u32) -> Option<Box<dyn SectorDev>> {
 }
 
 /// Un dispositivo se ha quitado (se llama desde `Xhci::quitar`, con la ranura ya deshabilitada).
-pub fn quitado(ctrl: usize, slot: u8) {
+/// Con `fuga`, el controlador no confirmó el Disable Slot y aún podría escribir en sus búferes: no se liberan.
+pub fn quitado(ctrl: usize, slot: u8, fuga: bool) {
     let bots = unsafe { &mut *BOTS.0.get() };
     let cola = unsafe { &mut *CAMBIOS.0.get() };
-    bots.retain(|b| {
-        if b.ctrl != ctrl || b.slot != slot {
-            return true;
-        }
+    while let Some(i) = bots.iter().position(|b| b.ctrl == ctrl && b.slot == slot) {
+        let b = bots.remove(i);
         for l in &b.luns {
             cola.push(CambioDisco::Quitado { id: l.id });
         }
-        false
-    });
+        if fuga {
+            core::mem::forget(b);
+        }
+    }
 }
 
 /// Una interfaz BOT recién configurada: Get Max LUN, y por cada LUN las órdenes de arranque del disco.
@@ -129,11 +130,13 @@ pub fn alta(x: &mut Xhci, slot: u8, iface: u8, ent: (u8, u8), sal: (u8, u8)) {
         Ok(1) if m[0] <= 15 => m[0],
         _ => 0,
     };
+    // Un plazo para todos los LUN: un lector de 16 ranuras que nunca está listo no para el sistema 16 × 5 s.
+    let plazo = Plazo::ms(8000);
     for lun in 0..=max {
-        if b.roto || x.dev(slot).is_none() {
+        if b.roto || x.dev(slot).is_none() || plazo.vencido() {
             break;
         }
-        match iniciar(x, &mut b, lun) {
+        match iniciar(x, &mut b, lun, &plazo) {
             Ok((nombre, ss, nsec, ro)) => {
                 let id = SIG_ID.fetch_add(1, Relaxed);
                 traza!("NF usb: ranura {} LUN {}: «{}» {} sectores de {} bytes ({} MiB){}", slot, lun, nombre, nsec, ss, (nsec * ss as u64) >> 20, if ro { ", solo lectura" } else { "" });
@@ -309,7 +312,7 @@ fn texto(b: &[u8]) -> String {
 }
 
 /// INQUIRY, TEST UNIT READY, READ CAPACITY y MODE SENSE. (nombre, tamaño de sector, sectores, solo lectura).
-fn iniciar(x: &mut Xhci, b: &mut Bot, lun: u8) -> Result<(String, usize, u64, bool), &'static str> {
+fn iniciar(x: &mut Xhci, b: &mut Bot, lun: u8, plazo: &Plazo) -> Result<(String, usize, u64, bool), &'static str> {
     let n = scsi(x, b, lun, &[0x12, 0, 0, 0, 36, 0], Dir::In, 36, 2000).map_err(|_| "INQUIRY falla")?;
     if n < 36 {
         return Err("respuesta de INQUIRY corta");
@@ -324,8 +327,8 @@ fn iniciar(x: &mut Xhci, b: &mut Bot, lun: u8) -> Result<(String, usize, u64, bo
     let optico = matches!(tipo, 5 | 7);
     let (v, p) = (texto(&inq[8..16]), texto(&inq[16..32]));
     let nombre = if v.is_empty() && p.is_empty() { String::from("USB") } else { alloc::format!("{} {}", v, p).trim().into() };
-    // Mientras el medio «se prepara» (NOT READY) o tras un reinicio (UNIT ATTENTION) se reintenta ~5 s.
-    let plazo = Plazo::ms(5000);
+    // Mientras el medio «se prepara» (NOT READY) o tras un reinicio (UNIT ATTENTION) se reintenta
+    // hasta el plazo del dispositivo.
     loop {
         match scsi(x, b, lun, &[0; 6], Dir::Nada, 0, 2000) {
             Ok(_) => break,

@@ -434,8 +434,11 @@ impl Xhci {
         if slot == 0 || slot as usize >= self.devs.len() {
             return Err(Error::Datos);
         }
-        let anillo = Anillo::de(self.mem(64 * 16, 1024)?, 64);
-        let (salida, entrada) = (self.mem(self.cs * 32, 4096)?, self.mem(self.cs * 33, 4096)?);
+        let (Ok(anillo), Ok(salida), Ok(entrada)) = (self.mem(64 * 16, 1024), self.mem(self.cs * 32, 4096), self.mem(self.cs * 33, 4096)) else {
+            let _ = self.comando(trb_cmd(10, 0, slot, 0));
+            return Err(Error::Memoria);
+        };
+        let anillo = Anillo::de(anillo, 64);
         let mps0: u32 = match o.vel {
             3 => 64,
             4 | 5 => 512,
@@ -488,18 +491,28 @@ impl Xhci {
         for h in hijos {
             self.quitar(h);
         }
-        let Some(d) = self.devs.get_mut(slot as usize).and_then(|d| d.take()) else { return };
-        let _ = self.comando(trb_cmd(10, 0, slot, 0));
+        let Some(mut d) = self.devs.get_mut(slot as usize).and_then(|d| d.take()) else { return };
+        let fuera = self.comando(trb_cmd(10, 0, slot, 0)).is_ok();
         unsafe { write_volatile(self.dcbaa.ptr::<u64>().add(slot as usize), 0) };
-        super::masivo::quitado(self.id, slot);
-        for e in d.eps.iter().flatten() {
-            if let Uso::Mando(m) = &e.uso {
-                super::evento_mando(nf_core::gamepad::PadEvent::Removed(m.id));
-                traza!("NF usb: mando {} quitado", m.id);
+        super::masivo::quitado(self.id, slot, !fuera);
+        for e in d.eps.iter_mut().flatten() {
+            match &mut e.uso {
+                Uso::Mando(m) => {
+                    super::evento_mando(nf_core::gamepad::PadEvent::Removed(m.id));
+                    traza!("NF usb: mando {} quitado", m.id);
+                }
+                // Lo que estuviera pulsado se suelta: si no, Mayús o un botón quedarían pegados.
+                Uso::Teclado(kb) => kb.feed(&[0; 8], 0, super::soltar_teclas()),
+                Uso::Raton => super::soltar_raton(),
+                _ => {}
             }
         }
         if d.padre.is_none() && self.puerto_slot[d.raiz as usize] == slot {
             self.puerto_slot[d.raiz as usize] = 0;
+        }
+        if !fuera {
+            traza!("NF usb: ranura {}: Disable Slot falla, su memoria no se libera", slot);
+            core::mem::forget(d);
         }
     }
 
@@ -525,6 +538,9 @@ impl Xhci {
     pub fn configurar(&mut self, slot: u8, eps: Vec<(CfgEp, Uso)>, hub: Option<(u8, u8)>) -> R<()> {
         let mut nuevos = Vec::new();
         for (c, uso) in eps {
+            if !(2..=31).contains(&c.dci) {
+                return Err(Error::Datos);
+            }
             let anillo = Anillo::de(self.mem(64 * 16, 1024)?, 64);
             let tam = (c.mps.max(8) as usize).next_power_of_two();
             let buf = if c.tipo == 7 { Some(self.mem(tam, tam)?) } else { None };
@@ -600,7 +616,14 @@ impl Xhci {
             ep.ult = ep.anillo.push([0, 0, 0, 4 << 10 | 1 << 5 | if len == 0 || !entrada { 1 << 16 } else { 0 }]);
         }
         self.timbre(slot, 1);
-        let n = self.esperar(slot, 1, 1000)?;
+        let n = match self.esperar(slot, 1, 1000) {
+            Err(Error::Tiempo) => {
+                // Sin abortar, el TD quedaría en el anillo y su evento tardío respondería a la siguiente.
+                self.abortar(slot, 1);
+                return Err(Error::Tiempo);
+            }
+            r => r?,
+        };
         if entrada {
             unsafe { core::ptr::copy_nonoverlapping(rb as *const u8, datos.as_mut_ptr(), n.min(len)) };
         }

@@ -503,7 +503,7 @@ impl Generic {
                     // Fuera de [lmin, lmax] (el «sin pulsar» de 8) es centro; de 4 posiciones, N E S O.
                     let h = v - f.lmin as i64;
                     let h = if h < 0 || h > span { 8 } else if span == 3 { h * 2 } else { h };
-                    st.buttons |= hat_btns(h as u8);
+                    st.buttons |= hat_btns(h.min(8) as u8);
                 }
                 Slot::Axis(a) if span > 0 => {
                     let t = v.clamp(f.lmin as i64, f.lmax as i64) - f.lmin as i64;

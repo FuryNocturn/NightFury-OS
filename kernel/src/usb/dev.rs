@@ -4,7 +4,7 @@
 //! Las clases se enchufan en `Uso::de` (qué interfaz reclaman), en `preparar` (qué piden al dispositivo
 //! antes de configurar) y en `atender` (qué hacen con cada transferencia terminada).
 use super::xhci::{intervalo, CfgEp, Error, Origen, Xhci, CCS, CSC};
-use super::{espera_ms, evento_mando, Dma, Mando, Plazo, Uso, ID_MANDO};
+use super::{espera_ms, evento_mando, Mando, Plazo, Uso, ID_MANDO};
 use crate::serial::traza;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -186,13 +186,17 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8], vid: u16, pid: u1
     // Interfaces de almacenamiento: (interfaz, dci bulk IN, dci bulk OUT, direcciones de los endpoints).
     let mut masivos: Vec<(u8, u8, u8, u8, u8)> = Vec::new();
     let mut configurado = false;
-    for f in interfaces(cfg) {
+    // shortcut: 16 interfaces bastan para los dispositivos reales; subir si apareciera uno con más.
+    for f in interfaces(cfg).into_iter().take(16) {
         if f.clase == 8 && f.proto == 0x62 {
             // UAS sin alternativa BOT en el ajuste 0 (con ella, `interfaces` ya ve la BOT): no se soporta.
             traza!("NF usb: ranura {}: interfaz {} es UAS sin alternativa BOT, se ignora", slot, f.num);
         }
         let mut out_plan = None;
-        let uso = match mando_de(x, slot, &f, vid, pid, valor_cfg, &mut configurado) {
+        // Un mando necesita un endpoint de interrupción IN (y no el 0): sin él no se pide su descriptor.
+        let int_in = f.eps.iter().any(|e| e.attr & 3 == 3 && e.addr & 0x80 != 0 && e.addr & 0xF != 0);
+        let pad = if int_in { mando_de(x, slot, &f, vid, pid, valor_cfg, &mut configurado) } else { None };
+        let uso = match pad {
             Some(pad) => {
                 let out = f.eps.iter().find(|e| e.attr & 3 == 3 && e.addr & 0x80 == 0);
                 let out_dci = out.map(|e| (e.addr & 0xF) * 2).filter(|d| *d > 1);
@@ -225,7 +229,7 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8], vid: u16, pid: u1
             masivos.push((f.num, di, d_o, ei.addr, eo.addr));
             continue;
         }
-        let Some(e) = f.eps.iter().find(|e| e.attr & 3 == 3 && e.addr & 0x80 != 0) else { continue };
+        let Some(e) = f.eps.iter().find(|e| e.attr & 3 == 3 && e.addr & 0x80 != 0 && e.addr & 0xF != 0) else { continue };
         let dci = (e.addr & 0xF) * 2 + 1;
         if planes.iter().any(|p| p.1.dci == dci) {
             continue;
@@ -262,7 +266,8 @@ fn preparar(x: &mut Xhci, slot: u8, valor_cfg: u8, cfg: &[u8], vid: u16, pid: u1
                 if n < 7 || h[2] == 0 {
                     return Err(Error::Datos);
                 }
-                hub = Some((h[2], if vel >= 4 { 0 } else { h[3] >> 5 & 3 }));
+                // La ruta de un hub guarda 4 bits por nivel: más de 15 puertos no se pueden direccionar.
+                hub = Some((h[2].min(15), if vel >= 4 { 0 } else { h[3] >> 5 & 3 }));
                 espera_hub = h[5] as u64 * 2;
             }
             Uso::Mando(_) => {
@@ -327,7 +332,7 @@ fn cadena(x: &mut Xhci, slot: u8, idx: u8) -> Option<String> {
         return None;
     }
     let u = b[2..l].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
-    let s: String = char::decode_utf16(u).map(|c| c.unwrap_or('?')).take(64).collect();
+    let s: String = char::decode_utf16(u).map(|c| c.ok().filter(|c| !c.is_control()).unwrap_or('?')).take(64).collect();
     (!s.trim().is_empty()).then_some(s)
 }
 
@@ -350,7 +355,7 @@ fn mando_alta(x: &mut Xhci, slot: u8, dci: u8, i_prod: u8) {
 fn enviar(x: &mut Xhci, slot: u8, iface: u8, out: Option<u8>, salidas: Vec<Vec<u8>>) {
     for mut s in salidas.into_iter().filter(|s| !s.is_empty()) {
         let r = match out {
-            Some(dci) => match Dma::nuevo(s.len(), 64) {
+            Some(dci) => match x.mem(s.len(), 64).ok() {
                 Some(b) => {
                     unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), b.ptr::<u8>(), s.len()) };
                     let r = x.normal(slot, dci, b.dir(), s.len(), false).and_then(|_| x.esperar(slot, dci, 20));
@@ -520,7 +525,7 @@ fn atender(x: &mut Xhci, slot: u8, dci: u8, ahora: u64, tec: &mut Vec<u8>, rat: 
 pub fn servir(x: &mut Xhci, ahora: u64, tec: &mut Vec<u8>, rat: &mut Vec<MousePacket>) {
     AHORA.store(ahora, Relaxed);
     x.eventos();
-    while let Some(p) = x.psc.pop() {
+    for p in core::mem::take(&mut x.psc) {
         if (1..=x.npuertos).contains(&p) {
             cambio_raiz(x, p, false);
         }
