@@ -157,6 +157,8 @@ pub struct Sock {
     retries: u8,
     probe: Option<(u32, u64)>,
     dup: u8,
+    /// Recuperando pérdidas: hasta qué número de secuencia se había enviado al retransmitir.
+    recover: Option<u32>,
     last_wnd: u16,
     created: u64,
     wait_until: u64,
@@ -191,6 +193,7 @@ impl Sock {
             retries: 0,
             probe: Some((iss.wrapping_add(1), now)),
             dup: 0,
+            recover: None,
             last_wnd: 0,
             created: now,
             wait_until: 0,
@@ -306,7 +309,15 @@ impl Sock {
             self.rttvar = (3 * self.rttvar + self.srtt.abs_diff(r)) / 4;
             self.srtt = (7 * self.srtt + r) / 8;
         }
-        self.rto = (self.srtt + (4 * self.rttvar).max(1)).clamp(RTO_MIN, RTO_MAX);
+        self.rto = self.base_rto();
+    }
+
+    fn base_rto(&self) -> u64 {
+        if self.have_rtt {
+            (self.srtt + (4 * self.rttvar).max(1)).clamp(RTO_MIN, RTO_MAX)
+        } else {
+            RTO_INIT
+        }
     }
 
     fn arm(&mut self, now: u64) {
@@ -366,6 +377,9 @@ impl Sock {
             return;
         }
         let inflight = self.inflight();
+        if inflight > 0 {
+            self.recover = Some(self.snd_nxt);
+        }
         let data_in = inflight.saturating_sub(self.fin_sent as usize);
         if data_in > 0 {
             let n = self.mss.min(data_in).min(self.sendq.len());
@@ -494,7 +508,10 @@ impl Sock {
             self.snd_wnd = t.win as u32;
             let newly = t.ack.wrapping_sub(self.snd_una) as usize;
             if newly > 0 {
-                self.new_ack(t.ack, newly, now);
+                // tras una pérdida, cada ACK parcial pide ya lo siguiente (sin esperar al RTO)
+                if self.new_ack(t.ack, newly, now) {
+                    self.retransmit(out);
+                }
             } else if t.data.is_empty() && t.flags & FIN == 0 && same_wnd && self.snd_nxt != self.snd_una {
                 self.dup += 1;
                 if self.dup == 3 {
@@ -559,7 +576,8 @@ impl Sock {
         }
     }
 
-    fn new_ack(&mut self, ack: u32, newly: usize, now: u64) {
+    /// Procesa un ACK que avanza; `true` si estamos recuperando y falta por confirmar.
+    fn new_ack(&mut self, ack: u32, newly: usize, now: u64) -> bool {
         let fin_acked = self.fin_sent && ack == self.snd_nxt;
         let data_acked = newly - fin_acked as usize;
         self.sendq.drain(..data_acked.min(self.sendq.len()));
@@ -572,7 +590,16 @@ impl Sock {
                 self.probe = None;
             }
         }
+        self.rto = self.base_rto(); // el ACK de datos nuevos deshace la espera exponencial
         self.timer = if self.snd_nxt != self.snd_una { Some(now + self.rto) } else { None };
+        let partial = match self.recover {
+            Some(r) if lt(ack, r) => true,
+            Some(_) => {
+                self.recover = None;
+                false
+            }
+            None => false,
+        };
         if fin_acked {
             match self.st {
                 St::FinWait1 => {
@@ -587,6 +614,7 @@ impl Sock {
                 _ => {}
             }
         }
+        partial && self.snd_nxt != self.snd_una
     }
 
     /// Datos en orden (`seq == rcv_nxt`) al búfer de lectura; si traen FIN, avanza el estado.
