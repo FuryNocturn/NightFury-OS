@@ -16,6 +16,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 pub mod http;
+mod dhcp;
+mod dns;
+mod icmp;
+mod ip;
+mod pkt;
+mod tcb;
+mod tcp;
+#[cfg(test)]
+mod tests;
 
 /// Dirección IPv4, en el orden en que se escribe (`[192, 168, 1, 1]`).
 pub type Ipv4 = [u8; 4];
@@ -146,97 +155,263 @@ pub const MAX_PINGS: usize = 16;
 pub const MAX_QUERIES: usize = 16;
 pub const TCP_BUF: usize = 64 * 1024;
 
+/// Configuración obtenida por DHCP.
+pub(crate) struct Cfg {
+    pub ip: Ipv4,
+    pub mask: Ipv4,
+    pub gw: Option<Ipv4>,
+    pub dns: Vec<Ipv4>,
+    pub server: Ipv4,
+    pub lease_s: u32,
+    pub since: u64,
+}
+
 /// La pila de red. Un solo adaptador.
 pub struct Net {
-    _todo: (),
+    secret: [u8; 32],
+    ctr: u64,
+    now: u64,
+    dev: Option<Box<dyn NetDev>>,
+    mac: [u8; 6],
+    link: Option<Link>,
+    rxbuf: Vec<u8>,
+    cfg: Option<Cfg>,
+    dhcp: dhcp::Dhcp,
+    arp: ip::ArpState,
+    ip_id: u16,
+    pings: Vec<icmp::PingOp>,
+    next_ping: u32,
+    ping_seq: u16,
+    queries: Vec<dns::Query>,
+    next_query: u32,
+    dns_cache: Vec<dns::CacheEntry>,
+    socks: Vec<tcb::Sock>,
+    next_sock: u32,
 }
 
 impl Net {
     /// `secret`: 32 bytes impredecibles del acumulador del sistema (para los números de secuencia
     /// de TCP, el identificador de DHCP y los puertos e identificadores de DNS).
-    pub fn new(_secret: [u8; 32]) -> Net {
-        todo!()
+    pub fn new(secret: [u8; 32]) -> Net {
+        Net {
+            secret,
+            ctr: 0,
+            now: 0,
+            dev: None,
+            mac: [0; 6],
+            link: None,
+            rxbuf: alloc::vec![0; 1514],
+            cfg: None,
+            dhcp: dhcp::Dhcp::default(),
+            arp: ip::ArpState::default(),
+            ip_id: 0,
+            pings: Vec::new(),
+            next_ping: 0,
+            ping_seq: 0,
+            queries: Vec::new(),
+            next_query: 0,
+            dns_cache: Vec::new(),
+            socks: Vec::new(),
+            next_sock: 0,
+        }
     }
 
     /// Engancha la tarjeta. Con cable, empieza DHCP en el siguiente `poll`.
-    pub fn attach(&mut self, _dev: Box<dyn NetDev>) {
-        todo!()
+    pub fn attach(&mut self, dev: Box<dyn NetDev>) {
+        self.mac = dev.mac();
+        self.dev = Some(dev);
+        self.link = None;
+        self.lose_config();
+        self.dhcp = dhcp::Dhcp::default();
     }
 
     /// Recibe y procesa las tramas pendientes, envía lo que toque (DHCP, ARP, retransmisiones de TCP)
     /// y vence los plazos. Mira el enlace: si se quita el cable, se pierde la dirección; al volver,
     /// DHCP empieza de nuevo. Renueva la concesión a la mitad de su duración.
-    pub fn poll(&mut self, _now_ms: u64) {
-        todo!()
+    pub fn poll(&mut self, now_ms: u64) {
+        self.now = now_ms;
+        let Some(dev) = self.dev.as_mut() else { return };
+        let link = dev.link();
+        if link.is_some() != self.link.is_some() {
+            if link.is_some() {
+                self.dhcp_start();
+            } else {
+                self.lose_config();
+                self.dhcp.st = dhcp::DState::Off;
+            }
+        }
+        self.link = link;
+        if link.is_none() {
+            return;
+        }
+        self.rx_all();
+        self.arp_tick();
+        self.dhcp_tick();
+        self.icmp_tick();
+        self.dns_tick();
+        self.tcp_tick();
     }
 
     pub fn status(&self) -> NetStatus {
-        todo!()
+        let state = if self.dev.is_none() {
+            State::NoAdapter
+        } else if self.link.is_none() {
+            State::NoCable
+        } else if let Some(c) = &self.cfg {
+            if self.arp.gw_fail {
+                State::NoInternet
+            } else if c.gw.is_some() && !self.arp.gw_ok {
+                State::Configuring
+            } else {
+                State::Connected
+            }
+        } else if self.now.saturating_sub(self.dhcp.since) >= DHCP_TIMEOUT_MS {
+            State::NoInternet
+        } else {
+            State::Configuring
+        };
+        let c = self.cfg.as_ref();
+        NetStatus {
+            state,
+            adapter: self.dev.as_ref().map(|d| d.name()).unwrap_or_default(),
+            mac: self.mac,
+            speed_mbps: self.link.map_or(0, |l| l.speed_mbps),
+            full_duplex: self.link.is_some_and(|l| l.full_duplex),
+            ip: c.map(|c| c.ip),
+            mask: c.map(|c| c.mask),
+            gateway: c.and_then(|c| c.gw),
+            dns: c.map(|c| c.dns.clone()).unwrap_or_default(),
+            dhcp_server: c.map(|c| c.server),
+            lease_s: c.map_or(0, |c| c.lease_s),
+            lease_since_ms: c.map_or(0, |c| c.since),
+        }
     }
 
     /// `ipconfig /renew` y el botón «Renovar dirección»: suelta la concesión y empieza DHCP de nuevo.
     pub fn renew(&mut self) {
-        todo!()
+        self.dhcp_release();
+        self.lose_config();
+        if self.link.is_some() {
+            self.dhcp_start();
+        }
     }
 
     /// Envía un eco ICMP con `bytes` de datos y el `ttl` dado. El resultado llega por `ping_poll`.
-    pub fn ping(&mut self, _dst: Ipv4, _bytes: u16, _ttl: u8) -> Result<PingId, NetError> {
-        todo!()
+    pub fn ping(&mut self, dst: Ipv4, bytes: u16, ttl: u8) -> Result<PingId, NetError> {
+        self.ping_start(dst, bytes, ttl)
     }
 
     /// `None` mientras espera; después, la respuesta o el error (`Timeout` a los `PING_TIMEOUT_MS`).
     /// Tras devolver `Some`, el identificador se libera.
-    pub fn ping_poll(&mut self, _id: PingId) -> Option<Result<PingReply, NetError>> {
-        todo!()
+    pub fn ping_poll(&mut self, id: PingId) -> Option<Result<PingReply, NetError>> {
+        self.ping_result(id)
     }
 
     /// Resuelve un nombre (registros A) con el DNS de DHCP, con caché según el TTL. Un texto que ya
     /// es una IP se devuelve tal cual.
-    pub fn resolve(&mut self, _name: &str) -> Result<QueryId, NetError> {
-        todo!()
+    pub fn resolve(&mut self, name: &str) -> Result<QueryId, NetError> {
+        self.dns_start(name)
     }
 
     /// Como `ping_poll`.
-    pub fn resolve_poll(&mut self, _id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>> {
-        todo!()
+    pub fn resolve_poll(&mut self, id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>> {
+        self.dns_result(id)
     }
 
     /// Abre una conexión TCP. El estado se mira con `tcp_state`.
-    pub fn tcp_connect(&mut self, _dst: Ipv4, _port: u16) -> Result<SockId, NetError> {
-        todo!()
+    pub fn tcp_connect(&mut self, dst: Ipv4, port: u16) -> Result<SockId, NetError> {
+        self.tcp_open(dst, port)
     }
 
-    pub fn tcp_state(&self, _s: SockId) -> TcpState {
-        todo!()
+    pub fn tcp_state(&self, s: SockId) -> TcpState {
+        match self.socks.iter().find(|k| k.id == s.0 && !k.released) {
+            Some(k) => k.state(),
+            None => TcpState::Failed(NetError::Gone),
+        }
     }
 
     /// Copia en el búfer de envío lo que quepa y devuelve cuánto (0 si está lleno). Error si la
     /// conexión no está abierta.
-    pub fn tcp_send(&mut self, _s: SockId, _data: &[u8]) -> Result<usize, NetError> {
-        todo!()
+    pub fn tcp_send(&mut self, s: SockId, data: &[u8]) -> Result<usize, NetError> {
+        self.tcp_write(s, data)
     }
 
     /// Copia en `buf` lo recibido y devuelve cuánto (0 si no hay nada todavía: mira `tcp_state` para
     /// saber si ya no llegará más).
-    pub fn tcp_recv(&mut self, _s: SockId, _buf: &mut [u8]) -> Result<usize, NetError> {
-        todo!()
+    pub fn tcp_recv(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError> {
+        self.tcp_read(s, buf)
     }
 
     /// Cierre ordenado (FIN tras enviar lo pendiente). El identificador queda libre; la pila termina
     /// el cierre por su cuenta.
-    pub fn tcp_close(&mut self, _s: SockId) {
-        todo!()
+    pub fn tcp_close(&mut self, s: SockId) {
+        self.tcp_shut(s, false)
     }
 
     /// Corta la conexión con RST y libera el identificador.
-    pub fn tcp_abort(&mut self, _s: SockId) {
-        todo!()
+    pub fn tcp_abort(&mut self, s: SockId) {
+        self.tcp_shut(s, true)
+    }
+
+    /// 32 bits impredecibles: SHA-256(secreto ‖ contador).
+    pub(crate) fn rand(&mut self) -> u32 {
+        let mut m = [0u8; 40];
+        m[..32].copy_from_slice(&self.secret);
+        m[32..].copy_from_slice(&self.ctr.to_be_bytes());
+        self.ctr = self.ctr.wrapping_add(1);
+        let h = crate::crypto::sha256(&m);
+        u32::from_be_bytes([h[0], h[1], h[2], h[3]])
+    }
+
+    /// Nuestra IP si se puede operar (hay tarjeta, cable y dirección).
+    pub(crate) fn ready(&self) -> Result<Ipv4, NetError> {
+        if self.dev.is_none() {
+            return Err(NetError::NoAdapter);
+        }
+        if self.link.is_none() {
+            return Err(NetError::NoCable);
+        }
+        self.cfg.as_ref().map(|c| c.ip).ok_or(NetError::NoAddress)
+    }
+
+    /// Se pierde la dirección (cable, caducidad o `renew`): caen ARP y conexiones.
+    pub(crate) fn lose_config(&mut self) {
+        self.cfg = None;
+        self.arp = ip::ArpState::default();
+        for s in self.socks.iter_mut() {
+            s.kill(NetError::Reset);
+        }
+        self.socks.retain(|s| !s.released);
+    }
+
+    fn rx_all(&mut self) {
+        let mut buf = core::mem::take(&mut self.rxbuf);
+        for _ in 0..128 {
+            let Some(n) = self.dev.as_mut().and_then(|d| d.recv(&mut buf)) else { break };
+            if n <= buf.len() {
+                self.rx(&buf[..n]);
+            }
+        }
+        self.rxbuf = buf;
     }
 }
 
 /// Lee «a.b.c.d» (cuatro números de 0 a 255, sin ceros a la izquierda raros ni espacios).
-pub fn parse_ip(_s: &str) -> Option<Ipv4> {
-    todo!()
+pub fn parse_ip(s: &str) -> Option<Ipv4> {
+    let mut ip = [0u8; 4];
+    let mut it = s.split('.');
+    for b in ip.iter_mut() {
+        let p = it.next()?;
+        // solo cifras, sin ceros a la izquierda («01» no vale) y 3 como mucho
+        if p.is_empty() || p.len() > 3 || !p.bytes().all(|c| c.is_ascii_digit()) || (p.len() > 1 && p.starts_with('0')) {
+            return None;
+        }
+        *b = p.parse().ok()?;
+    }
+    if it.next().is_some() {
+        return None;
+    }
+    Some(ip)
 }
 
 /// «a.b.c.d».
