@@ -197,6 +197,7 @@ const R_V_LIST: u32 = 23;
 const R_V_DETAILS: u32 = 24;
 const R_SORT: u32 = 25;
 const R_EXT: u32 = 26;
+const R_HIDDEN: u32 = 27;
 /// Botón de cinta -> orden, para los que se activan o desactivan según el contexto.
 const RIB_CMDS: [(u32, Cmd); 16] = [
     (R_COPY, Cmd::Copy),
@@ -387,6 +388,8 @@ struct Explorer {
     sort: Sort,
     desc: bool,
     show_ext: bool,
+    /// «Elementos ocultos» marcado (lo oculto lo quita `list_view`; esto es solo la casilla).
+    show_hidden: bool,
     /// Archivo de preferencias ya leído (cambia con la cuenta de la sesión).
     prefs_for: String,
     /// Se puede crear y pegar en la carpeta actual (permisos de la sesión).
@@ -456,7 +459,11 @@ fn build_ribbon(trash: bool) -> Ribbon {
             ],
         },
         Group { title: "Vista actual", items: vec![item(R_SORT, "Ordenar por", Icon::Ordenar).large().dropdown()] },
-        Group { title: "Mostrar u ocultar", items: vec![item(R_EXT, "Extensiones de nombre de archivo", Icon::FileBlank).checkbox()] },
+        Group { title: "Mostrar u ocultar", items: vec![
+                item(R_EXT, "Extensiones de nombre de archivo", Icon::FileBlank).checkbox(),
+                item(R_HIDDEN, "Elementos ocultos", Icon::FileBlank).checkbox(),
+            ],
+        },
     ];
     Ribbon::new(Some("Archivo"), vec![Tab { title: "Inicio", groups: inicio }, Tab { title: "Vista", groups: vista }])
 }
@@ -490,6 +497,7 @@ fn make() -> Explorer {
         sort: Sort::Name,
         desc: false,
         show_ext: true,
+        show_hidden: false,
         prefs_for: String::new(),
         can_create: true,
         pending_sys: None,
@@ -1039,7 +1047,9 @@ impl Explorer {
         self.gen = f.generation();
         (self.press, self.mq) = (None, None);
         let prefs = f.explorer_prefs();
-        self.show_ext = f.read(&prefs).map_or(true, |d| !String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "extensiones=no"));
+        let p = f.read(&prefs).map(|d| String::from_utf8_lossy(&d).into_owned());
+        self.show_ext = p.as_ref().map_or(true, |d| !d.lines().any(|l| l.trim() == "extensiones=no"));
+        self.show_hidden = p.as_ref().is_ok_and(|d| d.lines().any(|l| l.trim() == "ocultos=si"));
         self.rows.clear();
         self.drives = f.drives();
         // La unidad ya no está (o se cerró): se vuelve a «Este equipo».
@@ -1061,7 +1071,7 @@ impl Explorer {
             }
         } else {
             loop {
-                match f.list(&self.cwd) {
+                match f.list_view(&self.cwd) {
                     Ok(v) => {
                         for e in v {
                             self.rows.push(Row {
@@ -1543,6 +1553,7 @@ impl Explorer {
             self.rib.set_checked(id, self.view == v);
         }
         self.rib.set_checked(R_EXT, self.show_ext);
+        self.rib.set_checked(R_HIDDEN, self.show_hidden);
     }
 
     fn rib_pick(&mut self, id: u32, cx: &mut Ctx) {
@@ -1569,6 +1580,11 @@ impl Explorer {
             R_EXT => {
                 let v = if self.show_ext { "no" } else { "si" };
                 Self::write_prefs(cx.sys, &[("extensiones", v.into())]);
+                self.reload(cx.sys);
+            }
+            R_HIDDEN => {
+                let v = if self.show_hidden { "no" } else { "si" };
+                Self::write_prefs(cx.sys, &[("ocultos", v.into())]);
                 self.reload(cx.sys);
             }
             _ => {}
@@ -3788,6 +3804,18 @@ mod tests {
         t.pick(TAG_MENU_SORT, M_DESC);
         assert_eq!((t.e.sort, t.e.desc), (Sort::Size, true));
         assert_eq!(t.sys.files.read(&prefs()).unwrap(), b"vista=detalles\norden=tamano\ndesc=1\n");
+    }
+
+    #[test]
+    fn casilla_de_elementos_ocultos() {
+        let mut t = T::new();
+        t.tab(1);
+        t.rib(R_HIDDEN);
+        assert!(t.e.show_hidden && t.sys.files.show_hidden());
+        let p = String::from_utf8(t.sys.files.read(&prefs()).unwrap()).unwrap();
+        assert!(p.contains("ocultos=si"), "{p}");
+        t.rib(R_HIDDEN);
+        assert!(!t.e.show_hidden && !t.sys.files.show_hidden());
     }
 
     #[test]

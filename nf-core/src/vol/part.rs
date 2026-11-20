@@ -72,6 +72,19 @@ fn detect_kind(dev: &mut dyn SectorDev, start: u64, sectors: u64) -> FsKind {
         if &s0[0..4] == b"NFFS" {
             return FsKind::NightFury;
         }
+        if &s0[3..11] == b"NTFS    " && s0[510] == 0x55 && s0[511] == 0xAA {
+            return FsKind::Ntfs;
+        }
+        // BitLocker pone su firma en el lugar del nombre OEM del sector de arranque.
+        if &s0[3..11] == b"-FVE-FS-" {
+            return FsKind::BitLocker;
+        }
+    }
+    // ext2/3/4: superbloque en el byte 1024, firma 0xEF53 en su desplazamiento 56.
+    if let Some(sb) = rd(dev, base, bytes, 1024 + 56, 2) {
+        if sb == [0x53, 0xEF] {
+            return FsKind::Ext;
+        }
     }
     // Disco NightFury cifrado: la cabecera está en el último bloque de 4096 bytes.
     if bytes >= 4096 * 2 {
@@ -131,11 +144,43 @@ fn gpt(dev: &mut dyn SectorDev, lba: u64) -> Option<Vec<(u64, u64)>> {
     let mut out = Vec::new();
     for e in t.chunks(esz as usize) {
         let (f, l) = (u64le(e, 32), u64le(e, 40));
-        if e[..16].iter().any(|&b| b != 0) && f <= l && l < n {
+        if e[..16].iter().any(|&b| b != 0) && f <= l && l < n && !NOT_DATA_GPT.iter().any(|g| guid(g) == e[..16]) {
             out.push((f, l));
         }
     }
     Some(out)
+}
+
+/// Tipos GPT que no son de datos y no reciben letra (especificación UEFI y tipos publicados por
+/// Microsoft y freedesktop): sistema EFI, reservada de Microsoft, recuperación de Windows, metadatos
+/// de discos dinámicos, swap de Linux, LVM y RAID de Linux.
+const NOT_DATA_GPT: [&str; 8] = [
+    "C12A7328-F81F-11D2-BA4B-00A0C93EC93B",
+    "E3C9E316-0B5C-4DB8-817D-F92DF00215AE",
+    "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC",
+    "5808C8AA-7E8F-42E0-85D2-E1E90434CFB3",
+    "AF9B60A0-1431-4F62-BC68-3311714A69AD",
+    "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F",
+    "E6D6D379-F507-44C2-A23C-238F2A3DF928",
+    "A19D880F-05FC-4D3B-A006-743F0F84911E",
+];
+
+/// Tipos MBR equivalentes: sistema EFI, recuperación de Windows, swap de Linux, LVM, RAID y
+/// discos dinámicos de Windows.
+const NOT_DATA_MBR: [u8; 6] = [0xEF, 0x27, 0x82, 0x8E, 0xFD, 0x42];
+
+/// GUID en texto a los 16 bytes del disco (los tres primeros grupos van al revés).
+fn guid(s: &str) -> [u8; 16] {
+    let h: Vec<u8> = s.bytes().filter(|c| *c != b'-').collect();
+    let mut b = [0u8; 16];
+    for (i, x) in b.iter_mut().enumerate() {
+        let d = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+        *x = d(h[2 * i]) << 4 | d(h[2 * i + 1]);
+    }
+    b[0..4].reverse();
+    b[4..6].reverse();
+    b[6..8].reverse();
+    b
 }
 
 fn is_ext(t: u8) -> bool {
@@ -158,7 +203,7 @@ fn mbr(dev: &mut dyn SectorDev, s0: &[u8]) -> Option<Vec<(u64, u64)>> {
         }
         if is_ext(t) {
             ext = Some(s);
-        } else if t != 0xEE {
+        } else if t != 0xEE && !NOT_DATA_MBR.contains(&t) {
             out.push((s, l.min(n - s)));
         }
     }
@@ -172,7 +217,7 @@ fn mbr(dev: &mut dyn SectorDev, s0: &[u8]) -> Option<Vec<(u64, u64)>> {
                 break;
             }
             let (t, s, l) = (b[450], lba + u32le(&b, 454) as u64, u32le(&b, 458) as u64);
-            if t != 0 && !is_ext(t) && l != 0 && s < n {
+            if t != 0 && !is_ext(t) && !NOT_DATA_MBR.contains(&t) && l != 0 && s < n {
                 out.push((s, l.min(n - s)));
             }
             let (t2, s2) = (b[466], u32le(&b, 470) as u64);
@@ -247,6 +292,38 @@ pub(super) fn write_mbr(dev: &mut dyn SectorDev, start: u64, sectors: u64, ptype
 mod tests {
     use super::*;
     use crate::vol::MemSectors;
+
+    #[test]
+    fn guid_en_disco() {
+        // Sistema EFI tal como aparece en una tabla GPT real.
+        assert_eq!(guid("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"), [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B]);
+    }
+
+    #[test]
+    fn ntfs_bitlocker_y_ext_se_reconocen() {
+        let mut d = MemSectors::new(4096, 512);
+        d.data[3..11].copy_from_slice(b"NTFS    ");
+        d.data[510] = 0x55;
+        d.data[511] = 0xAA;
+        assert_eq!(detect_kind(&mut d, 0, 4096), FsKind::Ntfs);
+        d.data[3..11].copy_from_slice(b"-FVE-FS-");
+        assert_eq!(detect_kind(&mut d, 0, 4096), FsKind::BitLocker);
+        let mut d = MemSectors::new(4096, 512);
+        d.data[1024 + 56] = 0x53;
+        d.data[1024 + 57] = 0xEF;
+        assert_eq!(detect_kind(&mut d, 0, 4096), FsKind::Ext);
+    }
+
+    #[test]
+    fn particiones_que_no_son_de_datos_no_salen() {
+        let mut d = MemSectors::new(1000, 512);
+        put_mbr(&mut d, 0, 0x07, 10, 100);
+        put_mbr(&mut d, 1, 0x27, 200, 100);
+        put_mbr(&mut d, 2, 0x82, 400, 100);
+        put_mbr(&mut d, 3, 0x83, 600, 100);
+        let p = partitions(&mut d).unwrap();
+        assert_eq!(p.iter().map(|p| p.start).collect::<Vec<_>>(), vec![10, 600]);
+    }
 
     #[test]
     fn crc32_known() {

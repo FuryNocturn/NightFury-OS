@@ -397,6 +397,8 @@ pub struct Files {
 struct XDrive {
     letter: char,
     disk: u32,
+    /// `false` en las particiones de los discos internos (SATA, NVMe).
+    removable: bool,
     device: String,
     vol: Option<Box<dyn Volume>>,
     locked: Option<LockedDrive>,
@@ -570,6 +572,17 @@ impl Files {
     /// Cambia cada vez que se modifica algo; sirve para saber cuándo refrescar una vista.
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Como `list`, pero sin lo oculto o de sistema salvo que el usuario marcara «Elementos
+    /// ocultos». Es lo que enseñan el Explorador, el escritorio y los diálogos; copiar, mover y
+    /// borrar usan `list` para no dejarse nada.
+    pub fn list_view(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
+        let mut v = self.list(dir)?;
+        if v.iter().any(|e| e.hidden) && !self.show_hidden() {
+            v.retain(|e| !e.hidden);
+        }
+        Ok(v)
     }
 
     /// Entradas de una carpeta: carpetas primero, luego por nombre sin distinguir mayúsculas.
@@ -1102,6 +1115,12 @@ impl Files {
     }
 
     // ---- Extensiones de nombre de archivo (Explorador y escritorio) ----
+
+    /// `true` si el usuario pidió ver los elementos ocultos (`ocultos=si` en `explorer_prefs()`).
+    pub fn show_hidden(&mut self) -> bool {
+        let prefs = self.explorer_prefs();
+        self.read(&prefs).is_ok_and(|d| String::from_utf8_lossy(&d).lines().any(|l| l.trim() == "ocultos=si"))
+    }
 
     /// `false` si el usuario ocultó las extensiones (`extensiones=no` en `explorer_prefs()`).
     pub fn show_ext(&mut self) -> bool {
@@ -2407,7 +2426,7 @@ impl Files {
                 Some(i) => join_rel(&f.parent, &i.raw),
             }
         };
-        Ok(self.items(&raw)?.into_iter().map(|i| Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified }).collect())
+        Ok(self.items(&raw)?.into_iter().map(|i| Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified, hidden: false }).collect())
     }
 
     fn r_stat(&mut self, r: &str) -> Result<Entry, FsError> {
@@ -2415,7 +2434,7 @@ impl Files {
             return self.fs.stat(r);
         }
         let i = self.find_enc(r)?.item.ok_or(FsError::NotFound)?;
-        Ok(Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified })
+        Ok(Entry { name: i.name, dir: i.dir, size: i.size, modified: i.modified, hidden: false })
     }
 
     fn r_read(&mut self, r: &str) -> Result<Vec<u8>, FsError> {
@@ -2788,7 +2807,7 @@ impl Files {
     fn v_stat(&mut self, l: char, r: &str) -> Result<Entry, FsError> {
         let v = self.vol(l)?;
         if r.is_empty() {
-            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default() });
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
         }
         v.stat(r)
     }
@@ -2894,8 +2913,14 @@ impl Files {
     /// Conecta un volumen montado de la partición del disco `disk` en la primera letra libre
     /// (D..Z). `None` si no quedan letras.
     pub fn attach(&mut self, disk: u32, device: &str, vol: Box<dyn Volume>) -> Option<char> {
+        self.attach_as(disk, device, vol, true)
+    }
+
+    /// Como `attach`, diciendo si la unidad es extraíble (USB) o una partición de un disco interno.
+    /// Las internas no se expulsan; si no son de NightFury, el núcleo las monta en solo lectura.
+    pub fn attach_as(&mut self, disk: u32, device: &str, vol: Box<dyn Volume>, removable: bool) -> Option<char> {
         let letter = self.free_letter()?;
-        self.xd.list.push(XDrive { letter, disk, device: String::from(device), vol: Some(vol), locked: None });
+        self.xd.list.push(XDrive { letter, disk, removable, device: String::from(device), vol: Some(vol), locked: None });
         self.generation += 1;
         Some(letter)
     }
@@ -2903,7 +2928,7 @@ impl Files {
     /// Como `attach`, para un volumen NightFury cifrado que espera contraseña.
     pub fn attach_locked(&mut self, locked: Locked) -> Option<char> {
         let letter = self.free_letter()?;
-        self.xd.list.push(XDrive { letter, disk: locked.disk, device: locked.device, vol: None, locked: Some(locked.drive) });
+        self.xd.list.push(XDrive { letter, disk: locked.disk, removable: locked.removable, device: locked.device, vol: None, locked: Some(locked.drive) });
         self.generation += 1;
         Some(letter)
     }
@@ -2946,9 +2971,9 @@ impl Files {
             .map(|d| match d.vol.as_mut() {
                 Some(vol) => {
                     let (total, free) = vol.space();
-                    DriveInfo { letter: d.letter, label: vol.label(), device: d.device.clone(), kind: vol.kind(), total, free, read_only: vol.read_only(), removable: true, locked: false }
+                    DriveInfo { letter: d.letter, label: vol.label(), device: d.device.clone(), kind: vol.kind(), total, free, read_only: vol.read_only(), removable: d.removable, locked: false }
                 }
-                None => DriveInfo { letter: d.letter, label: String::new(), device: d.device.clone(), kind: crate::vol::FsKind::NightFury, total: 0, free: 0, read_only: false, removable: true, locked: true },
+                None => DriveInfo { letter: d.letter, label: String::new(), device: d.device.clone(), kind: crate::vol::FsKind::NightFury, total: 0, free: 0, read_only: false, removable: d.removable, locked: true },
             })
             .collect();
         rest.sort_by_key(|d| d.letter);
@@ -5563,6 +5588,35 @@ mod drive_tests {
 
     fn names(f: &mut Files, dir: &str) -> Vec<String> {
         f.list(dir).unwrap().into_iter().map(|e| e.name).collect()
+    }
+
+    #[test]
+    fn ocultos_y_unidades_internas() {
+        let s = stick(FsKind::Fat32, "");
+        let mut v = mount(&s);
+        v.write("visto.txt", b"1", NOW).unwrap();
+        v.write("oculto.txt", b"2", NOW).unwrap();
+        v.flush().unwrap();
+        drop(v);
+        let mut f = Files::default();
+        // Atributo «oculto» (0x02) puesto a mano en la entrada corta de la raíz.
+        {
+            let mut m = s.0.borrow_mut();
+            let i = m.data.windows(11).position(|w| w == b"OCULTO  TXT").unwrap();
+            m.data[i + 11] |= 0x02;
+        }
+        let d = f.attach_as(1, "Disco interno", Box::new(vol::ReadOnly(mount(&s))), false).unwrap();
+        let path = alloc::format!("{d}:\\");
+        let view = |f: &mut Files| f.list_view(&path).unwrap().into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(view(&mut f), ["visto.txt"]);
+        assert_eq!(names(&mut f, &path).len(), 2, "list (copiar, mover) lo ve todo");
+        let prefs = f.explorer_prefs();
+        f.write(&prefs, b"ocultos=si\n", NOW).unwrap();
+        assert_eq!(view(&mut f).len(), 2);
+        // Interna y de solo lectura: no es extraíble y no se escribe.
+        let info = f.drives().into_iter().find(|i| i.letter == d).unwrap();
+        assert!(!info.removable && info.read_only);
+        assert_eq!(f.write(&alloc::format!("{d}:\\x.txt"), b"x", NOW), Err(FsError::Denied));
     }
 
     #[test]

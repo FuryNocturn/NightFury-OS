@@ -13,6 +13,7 @@ mod arch;
 mod demo;
 mod boot;
 mod fb;
+mod nvme;
 mod paging;
 mod pci;
 mod ps2;
@@ -246,17 +247,17 @@ impl Platform for Plat {
 
 // ---------- Disco de datos ----------
 
-/// Sondea PCI/AHCI y ofrece el primer disco SATA que sea de NightFury o esté en blanco.
-/// Cualquier otro disco se salta sin escribir nada en él.
-fn elegir_disco() -> Option<Box<dyn BlockDev>> {
-    let Some(abar) = pci::buscar_ahci() else {
-        if TRAZA {
-            traza!("NF disco: sin controlador AHCI");
-        }
-        return None;
-    };
+/// Sondea PCI/AHCI y ofrece el primer disco SATA que sea de NightFury o esté en blanco (el del
+/// sistema, C:). El resto de discos SATA, de todos los controladores, se devuelven aparte: son internos.
+fn elegir_disco() -> (Option<Box<dyn BlockDev>>, Vec<Box<ahci::Disco>>) {
+    let abars = pci::buscar_ahci();
+    if abars.is_empty() && TRAZA {
+        traza!("NF disco: sin controlador AHCI");
+    }
     let mut elegido: Option<Box<dyn BlockDev>> = None;
-    for mut d in ahci::sondear(abar) {
+    let mut resto = Vec::new();
+    for d in abars.into_iter().flat_map(ahci::sondear) {
+        let mut d = d;
         let mib = d.blocks() * BLOCK as u64 >> 20;
         let motivo = if Nffs::is_formatted(&mut *d) {
             "NightFury"
@@ -272,19 +273,20 @@ fn elegir_disco() -> Option<Box<dyn BlockDev>> {
         if TRAZA {
             let r = match (motivo, ofrecer) {
                 (_, true) => "se ofrece",
-                ("", _) => "se salta: contenido ajeno",
-                _ => "se salta: ya hay otro disco ofrecido",
+                _ => "es interno",
             };
             traza!("NF disco: puerto {} {} MiB {} bloques ({}) {}", d.puerto(), mib, d.blocks(), motivo, r);
         }
         if ofrecer {
             elegido = Some(d);
+        } else {
+            resto.push(d);
         }
     }
     if elegido.is_none() && TRAZA {
         traza!("NF disco: ninguno ofrecido");
     }
-    elegido
+    (elegido, resto)
 }
 
 // ---------- Núcleo ----------
@@ -312,7 +314,8 @@ extern "C" fn kmain() -> ! {
         traza!("NF usb: {} controlador(es) xHCI iniciado(s)", n_usb);
     }
 
-    let disco = elegir_disco();
+    let (disco, sata) = elegir_disco();
+    let nvme = nvme::sondear();
     let files = Files::probe(disco, rtc::now());
     if TRAZA {
         traza!("NF archivos: persistente={} formato_pendiente={}", files.persistent(), files.pending_format());
@@ -342,6 +345,9 @@ extern "C" fn kmain() -> ! {
     }
     #[cfg(feature = "demo")]
     demo::lanzar(&mut desk, &mut plat);
+    // Los discos internos se enganchan antes que ningún USB.
+    let mut unidades = unidades::Unidades::default();
+    unidades.internos(&mut plat.files, sata, nvme);
     unsafe { core::arch::asm!("sti") };
 
     let mut teclado = Keyboard::new();
@@ -350,7 +356,6 @@ extern "C" fn kmain() -> ! {
     let mut usb_teclado: Vec<u8> = Vec::new();
     let mut usb_raton: Vec<nf_core::input::MousePacket> = Vec::new();
     let mut usb_mandos: Vec<nf_core::gamepad::PadEvent> = Vec::new();
-    let mut unidades = unidades::Unidades::default();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
     loop {

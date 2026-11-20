@@ -696,7 +696,7 @@ impl Dialog {
             self.error = Some(String::from("Esa carpeta es del sistema."));
             return false;
         }
-        match sys.files().list(dir) {
+        match sys.files().list_view(dir) {
             Ok(mut v) => {
                 if self.mode == Mode::Folder {
                     v.retain(|e| e.dir && (admin || !(target.len() == 3 && is_c(&target) && e.name.eq_ignore_ascii_case(SYSTEM))));

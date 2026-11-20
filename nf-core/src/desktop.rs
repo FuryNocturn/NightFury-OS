@@ -714,7 +714,7 @@ fn build_icons(sys: &mut dyn Platform, order: Order, show_ext: bool) -> Vec<DIco
         .collect();
     v.push(DIcon { name: String::from("Papelera"), label: String::from("Papelera"), icon: Icon::Trash, pic: None, act: Act::Path(String::from(files::TRASH)) });
     let dir = sys.files().std_dir(Std::Desktop);
-    let mut list = sys.files().list(&dir).unwrap_or_default();
+    let mut list = sys.files().list_view(&dir).unwrap_or_default();
     list.sort_by(|a, b| {
         let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
         b.dir.cmp(&a.dir).then_with(|| match order {

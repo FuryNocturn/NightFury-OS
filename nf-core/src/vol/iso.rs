@@ -214,7 +214,7 @@ impl Iso {
 }
 
 fn entry_of(r: &Rec) -> Entry {
-    Entry { name: r.name.clone(), dir: r.dir, size: r.size, modified: r.date }
+    Entry { name: r.name.clone(), dir: r.dir, size: r.size, modified: r.date, hidden: false }
 }
 
 impl Volume for Iso {

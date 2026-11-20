@@ -91,8 +91,14 @@ pub enum FsKind {
     Udf,
     /// El formato propio (NFFS), en claro o cifrado: lo monta `files`, no este módulo.
     NightFury,
-    /// NTFS, ext, HFS+, APFS…: se ve la unidad pero sale «Formato no compatible» (v0.11).
+    /// HFS+, APFS…: no se monta.
     Unknown,
+    /// NTFS (Windows), en solo lectura (v0.11.1).
+    Ntfs,
+    /// ext2, ext3 y ext4 (Linux), en solo lectura (v0.11.1).
+    Ext,
+    /// Cifrada con BitLocker: se ve bloqueada y no se abre.
+    BitLocker,
 }
 
 /// Partición encontrada en el disco (o el disco entero si no hay tabla).
@@ -125,6 +131,10 @@ pub trait Volume {
     fn delete(&mut self, path: &str) -> Result<(), FsError>;
     /// Escribe lo pendiente y deja el volumen limpio (antes de expulsar).
     fn flush(&mut self) -> Result<(), FsError>;
+    /// Aviso para mostrar al conectar la unidad (p. ej. un ext con el diario a medias).
+    fn notice(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 /// Lee la tabla de particiones (GPT, si no MBR; si no hay, el disco entero es una partición) y
@@ -141,6 +151,9 @@ pub fn mount(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Box<dyn Volume>, 
         FsKind::ExFat => exfat::mount(dev, p),
         FsKind::Iso9660 => iso::mount(dev, p),
         FsKind::Udf => udf::mount(dev, p),
+        FsKind::Ntfs => ntfs::mount(dev, p),
+        FsKind::Ext => ext::mount(dev, p),
+        FsKind::BitLocker => Ok(Box::new(Sealed { kind: FsKind::BitLocker, bytes: p.sectors * dev.sector_size() as u64 })),
         FsKind::NightFury | FsKind::Unknown => Err(FsError::Corrupt),
     }
 }
@@ -155,10 +168,106 @@ pub fn format(dev: &mut dyn SectorDev, kind: FsKind, label: &str, now: DateTime)
     }
 }
 
+/// Unidad que se ve pero no se abre (BitLocker): sin contenido y sin escritura.
+struct Sealed {
+    kind: FsKind,
+    bytes: u64,
+}
+
+impl Volume for Sealed {
+    fn kind(&self) -> FsKind {
+        self.kind
+    }
+    fn label(&self) -> String {
+        String::new()
+    }
+    fn space(&mut self) -> (u64, u64) {
+        (self.bytes, 0)
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn list(&mut self, _: &str) -> Result<Vec<Entry>, FsError> {
+        Err(FsError::Denied)
+    }
+    fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
+        if path.trim_matches('\\').is_empty() {
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
+        }
+        Err(FsError::Denied)
+    }
+    fn read(&mut self, _: &str) -> Result<Vec<u8>, FsError> {
+        Err(FsError::Denied)
+    }
+    fn write(&mut self, _: &str, _: &[u8], _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn mkdir(&mut self, _: &str, _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn rename(&mut self, _: &str, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn delete(&mut self, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn flush(&mut self) -> Result<(), FsError> {
+        Ok(())
+    }
+}
+
+/// Envoltorio de solo lectura: las particiones internas que no son de NightFury se montan así, para
+/// que ningún fallo pueda escribir en el Windows o el Linux del PC.
+pub struct ReadOnly(pub Box<dyn Volume>);
+
+impl Volume for ReadOnly {
+    fn kind(&self) -> FsKind {
+        self.0.kind()
+    }
+    fn label(&self) -> String {
+        self.0.label()
+    }
+    fn space(&mut self) -> (u64, u64) {
+        self.0.space()
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
+        self.0.list(dir)
+    }
+    fn notice(&self) -> Option<&'static str> {
+        self.0.notice()
+    }
+    fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
+        self.0.stat(path)
+    }
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, FsError> {
+        self.0.read(path)
+    }
+    fn write(&mut self, _: &str, _: &[u8], _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn mkdir(&mut self, _: &str, _: DateTime) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn rename(&mut self, _: &str, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn delete(&mut self, _: &str) -> Result<(), FsError> {
+        Err(FsError::Denied)
+    }
+    fn flush(&mut self) -> Result<(), FsError> {
+        Ok(())
+    }
+}
+
 pub mod exfat;
+pub mod ext;
 pub mod fat;
 pub mod iso;
 pub mod nfvol;
+pub mod ntfs;
 pub use nfvol::LockedDrive;
 pub mod part;
 pub mod udf;

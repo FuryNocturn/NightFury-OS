@@ -55,6 +55,7 @@ api! {
     fn persistent(&mut self) -> bool;
     fn generation(&mut self) -> u64;
     fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError>;
+    fn list_view(&mut self, dir: &str) -> Result<Vec<Entry>, FsError>;
     fn stat(&mut self, path: &str) -> Result<Entry, FsError>;
     fn exists(&mut self, path: &str) -> bool;
     fn read(&mut self, path: &str) -> Result<Vec<u8>, FsError>;

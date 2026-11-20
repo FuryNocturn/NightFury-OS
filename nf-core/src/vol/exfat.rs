@@ -625,7 +625,7 @@ impl Ex {
 
     fn entry_of(&self, it: &Item) -> Entry {
         let size = if it.dir() { 0 } else { it.size() };
-        Entry { name: it.name.clone(), dir: it.dir(), size, modified: unpack_time(u32le(&it.set, 12)) }
+        Entry { name: it.name.clone(), dir: it.dir(), size, modified: unpack_time(u32le(&it.set, 12)), hidden: it.attr() & 0x06 != 0 }
     }
 }
 
@@ -651,7 +651,7 @@ impl Volume for Ex {
 
     fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
         if split(path).is_empty() {
-            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default() });
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
         }
         let it = self.lookup(path)?;
         Ok(self.entry_of(&it))

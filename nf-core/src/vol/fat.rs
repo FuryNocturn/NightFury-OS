@@ -863,7 +863,7 @@ impl Fat {
 
     fn entry_of(&self, it: &Item) -> Entry {
         let size = if it.dir() { 0 } else { u32le(&it.raw, 28) as u64 };
-        Entry { name: it.name.clone(), dir: it.dir(), size, modified: unpack_time((u16le(&it.raw, 24) as u32) << 16 | u16le(&it.raw, 22) as u32) }
+        Entry { name: it.name.clone(), dir: it.dir(), size, modified: unpack_time((u16le(&it.raw, 24) as u32) << 16 | u16le(&it.raw, 22) as u32), hidden: it.raw[11] & 0x06 != 0 }
     }
 
     /// (clusters de los directorios del camino, nombre final) de una ruta que no es la raíz.
@@ -902,7 +902,7 @@ impl Volume for Fat {
 
     fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
         if split(path).is_empty() {
-            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default() });
+            return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
         }
         let (_, it) = self.lookup(path)?;
         Ok(self.entry_of(&it))

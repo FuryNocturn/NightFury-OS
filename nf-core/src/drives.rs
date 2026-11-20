@@ -75,6 +75,9 @@ pub fn kind_name(k: FsKind) -> &'static str {
         FsKind::Iso9660 => "ISO 9660",
         FsKind::Udf => "UDF",
         FsKind::NightFury => "NightFury",
+        FsKind::Ntfs => "NTFS",
+        FsKind::Ext => "ext",
+        FsKind::BitLocker => "BitLocker",
         FsKind::Unknown => "Formato no compatible",
     }
 }
@@ -82,6 +85,8 @@ pub fn kind_name(k: FsKind) -> &'static str {
 /// Unidad cifrada esperando contraseña (la guarda `Files`).
 pub struct Locked {
     pub disk: u32,
+    /// `false` si es una partición de un disco interno.
+    pub removable: bool,
     pub device: String,
     pub drive: LockedDrive,
 }

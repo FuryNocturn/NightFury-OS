@@ -127,6 +127,7 @@ calls! {
     UnlockDrive { letter: char, secret: String, recovery: bool } = 59,
     DriveAction { letter: char, req: FormatRequest } = 60,
     DriveResult = 61,
+    ListView { dir: String } = 62,
 }
 
 // ---------- Wire de los tipos que viajan ----------
@@ -250,7 +251,8 @@ impl Wire for char {
     }
 }
 
-const FS_KINDS: [FsKind; 8] = [FsKind::Fat12, FsKind::Fat16, FsKind::Fat32, FsKind::ExFat, FsKind::Iso9660, FsKind::Udf, FsKind::NightFury, FsKind::Unknown];
+// Solo se añade al final: los números ya publicados no cambian.
+const FS_KINDS: [FsKind; 11] = [FsKind::Fat12, FsKind::Fat16, FsKind::Fat32, FsKind::ExFat, FsKind::Iso9660, FsKind::Udf, FsKind::NightFury, FsKind::Unknown, FsKind::Ntfs, FsKind::Ext, FsKind::BitLocker];
 
 impl Wire for FsKind {
     fn put(&self, w: &mut Writer) {
@@ -311,7 +313,7 @@ impl Wire for Entry {
         w.put(&self.name).put(&self.dir).put(&self.size).put(&self.modified);
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
-        Ok(Entry { name: r.get()?, dir: r.get()?, size: r.get()?, modified: r.get()? })
+        Ok(Entry { name: r.get()?, dir: r.get()?, size: r.get()?, modified: r.get()?, hidden: false })
     }
 }
 
@@ -409,6 +411,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         Persistent => encode(&sys.files().persistent()),
         Generation => encode(&sys.files().generation()),
         List { dir } => encode(&sys.files().list(&dir)),
+        ListView { dir } => encode(&sys.files().list_view(&dir)),
         Stat { path } => encode(&sys.files().stat(&path)),
         Exists { path } => encode(&sys.files().exists(&path)),
         // Un programa de terceros no lee `C:\Sistema` (con sesión de administrador vería las cuentas).
@@ -591,6 +594,9 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     }
     fn list(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
         self.fs(Call::List { dir: s(dir) })
+    }
+    fn list_view(&mut self, dir: &str) -> Result<Vec<Entry>, FsError> {
+        self.fs(Call::ListView { dir: s(dir) })
     }
     fn stat(&mut self, path: &str) -> Result<Entry, FsError> {
         self.fs(Call::Stat { path: s(path) })
@@ -876,7 +882,7 @@ mod tests {
 
     #[test]
     fn tipos_ida_y_vuelta() {
-        let e = Entry { name: s("ñ.txt"), dir: false, size: 7, modified: NOW };
+        let e = Entry { name: s("ñ.txt"), dir: false, size: 7, modified: NOW, hidden: false };
         assert_eq!(decode::<Result<Entry, FsError>>(&encode(&Ok::<_, FsError>(e.clone()))), Ok(Ok(e)));
         for fe in FS_ERRORS {
             assert_eq!(decode::<FsError>(&encode(&fe)), Ok(fe));

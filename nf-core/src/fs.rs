@@ -100,6 +100,10 @@ pub struct Entry {
     /// Tamaño en bytes (0 en carpetas).
     pub size: u64,
     pub modified: DateTime,
+    /// Oculto o de sistema en su volumen (atributos de FAT, exFAT o NTFS). El Explorador, el
+    /// escritorio y los diálogos no lo muestran salvo con «Elementos ocultos». No viaja por el
+    /// servicio (los programas lo ven siempre como `false`).
+    pub hidden: bool,
 }
 
 const MAGIC: &[u8; 4] = b"NFFS";
@@ -579,7 +583,7 @@ impl Nffs {
 
     fn entry(&self, name: &str, id: u32) -> Result<Entry, FsError> {
         let n = self.get(id)?;
-        Ok(Entry { name: String::from(name), dir: n.dir, size: if n.dir { 0 } else { n.size }, modified: n.mtime })
+        Ok(Entry { name: String::from(name), dir: n.dir, size: if n.dir { 0 } else { n.size }, modified: n.mtime, hidden: false })
     }
 
     /// Entradas de una carpeta, sin orden garantizado.
