@@ -381,6 +381,7 @@ extern "C" fn kmain() -> ! {
     let mut usb_mandos: Vec<nf_core::gamepad::PadEvent> = Vec::new();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
+    let mut estado_red = None;
     loop {
         // Programas del sistema: se instalan (o actualizan) en cuanto el disco está listo.
         if !programas_listos && !plat.files.disk_locked() && !plat.files.pending_format() {
@@ -412,6 +413,14 @@ extern "C" fn kmain() -> ! {
         usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton, &mut usb_mandos);
         unidades.sondear(&mut plat.files, &mut plat.pool);
         plat.net.poll(arch::TICKS.load(Relaxed) * 10);
+        if TRAZA {
+            let st = plat.net.status();
+            if Some(st.state) != estado_red {
+                estado_red = Some(st.state);
+                let ip = |x: Option<nf_core::net::Ipv4>| x.map_or(String::from("-"), nf_core::net::ip_text);
+                traza!("NF red: {:?} ip={} puerta={} dns={:?}", st.state, ip(st.ip), ip(st.gateway), st.dns);
+            }
+        }
         for b in usb_teclado.drain(..) {
             if let Some(k) = teclado.feed(b) {
                 desk.event(Event::Key(k), &mut plat);
