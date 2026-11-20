@@ -60,6 +60,36 @@ pub fn alloc_pages(n: usize) -> (*mut u8, Layout) {
     (unsafe { alloc_zeroed(l) }, l)
 }
 
+/// Mapea (identidad, sin caché, páginas de 2 MiB) el rango de un dispositivo en las tablas del núcleo.
+/// Para BAR por encima de lo que `init` ya cubre. Debe hacerse antes de crear programas: sus PML4 son
+/// copias de la del núcleo. `false` si no hay memoria.
+pub fn mapear_mmio(base: u64, len: u64) -> bool {
+    const PCD_PWT: u64 = 0x18;
+    unsafe fn tabla(e: *mut u64) -> Option<*mut u64> {
+        if *e & P == 0 {
+            let (t, _) = alloc_pages(1);
+            if t.is_null() {
+                return None;
+            }
+            *e = t as u64 | P | W;
+        }
+        Some((*e & ADDR) as *mut u64)
+    }
+    let pml4 = KERNEL_CR3.load(Relaxed) as *mut u64;
+    let mut a = base & !((2 << 20) - 1);
+    while a < base + len {
+        // Las tablas del núcleo son nuestras y los índices tienen 9 bits.
+        unsafe {
+            let Some(pdpt) = tabla(pml4.add((a >> 39 & 511) as usize)) else { return false };
+            let Some(pd) = tabla(pdpt.add((a >> 30 & 511) as usize)) else { return false };
+            pd.add((a >> 21 & 511) as usize).write(a | P | W | PS | PCD_PWT);
+        }
+        a += 2 << 20;
+    }
+    unsafe { set_cr3(cr3()) }; // vacía la TLB
+    true
+}
+
 /// Crea las tablas del núcleo y las activa. `fin_ram` y `fin_fb` en bytes físicos.
 /// Las BAR de AHCI son de 32 bits (`pci.rs`), así que el mínimo de 4 GiB ya las cubre.
 pub fn init(fin_ram: u64, fin_fb: u64) {

@@ -24,6 +24,25 @@ pub fn escribir(bus: u8, dev: u8, fun: u8, reg: u8, v: u32) {
     }
 }
 
+/// Todas las funciones PCI de una clase (`clase << 16 | subclase << 8 | interfaz`), como (bus, dispositivo, función).
+pub fn buscar(codigo: u32) -> alloc::vec::Vec<(u8, u8, u8)> {
+    let mut v = alloc::vec::Vec::new();
+    for bus in 0..=255u8 {
+        for dev in 0..32u8 {
+            if leer(bus, dev, 0, 0) & 0xFFFF == 0xFFFF {
+                continue;
+            }
+            let multi = (leer(bus, dev, 0, 0x0C) >> 16) & 0x80 != 0;
+            for fun in 0..(if multi { 8 } else { 1 }) {
+                if leer(bus, dev, fun, 0) & 0xFFFF != 0xFFFF && leer(bus, dev, fun, 0x08) >> 8 == codigo {
+                    v.push((bus, dev, fun));
+                }
+            }
+        }
+    }
+    v
+}
+
 /// Busca el primer controlador AHCI (clase 0x01, subclase 0x06, interfaz 0x01), activa
 /// espacio de memoria y bus master y devuelve la dirección base de BAR5 (ABAR).
 pub fn buscar_ahci() -> Option<u64> {

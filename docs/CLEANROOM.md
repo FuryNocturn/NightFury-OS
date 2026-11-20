@@ -6,7 +6,8 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 - El compilador de Rust y sus bibliotecas base `core` y `alloc` (MIT/Apache-2.0).
 - Especificaciones y documentación públicas, usadas solo como descripción de interfaces y formatos:
   UEFI Specification, Intel SDM, documentación pública de los chips 8259 (PIC), 8254 (PIT),
-  8042 (PS/2) y MC146818 (reloj).
+  8042 (PS/2) y MC146818 (reloj); especificaciones de USB, xHCI, HID, almacenamiento masivo y sistemas
+  de archivos listadas abajo.
 - Herramientas externas para compilar y probar (cargo, QEMU). No forman parte del sistema.
 
 ## Prohibido
@@ -31,6 +32,14 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/cipher.rs` | AES-256, modos CTR y XTS | FIPS 197 (la caja S se calcula, no se copia); NIST SP 800-38A; IEEE 1619 / NIST SP 800-38E. Código propio, comprobado con los vectores oficiales |
 | `nf-core/src/keys.rs`, `accounts.rs` | Llaves envueltas, acumulador de aleatoriedad, cuentas | Diseño propio sobre las primitivas anteriores |
 | `kernel/src/main.rs` (`entropy`) | RDRAND, contador de ciclos | Intel SDM vol. 2 (RDRAND, RDTSC, CPUID.01H:ECX bit 30) |
+| `kernel/src/usb/xhci.rs`, `dev.rs`, `mod.rs` | Controlador xHCI, hubs, enumeración, teclado y ratón | eXtensible Host Controller Interface 1.2 (Intel); USB 2.0 y 3.2 Specification (descriptores, peticiones estándar, hubs cap. 11); Device Class Definition for HID 1.11 (protocolo de arranque) |
+| `kernel/src/usb/masivo.rs`, `kernel/src/unidades.rs` | Pendrives y discos USB | USB Mass Storage Class Bulk-Only Transport 1.0; SCSI Primary/Block Commands (INQUIRY, TEST UNIT READY, READ CAPACITY, READ/WRITE(10/16), REQUEST SENSE) |
+| `nf-core/src/usbhid.rs`, `gamepad.rs` | Informes HID, parser de descriptores, mandos | HID 1.11 y HID Usage Tables 1.4; formatos de informe de los mandos (DualShock 4, DualSense, Switch Pro, Xbox 360, GIP de Xbox One) según la documentación pública de la comunidad, sin código de terceros |
+| `nf-core/src/vol/part.rs` | MBR y GPT | UEFI Specification (GPT, CRC32); formato público del MBR |
+| `nf-core/src/vol/fat.rs` | FAT12/16/32 con nombres largos | Microsoft FAT32 File System Specification (FAT: General Overview of On-Disk Format 1.03) |
+| `nf-core/src/vol/exfat.rs` | exFAT | Microsoft exFAT File System Specification (publicada en 2019) |
+| `nf-core/src/vol/iso.rs`, `udf.rs` | CD/DVD de solo lectura | ECMA-119 (ISO 9660) y Joliet; ECMA-167 y OSTA UDF 1.02–2.50 |
+| `nf-core/src/vol/nfvol.rs`, `vol.rs` | NightFury en pendrives (en claro o cifrado), montaje | Diseño propio sobre NFFS y el cifrado anterior |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
 
 ## Criptografía

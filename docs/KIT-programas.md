@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.10)
+# Kit de programas de NightFury (v0.11)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -113,6 +113,24 @@ Lo que un programa **de terceros** no puede (se le contesta `FsError::Denied` o 
 
 Eso solo lo hacen los programas del sistema que vienen con NightFury (Bloc de notas, Terminal,
 Configuración y Explorador), que el sistema reconoce por su binario exacto.
+
+### Unidades extraíbles y mandos (v0.11)
+
+- **Pendrives y discos USB** aparecen como `D:`, `E:`… y se usan con el mismo `cx.sys.fs()` que `C:`
+  (`D:\carpeta\archivo.txt`), con los permisos del usuario. `fs().drives()` da la lista (`DriveInfo`: letra,
+  etiqueta, formato, tamaño, libre, `read_only`, `removable`, `locked`). Las ISO y UDF son de solo lectura
+  (al escribir, `FsError::Denied`) y una unidad cifrada sin desbloquear no se puede abrir. Si el usuario quita el
+  pendrive, las llamadas sobre esa letra fallan: trátalo como cualquier error de disco.
+- Formatear, expulsar, cifrar y desbloquear unidades es solo para los programas del sistema.
+- **Mandos**: `App::gamepads(&[PadInfo], cx)` llega al abrir la ventana y cada vez que se conecta o quita
+  uno (`id`, `kind`: genérico, DualShock 4, DualSense, Switch Pro, Xbox 360, Xbox One, y `name`).
+  `App::gamepad(id, &PadState, cx)` llega **solo a la ventana activa**, cuando cambia algo y al ganar el foco;
+  al perderlo, da todos los botones por sueltos.
+  - Botones por posición (`nf_core::gamepad::BTN_*`): `BTN_SOUTH` es el de abajo (A en Xbox, ✕ en
+    PlayStation, B en Nintendo), y además `EAST/WEST/NORTH`, `L1 R1 L2 R2`, `SELECT START HOME`, `L3 R3`,
+    la cruceta `UP DOWN LEFT RIGHT` y `EXTRA` (panel táctil o captura).
+  - Ejes `state.axes[AXIS_LX..=AXIS_RT]`: sticks de −32768 a 32767 (Y negativa = arriba) y gatillos de 0 a
+    32767. En el ABI son los eventos `EV_GAMEPAD` (20) y `EV_GAMEPADS` (21); ver `nf-core\src\abi.rs`.
 
 ## Guardar un archivo (`SAVE_AS`)
 

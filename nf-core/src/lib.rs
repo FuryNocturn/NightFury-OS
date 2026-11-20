@@ -13,11 +13,13 @@ pub mod cryptdev;
 pub mod crypto;
 pub mod bmp;
 pub mod dialogs;
+pub mod drives;
 pub mod files;
 pub mod fs;
 pub mod fsapi;
 pub mod desktop;
 pub mod font;
+pub mod gamepad;
 pub mod geom;
 pub mod glyphs;
 pub mod heap;
@@ -39,6 +41,8 @@ pub mod service;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod usbhid;
+pub mod vol;
 pub mod wire;
 
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).

@@ -8,7 +8,9 @@ param(
     [int]$Port = 4455,
     [switch]$NoBuild,
     [string]$Disk = 'disco.img',
-    [switch]$NoDisk
+    [switch]$NoDisk,
+    [string[]]$Usb = @(),  # imágenes de pendrive (`nfdisk usb`), como usb-storage del xHCI
+    [string[]]$Device = @()  # dispositivos USB extra del xHCI (p. ej. usb-tablet)
 )
 $ErrorActionPreference = 'Stop'
 $Commands = @($Commands | ForEach-Object { $_ -split "," })  # con -File, una lista llega como una sola cadena con comas
@@ -34,6 +36,7 @@ $q = @(
     '-drive', '"if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd"',
     '-drive', 'format=raw,file=fat:rw:esp',
     '-rtc', 'base=localtime', '-vga', 'std',
+    '-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0',
     '-display', 'none',
     '-monitor', "tcp:127.0.0.1:$Port,server,nowait"
 )
@@ -41,6 +44,15 @@ if (-not $NoDisk) {
     $img = if ([System.IO.Path]::IsPathRooted($Disk)) { $Disk } else { [System.IO.Path]::GetFullPath((Join-Path $root $Disk)) }
     if (-not (Test-Path $img)) { fsutil file createnew $img 268435456 | Out-Null }
     $q += @('-drive', "id=datos,if=none,format=raw,file=$img", '-device', 'ide-hd,drive=datos,bus=ide.1')
+}
+$n = 0
+foreach ($u in @($Usb | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+    $img = if ([System.IO.Path]::IsPathRooted($u)) { $u } else { [System.IO.Path]::GetFullPath((Join-Path $root $u)) }
+    $q += @('-drive', "if=none,id=usb$n,format=raw,file=$img", '-device', "usb-storage,bus=xhci.0,drive=usb$n")
+    $n++
+}
+foreach ($d in @($Device | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+    $q += @('-device', "$d,bus=xhci.0")
 }
 if ($Serial) {
     $s = [System.IO.Path]::GetFullPath((Join-Path $root $Serial))

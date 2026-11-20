@@ -128,6 +128,14 @@ pub const EV_DRAG_SOURCE: u32 = 17;
 pub const EV_DROP: u32 = 18;
 /// Abrir una ruta en esta ventana (`App::open_path`); datos: la ruta.
 pub const EV_OPEN: u32 = 19;
+/// Estado de un mando (solo a la ventana activa, cuando cambia y al ganar el foco). `a` = id del
+/// mando, `b` = botones (`gamepad::BTN_*`), y los ejes de dos en dos como i16 (bajo | alto << 16):
+/// `c` = LX, LY; `d` = RX, RY; `flags` = LT, RT. Ver `WireEvent::gamepad` y `to_gamepad`.
+/// Al perder el foco, el programa debe dar todo por suelto.
+pub const EV_GAMEPAD: u32 = 20;
+/// Lista de mandos conectados (lleva datos: `Vec<gamepad::PadInfo>`). Llega a todas las ventanas
+/// al abrirse y cada vez que se conecta o quita uno.
+pub const EV_GAMEPADS: u32 = 21;
 
 pub const F_SHIFT: u32 = 1;
 pub const F_CTRL: u32 = 2;
@@ -187,6 +195,23 @@ impl WireEvent {
         let (code, kc) = key_code(ev.key);
         let d = ev.ch.or(kc).map_or(0, |c| c as u32);
         WireEvent { kind: EV_KEY, a: code, d, flags, now_ms, ..Default::default() }
+    }
+
+    /// `EV_GAMEPAD` del mando `id`.
+    pub fn gamepad(id: u32, st: &crate::gamepad::PadState, now_ms: u64) -> Self {
+        let pair = |i: usize| (st.axes[i] as u16 as u32 | (st.axes[i + 1] as u16 as u32) << 16) as i32;
+        WireEvent { kind: EV_GAMEPAD, a: id as i32, b: st.buttons as i32, c: pair(0), d: pair(2) as u32, flags: pair(4) as u32, now_ms }
+    }
+
+    /// Vuelve a (id, estado). `None` si no es `EV_GAMEPAD`.
+    pub fn to_gamepad(&self) -> Option<(u32, crate::gamepad::PadState)> {
+        if self.kind != EV_GAMEPAD {
+            return None;
+        }
+        let (c, d, f) = (self.c as u32, self.d, self.flags);
+        let lo = |v: u32| v as u16 as i16;
+        let hi = |v: u32| (v >> 16) as u16 as i16;
+        Some((self.a as u32, crate::gamepad::PadState { buttons: self.b as u32, axes: [lo(c), hi(c), lo(d), hi(d), lo(f), hi(f)] }))
     }
 
     /// Vuelve a `KeyEvent` (siempre `down = true`). `None` si no es `EV_KEY` o el código no existe.
@@ -282,6 +307,16 @@ mod tests {
         let e = WireEvent { kind: EV_MOUSE_WHEEL, a: -5, b: 7, c: 3, d: 0xABCD, flags: 6, now_ms: 0x1122_3344_5566 };
         assert_eq!(WireEvent::from_bytes(&e.to_bytes()), e);
         assert_eq!(core::mem::size_of::<WireEvent>(), WIRE_EVENT_SIZE);
+    }
+
+    #[test]
+    fn mando_ida_y_vuelta() {
+        use crate::gamepad::*;
+        let st = PadState { buttons: BTN_SOUTH | BTN_EXTRA | BTN_RIGHT, axes: [-32768, 32767, -1, 1, 0, 32767] };
+        let e = WireEvent::gamepad(7, &st, 99);
+        assert_eq!((e.kind, e.a, e.now_ms), (EV_GAMEPAD, 7, 99));
+        assert_eq!(WireEvent::from_bytes(&e.to_bytes()).to_gamepad(), Some((7, st)));
+        assert_eq!(WireEvent::new(EV_KEY, 0).to_gamepad(), None);
     }
 
     #[test]

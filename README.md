@@ -1,8 +1,8 @@
 # NightFury-OS
 
-**ES** · Sistema operativo x86_64 con arranque UEFI, escrito desde cero en Rust (*clean room*): núcleo, escritorio, ventanas, tipografía, iconos, sistema de archivos, cuentas y cifrado de disco propios. Sin crates de terceros.
+**ES** · Sistema operativo x86_64 con arranque UEFI, escrito desde cero en Rust (*clean room*): núcleo, escritorio, ventanas, tipografía, iconos, sistema de archivos, cuentas, cifrado de disco y USB propios. Sin crates de terceros.
 
-**EN** · An x86_64 UEFI operating system written from scratch in Rust (*clean room*): its own kernel, desktop, windowing, font, icons, file system, user accounts and disk encryption. No third-party crates.
+**EN** · An x86_64 UEFI operating system written from scratch in Rust (*clean room*): its own kernel, desktop, windowing, font, icons, file system, user accounts, disk encryption and USB stack. No third-party crates.
 
 ![Escritorio / Desktop](docs/img/escritorio.png)
 
@@ -11,8 +11,8 @@
 | ![Explorador](docs/img/explorador.png) | ![Terminal](docs/img/terminal.png) |
 
 ## Estado / Status
-Versión 0.10, en desarrollo. Probado en QEMU; en hardware real todavía no.
-Version 0.10, work in progress. Tested in QEMU; not yet on real hardware.
+Versión 0.11, en desarrollo: USB propio (teclado, ratón, pendrives FAT/exFAT/ISO/UDF y mandos). Probado en QEMU; en hardware real todavía no.
+Version 0.11, work in progress: native USB (keyboard, mouse, FAT/exFAT/ISO/UDF drives and gamepads). Tested in QEMU; not yet on real hardware.
 
 > **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS) es una implementación propia **no auditada**. No protejas con ella nada importante.
 > The cryptography is a custom, **unaudited** implementation. Do not rely on it for anything important.

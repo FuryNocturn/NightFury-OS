@@ -27,6 +27,8 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk borrar <imagen> <ruta>\n\
   nfdisk ver <imagen> <ruta>\n\
   nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
+  nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>  | nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
+  nfdisk usb-ver <imagen>\n\
   nfdisk ayuda\n\
 Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
 y la clave de esa cuenta en la variable NFDISK_CLAVE_USUARIO (o por teclado; nunca por argumento), «listar», «ver», «sacar», «meter»,\n\
@@ -40,6 +42,8 @@ Rutas de la imagen: C:\\Usuarios\\Ana\\Documentos\\nota.txt, \\Usuarios\\Ana\\Do
 Estructura: Usuarios\\<nombre>\\{Escritorio,Documentos,Descargas,Imágenes,Música,Vídeos,.config,.papelera} y Sistema\\{config,temp,lib,drivers,logs}.\n\
 «instalar» copia el programa (app.txt, programa.nfx e icono.bmp si lo hay) a C:\\Programas\\<nombre>; no reemplaza los del sistema.\n\
 nfdisk trabaja directamente sobre el volumen, sin cuentas ni permisos (como administrador): no crea cuentas ni migra discos antiguos; eso lo hace NightFury al arrancar.";
+
+mod usb;
 
 type R<T> = Result<T, String>;
 
@@ -440,6 +444,13 @@ fn user_cmd(cmd: &str, pos: &[&str], flags: (bool, bool), user: &str, o: Opts, u
 }
 
 fn run(args: &[String]) -> R<()> {
+    // Imágenes de pendrive de prueba (no llevan opciones de usuario ni de clave).
+    let resto: Vec<&str> = args.iter().skip(1).map(|s| s.as_str()).collect();
+    match args.first().map(|s| s.as_str()) {
+        Some("usb") => return usb::crear(&resto, now()),
+        Some("usb-ver") => return usb::ver(&resto),
+        _ => {}
+    }
     run_with(args, &read_secret, &read_user_secret)
 }
 

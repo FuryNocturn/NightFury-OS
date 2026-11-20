@@ -99,9 +99,13 @@ const ENT_ROW_H: i32 = 19;
 const ENT_BOX_H: i32 = ENT_ROWS as i32 * ENT_ROW_H + 14;
 const SYSTEM: &str = "Sistema";
 
+fn is_c(path: &str) -> bool {
+    path.starts_with(['C', 'c'])
+}
+
 /// ¿Es `C:\Sistema` o algo dentro?
 fn is_system(path: &str) -> bool {
-    path.get(3..).and_then(|r| r.split('\\').next()).is_some_and(|f| f.eq_ignore_ascii_case(SYSTEM))
+    is_c(path) && path.get(3..).and_then(|r| r.split('\\').next()).is_some_and(|f| f.eq_ignore_ascii_case(SYSTEM))
 }
 
 /// Dibuja con el recorte limitado a `r`.
@@ -695,7 +699,7 @@ impl Dialog {
         match sys.files().list(dir) {
             Ok(mut v) => {
                 if self.mode == Mode::Folder {
-                    v.retain(|e| e.dir && (admin || !(target.len() == 3 && e.name.eq_ignore_ascii_case(SYSTEM))));
+                    v.retain(|e| e.dir && (admin || !(target.len() == 3 && is_c(&target) && e.name.eq_ignore_ascii_case(SYSTEM))));
                 }
                 self.dir = target;
                 self.entries = v;

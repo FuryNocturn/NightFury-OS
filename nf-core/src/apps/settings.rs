@@ -19,6 +19,7 @@ use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
 use crate::fsapi::FilesApi;
 use crate::fs::same;
+use crate::gamepad::*;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::KeyEvent;
@@ -37,17 +38,19 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 5] = [
+const SECTIONS: [(&str, Icon); 6] = [
     ("Personalización", Icon::Palette),
     ("Cuentas", Icon::Cuentas),
     ("Aplicaciones", Icon::VistaIconosGrandes),
     ("Disco", Icon::DiscoSeguro),
+    ("Dispositivos", Icon::Mando),
     ("Acerca de", Icon::Info),
 ];
 const PAGE_ACCOUNTS: usize = 1;
 const PAGE_APPS: usize = 2;
 const PAGE_DISK: usize = 3;
-const PAGE_ABOUT: usize = 4;
+const PAGE_DEVICES: usize = 4;
+const PAGE_ABOUT: usize = 5;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -98,6 +101,9 @@ enum Act {
     AppInstall,
     /// Índice en `Settings::apps`.
     AppUninstall(usize),
+    /// Probar el mando `i` de `Settings::pads` y volver a la lista.
+    PadTest(usize),
+    PadBack,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,6 +183,10 @@ struct Settings {
     apps: Vec<Program>,
     /// Programa a instalar (reemplazo) o a desinstalar mientras se pregunta.
     pending_app: Option<Program>,
+    /// Mandos conectados (`App::gamepads`), el que se está probando y su último estado.
+    pads: Vec<PadInfo>,
+    testing: Option<u32>,
+    pad_state: PadState,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -200,6 +210,9 @@ fn init() -> Settings {
         hover_hit: None,
         apps: Vec::new(),
         pending_app: None,
+        pads: Vec::new(),
+        testing: None,
+        pad_state: PadState::default(),
     }
 }
 
@@ -584,7 +597,7 @@ impl Settings {
     }
 
     fn scrolls(&self) -> bool {
-        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS
+        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || (self.page == PAGE_DEVICES && self.testing.is_none())
     }
 
     fn metrics(&self) -> Metrics {
@@ -593,6 +606,243 @@ impl Settings {
 
     fn max_scroll(&self) -> i32 {
         (self.content_h - self.size.1).max(0)
+    }
+}
+
+// ---- Página Dispositivos: mandos y unidades ----
+
+/// Marca del mando, para los nombres y las etiquetas de sus botones.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Family {
+    Xbox,
+    PlayStation,
+    Nintendo,
+    Generic,
+}
+
+fn family(k: PadKind) -> Family {
+    match k {
+        PadKind::Xbox360 | PadKind::XboxOne => Family::Xbox,
+        PadKind::DualShock4 | PadKind::DualSense => Family::PlayStation,
+        PadKind::SwitchPro => Family::Nintendo,
+        PadKind::Generic => Family::Generic,
+    }
+}
+
+fn kind_text(k: PadKind) -> &'static str {
+    match k {
+        PadKind::Generic => "Mando USB genérico",
+        PadKind::DualShock4 => "PlayStation (DualShock 4)",
+        PadKind::DualSense => "PlayStation (DualSense)",
+        PadKind::SwitchPro => "Nintendo (Switch Pro)",
+        PadKind::Xbox360 => "Xbox 360",
+        PadKind::XboxOne => "Xbox One / Series",
+    }
+}
+
+/// Etiquetas de (hombro izquierdo, hombro derecho, gatillo izquierdo, gatillo derecho).
+fn shoulder_labels(f: Family) -> [&'static str; 4] {
+    match f {
+        Family::Xbox => ["LB", "RB", "LT", "RT"],
+        Family::PlayStation => ["L1", "R1", "L2", "R2"],
+        Family::Nintendo => ["L", "R", "ZL", "ZR"],
+        Family::Generic => ["L1", "R1", "L2", "R2"],
+    }
+}
+
+/// Etiquetas de los botones de los botones del rombo en el orden (abajo, derecha, izquierda, arriba).
+/// `None` en PlayStation: ahí se dibujan los símbolos.
+fn face_labels(f: Family) -> Option<[&'static str; 4]> {
+    match f {
+        Family::Xbox => Some(["A", "B", "X", "Y"]),
+        Family::Nintendo => Some(["B", "A", "Y", "X"]),
+        Family::Generic => Some(["1", "2", "3", "4"]),
+        Family::PlayStation => None,
+    }
+}
+
+/// Botones del centro y de los sticks, con su nombre en cada marca.
+fn center_buttons(f: Family) -> [(u32, &'static str); 6] {
+    let (sel, start, home, extra) = match f {
+        Family::Xbox => ("Ver", "Menú", "Xbox", "Compartir"),
+        Family::PlayStation => ("Share", "Options", "PS", "Panel táctil"),
+        Family::Nintendo => ("-", "+", "Home", "Captura"),
+        Family::Generic => ("Select", "Start", "Home", "Extra"),
+    };
+    [(BTN_SELECT, sel), (BTN_HOME, home), (BTN_START, start), (BTN_L3, "L3"), (BTN_R3, "R3"), (BTN_EXTRA, extra)]
+}
+
+/// Posición de un stick dentro del círculo unidad (Y hacia abajo), sin salirse de él.
+fn stick_dot(x: i16, y: i16) -> (f32, f32) {
+    let (fx, fy) = (x as f32 / 32767.0, y as f32 / 32767.0);
+    let len = crate::math::sqrt(fx * fx + fy * fy);
+    if len > 1.0 { (fx / len, fy / len) } else { (fx, fy) }
+}
+
+const OFF: u32 = 0xE6E6E6;
+const OFF_LINE: u32 = 0xA0A0A0;
+
+/// Rectángulo con etiqueta que se ilumina (hombros, botones del centro).
+fn chip(s: &mut Surface, r: Rect, label: &str, lit: bool, theme: &Theme) {
+    s.fill_rect(r, if lit { theme.accent } else { OFF });
+    s.frame(r, if lit { theme.accent } else { OFF_LINE });
+    font::draw_in(s, r, label, 9, false, if lit { 0xFFFFFF } else { TEXT }, Align::Center);
+}
+
+fn stick(s: &mut Surface, c: (f32, f32), r: f32, pos: (i16, i16), pressed: bool, theme: &Theme) {
+    s.fill_circle(c.0, c.1, r, OFF, 255);
+    s.arc(c.0, c.1, r - 0.5, 0.0, 360.0, if pressed { 3.0 } else { 1.5 }, if pressed { theme.accent } else { OFF_LINE });
+    let (dx, dy) = stick_dot(pos.0, pos.1);
+    let reach = r - 7.0;
+    s.fill_circle(c.0 + dx * reach, c.1 + dy * reach, 6.0, theme.accent, 255);
+}
+
+fn dpad(s: &mut Surface, c: (i32, i32), d: i32, buttons: u32, theme: &Theme) {
+    let (l, t) = (d / 2, (d / 3).max(4));
+    let col = |m: u32| if buttons & m != 0 { theme.accent } else { 0xCFCFCF };
+    let arm = l - t / 2;
+    s.fill_rect(Rect::new(c.0 - t / 2, c.1 - l, t, arm), col(BTN_UP));
+    s.fill_rect(Rect::new(c.0 - t / 2, c.1 + t / 2, t, arm), col(BTN_DOWN));
+    s.fill_rect(Rect::new(c.0 - l, c.1 - t / 2, arm, t), col(BTN_LEFT));
+    s.fill_rect(Rect::new(c.0 + t / 2, c.1 - t / 2, arm, t), col(BTN_RIGHT));
+    s.fill_rect(Rect::new(c.0 - t / 2, c.1 - t / 2, t, t), 0xCFCFCF);
+}
+
+/// Los cuatro botones del rombo: abajo, derecha, izquierda, arriba (en ese orden de `BTN_*`).
+fn face_buttons(s: &mut Surface, c: (i32, i32), d: i32, buttons: u32, fam: Family, theme: &Theme) {
+    let rb = (d / 5).max(7) as f32;
+    let o = d as f32 / 2.0 - rb;
+    let (cx, cy) = (c.0 as f32, c.1 as f32);
+    let spots = [(BTN_SOUTH, cx, cy + o), (BTN_EAST, cx + o, cy), (BTN_WEST, cx - o, cy), (BTN_NORTH, cx, cy - o)];
+    for (i, (m, x, y)) in spots.into_iter().enumerate() {
+        let lit = buttons & m != 0;
+        s.fill_circle(x, y, rb, if lit { theme.accent } else { OFF }, 255);
+        s.arc(x, y, rb - 0.5, 0.0, 360.0, 1.2, if lit { theme.accent } else { OFF_LINE });
+        let ink = if lit { 0xFFFFFF } else { TEXT };
+        match face_labels(fam) {
+            Some(names) => {
+                let r = Rect::new(x as i32 - 8, y as i32 - 8, 16, 16);
+                font::draw_in(s, r, names[i], 9, true, ink, Align::Center);
+            }
+            // PlayStation: cruz (abajo), círculo (derecha), cuadrado (izquierda) y triángulo (arriba).
+            None => {
+                let g = rb * 0.5;
+                match i {
+                    0 => {
+                        s.stroke(&[(x - g, y - g), (x + g, y + g)], 1.6, ink);
+                        s.stroke(&[(x - g, y + g), (x + g, y - g)], 1.6, ink);
+                    }
+                    1 => s.arc(x, y, g, 0.0, 360.0, 1.6, ink),
+                    2 => s.frame(Rect::new((x - g) as i32, (y - g) as i32, (2.0 * g) as i32, (2.0 * g) as i32), ink),
+                    _ => s.stroke(&[(x, y - g), (x + g, y + g * 0.8), (x - g, y + g * 0.8), (x, y - g)], 1.6, ink),
+                }
+            }
+        }
+    }
+}
+
+impl Settings {
+    fn devices_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, focused: bool) {
+        if self.testing.is_some() {
+            // Sin el foco no llegan estados: se da todo por suelto.
+            if !focused {
+                self.pad_state = PadState::default();
+            }
+            return self.pad_test(s, theme);
+        }
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if s.h < 440 { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, "Dispositivos", 18, false, TEXT);
+        y += font::line_h(18) + 12;
+        font::draw(s, x0, y, "Mandos", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        if self.pads.is_empty() {
+            font::draw(s, x0, y, "No hay ningún mando conectado.", 9, false, GRAY);
+            y += font::line_h(9) + 6;
+        }
+        for i in 0..self.pads.len() {
+            let p = self.pads[i].clone();
+            icons::draw(s, Icon::Mando, x0, y + 2, 32, TEXT);
+            let tx = x0 + 44;
+            font::draw(s, tx, y, &p.name, 10, true, TEXT);
+            font::draw(s, tx, y + font::line_h(10) + 2, kind_text(p.kind), 9, false, GRAY);
+            let mut at = (tx, y + font::line_h(10) + font::line_h(9) + 8);
+            self.button(s, &mut at, tx, right, "Probar mando", Act::PadTest(i), theme);
+            y = at.1 + BTN_H + 14;
+        }
+        y += 8;
+        font::draw(s, x0, y, "Unidades", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        for d in sys.fs().drives() {
+            icons::draw(s, if d.locked && d.removable { Icon::UsbSeguro } else if d.removable { Icon::Usb } else { Icon::Drive }, x0, y + 2, 32, TEXT);
+            let tx = x0 + 44;
+            font::draw(s, tx, y, &d.name(), 10, true, TEXT);
+            let info = if d.locked {
+                String::from("Cifrada: hay que desbloquearla para verla")
+            } else {
+                let units = super::terminal::units;
+                format!("{} · {} libres de {}", crate::drives::kind_name(d.kind), units(d.free), units(d.total))
+            };
+            font::draw(s, tx, y + font::line_h(10) + 2, &info, 9, false, GRAY);
+            y += font::line_h(10) + font::line_h(9) + 16;
+        }
+        self.content_h = y + self.scroll + 16;
+    }
+
+    /// Vista de «Probar mando»: sticks, gatillos, cruceta y botones, que se iluminan al pulsar.
+    fn pad_test(&mut self, s: &mut Surface, theme: &Theme) {
+        let Some(pad) = self.testing.and_then(|t| self.pads.iter().find(|p| p.id == t)).cloned() else { return };
+        let st = self.pad_state;
+        let fam = family(pad.kind);
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let right = (s.w - 12).max(x0 + 1);
+        let avail = right - x0;
+        let on = |m: u32| st.buttons & m != 0;
+        let mut y = if compact { 14 } else { 24 };
+        font::draw(s, x0, y, "Probar mando", 18, false, TEXT);
+        y += font::line_h(18) + 2;
+        font::draw(s, x0, y, &pad.name, 9, false, GRAY);
+        y += font::line_h(9) + if compact { 6 } else { 10 };
+        // Hombros y gatillos (con su recorrido).
+        let [lb, rb, lt, rt] = shoulder_labels(fam);
+        let half = ((avail - 8) / 2).max(1);
+        let cols = [x0, x0 + half + 8];
+        chip(s, Rect::new(cols[0], y, half, 16), lb, on(BTN_L1), theme);
+        chip(s, Rect::new(cols[1], y, half, 16), rb, on(BTN_R1), theme);
+        y += 20;
+        for (i, (name, v)) in [(lt, st.axes[AXIS_LT]), (rt, st.axes[AXIS_RT])].into_iter().enumerate() {
+            let bar = Rect::new(cols[i] + 26, y, (half - 26).max(1), 14);
+            font::draw_in(s, Rect::new(cols[i], y, 24, 14), name, 9, false, TEXT, Align::Left);
+            s.fill_rect(bar, OFF);
+            s.fill_rect(Rect::new(bar.x, bar.y, (bar.w as i64 * v.max(0) as i64 / 32767) as i32, bar.h), theme.accent);
+            s.frame(bar, OFF_LINE);
+        }
+        y += 14 + if compact { 8 } else { 14 };
+        // Sticks, cruceta y rombo: izquierda arriba / derecha abajo, como en un mando de Xbox.
+        let d = if compact { 56 } else { 72 };
+        let row = d + if compact { 8 } else { 12 };
+        let (c1, c2) = (x0 + d / 2 + 4, x0 + half + 8 + d / 2 + 4);
+        let mid = y + d / 2;
+        stick(s, (c1 as f32, mid as f32), d as f32 / 2.0, (st.axes[AXIS_LX], st.axes[AXIS_LY]), on(BTN_L3), theme);
+        face_buttons(s, (c2, mid), d, st.buttons, fam, theme);
+        let mid = mid + row;
+        dpad(s, (c1, mid), d, st.buttons, theme);
+        stick(s, (c2 as f32, mid as f32), d as f32 / 2.0, (st.axes[AXIS_RX], st.axes[AXIS_RY]), on(BTN_R3), theme);
+        y += 2 * row + 2;
+        // Botones del centro.
+        let mut at = (x0, y);
+        for (m, name) in center_buttons(fam) {
+            let w = font::width(name, 9, false) + 16;
+            if at.0 > x0 && at.0 + w > right {
+                at = (x0, at.1 + 22);
+            }
+            chip(s, Rect::new(at.0, at.1, w, 18), name, on(m), theme);
+            at.0 += w + 6;
+        }
+        at = (x0, at.1 + 18 + if compact { 8 } else { 14 });
+        self.button(s, &mut at, x0, right, "Volver", Act::PadBack, theme);
     }
 }
 
@@ -610,6 +860,19 @@ impl Settings {
                 let text = format!("¿Desinstalar «{}»?\nSu carpeta irá a la Papelera.", p.name);
                 cx.dialog = Some(DialogRequest::Message { tag: T_APP_DEL, title: String::from("Aplicaciones"), text, buttons: Buttons::YesNo });
                 self.pending_app = Some(p);
+                return;
+            }
+            Act::PadTest(i) => {
+                let Some(p) = self.pads.get(i) else { return };
+                self.testing = Some(p.id);
+                self.pad_state = PadState::default();
+                self.scroll = 0;
+                cx.redraw = true;
+                return;
+            }
+            Act::PadBack => {
+                self.testing = None;
+                cx.redraw = true;
                 return;
             }
             _ => {}
@@ -644,7 +907,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -939,7 +1202,7 @@ impl App for Settings {
         (520, 360)
     }
 
-    fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, _focused: bool) {
+    fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, focused: bool) {
         // Las miniaturas se generan una vez; la de "Color sólido" se rehace si cambia el énfasis.
         if self.thumbs.is_empty() {
             self.thumbs = (0..WALLPAPERS.len() as u8).map(|i| render_wallpaper(i, THUMB.0, THUMB.1, theme.accent)).collect();
@@ -962,6 +1225,7 @@ impl App for Settings {
                 PAGE_ACCOUNTS => self.accounts_page(s, theme, sys),
                 PAGE_DISK => self.disk_page(s, theme, sys),
                 PAGE_APPS => self.apps_page(s, theme, sys),
+                PAGE_DEVICES => self.devices_page(s, theme, sys, focused),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
@@ -1045,6 +1309,22 @@ impl App for Settings {
         }
     }
 
+    fn gamepad(&mut self, id: u32, state: &PadState, cx: &mut Ctx) {
+        if self.testing == Some(id) && self.pad_state != *state {
+            self.pad_state = *state;
+            cx.redraw = true;
+        }
+    }
+
+    fn gamepads(&mut self, list: &[PadInfo], cx: &mut Ctx) {
+        self.pads = list.to_vec();
+        // Si el mando que se probaba se ha desconectado, vuelve a la lista.
+        if self.testing.is_some_and(|t| !self.pads.iter().any(|p| p.id == t)) {
+            self.testing = None;
+        }
+        cx.redraw |= self.page == PAGE_DEVICES;
+    }
+
     fn dialog_result(&mut self, result: DialogResult, cx: &mut Ctx) {
         cx.redraw = true;
         match result {
@@ -1080,7 +1360,7 @@ impl App for Settings {
         let sec = cx.now_ms / 1000;
         // El avance de las conversiones de cifrado también cambia solo.
         let moving = match self.page {
-            PAGE_ABOUT | PAGE_DISK => true,
+            PAGE_ABOUT | PAGE_DISK | PAGE_DEVICES => true,
             PAGE_ACCOUNTS => cx.sys.fs().home_conversion().is_some(),
             _ => false,
         };
@@ -1313,10 +1593,115 @@ mod tests {
         assert!(!cx.redraw);
     }
 
+    fn mando(id: u32, kind: PadKind) -> PadInfo {
+        PadInfo { id, kind, name: format!("Mando {id}") }
+    }
+
+    impl Banco {
+        fn mandos(&mut self, lista: &[PadInfo]) {
+            let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
+            self.app.gamepads(lista, &mut cx);
+            self.redraw |= cx.redraw;
+        }
+        fn estado(&mut self, id: u32, st: PadState) {
+            self.redraw = false;
+            let mut cx = Ctx::new(&mut self.sys, &mut self.theme, 0);
+            self.app.gamepad(id, &st, &mut cx);
+            self.redraw |= cx.redraw;
+        }
+    }
+
+    #[test]
+    fn dispositivos_lista_y_prueba_del_mando() {
+        let mut b = Banco::new();
+        b.pagina(PAGE_DEVICES);
+        // Sin mandos: no hay botón de probar y se dibuja igual.
+        b.dibuja(780, 520);
+        assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(Act::PadTest(_)))));
+        b.mandos(&[mando(1, PadKind::Xbox360), mando(2, PadKind::DualSense)]);
+        assert!(b.redraw);
+        assert!(b.hay(Act::PadTest(0)) && b.hay(Act::PadTest(1)));
+        // Probar el segundo: la vista de prueba tiene «Volver» y ya no la lista.
+        b.pulsa(Act::PadTest(1));
+        assert_eq!(b.app.testing, Some(2));
+        assert!(b.hay(Act::PadBack) && !b.hay(Act::PadTest(1)));
+        // Un botón pulsado ilumina con el color de acento; el estado de otro mando no cuenta.
+        let acento = b.theme.accent;
+        let cuenta = |s: &Surface| s.px.iter().filter(|&&p| p == acento).count();
+        let suelto = cuenta(&b.dibuja(780, 520));
+        b.estado(1, PadState { buttons: BTN_SOUTH, axes: [0; 6] });
+        assert!(!b.redraw && b.app.pad_state == PadState::default());
+        let pulsado = PadState { buttons: BTN_SOUTH | BTN_UP | BTN_L1, axes: [-32768, 0, 0, 32767, 0, 32767] };
+        b.estado(2, pulsado);
+        assert!(b.redraw && b.app.pad_state == pulsado);
+        assert!(cuenta(&b.dibuja(780, 520)) > suelto);
+        // El mismo estado no pide redibujar.
+        b.estado(2, pulsado);
+        assert!(!b.redraw);
+        // Si se desconecta mientras se prueba, vuelve a la lista.
+        b.mandos(&[mando(1, PadKind::Xbox360)]);
+        assert_eq!(b.app.testing, None);
+        assert!(b.hay(Act::PadTest(0)));
+        // Volver desde la prueba.
+        b.pulsa(Act::PadTest(0));
+        b.pulsa(Act::PadBack);
+        assert_eq!(b.app.testing, None);
+    }
+
+    #[test]
+    fn dispositivos_dibuja_cada_familia_y_tamano() {
+        let mut b = Banco::new();
+        b.pagina(PAGE_DEVICES);
+        let todos = [PadKind::Generic, PadKind::DualShock4, PadKind::DualSense, PadKind::SwitchPro, PadKind::Xbox360, PadKind::XboxOne];
+        let lista: Vec<PadInfo> = todos.iter().enumerate().map(|(i, k)| mando(i as u32, *k)).collect();
+        b.mandos(&lista);
+        for i in 0..lista.len() {
+            b.pulsa(Act::PadTest(i));
+            b.estado(i as u32, PadState { buttons: u32::MAX, axes: [i16::MIN, i16::MAX, i16::MAX, i16::MIN, i16::MAX, i16::MAX] });
+            for (w, h) in [(520, 360), (780, 520), (1, 1), (0, 0), (221, 400), (600, 1)] {
+                b.dibuja(w, h);
+            }
+            b.pulsa(Act::PadBack);
+        }
+    }
+
+    /// Para mirar la vista «Probar mando» sin mando: `NF_CAPTURA=<carpeta> cargo test -p nf-core captura_probar_mando -- --ignored`.
+    #[test]
+    #[ignore]
+    fn captura_probar_mando() {
+        let dir = std::env::var("NF_CAPTURA").unwrap_or_else(|_| String::from("."));
+        let mut b = Banco::new();
+        b.pagina(PAGE_DEVICES);
+        let todos = [PadKind::Xbox360, PadKind::DualSense, PadKind::SwitchPro, PadKind::Generic];
+        let lista: Vec<PadInfo> = todos.iter().enumerate().map(|(i, k)| mando(i as u32, *k)).collect();
+        b.mandos(&lista);
+        std::fs::write(format!("{dir}/mandos-lista.bmp"), crate::bmp::encode(&b.dibuja(780, 520))).unwrap();
+        for i in 0..lista.len() {
+            b.pulsa(Act::PadTest(i));
+            b.estado(i as u32, PadState { buttons: BTN_SOUTH | BTN_UP | BTN_L1 | BTN_START, axes: [-20000, 0, 12000, 25000, 0, 30000] });
+            std::fs::write(format!("{dir}/mando-{i}.bmp"), crate::bmp::encode(&b.dibuja(780, 520))).unwrap();
+            b.pulsa(Act::PadBack);
+        }
+    }
+
+    #[test]
+    fn sticks_y_etiquetas_por_familia() {
+        assert_eq!(stick_dot(0, 0), (0.0, 0.0));
+        assert_eq!(stick_dot(32767, 0), (1.0, 0.0));
+        // En la esquina no se sale del círculo.
+        let (x, y) = stick_dot(i16::MAX, i16::MAX);
+        assert!(x * x + y * y <= 1.001);
+        assert_eq!(face_labels(family(PadKind::SwitchPro)), Some(["B", "A", "Y", "X"]));
+        assert_eq!(face_labels(family(PadKind::XboxOne)), Some(["A", "B", "X", "Y"]));
+        assert_eq!(face_labels(family(PadKind::Generic)), Some(["1", "2", "3", "4"]));
+        assert_eq!(face_labels(family(PadKind::DualShock4)), None);
+        assert_eq!(shoulder_labels(Family::Nintendo)[2], "ZL");
+    }
+
     #[test]
     fn tamanos_extremos() {
         let mut b = Banco::new();
-        for pagina in 0..4 {
+        for pagina in 0..6 {
             b.clic(50, 56 + 40 * pagina + 5);
             for (w, h) in [(520, 360), (780, 520), (1, 1), (0, 0), (221, 400), (600, 1)] {
                 b.dibuja(w, h);
