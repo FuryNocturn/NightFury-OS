@@ -11,6 +11,7 @@ use core::ptr::{read_volatile, write_volatile};
 use nf_core::net::NetDev;
 
 mod intel;
+mod realtek;
 mod virtio;
 
 /// Lectura y escritura MMIO de las tarjetas, sobre regiones que cada controlador ha mapeado.
@@ -34,6 +35,7 @@ pub fn sondear() -> Option<Box<dyn NetDev>> {
         let iniciar = match () {
             _ if virtio::soporta(v, d) => virtio::iniciar,
             _ if intel::soporta(v, d) => intel::iniciar,
+            _ if realtek::soporta(v, d) => realtek::iniciar,
             _ => continue,
         };
         let Some(mut tarjeta) = iniciar(bus, dev, fun) else {
