@@ -36,7 +36,7 @@ pub(super) struct CacheEntry {
 
 /// Qué hacer con un datagrama recibido.
 #[derive(Debug, PartialEq, Eq)]
-enum Resp {
+pub(super) enum Resp {
     /// No casa o está mal formada: se ignora y se sigue esperando.
     Ignore,
     Answer(Vec<Ipv4>, u32),
@@ -71,7 +71,7 @@ fn build_query(id: u16, name: &str) -> Vec<u8> {
 
 /// Lee un nombre (con compresión) en `pos`; devuelve el nombre en minúsculas y dónde sigue el
 /// mensaje. Un puntero solo puede ir hacia atrás y se siguen 10 como mucho; el nombre, 255 bytes.
-fn read_name(msg: &[u8], pos: usize) -> Option<(String, usize)> {
+pub(super) fn read_name(msg: &[u8], pos: usize) -> Option<(String, usize)> {
     let (mut out, mut p, mut end, mut jumps) = (String::new(), pos, None, 0);
     loop {
         let l = *msg.get(p)? as usize;
@@ -114,7 +114,7 @@ enum Rec {
 
 /// Valida la respuesta contra la consulta (identificador y pregunta) y extrae las direcciones A
 /// del nombre, siguiendo los CNAME que traiga la propia respuesta.
-fn parse_response(m: &[u8], id: u16, name: &str) -> Resp {
+pub(super) fn parse_response(m: &[u8], id: u16, name: &str) -> Resp {
     parse_inner(m, id, name).unwrap_or(Resp::Ignore)
 }
 
