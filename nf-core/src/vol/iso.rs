@@ -39,10 +39,8 @@ fn date7(b: &[u8]) -> DateTime {
 
 /// Texto UCS-2 big-endian (Joliet).
 fn ucs2(b: &[u8]) -> Result<String, FsError> {
-    if b.len() % 2 != 0 {
-        return Err(FsError::Corrupt);
-    }
-    Ok(char::decode_utf16(b.chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]]))).map(|r| r.unwrap_or('\u{FFFD}')).collect())
+    // Un byte suelto al final (imagen dañada) se ignora: no debe tumbar la carpeta entera.
+    Ok(char::decode_utf16(b.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]]))).map(|r| r.unwrap_or('\u{FFFD}')).collect())
 }
 
 #[derive(Clone)]

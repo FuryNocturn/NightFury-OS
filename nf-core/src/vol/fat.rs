@@ -339,6 +339,7 @@ fn short_ok(c: char) -> bool {
 
 /// Nombre corto 8.3 para `name` sin chocar con `taken`. Devuelve (nombre, ¿basta sin LFN?).
 fn make_short(name: &str, taken: &[[u8; 11]]) -> Result<([u8; 11], bool), FsError> {
+    let taken: alloc::collections::BTreeSet<[u8; 11]> = taken.iter().copied().collect();
     let trimmed = name.trim_start_matches(['.', ' ']);
     let mut lossy = trimmed.len() != name.len();
     let (b, e) = match trimmed.rsplit_once('.') {
@@ -670,9 +671,12 @@ impl Fat {
 
     fn release(&mut self, list: &[u32]) -> Result<(), FsError> {
         for &c in list {
-            self.set(c, 0)?;
+            // Una cadena cruzada (imagen dañada) puede nombrar dos veces el mismo cluster.
+            if self.get(c)? != 0 {
+                self.set(c, 0)?;
+                self.free += 1;
+            }
         }
-        self.free += list.len() as u32;
         Ok(())
     }
 
@@ -688,7 +692,7 @@ impl Fat {
         let (data, cl) = if dir == 0 && self.g.kind != FsKind::Fat32 {
             (self.io.read(self.g.root_start(), self.g.root_secs as usize)?, Vec::new())
         } else {
-            let cl = self.chain(dir, usize::MAX)?;
+            let cl = self.chain(dir, MAXDIR / self.cs + 1)?;
             if cl.len() * self.cs > MAXDIR {
                 return Err(FsError::Corrupt);
             }
@@ -949,6 +953,9 @@ impl Volume for Fat {
         let n = data.len().div_ceil(self.cs);
         let mut old_freed = false;
         if (self.free as usize) < n {
+            // Antes de soltar los viejos, el libre exacto (el de FSInfo es una pista y puede mentir):
+            // así `alloc` no puede fallar después y dejar el archivo apuntando a clusters libres.
+            self.free = self.count_free()?;
             if self.free as usize + old.len() < n {
                 return Err(FsError::NoSpace);
             }
@@ -1051,8 +1058,11 @@ impl Volume for Fat {
                     // ".." del directorio movido apunta al nuevo padre (0 = raíz).
                     let mut db = self.load(first)?;
                     let up = if td == self.g.root_clus && self.g.kind == FsKind::Fat32 { 0 } else { td };
-                    set_first(&mut db.data[32..64], up);
-                    self.store(&mut db)?;
+                    // En una imagen dañada la segunda entrada puede ser un archivo: no se le cambia el cluster.
+                    if db.data.get(32..44).is_some_and(|e| &e[..11] == b"..         " && e[11] & 0x10 != 0) {
+                        set_first(&mut db.data[32..64], up);
+                        self.store(&mut db)?;
+                    }
                 }
                 kill(&mut fb);
                 self.store(&mut fb)?;

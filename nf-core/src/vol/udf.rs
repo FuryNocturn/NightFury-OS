@@ -285,7 +285,8 @@ impl Ctx {
                 continue;
             }
             let (_, _, lbn, part) = long_ad(f, 20);
-            out.push((cs0(&f[38 + liu..38 + liu + lfi])?, part, lbn));
+            let Ok(nombre) = cs0(&f[38 + liu..38 + liu + lfi]) else { continue };
+            out.push((nombre, part, lbn));
         }
         Ok(out)
     }
@@ -466,7 +467,8 @@ impl Volume for Udf {
         let d = self.walk(dir)?;
         let mut out = Vec::new();
         for (name, part, lbn) in self.c.fids(&d)? {
-            let n = self.c.load(part, lbn)?;
+            // Una entrada dañada no esconde el resto de la carpeta.
+            let Ok(n) = self.c.load(part, lbn) else { continue };
             if n.shown {
                 out.push(entry_of(name, &n));
             }

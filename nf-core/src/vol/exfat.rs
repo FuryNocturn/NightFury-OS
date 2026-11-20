@@ -200,7 +200,7 @@ pub fn mount(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Box<dyn Volume>, 
     if blen < need || need > 32 << 20 {
         return Err(FsError::Corrupt);
     }
-    v.bm_cl = v.chain_of(bfirst, false, blen)?;
+    v.bm_cl = v.chain_of(bfirst, false, need)?;
     let mut bm = v.read_cl(&v.bm_cl.clone())?;
     bm.truncate(need.div_ceil(ss as u64) as usize * ss);
     v.bm = bm;
@@ -233,6 +233,17 @@ pub fn mount(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Box<dyn Volume>, 
         }
         if v.up.len() > 65536 {
             return Err(FsError::Corrupt);
+        }
+    }
+    // Si el mapa de bits no marca sus propios clusters, la tabla de mayúsculas o la raíz, `alloc`
+    // podría entregarlos: se marcan (en memoria) como usados.
+    let mut fijos = v.bm_cl.clone();
+    fijos.extend(&cl);
+    fijos.extend(v.chain(v.g.root, MAXDIR / v.g.cs + 1)?);
+    for c in fijos {
+        if !v.bit(c as usize - 2) {
+            v.bm[(c as usize - 2) / 8] |= 1 << ((c as usize - 2) % 8);
+            v.free -= 1;
         }
     }
     if !ro {
@@ -373,9 +384,12 @@ impl Ex {
 
     fn release(&mut self, list: &[u32]) {
         for &c in list {
-            self.set_bit(c as usize - 2, false);
+            // Un cluster ya libre (imagen dañada) no suma: el libre inflado haría fallar `alloc` después.
+            if self.bit(c as usize - 2) {
+                self.set_bit(c as usize - 2, false);
+                self.free += 1;
+            }
         }
-        self.free += list.len() as u32;
     }
 
     /// Deja en disco el mapa de bits y la FAT (antes de escribir la entrada de directorio).
@@ -412,7 +426,10 @@ impl Ex {
     // --- directorios ---
 
     fn load(&mut self, d: Dir) -> Result<DirBuf, FsError> {
-        let cl = if d.nofat { self.chain_of(d.first, true, d.len)? } else { self.chain(d.first, usize::MAX)? };
+        if d.nofat && d.len > MAXDIR as u64 {
+            return Err(FsError::Corrupt);
+        }
+        let cl = if d.nofat { self.chain_of(d.first, true, d.len)? } else { self.chain(d.first, MAXDIR / self.g.cs + 1)? };
         if cl.is_empty() || cl.len() * self.g.cs > MAXDIR {
             return Err(FsError::Corrupt);
         }
@@ -688,6 +705,11 @@ impl Volume for Ex {
             Some(it) => {
                 let mut set = self.build_set(&it.name, it.attr() | 0x20, t, first, data.len() as u64, data.len() as u64, contig);
                 set[8..12].copy_from_slice(&it.set[8..12]); // la fecha de creación se conserva
+                if set.len() == it.set.len() {
+                    // Nombre y su hash, tal cual (un sustituto suelto se decodifica como U+FFFD).
+                    set[64..].copy_from_slice(&it.set[64..]);
+                    set[36..38].copy_from_slice(&it.set[36..38]);
+                }
                 let c = sum16(set.iter().copied(), &[2, 3]);
                 set[2..4].copy_from_slice(&c.to_le_bytes());
                 buf.data[it.at * 32..(it.at + it.n) * 32].copy_from_slice(&set);
