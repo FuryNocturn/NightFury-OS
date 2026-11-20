@@ -279,6 +279,11 @@ impl Realtek {
         .then_some(v as u16)
     }
     fn phy_w(&self, a: u16, d: u16) -> Option<()> {
+        if self.v == 40 && a == std_phy(0) {
+            // Ajuste de V40: reinicio o encendido del PHY ponen los bits altos de ERI 0x1A8; apagarlo los quita.
+            let poner = d & 1 << 15 != 0 || d & 1 << 11 == 0;
+            self.eri_rmw(0x1A8, if poner { 0 } else { 0xFC00_0000 }, if poner { 0xFC00_0000 } else { 0 })?;
+        }
         self.w32(OCPPHY, OWN | (a as u32) << 15 | d as u32);
         esperar(2, || self.r32(OCPPHY) & OWN == 0).then_some(())
     }
@@ -375,40 +380,37 @@ impl Realtek {
         }
     }
 
-    /// Secuencia propia de la revisión (4.F3-X, V40 a V46), con la configuración desbloqueada.
-    /// shortcut: sin los umbrales y tamaños del FIFO (ERI 0xC8/0xCC/0xD0/0xE8, ambiguos en la
-    /// especificación) ni el parche del V44; se añaden si se miden pérdidas de tramas en hardware real.
-    fn secuencia(&self) -> Option<()> {
-        let v = self.v;
-        let tabla = match v {
-            40 => EPHY40,
-            42 => EPHY42,
-            44 => EPHY44,
-            _ => EPHY46,
-        };
-        for &(r, q, p) in tabla {
-            self.ephy_rmw(r, q, p)?;
-        }
+    /// Tamaños de FIFO, umbrales de pausa y latencia ASPM, comunes a V40 a V46 (4.F3-X).
+    fn fifo(&self) -> Option<()> {
+        self.eri_w(0xC8, 0x0008_0002, 0xF)?;
+        self.eri_w(0xE8, 0x0010_0006, 0xF)?;
+        self.eri_w(0xCC, 0x38, 1)?;
+        self.eri_w(0xD0, 0x48, 1)?;
         self.latencia_aspm();
         self.eri_rmw(0xDC, 1, 0)?; // reinicio del filtro de paquetes: a 0 y otra vez a 1
-        self.eri_rmw(0xDC, 0, if v == 46 { 0x1D } else { 1 })?;
+        self.eri_rmw(0xDC, 0, 1)
+    }
+
+    /// Secuencia propia de la revisión (4.F3-X, V40 a V46), con la configuración desbloqueada.
+    /// shortcut: sin el parche del V44 (107 palabras sin transcribir en la especificación, omitible);
+    /// se añade si aparece una 8411b con la unidad RX confundida tras apagar el PHY.
+    fn secuencia(&self) -> Option<()> {
+        let v = self.v;
         if v == 46 {
+            for &(r, q, p) in EPHY46 {
+                self.ephy_rmw(r, q, p)?;
+            }
+            self.fifo()?;
+            self.eri_rmw(0xDC, 0, 0x1C)?;
             self.eri_w(0x5F0, 0x4F87, 3)?;
-        } else {
-            self.eri_w(0x2F8, 0x1D8F, 3)?;
-        }
-        self.w32(MISC, self.r32(MISC) & !MISC_RXDV); // reabre RXDV
-        self.eri_w(0xC0, 0, 3)?;
-        self.eri_w(0xB8, 0, 3)?;
-        if v == 46 {
-            self.w8(DLLPR, self.r8(DLLPR) & !0xC0);
-            self.w16(MISC1, self.r16(MISC1) & !(1 << 6));
-        } else {
-            self.eri_rmw(0x2FC, 0b110, 1)?;
-        }
-        self.eri_rmw(0x1B0, 1 << 12 | 3, 0)?; // y EEE apagado (bits 0-1)
-        self.w8(CONFIG3, self.r8(CONFIG3) & !2);
-        if v == 46 {
+            self.w32(MISC, self.r32(MISC) & !MISC_RXDV); // reabre RXDV
+            self.eri_w(0xC0, 0, 3)?;
+            self.eri_w(0xB8, 0, 3)?;
+            self.w8(DLLPR, self.r8(DLLPR) & !(1 << 6));
+            self.w8(MISC1, self.r8(MISC1) & !(1 << 6));
+            self.w8(DLLPR, self.r8(DLLPR) & !(1 << 7));
+            self.eri_rmw(0x1B0, 1 << 12, 0)?;
+            self.w8(CONFIG3, self.r8(CONFIG3) & !2);
             let cnt = self.phy_r(0xC426)? & 0x3FFF; // página 0x0C42, registro 0x13
             if cnt > 0 {
                 self.ocp_rmw(0xD412, 0x0FFF, (16_000_000 / cnt as u32) as u16 & 0x0FFF);
@@ -421,8 +423,25 @@ impl Realtek {
             self.ocp_w(0xE63E, 0);
             self.ocp_w(0xC094, 0);
             self.ocp_w(0xC09E, 0);
+        } else {
+            self.fifo()?;
+            self.eri_w(0x2F8, 0x1D8F, 3)?;
+            self.w32(MISC, self.r32(MISC) & !MISC_RXDV);
+            self.eri_w(0xC0, 0, 3)?;
+            self.eri_w(0xB8, 0, 3)?;
+            self.eri_rmw(0x2FC, 0b110, 1)?;
+            self.eri_rmw(0x1B0, 1 << 12, 0)?;
+            self.w8(CONFIG3, self.r8(CONFIG3) & !2);
+            let tabla = match v {
+                40 => EPHY40,
+                42 => EPHY42,
+                _ => EPHY44,
+            };
+            for &(r, q, p) in tabla {
+                self.ephy_rmw(r, q, p)?;
+            }
         }
-        Some(())
+        self.eri_rmw(0x1B0, 3, 0) // EEE apagado (F15, ERI 0x1B0 bits 0-1)
     }
 
     fn armar_rx(&self, i: usize) {
