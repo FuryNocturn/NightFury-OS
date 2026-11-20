@@ -20,6 +20,8 @@ pub struct BootInfo {
     /// Fin (exclusivo) de la RAM más alta según el mapa de memoria.
     pub ram_end: u64,
     pub runtime: *mut RuntimeServices,
+    /// Dirección de la RSDP de ACPI (0 si el firmware no la da).
+    pub rsdp: u64,
 }
 
 static mut BOOT: BootInfo = BootInfo {
@@ -33,6 +35,7 @@ static mut BOOT: BootInfo = BootInfo {
     ram_total: 0,
     ram_end: 0,
     runtime: null_mut(),
+    rsdp: 0,
 };
 
 pub fn info() -> BootInfo {
@@ -133,6 +136,12 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
         return EFI_ERROR_UNSUPPORTED;
     }
 
+    // RSDP de ACPI 2.0 (tabla de configuración con su GUID); la memoria de las tablas ACPI sobrevive.
+    let rsdp = (0..st.number_of_table_entries)
+        .map(|i| unsafe { st.configuration_table.cast::<u8>().add(i * 24) })
+        .find(|&e| unsafe { e.cast::<Guid>().read_unaligned() } == ACPI20_GUID)
+        .map_or(0, |e| unsafe { e.add(16).cast::<u64>().read_unaligned() });
+
     // Salida de los servicios de arranque (el mapa puede cambiar, así que se reintenta).
     let mut ram_total = 0u64;
     let mut ram_end = 0u64;
@@ -175,6 +184,7 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
             ram_total,
             ram_end,
             runtime: st.runtime_services,
+            rsdp,
         });
         let top = (base + STACK_SIZE) & !15;
         core::arch::asm!(

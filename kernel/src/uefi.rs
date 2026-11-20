@@ -7,6 +7,7 @@ pub type Status = usize;
 pub const EFI_ERROR_UNSUPPORTED: Status = 0x8000_0000_0000_0003;
 
 #[repr(C)]
+#[derive(PartialEq)]
 pub struct Guid {
     pub d1: u32,
     pub d2: u16,
@@ -16,6 +17,9 @@ pub struct Guid {
 
 pub const GOP_GUID: Guid =
     Guid { d1: 0x9042a9de, d2: 0x23dc, d3: 0x4a38, d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a] };
+
+pub const ACPI20_GUID: Guid =
+    Guid { d1: 0x8868e871, d2: 0xe4f1, d3: 0x11d3, d4: [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81] };
 
 #[repr(C)]
 pub struct TableHeader {
