@@ -19,11 +19,30 @@ Para una captura sin ventana (pruebas): `tools\shot.ps1 -Out shots\a.png`.
 
 No toca los discos del PC: todo vive en memoria.
 
-### Límites conocidos en PC real (v0.1)
-- Teclado y ratón van por PS/2. Funcionan los integrados de muchos portátiles; un teclado o ratón USB
-  solo funciona si la placa emula PS/2 para USB. Si no, el escritorio se ve pero no responde.
+### Dispositivos USB (v0.11)
+Desde la v0.11 NightFury tiene su propio controlador USB (xHCI, USB 3), así que no depende de que la placa
+emule PS/2:
+- **Teclado y ratón USB**, también detrás de un hub. Los PS/2 siguen funcionando.
+- **Pendrives y discos USB** como `D:`, `E:`…: FAT12/16/32 y exFAT en lectura y escritura, ISO 9660 y UDF en
+  lectura, y pendrives NightFury (en claro o cifrados). Al conectarlos sale un aviso; se expulsan desde la
+  bandeja o el menú contextual, y se formatean o cifran desde el Explorador (**formatear y cifrar borran el
+  pendrive**). Lo borrado en una unidad extraíble no va a la Papelera.
+- **Mandos**: PlayStation (DualShock 4, DualSense), Nintendo Switch Pro, Xbox 360/One y mandos HID genéricos.
+  Se prueban en Configuración › Dispositivos › Probar mando.
+
+### Límites conocidos en PC real
+- No probado todavía en hardware real; el soporte USB solo se ha probado en QEMU.
+- Controladores USB antiguos (UHCI/OHCI/EHCI sin xHCI) no están soportados.
 - Para apagar si no responde: mantener pulsado el botón de encendido.
-- No probado todavía en hardware real.
+
+## Pendrives de prueba en QEMU
+```powershell
+nfdisk usb pen.img fat32 64                  # también exfat o nightfury
+nfdisk usb pen.img nightfury-cifrado 64 clave   # imprime el código de recuperación
+powershell -ExecutionPolicy Bypass -File run.ps1 -Usb pen.img   # varias: -Usb a.img,b.img
+nfdisk usb-ver pen.img                       # lo que quedó dentro tras usarla (NFDISK_CLAVE si va cifrada)
+```
+`nfdisk usb` solo crea archivos nuevos; nunca escribe en dispositivos ni unidades reales.
 
 ## Intercambiar archivos con el disco virtual (nfdisk)
 `nfdisk` es una herramienta de consola para Windows que lee y escribe la imagen NFFS (`disco.img`)
