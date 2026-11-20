@@ -1266,6 +1266,10 @@ impl Desktop {
                 self.send_pads(sys, true);
             }
             PadEvent::Removed(id) => {
+                // Quitado con algo pulsado: la ventana activa lo recibe suelto antes de la lista nueva.
+                if let (Some(w), true) = (self.pads_to, self.pads.iter().any(|p| p.0.id == id && p.1 != PadState::default())) {
+                    self.with_app(w, sys, |a, cx| a.gamepad(id, &PadState::default(), cx));
+                }
                 self.pads.retain(|p| p.0.id != id);
                 self.send_pads(sys, true);
             }
@@ -1290,10 +1294,18 @@ impl Desktop {
     /// Reparto de mandos tras un cambio de foco o de ventanas: lista a las ventanas nuevas y, a la que
     /// pasa a ser la activa, el estado actual de cada mando.
     fn sync_pads(&mut self, sys: &mut dyn Platform) {
+        use crate::gamepad::PadState;
         self.send_pads(sys, false);
         let target = self.input_target();
         if target == self.pads_to {
             return;
+        }
+        // La que deja de recibir (abrir Inicio o un menú no le quita el foco) da todo por suelto.
+        if let Some(old) = self.pads_to {
+            let held: Vec<u32> = self.pads.iter().filter(|p| p.1 != PadState::default()).map(|p| p.0.id).collect();
+            for id in held {
+                self.with_app(old, sys, |a, cx| a.gamepad(id, &PadState::default(), cx));
+            }
         }
         self.pads_to = target;
         if let Some(w) = target {
@@ -5307,14 +5319,29 @@ mod cinta_tests {
         d.launch_app(Box::new(PadRec(lb.clone())), &mut sys);
         d.event(Event::Tick(20), &mut sys);
         assert_eq!(*lb.borrow(), ["lista 1", &format!("estado 1 {BTN_SOUTH}")]);
+        // La que pierde el foco lo da todo por suelto.
+        assert_eq!(la.borrow().last().map(String::as_str), Some("estado 1 0"));
         // Los estados solo van a la activa; las conexiones, a todas.
         la.borrow_mut().clear();
         lb.borrow_mut().clear();
         d.gamepad(PadEvent::State(1, st(0)), &mut sys);
         assert!(la.borrow().is_empty());
         assert_eq!(*lb.borrow(), ["estado 1 0"]);
+        // Abrir Inicio no quita el foco, pero la ventana deja de recibir: suelta lo pulsado, y al
+        // cerrarlo vuelve a tener el estado actual.
+        d.gamepad(PadEvent::State(1, st(BTN_SOUTH)), &mut sys);
+        lb.borrow_mut().clear();
+        d.toggle_start(&mut sys);
+        d.event(Event::Tick(30), &mut sys);
+        assert_eq!(*lb.borrow(), ["estado 1 0"]);
+        d.toggle_start(&mut sys);
+        d.event(Event::Tick(40), &mut sys);
+        assert_eq!(lb.borrow().last().cloned(), Some(format!("estado 1 {BTN_SOUTH}")));
+        // Quitado con el botón pulsado: llega suelto y después la lista vacía.
+        lb.borrow_mut().clear();
         d.gamepad(PadEvent::Removed(1), &mut sys);
-        assert_eq!((la.borrow().last().cloned(), lb.borrow().last().cloned()), (Some(String::from("lista 0")), Some(String::from("lista 0"))));
+        assert_eq!(*lb.borrow(), ["estado 1 0", "lista 0"]);
+        assert_eq!(la.borrow().last().cloned(), Some(String::from("lista 0")));
     }
 
     #[test]

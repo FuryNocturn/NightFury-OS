@@ -157,7 +157,7 @@ pub fn parent(path: &str) -> Option<String> {
     }
     match path.rfind('\\') {
         Some(i) if i > 2 => Some(String::from(&path[..i])),
-        Some(_) => Some(format!("{}:\\", &path[..1])),
+        Some(_) => Some(format!("{}:\\", path.chars().next()?)),
         None => None,
     }
 }
@@ -2914,6 +2914,24 @@ impl Files {
         self.xd.list.retain(|d| d.disk != disk);
         if self.xd.list.len() != n {
             self.generation += 1;
+            self.forget_gone();
+        }
+    }
+
+    /// Olvida deshacer y portapapeles que nombren una letra que ya no está: si otro pendrive
+    /// recibe esa letra, Ctrl+Z o pegar actuarían sobre sus archivos.
+    fn forget_gone(&mut self) {
+        let list = &self.xd.list;
+        let gone = |p: &String| p.chars().next().is_some_and(|c| !c.eq_ignore_ascii_case(&'C') && !list.iter().any(|d| d.letter.eq_ignore_ascii_case(&c)));
+        if self.clip.as_ref().is_some_and(|(v, _)| v.iter().any(gone)) {
+            self.clip = None;
+        }
+        let stale = |u: &Undo| match u {
+            Undo::Move { from, to } => gone(from) || gone(to),
+            Undo::Created(p) | Undo::Trashed(p) => gone(p),
+        };
+        if self.undo.as_ref().is_some_and(|(v, _)| v.iter().any(stale)) {
+            self.undo = None;
         }
     }
 
@@ -2983,6 +3001,7 @@ impl Files {
         }
         self.xd.list.retain(|d| d.disk != disk);
         self.generation += 1;
+        self.forget_gone();
         self.xd.result = None;
         self.xd.actions.push(match req {
             FormatRequest::Eject => DriveAction::Eject { disk },
@@ -5649,6 +5668,29 @@ mod drive_tests {
         assert_eq!(f.attach(3, "Otro", mount(&stick(FsKind::Fat32, ""))), Some('D'));
         assert_eq!(f.attach(4, "Otro", mount(&stick(FsKind::Fat32, ""))), Some('F'));
         f.detach(99);
+    }
+
+    #[test]
+    fn quitar_una_unidad_olvida_deshacer_y_portapapeles() {
+        let mut f = Files::default();
+        f.attach(1, "A", mount(&stick(FsKind::Fat32, ""))).unwrap();
+        f.user_create("D:\\x.txt", false, NOW).unwrap();
+        f.set_clip_many(&[String::from("D:\\x.txt")], true);
+        // Otra unidad en E: no cuenta.
+        f.attach(2, "B", mount(&stick(FsKind::Fat32, ""))).unwrap();
+        f.detach(2);
+        assert!(f.undo_label().is_some() && !f.clip_paths().0.is_empty());
+        // Se quita A y otro pendrive con su propio D:\x.txt recibe la letra D:.
+        f.detach(1);
+        assert_eq!(f.attach(3, "B", mount(&stick(FsKind::Fat32, ""))), Some('D'));
+        f.write("D:\\x.txt", b"de B", NOW).unwrap();
+        assert_eq!(f.undo_label(), None);
+        assert!(f.clip_paths().0.is_empty());
+        assert_eq!(f.read("D:\\x.txt").unwrap(), b"de B");
+        // Lo de C: no se olvida al quitar una unidad.
+        f.user_create("C:\\y.txt", false, NOW).unwrap();
+        f.request_drive_action('D', FormatRequest::Eject).unwrap();
+        assert_eq!(f.undo_label(), Some("Nuevo"));
     }
 
     #[test]

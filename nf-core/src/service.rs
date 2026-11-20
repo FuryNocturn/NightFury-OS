@@ -371,6 +371,12 @@ pub(crate) fn blocked(system: bool, path: &str) -> bool {
     in_system(path) || (!system && in_programs(path))
 }
 
+/// Origen que un programa de terceros no puede copiar ni mover: lo de `blocked` y la raíz de C:,
+/// que contiene `C:\Sistema` (copiarla a D: la leería entera).
+fn src_blocked(system: bool, path: &str) -> bool {
+    blocked(system, path) || (!system && resolve("C:\\", path).is_ok_and(|c| c.len() == 3 && c.starts_with('C')))
+}
+
 fn in_programs(path: &str) -> bool {
     // Solo en C:: `D:\Programas` es una carpeta cualquiera de una unidad extraíble.
     resolve("C:\\", path).is_ok_and(|c| c.starts_with('C') && c[3..].split('\\').next().is_some_and(|t| t.eq_ignore_ascii_case(&PROGRAMS_DIR[3..])))
@@ -418,7 +424,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         Rename { from, to } => gate(outside(system, &[&from, &to]), Err(denied), || sys.files().rename(&from, &to)),
         Copy { from, to } => {
             let now = sys.now();
-            gate(outside(system, &[&from, &to]), Err(denied), || sys.files().copy(&from, &to, now))
+            gate(outside(system, &[&to]) && !src_blocked(system, &from), Err(denied), || sys.files().copy(&from, &to, now))
         }
         Delete { path } => gate(outside(system, &[&path]), Err(denied), || sys.files().delete(&path)),
         FreeName { dir, name } => encode(&sys.files().free_name(&dir, &name)),
@@ -435,12 +441,12 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         PasteAll { dir } => {
             let now = sys.now();
             let files = sys.files();
-            let from_system = files.clip_paths().0.iter().any(|p| blocked(system, p));
+            let from_system = files.clip_paths().0.iter().any(|p| src_blocked(system, p));
             gate(outside(system, &[&dir]) && !from_system, Err(denied), || files.paste_all(&dir, now))
         }
         Transfer { paths, dir, mv } => {
             let now = sys.now();
-            let ok = outside(system, &[&dir]) && !paths.iter().any(|p| blocked(system, p));
+            let ok = outside(system, &[&dir]) && !paths.iter().any(|p| src_blocked(system, p));
             gate(ok, Err(denied), || sys.files().transfer(&paths, &dir, mv, now))
         }
         UserRename { from, to } => gate(outside(system, &[&from, &to]), Err(denied), || sys.files().user_rename(&from, &to)),
@@ -1079,6 +1085,16 @@ mod tests {
             assert_eq!(f.copy("D:\\Programas\\a.txt", "C:\\Sistema\\temp\\a.txt", NOW), Err(FsError::Denied));
             assert_eq!(f.transfer(&[s("D:\\Programas\\a.txt")], "C:\\Sistema\\temp", false, NOW), Err(FsError::Denied));
             assert!(!f.exists("C:\\Sistema\\temp\\a.txt"));
+            // Ni copiando la raíz de C:, que lleva dentro C:\Sistema.
+            if !system {
+                for root in ["C:\\", "c:", "C:\\Usuarios\\.."] {
+                    assert_eq!(f.copy(root, "D:\\x", NOW), Err(FsError::Denied), "{root}");
+                    assert_eq!(f.transfer(&[s(root)], "D:\\", false, NOW), Err(FsError::Denied), "{root}");
+                    f.set_clip_many(&[s(root)], false);
+                    assert_eq!(f.paste_all("D:\\", NOW), Err(FsError::Denied), "{root}");
+                }
+                assert!(!f.exists("D:\\x"));
+            }
             // Abrir, expulsar, formatear y cifrar: solo el sistema.
             assert_eq!(f.unlock_drive('D', "x", false), Err(if system { KeyError::NotEncrypted } else { KeyError::NotAdmin }));
             assert_eq!(f.request_drive_action('C', FormatRequest::Eject), Err(if system { FsError::Invalid } else { FsError::Denied }));

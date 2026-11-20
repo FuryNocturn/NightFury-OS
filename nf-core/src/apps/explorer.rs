@@ -299,6 +299,9 @@ struct Row {
 /// Operación sobre una unidad que va pidiendo datos con diálogos.
 struct DrvJob {
     letter: char,
+    /// Modelo y tamaño de la unidad al empezar: si al confirmar la letra es de otra, no se hace nada.
+    /// shortcut: dos pendrives del mismo modelo y tamaño no se distinguen; pasar el id del disco en `DriveInfo` si hiciera falta.
+    dev: (String, u64),
     name: String,
     op: DrvOp,
     kind: FormatKind,
@@ -1121,7 +1124,7 @@ impl Explorer {
 
     /// Pide la contraseña de una unidad cifrada (vacía + Aceptar = usar el código de recuperación).
     fn ask_unlock(&mut self, d: DriveInfo, cx: &mut Ctx) {
-        self.job = Some(DrvJob { letter: d.letter, name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
+        self.job = Some(DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
         cx.dialog = Some(DialogRequest::Password {
             tag: TAG_DRV_PW,
             title: String::from("Desbloquear unidad"),
@@ -1136,7 +1139,7 @@ impl Explorer {
         if !d.removable {
             return;
         }
-        let job = |op, kind| DrvJob { letter: d.letter, name: d.name(), op, kind, label: String::new(), pw: String::new() };
+        let job = |op, kind| DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), name: d.name(), op, kind, label: String::new(), pw: String::new() };
         match id {
             M_EJECT => match cx.sys.fs().request_drive_action(d.letter, FormatRequest::Eject) {
                 Ok(()) => {
@@ -1177,8 +1180,14 @@ impl Explorer {
     }
 
     /// Manda formatear o cifrar y queda a la espera del resultado.
-    fn drive_request(&mut self, letter: char, req: FormatRequest, cx: &mut Ctx) {
+    fn drive_request(&mut self, letter: char, dev: &(String, u64), req: FormatRequest, cx: &mut Ctx) {
         let enc = matches!(req, FormatRequest::Encrypt { .. });
+        // Mientras se confirmaba, el pendrive pudo quitarse y otro recibir la misma letra.
+        if !cx.sys.fs().drives().iter().any(|i| i.letter == letter && i.device == dev.0 && i.total == dev.1) {
+            self.reload(cx.sys);
+            self.drive_msg("Unidades", format!("La unidad ({letter}:) ha cambiado. No se ha hecho nada."), cx);
+            return;
+        }
         match cx.sys.fs().request_drive_action(letter, req) {
             Ok(()) => self.waiting = Some((letter, enc)),
             Err(e) => self.fail(e, cx),
@@ -2462,7 +2471,7 @@ impl App for Explorer {
                 }
             }
             DialogResult::Answer { tag: TAG_DRV_SURE, answer } => match (answer, self.job.take()) {
-                (Answer::Yes, Some(j)) => self.drive_request(j.letter, FormatRequest::Format { kind: j.kind, label: j.label }, cx),
+                (Answer::Yes, Some(j)) => self.drive_request(j.letter, &j.dev, FormatRequest::Format { kind: j.kind, label: j.label }, cx),
                 _ => {}
             },
             DialogResult::Answer { tag: TAG_DRV_WARN, answer } => match (answer, self.job.as_ref()) {
@@ -2512,7 +2521,7 @@ impl App for Explorer {
                     } else {
                         let label = self.drive(j.letter).map(|d| d.label.clone()).unwrap_or_default();
                         let password = core::mem::take(&mut j.pw);
-                        self.drive_request(j.letter, FormatRequest::Encrypt { label, password }, cx);
+                        self.drive_request(j.letter, &j.dev, FormatRequest::Encrypt { label, password }, cx);
                     }
                 }
                 scrub(&mut p2);
@@ -4740,6 +4749,20 @@ mod tests {
         let (_, d, _) = t.cx(|e, cx| e.tick(cx));
         assert_eq!(msg(d).1, "La unidad (D:) se ha formateado.");
         assert_eq!(t.e.waiting, None);
+    }
+
+    #[test]
+    fn no_formatea_otro_pendrive_con_la_misma_letra() {
+        let mut t = con_usb();
+        t.right_row("D:");
+        t.pick(TAG_MENU_ITEM, M_FMT_EXFAT);
+        t.answer(DialogResult::Text { tag: TAG_DRV_LABEL, value: Some(String::from("COPIAS")) });
+        // Con la confirmación abierta se quita el pendrive y entra otro, que también es D:.
+        t.sys.files.detach(1);
+        assert_eq!(t.sys.files.attach(2, "Otro", usb("FOTOS")), Some('D'));
+        let d = t.answer(DialogResult::Answer { tag: TAG_DRV_SURE, answer: Answer::Yes });
+        assert_eq!(msg(d).1, "La unidad (D:) ha cambiado. No se ha hecho nada.");
+        assert!(t.sys.files.take_drive_actions().is_empty() && t.e.waiting.is_none());
     }
 
     #[test]
