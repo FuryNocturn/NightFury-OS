@@ -21,7 +21,7 @@ use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
-use crate::net::{Ipv4, NetApi, NetError, NetStatus, PingId, PingReply, QueryId, SockId, State, TcpState, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, TCP_BUF};
+use crate::net::{ConnInfo, Datagram, Ipv4, ListenId, NetApi, NetError, NetStatus, PingId, PingReply, Proto, QueryId, SockId, State, TcpState, UdpId, MAX_LISTEN, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, MAX_UDP, TCP_BUF, UDP_MAX};
 use crate::platform::{DateTime, MemInfo, Platform};
 use crate::wire::{decode, encode, Bad, Reader, Wire, WireResult, Writer};
 use alloc::string::String;
@@ -141,6 +141,14 @@ calls! {
     NetRecv { id: SockId, max: u32 } = 72,
     NetClose { id: SockId } = 73,
     NetAbort { id: SockId } = 74,
+    UdpBind { port: u16 } = 75,
+    UdpSend { id: UdpId, dst: Ipv4, port: u16, data: Blob } = 76,
+    UdpRecv { id: UdpId } = 77,
+    UdpClose { id: UdpId } = 78,
+    TcpListen { port: u16 } = 79,
+    TcpAccept { id: ListenId } = 80,
+    TcpUnlisten { id: ListenId } = 81,
+    NetConnections = 82,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -402,7 +410,49 @@ macro_rules! net_id {
         }
     )*};
 }
-net_id!(PingId, QueryId, SockId);
+net_id!(PingId, QueryId, SockId, UdpId, ListenId);
+
+impl Wire for Datagram {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.from).put(&self.port).bytes(&self.data);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(Datagram { from: r.get()?, port: r.get()?, data: r.bytes()?.to_vec() })
+    }
+}
+
+/// Textos de `ConnInfo::state`, por posición (como `PROTOCOL`).
+const CONN_STATES: [&str; 6] = ["Conectando", "Abierta", "Cerrando", "Cerrada", "Escuchando", "—"];
+
+impl Wire for ConnInfo {
+    fn put(&self, w: &mut Writer) {
+        let p: u8 = match self.proto {
+            Proto::Tcp => 0,
+            Proto::TcpListen => 1,
+            Proto::Udp => 2,
+        };
+        w.put(&p).put(&self.id).put(&self.local_port).put(&self.remote);
+        w.put(&(CONN_STATES.iter().position(|s| *s == self.state).unwrap_or(5) as u8));
+        w.put(&self.rx).put(&self.tx);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let proto = match u8::get(r)? {
+            0 => Proto::Tcp,
+            1 => Proto::TcpListen,
+            2 => Proto::Udp,
+            _ => return Err(Bad),
+        };
+        Ok(ConnInfo {
+            proto,
+            id: r.get()?,
+            local_port: r.get()?,
+            remote: r.get()?,
+            state: CONN_STATES.get(u8::get(r)? as usize).copied().unwrap_or("—"),
+            rx: r.get()?,
+            tx: r.get()?,
+        })
+    }
+}
 
 const STATES: [State; 5] = [State::NoAdapter, State::NoCable, State::Configuring, State::NoInternet, State::Connected];
 
@@ -441,7 +491,7 @@ impl Wire for NetStatus {
 
 /// Motivos de `NetError::Protocol` que viajan por su posición (el texto es `&'static str`, así que
 /// al recibir se vuelve a uno de estos y nunca se crea un texto nuevo). Solo se añade al final.
-const PROTOCOL: [&str; 10] = [
+const PROTOCOL: [&str; 11] = [
     "Content-Length no válido",
     "cabeceras demasiado grandes",
     "conexión cerrada antes de las cabeceras",
@@ -452,6 +502,7 @@ const PROTOCOL: [&str; 10] = [
     "sin servidor DNS",
     "tamaño de bloque no válido",
     "tamaño de eco excesivo",
+    "datagrama demasiado grande",
 ];
 const PROTOCOL_UNKNOWN: &str = "respuesta no válida";
 
@@ -473,6 +524,9 @@ impl Wire for NetError {
             BadUrl => w.put(&11u8),
             HttpsNotYet => w.put(&12u8),
             Protocol(t) => w.put(&13u8).put(&(PROTOCOL.iter().position(|p| p == t).map_or(255, |i| i as u8))),
+            Denied => w.put(&14u8),
+            Pending => w.put(&15u8),
+            InUse => w.put(&16u8),
         };
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
@@ -492,6 +546,9 @@ impl Wire for NetError {
             11 => BadUrl,
             12 => HttpsNotYet,
             13 => Protocol(PROTOCOL.get(u8::get(r)? as usize).copied().unwrap_or(PROTOCOL_UNKNOWN)),
+            14 => Denied,
+            15 => Pending,
+            16 => InUse,
             _ => return Err(Bad),
         })
     }
@@ -534,6 +591,8 @@ pub struct NetOwn {
     pings: Vec<PingId>,
     queries: Vec<QueryId>,
     socks: Vec<SockId>,
+    udps: Vec<UdpId>,
+    listens: Vec<ListenId>,
 }
 
 impl NetOwn {
@@ -550,6 +609,12 @@ impl NetOwn {
             for q in self.queries.drain(..) {
                 net.resolve_poll(q);
             }
+            for u in self.udps.drain(..) {
+                net.udp_close(u);
+            }
+            for l in self.listens.drain(..) {
+                net.tcp_unlisten(l);
+            }
         }
         *self = NetOwn::default();
     }
@@ -561,6 +626,8 @@ fn no_net(call: &Call) -> Vec<u8> {
     match call {
         Call::NetStatus => encode(&no_status()),
         Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
+        Call::UdpBind { .. } | Call::UdpSend { .. } | Call::UdpRecv { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => encode(&Err::<u8, _>(e)),
+        Call::NetConnections => encode(&Vec::<ConnInfo>::new()),
         Call::NetPingPoll { .. } | Call::NetResolvePoll { .. } => encode(&Some(Err::<u8, _>(e))),
         Call::NetState { .. } => encode(&TcpState::Failed(e)),
         _ => encode(&()),
@@ -770,7 +837,8 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         UnlockDrive { letter, secret, recovery } => gate(system, Err(no_key), || sys.files().unlock_drive(letter, &secret, recovery)),
         DriveAction { letter, req } => gate(system, Err(denied), || sys.files().request_drive_action(letter, req)),
         DriveResult => gate(system, None, || sys.files().drive_result()),
-        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. } => {
+        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
+        | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             // En esta versión solo los programas del sistema usan la red (los de terceros, con permiso, en v0.12.1).
             match if system { sys.net() } else { None } {
                 Some(net) => net_run(net, call, own),
@@ -873,6 +941,70 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
                 net.tcp_abort(id);
             }
             encode(&())
+        }
+        UdpBind { port } => {
+            let r = if own.udps.len() >= MAX_UDP { Err(NetError::Busy) } else { net.udp_bind(port) };
+            if let Ok(id) = r {
+                own.udps.push(id);
+            }
+            encode(&r)
+        }
+        UdpSend { id, dst, port, data } => {
+            encode(&if !own.udps.contains(&id) {
+                Err(NetError::Gone)
+            } else if data.0.len() > UDP_MAX {
+                Err(NetError::Protocol("datagrama demasiado grande"))
+            } else {
+                net.udp_send(id, dst, port, &data.0)
+            })
+        }
+        UdpRecv { id } => encode(&if own.udps.contains(&id) { net.udp_recv(id) } else { Err(NetError::Gone) }),
+        UdpClose { id } => {
+            if let Some(i) = own.udps.iter().position(|&u| u == id) {
+                own.udps.swap_remove(i);
+                net.udp_close(id);
+            }
+            encode(&())
+        }
+        TcpListen { port } => {
+            let r = if own.listens.len() >= MAX_LISTEN { Err(NetError::Busy) } else { net.tcp_listen(port) };
+            if let Ok(id) = r {
+                own.listens.push(id);
+            }
+            encode(&r)
+        }
+        TcpAccept { id } => {
+            if !own.listens.contains(&id) {
+                return encode(&Err::<Option<(SockId, Ipv4, u16)>, _>(NetError::Gone));
+            }
+            // Sin hueco en la lista del programa, la conexión espera en la cola de la pila.
+            if own.socks.len() >= MAX_SOCKS {
+                own.socks.retain(|&s| net.tcp_state(s) != TcpState::Failed(NetError::Gone));
+                if own.socks.len() >= MAX_SOCKS {
+                    return encode(&Ok::<Option<(SockId, Ipv4, u16)>, NetError>(None));
+                }
+            }
+            let r = net.tcp_accept(id);
+            if let Ok(Some((s, _, _))) = r {
+                own.socks.push(s);
+            }
+            encode(&r)
+        }
+        TcpUnlisten { id } => {
+            if let Some(i) = own.listens.iter().position(|&l| l == id) {
+                own.listens.swap_remove(i);
+                net.tcp_unlisten(id);
+            }
+            encode(&())
+        }
+        // Solo lo del propio programa (el Administrador de tareas, que es del sistema, ve todo con `Net`).
+        NetConnections => {
+            let mine = |c: &ConnInfo| match c.proto {
+                Proto::Tcp => own.socks.contains(&SockId(c.id)),
+                Proto::Udp => own.udps.contains(&UdpId(c.id)),
+                Proto::TcpListen => own.listens.contains(&ListenId(c.id)),
+            };
+            encode(&net.connections().into_iter().filter(mine).collect::<Vec<_>>())
         }
         _ => encode(&()),
     }
@@ -1148,6 +1280,38 @@ impl<T: Transport> NetApi for RemoteNet<T> {
     }
     fn tcp_abort(&mut self, id: SockId) {
         ask(&mut self.0, Call::NetAbort { id }, ())
+    }
+    fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
+        self.net(Call::UdpBind { port })
+    }
+    fn udp_send(&mut self, id: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError> {
+        if data.len() > UDP_MAX {
+            return Err(NetError::Protocol("datagrama demasiado grande"));
+        }
+        self.net(Call::UdpSend { id, dst, port, data: Blob(data.to_vec()) })
+    }
+    fn udp_recv(&mut self, id: UdpId) -> Result<Option<Datagram>, NetError> {
+        let mut d: Option<Datagram> = self.net(Call::UdpRecv { id })?;
+        // Un sistema que mintiera con un datagrama enorme no hace crecer la memoria del programa sin tope.
+        if let Some(g) = d.as_mut() {
+            g.data.truncate(UDP_MAX);
+        }
+        Ok(d)
+    }
+    fn udp_close(&mut self, id: UdpId) {
+        ask(&mut self.0, Call::UdpClose { id }, ())
+    }
+    fn tcp_listen(&mut self, port: u16) -> Result<ListenId, NetError> {
+        self.net(Call::TcpListen { port })
+    }
+    fn tcp_accept(&mut self, id: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError> {
+        self.net(Call::TcpAccept { id })
+    }
+    fn tcp_unlisten(&mut self, id: ListenId) {
+        ask(&mut self.0, Call::TcpUnlisten { id }, ())
+    }
+    fn connections(&mut self) -> Vec<ConnInfo> {
+        ask(&mut self.0, Call::NetConnections, Vec::new())
     }
 }
 
