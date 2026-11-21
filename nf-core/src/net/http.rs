@@ -405,7 +405,9 @@ impl HttpGet {
             return self.fail(net, NetError::Protocol("demasiadas redirecciones"), ev);
         }
         let auth = if self.url.port == 80 { self.url.host.clone() } else { format!("{}:{}", self.url.host, self.url.port) };
-        let full = if loc.contains("://") {
+        // absoluta solo si empieza por un esquema: «/login?next=http://x» es relativa
+        let absoluta = loc.find("://").is_some_and(|i| i > 0 && loc[..i].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.'));
+        let full = if absoluta {
             String::from(loc)
         } else if let Some(r) = loc.strip_prefix("//") {
             format!("http://{r}")

@@ -16,8 +16,8 @@ const ARP_GAP_MS: u64 = 1_000;
 const GW_RETRY_MS: u64 = 5_000;
 
 pub(super) struct ArpEntry {
-    ip: Ipv4,
-    mac: [u8; 6],
+    pub(super) ip: Ipv4,
+    pub(super) mac: [u8; 6],
     expires: u64,
 }
 
@@ -191,8 +191,12 @@ impl Net {
             return;
         }
         let ours = Some(a.tpa) == me;
-        // solo se aprende de quien ya conocemos, de quien esperamos o de quien nos habla a nosotros
-        if ours || self.arp.cache.iter().any(|e| e.ip == a.spa) || self.arp.reqs.iter().any(|r| r.ip == a.spa) {
+        // Se aprende de quien esperamos. De quien ya conocemos, solo si repite su MAC o si su entrada
+        // caducó: así una petición o respuesta suelta no cambia la MAC de la puerta de enlace ni llena la
+        // caché. A quien solo nos pregunta se le contesta sin guardarlo.
+        let esperado = self.arp.reqs.iter().any(|r| r.ip == a.spa);
+        let conocido = self.arp.cache.iter().any(|e| e.ip == a.spa && (e.mac == a.sha || e.expires <= self.now));
+        if esperado || conocido {
             self.arp_learn(a.spa, a.sha);
         }
         if a.op == 1 && ours {
@@ -206,6 +210,10 @@ impl Net {
         match &self.cfg {
             Some(c) => {
                 if ip.dst != c.ip && !self.is_bcast(ip.dst) {
+                    return;
+                }
+                // orígenes imposibles: nosotros, 0.0.0.0, multidifusión o difusión
+                if ip.src == c.ip || ip.src == [0; 4] || ip.src[0] >= 224 || self.is_bcast(ip.src) {
                     return;
                 }
             }

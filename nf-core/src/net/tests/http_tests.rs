@@ -246,6 +246,11 @@ fn redireccion_relativa_y_tope() {
     l.router.srv.listen(8081, b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nQ", false, false);
     let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
     assert_eq!(body(&ev), b"Q");
+    // relativa con «://» en la consulta
+    l.router.srv.reqs.clear();
+    l.router.srv.listen(80, b"HTTP/1.1 302 Found\r\nLocation: /login?next=http://x\r\nContent-Length: 0\r\n\r\n", false, false);
+    let _ = fetch(&mut l, "http://example.org/a", false, true);
+    assert!(l.router.srv.reqs[1].starts_with(b"GET /login?next=http://x HTTP/1.1"));
 }
 
 #[test]

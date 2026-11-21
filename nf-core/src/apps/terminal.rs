@@ -538,6 +538,12 @@ impl Terminal {
 }
 
 impl App for Terminal {
+    /// Al quitar la ventana, el `curl` en marcha cierra su conexión (si no, ocuparía un socket para siempre).
+    fn release(&mut self, sys: &mut dyn Platform) {
+        if let Some(mut j) = self.job.take() {
+            j.cancel(sys, &mut Vec::new());
+        }
+    }
     fn kind(&self) -> AppKind {
         AppKind::Terminal
     }

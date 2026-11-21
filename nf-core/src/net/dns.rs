@@ -179,6 +179,9 @@ fn parse_inner(m: &[u8], id: u16, name: &str) -> Option<Resp> {
             None => break,
         }
     }
+    if flags & 0x0200 != 0 {
+        return None; // truncada (TC) y sin direcciones: se prueba con el otro servidor
+    }
     Some(Resp::Fail(NetError::NotFound))
 }
 

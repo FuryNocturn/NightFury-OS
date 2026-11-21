@@ -359,6 +359,38 @@ fn arp_no_aprende_de_cualquiera() {
     assert_eq!(l.ping(SRV, 8, 64).unwrap().from, SRV, "la puerta de enlace sigue siendo la buena");
 }
 
+#[test]
+fn arp_no_cambia_la_puerta_ni_llena_la_cache() {
+    let mut l = Lan::up();
+    let malo = [2, 0, 0, 0, 6, 6];
+    // petición a nosotros que dice que la puerta de enlace tiene otra MAC
+    l.inject(eth(BCAST_MAC, malo, ETH_ARP, &arp_build(1, malo, R_IP, [0; 6], OFFER)));
+    let gw = l.net.arp.cache.iter().find(|e| e.ip == R_IP).map(|e| e.mac);
+    assert_eq!(gw, Some(R_MAC), "la MAC de la puerta no cambia");
+    // muchas IP desconocidas preguntando por nosotros: se contesta, pero no se guardan
+    let n = l.net.arp.cache.len();
+    for i in 0..40u8 {
+        l.inject(eth(BCAST_MAC, malo, ETH_ARP, &arp_build(1, malo, [192, 168, 1, 100 + i], [0; 6], OFFER)));
+    }
+    assert_eq!(l.net.arp.cache.len(), n);
+    assert_eq!(l.ping(SRV, 8, 64).unwrap().from, SRV);
+}
+
+#[test]
+fn ip_descarta_origenes_imposibles() {
+    let mut l = Lan::up();
+    let n = l.up_log.len();
+    let eco = |l: &mut Lan, src: Ipv4| l.router.ip_frame(src, OFFER, P_ICMP, &icmp_build(8, 0, [0, 1, 0, 1], &[]));
+    for src in [OFFER, [0, 0, 0, 0], [255, 255, 255, 255], [192, 168, 1, 255], [224, 0, 0, 1]] {
+        let f = eco(&mut l, src);
+        l.inject(f);
+    }
+    assert_eq!(l.up_log.len(), n, "no se contesta a ningún eco con origen imposible");
+    let f = eco(&mut l, R_IP);
+    l.inject(f);
+    assert!(l.up_log.len() > n, "a un origen normal sí");
+}
+
 // ---------- ICMP ----------
 
 #[test]

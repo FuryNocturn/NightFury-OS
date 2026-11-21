@@ -378,6 +378,7 @@ impl Net {
     pub(crate) fn lose_config(&mut self) {
         self.cfg = None;
         self.arp = ip::ArpState::default();
+        self.dns_cache.clear();
         for s in self.socks.iter_mut() {
             s.kill(NetError::Reset);
         }

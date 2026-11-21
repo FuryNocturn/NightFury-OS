@@ -224,6 +224,17 @@ fn ventana_cero_del_otro_sondea_y_reanuda() {
 }
 
 #[test]
+fn ventana_cero_para_siempre_acaba_en_timeout() {
+    let mut l = Lan::up();
+    l.router.srv.listen(9, b"", false, false);
+    l.router.srv.win = 0;
+    let s = l.connect(9);
+    l.send_all(s, &pat(100), 100);
+    l.run(600_000);
+    assert_eq!(l.net.tcp_state(s), TcpState::Failed(NetError::Timeout), "no retiene el socket para siempre");
+}
+
+#[test]
 fn nuestra_ventana_se_llena_y_se_reabre() {
     let mut l = Lan::up();
     let data = pat(120_000);

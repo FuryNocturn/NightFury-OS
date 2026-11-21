@@ -413,6 +413,16 @@ impl Sock {
         }
         let inflight = self.inflight();
         let unsent = self.sendq.len().saturating_sub(inflight.saturating_sub(self.fin_sent as usize));
+        // también cuentan las sondas de ventana cero: un otro que no abre nunca la ventana acaba en
+        // Timeout y no retiene el socket para siempre
+        self.retries += 1;
+        if self.retries > MAX_RETRIES {
+            let rst = self.rst_seg();
+            out.push(rst);
+            self.fail = Some(NetError::Timeout);
+            self.st = St::Closed;
+            return;
+        }
         if inflight == 0 && unsent > 0 {
             // sonda de ventana cero: un byte fuera de ventana, que el otro contesta con su ventana
             let seq = self.snd_nxt;
@@ -420,16 +430,6 @@ impl Sock {
             out.push(seg);
             self.snd_nxt = seq.wrapping_add(1);
         } else {
-            if self.snd_wnd != 0 || self.st == St::SynSent {
-                self.retries += 1;
-                if self.retries > MAX_RETRIES {
-                    let rst = self.rst_seg();
-                    out.push(rst);
-                    self.fail = Some(NetError::Timeout);
-                    self.st = St::Closed;
-                    return;
-                }
-            }
             self.retransmit(out);
         }
         self.rto = (self.rto * 2).min(RTO_MAX);
@@ -513,7 +513,7 @@ impl Sock {
                     self.retransmit(out);
                 }
             } else if t.data.is_empty() && t.flags & FIN == 0 && same_wnd && self.snd_nxt != self.snd_una {
-                self.dup += 1;
+                self.dup = self.dup.saturating_add(1);
                 if self.dup == 3 {
                     self.retransmit(out);
                 }

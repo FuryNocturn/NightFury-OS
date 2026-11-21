@@ -44,6 +44,12 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/vol/ntfs.rs` | NTFS en solo lectura (MFT, índices, listas de atributos, LZNT1) | Especificación de sala limpia «ntfs» (ver abajo) |
 | `nf-core/src/vol/ext.rs` | ext2, ext3 y ext4 en solo lectura | Especificación de sala limpia «ext4» (ver abajo) |
 | `nf-core/src/vol/part.rs` (BitLocker) | Reconocer una unidad cifrada con BitLocker | Solo la firma `-FVE-FS-` del sector de arranque, según la documentación pública de libbde |
+| `kernel/src/pci.rs` (ECAM) | Configuración PCI Express por memoria | PCI Express Base Specification (espacio de configuración ampliado); ACPI Specification (tabla MCFG) |
+| `kernel/src/red/intel.rs` | Intel 82540EM, 82574L, 82576, I210/I211 e I225/I226 por sondeo | Hojas de datos públicas de Intel (82540EM, 82574L, 82576, I210, I225); I225/I226 también con la especificación de sala limpia «intel-ethernet» (ver abajo) |
+| `kernel/src/red/intel/pch.rs` | Intel I217, I218 e I219 (salida de ULP, PHY paginado, ajustes de enlace) | Especificación de sala limpia «intel-ethernet» (ver abajo) |
+| `kernel/src/red/realtek.rs` | Realtek RTL8111/8168 (revisiones 8168g/gu/h/m y 8411b), sin firmware | Especificación de sala limpia «realtek» (ver abajo) |
+| `kernel/src/red/virtio.rs` | Tarjeta de red de las máquinas virtuales | OASIS Virtual I/O Device (VIRTIO) 1.2 (PCI moderno, colas divididas, dispositivo de red) |
+| `nf-core/src/net/` | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS y cliente HTTP/1.1 | RFC 826 (ARP), 791 (IPv4), 792 (ICMP), 768 (UDP), 9293 (TCP), 6298 (temporizador de retransmisión), 2131 y 2132 (DHCP), 1035 (DNS), 9110 y 9112 (HTTP); IEEE 802.3 (trama Ethernet). Diseño propio |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
 
 ## Sala limpia en dos equipos (desde v0.11.1)
@@ -64,9 +70,14 @@ Especificaciones escritas así:
 |---|---|
 | ntfs | ntfs-3g (commit 7f0f841, GPL-2.0/LGPL-2.1); driver ntfs3 de Linux (`fs/ntfs3`, commit 65e4fd9, GPL-2.0); documentación Linux-NTFS (Russon y Fledel); Microsoft [MS-FSCC] (etiquetas de reparse y atributos) y [MS-XCA] (LZNT1); documentación pública de WOF; documento de formato de libbde (solo la firma de BitLocker) |
 | ext4 | Documentación de ext4 del kernel Linux (`Documentation/filesystems/ext4`); código de Linux `fs/ext4`, `fs/jbd2` y `fs/crypto` (commit 65e4fd9, GPL-2.0); e2fsprogs (commit 8fd7952, GPL-2.0/LGPL-2.0) |
+| intel-ethernet | Linux `drivers/net/ethernet/intel/e1000e` e `igc` (commit d0f871b, GPL-2.0); FreeBSD `sys/dev/e1000` e `igc` (commit 83c94a8, BSD-3-Clause/BSD-2-Clause) |
+| realtek | Linux `drivers/net/ethernet/realtek/r8169*` y `drivers/net/phy/realtek` (commit 4dd10fb, GPL-2.0); FreeBSD `sys/dev/re`, `sys/dev/rl` y `sys/dev/mii/rgephy.c` (commits b0c14ea y 8cbe0dd, BSD). Sin hojas de datos de Realtek |
 
 Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas con discos reales usan
 `mkfs.ext4` y `mkntfs` solo como herramientas: se ejecutan, no se lee su código.
+
+## Firmware de terceros
+La versión 0.12.0 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa

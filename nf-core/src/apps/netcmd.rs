@@ -472,10 +472,19 @@ fn clean(b: &[u8]) -> String {
 
 fn feed(line: &mut Vec<u8>, data: &[u8], out: &mut Vec<String>) {
     line.extend_from_slice(data);
-    while let Some(i) = line.iter().position(|&b| b == b'\n').or((line.len() >= MAX_LINE).then_some(MAX_LINE - 1)) {
-        let l: Vec<u8> = line.drain(..=i).collect();
-        out.push(clean(&l));
+    // un cursor y un solo `drain` al final: con muchas líneas cortas no se mueve el búfer en cada una
+    let mut start = 0;
+    loop {
+        let rest = &line[start..];
+        let end = match rest.iter().take(MAX_LINE).position(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None if rest.len() >= MAX_LINE => MAX_LINE,
+            None => break,
+        };
+        out.push(clean(&rest[..end]));
+        start += end;
     }
+    line.drain(..start);
 }
 
 fn step_curl(c: &mut Curl, sys: &mut dyn Platform, now: u64, out: &mut Vec<String>) -> bool {

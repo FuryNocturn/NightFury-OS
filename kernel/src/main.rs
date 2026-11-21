@@ -245,11 +245,15 @@ fn entropia() -> u64 {
     #[allow(unused_unsafe)]
     let has = unsafe { __cpuid(1) }.ecx & (1 << 30) != 0;
     if has {
-        let r: u64;
-        let ok: u8;
-        unsafe { core::arch::asm!("rdrand {r}", "setc {ok}", r = out(reg) r, ok = out(reg_byte) ok, options(nomem, nostack)) };
-        if ok != 0 {
-            v ^= r;
+        // hasta 10 intentos, como recomienda Intel: RDRAND puede fallar un momento si se agota
+        for _ in 0..10 {
+            let r: u64;
+            let ok: u8;
+            unsafe { core::arch::asm!("rdrand {r}", "setc {ok}", r = out(reg) r, ok = out(reg_byte) ok, options(nomem, nostack)) };
+            if ok != 0 {
+                v ^= r;
+                break;
+            }
         }
     }
     v
