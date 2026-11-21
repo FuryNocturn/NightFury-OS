@@ -22,6 +22,7 @@ use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
 use crate::net::{ConnInfo, Datagram, Ipv4, ListenId, NetApi, NetError, NetStatus, PingId, PingReply, Proto, QueryId, SockId, State, TcpState, UdpId, MAX_LISTEN, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, MAX_UDP, TCP_BUF, UDP_MAX};
+use crate::netperm::{self, Kind};
 use crate::platform::{DateTime, MemInfo, Platform};
 use crate::wire::{decode, encode, Bad, Reader, Wire, WireResult, Writer};
 use alloc::string::String;
@@ -593,9 +594,72 @@ pub struct NetOwn {
     socks: Vec<SockId>,
     udps: Vec<UdpId>,
     listens: Vec<ListenId>,
+    /// v0.12.1, programa de terceros: SHA-256 de su `.nfx` y nombre. Sin esto no tiene red.
+    id: Option<([u8; 32], String)>,
+    /// Sus permisos tal como estaban en la generación de archivos dada (se releen si cambia).
+    cache: Option<(u64, Option<bool>, Option<bool>)>,
+    /// Aviso pendiente de respuesta, y si ya está en pantalla.
+    ask: Option<Kind>,
+    shown: bool,
 }
 
 impl NetOwn {
+    /// Programa de terceros con esta identidad (`ProcApp`, al cargarlo).
+    pub fn set_program(&mut self, hash: [u8; 32], name: &str) {
+        self.id = Some((hash, String::from(name)));
+    }
+
+    /// Aviso que falta enseñar (y lo da por enseñado). `ProcApp` lo llama cuando el escritorio
+    /// tiene el hueco de diálogo libre.
+    pub fn prompt(&mut self) -> Option<(Kind, String)> {
+        let (k, (_, name)) = (self.ask?, self.id.as_ref()?);
+        if self.shown {
+            return None;
+        }
+        self.shown = true;
+        Some((k, name.clone()))
+    }
+
+    /// El usuario respondió al aviso: se guarda para todas las cuentas y se apunta en el registro.
+    pub fn answered(&mut self, sys: &mut dyn Platform, allow: bool) {
+        let (Some(k), Some((hash, name))) = (self.ask.take(), self.id.clone()) else { return };
+        self.shown = false;
+        let now = sys.now();
+        let files = sys.files();
+        let mut perms = files.net_perms();
+        netperm::record(&mut perms, hash, &name, k, allow);
+        // Aunque no se pueda guardar (disco en memoria o lleno), vale para esta vez.
+        let _ = files.set_net_perms(&perms, now);
+        let what = match k {
+            Kind::Out => "usar la red",
+            Kind::In => "aceptar conexiones",
+        };
+        files.log(&alloc::format!("Red: «{}» {} {what}", netperm::clean_name(&name), if allow { "puede" } else { "no puede" }), now);
+        let p = perms.iter().find(|p| p.hash == hash);
+        self.cache = Some((files.generation(), p.and_then(|p| p.out), p.and_then(|p| p.inn)));
+    }
+
+    /// ¿Puede el programa hacer algo de tipo `k`? Sin respuesta todavía, pide el aviso (`Pending`).
+    fn check(&mut self, sys: &mut dyn Platform, k: Kind) -> Result<(), NetError> {
+        let Some((hash, _)) = self.id.as_ref() else { return Err(NetError::NoAdapter) };
+        let generation = sys.files().generation();
+        if self.cache.is_none_or(|c| c.0 != generation) {
+            let p = sys.files().net_perms().into_iter().find(|p| p.hash == *hash);
+            self.cache = Some((generation, p.as_ref().and_then(|p| p.out), p.as_ref().and_then(|p| p.inn)));
+        }
+        let (_, out, inn) = self.cache.unwrap_or_default();
+        match if k == Kind::Out { out } else { inn } {
+            Some(true) => Ok(()),
+            Some(false) => Err(NetError::Denied),
+            None => {
+                if self.ask.is_none() {
+                    self.ask = Some(k);
+                }
+                Err(NetError::Pending)
+            }
+        }
+    }
+
     /// El programa se va: corta sus conexiones y recoge sus pings y consultas (los que siguen en
     /// marcha vencen solos por plazo y la pila los borra poco después).
     pub fn release(&mut self, sys: &mut dyn Platform) {
@@ -616,13 +680,31 @@ impl NetOwn {
                 net.tcp_unlisten(l);
             }
         }
-        *self = NetOwn::default();
+        self.pings.clear();
+        self.queries.clear();
+        self.socks.clear();
+        self.udps.clear();
+        self.listens.clear();
     }
 }
 
-/// Lo que ve quien no tiene red (programa de terceros o equipo sin pila): no hay tarjeta.
+/// Qué permiso necesita una llamada de red de un programa de terceros (`None`: ninguno, porque solo
+/// lee el estado o trabaja con identificadores que ya abrió con permiso).
+fn needs(call: &Call) -> Option<Kind> {
+    match call {
+        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::UdpSend { .. } | Call::UdpBind { port: 0 } => Some(Kind::Out),
+        Call::UdpBind { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => Some(Kind::In),
+        _ => None,
+    }
+}
+
+/// Lo que ve quien no tiene red (equipo sin pila o programa sin identidad): no hay tarjeta.
 fn no_net(call: &Call) -> Vec<u8> {
-    let e = NetError::NoAdapter;
+    net_err(call, NetError::NoAdapter)
+}
+
+/// La respuesta de `call` cuando falla con `e`.
+fn net_err(call: &Call, e: NetError) -> Vec<u8> {
     match call {
         Call::NetStatus => encode(&no_status()),
         Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
@@ -839,8 +921,27 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         DriveResult => gate(system, None, || sys.files().drive_result()),
         NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
-            // En esta versión solo los programas del sistema usan la red (los de terceros, con permiso, en v0.12.1).
-            match if system { sys.net() } else { None } {
+            if !system {
+                if own.id.is_none() {
+                    return no_net(&call);
+                }
+                // Los puertos de menos de 1024 son del sistema, como en otros sistemas.
+                if let UdpBind { port } | TcpListen { port } = call {
+                    if (1..1024).contains(&port) {
+                        return net_err(&call, NetError::InUse);
+                    }
+                }
+                if let Some(k) = needs(&call) {
+                    if let Err(e) = own.check(sys, k) {
+                        return net_err(&call, e);
+                    }
+                }
+            }
+            match sys.net() {
+                // `renew` cambia la red de todo el equipo: solo el sistema. La MAC identifica el equipo:
+                // un programa de terceros no la ve.
+                Some(_) if !system && matches!(call, NetRenew) => encode(&()),
+                Some(net) if !system && matches!(call, NetStatus) => encode(&crate::net::NetStatus { mac: [0; 6], ..net.status() }),
                 Some(net) => net_run(net, call, own),
                 None => no_net(&call),
             }
@@ -1768,6 +1869,47 @@ pub(crate) mod tests {
         let (_real, mut p) = prog(true);
         assert_eq!(p.net.status().state, State::NoAdapter);
         assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::NoAdapter));
+    }
+
+    #[test]
+    fn red_de_terceros_con_aviso_que_se_recuerda() {
+        let (real, mut p, mut lan) = con_lan(false);
+        p.own.borrow_mut().set_program([7; 32], "Mensajes");
+        // El estado se ve sin preguntar, pero sin la MAC; renovar no hace nada.
+        let st = p.net.status();
+        assert_eq!((st.state, st.mac), (State::Connected, [0; 6]));
+        // Primera vez: aviso de «usar la red», una sola vez aunque insista.
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Pending));
+        assert_eq!(p.net.resolve("ejemplo.com"), Err(NetError::Pending));
+        assert_eq!(p.own.borrow_mut().prompt(), Some((Kind::Out, s("Mensajes"))));
+        assert_eq!(p.own.borrow_mut().prompt(), None, "ya en pantalla");
+        p.own.borrow_mut().answered(&mut *real.borrow_mut(), true);
+        let sk = p.net.tcp_connect(SRV, 80).unwrap();
+        corre(&real, &mut lan, 200);
+        assert_eq!(p.net.tcp_state(sk), TcpState::Open);
+        // Escuchar es otro permiso; los puertos bajos no se dan; se dice que no y se recuerda.
+        assert_eq!(p.net.tcp_listen(80), Err(NetError::InUse));
+        assert_eq!(p.net.udp_bind(5000), Err(NetError::Pending));
+        assert_eq!(p.own.borrow_mut().prompt(), Some((Kind::In, s("Mensajes"))));
+        p.own.borrow_mut().answered(&mut *real.borrow_mut(), false);
+        assert_eq!(p.net.tcp_listen(5000), Err(NetError::Denied));
+        // Guardado para todas las cuentas y en el registro.
+        let perms = real.borrow_mut().files().net_perms();
+        assert_eq!(perms, vec![netperm::Perm { hash: [7; 32], name: s("Mensajes"), out: Some(true), inn: Some(false) }]);
+        let log = real.borrow_mut().files().read(crate::files::LOG_FILE).unwrap();
+        assert!(String::from_utf8_lossy(&log).contains("Red: «Mensajes» puede usar la red"));
+        // Otra ventana del mismo programa ya no pregunta; uno con otro contenido, sí.
+        let mut b = otro(&real, false);
+        b.0.own.borrow_mut().set_program([7; 32], "Mensajes");
+        assert!(b.tcp_connect(SRV, 80).is_ok());
+        let mut c = otro(&real, false);
+        c.0.own.borrow_mut().set_program([8; 32], "Mensajes");
+        assert_eq!(c.tcp_connect(SRV, 80), Err(NetError::Pending));
+        // Quitado en Configuración: lo nuevo se niega.
+        let mut perms = real.borrow_mut().files().net_perms();
+        perms[0].out = Some(false);
+        real.borrow_mut().files().set_net_perms(&perms, NOW).unwrap();
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Denied));
     }
 
     #[test]

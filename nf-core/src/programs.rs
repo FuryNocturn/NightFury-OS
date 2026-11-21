@@ -139,8 +139,11 @@ pub fn open(sys: &mut dyn Platform, p: &Program, path: &str) -> Result<ProcApp, 
     let data = fs.read(path).map_err(fs_msg)?;
     // Del binario y no de la marca `.sistema`, que cualquiera con permisos puede crear.
     let system = sys.is_system_binary(&data);
+    let hash = crate::crypto::sha256(&data);
     let proc = sys.spawn(&data, &p.name)?;
-    Ok(ProcApp::new(proc, &p.name, Some(p.icon), system))
+    let mut app = ProcApp::new(proc, &p.name, Some(p.icon), system);
+    app.set_net_identity(hash);
+    Ok(app)
 }
 
 /// Programa instalado que abre los archivos con la extensión de `path` (`abre=` de su `app.txt`).

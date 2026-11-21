@@ -1509,6 +1509,20 @@ impl Files {
         let _ = self.fs.write(rel(LOG_FILE), &data, now);
     }
 
+    /// v0.12.1: permisos de red de los programas (`netperm`). Los lee y escribe el sistema (aviso y
+    /// Configuración) sin pasar por los permisos de la cuenta; los programas no llegan aquí.
+    pub fn net_perms(&mut self) -> Vec<crate::netperm::Perm> {
+        crate::netperm::parse(&self.fs.read(rel(crate::netperm::PERMS_FILE)).unwrap_or_default())
+    }
+    pub fn set_net_perms(&mut self, perms: &[crate::netperm::Perm], now: DateTime) -> Result<(), FsError> {
+        mk(&mut self.fs, rel(SYS_CONFIG_DIR), now);
+        let r = self.fs.write(rel(crate::netperm::PERMS_FILE), &crate::netperm::render(perms), now);
+        if r.is_ok() {
+            self.generation += 1;
+        }
+        r
+    }
+
     /// Al montar un disco: estructura, migración pendiente y limpieza. Nunca falla hacia fuera;
     /// lo que no pueda hacer ahora lo reintenta el siguiente arranque.
     fn startup(&mut self, now: DateTime) {
