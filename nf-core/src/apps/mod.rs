@@ -160,6 +160,8 @@ pub trait App {
     fn request_close(&mut self, _cx: &mut Ctx) -> bool {
         true
     }
+    /// La ventana se quita del escritorio: libera lo que tenga en el sistema (sockets y consultas de red).
+    fn release(&mut self, _sys: &mut dyn Platform) {}
 }
 
 /// Tamaño inicial del área de contenido de cada app.

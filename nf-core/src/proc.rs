@@ -18,7 +18,7 @@ use crate::icons::Icon;
 use crate::input::KeyEvent;
 use crate::platform::{DateTime, Platform};
 use crate::request::Request;
-use crate::service::serve;
+use crate::service::{serve, NetOwn};
 use crate::surface::{blend, Surface};
 use crate::theme::Theme;
 use crate::wire::{decode, encode};
@@ -527,6 +527,8 @@ pub struct ProcApp {
     /// Es uno de los programas que trae el sistema (`Platform::is_system_binary`): solo ellos
     /// pueden usar las llamadas de cuentas, claves, cifrado, reiniciar y apagar de `SERVICE`.
     system: bool,
+    /// Lo que el programa tiene abierto en la pila de red; se libera al quitar la ventana (`release`).
+    net_own: NetOwn,
 }
 
 /// Cuánto espera `drag_over`/`drag_source` la respuesta del programa, y cuántas veces como mucho
@@ -556,6 +558,7 @@ impl ProcApp {
             src_ans: None,
             last_over: false,
             system,
+            net_own: NetOwn::default(),
         }
     }
 
@@ -663,7 +666,7 @@ impl ProcApp {
         let t0 = cx.sys.uptime_ms();
         while self.proc.state().status == Status::Alive {
             let Some(req) = self.proc.state().service.take() else { break };
-            let mut r = serve(cx.sys, &req, self.system);
+            let mut r = serve(cx.sys, &req, self.system, &mut self.net_own);
             if r.len() as u64 > SERVICE_MAX {
                 r = vec![1];
             }
@@ -726,6 +729,9 @@ impl ProcApp {
 impl App for ProcApp {
     fn kind(&self) -> AppKind {
         AppKind::Program
+    }
+    fn release(&mut self, sys: &mut dyn Platform) {
+        self.net_own.release(sys);
     }
     fn title(&self) -> String {
         if self.hung {

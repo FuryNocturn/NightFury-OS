@@ -6,7 +6,7 @@ use super::terminal::tokens;
 use crate::files::resolve;
 use crate::fs::FsError;
 use crate::net::http::{parse_url, HttpEvent, HttpGet};
-use crate::net::{ip_text, mac_text, parse_ip, Ipv4, Net, NetError, NetStatus, PingId, QueryId, State, DHCP_TIMEOUT_MS};
+use crate::net::{ip_text, mac_text, parse_ip, Ipv4, NetApi, NetError, NetStatus, PingId, QueryId, State, DHCP_TIMEOUT_MS};
 use crate::platform::Platform;
 use alloc::format;
 use alloc::string::String;
@@ -24,7 +24,7 @@ const PING_EVERY_MS: u64 = 1000;
 /// `ipconfig /renew`: lo que tarda DHCP en rendirse, más un margen.
 const RENEW_MS: u64 = DHCP_TIMEOUT_MS + 2_000;
 /// Lo que `curl -o` acumula en memoria como mucho.
-const MAX_SAVE: usize = 64 << 20;
+const MAX_SAVE: usize = crate::abi::SAVE_MAX as usize;
 /// Una línea del cuerpo que no acaba nunca se parte a estos bytes.
 const MAX_LINE: usize = 4096;
 
@@ -393,7 +393,7 @@ fn stats(p: &Ping, out: &mut Vec<String>) {
     }
 }
 
-fn step_ping(p: &mut Ping, net: &mut Net, now: u64, out: &mut Vec<String>) -> bool {
+fn step_ping(p: &mut Ping, net: &mut dyn NetApi, now: u64, out: &mut Vec<String>) -> bool {
     if let Some(q) = p.q {
         match net.resolve_poll(q) {
             None => return false,
@@ -493,7 +493,7 @@ fn step_curl(c: &mut Curl, sys: &mut dyn Platform, now: u64, out: &mut Vec<Strin
             HttpEvent::Body(b) => match &mut c.save {
                 Some((_, _, data)) if data.len() + b.len() > MAX_SAVE => {
                     c.get.cancel(net);
-                    out.push(String::from("curl: el archivo es demasiado grande (más de 64 MB)"));
+                    out.push(String::from("curl: el archivo es demasiado grande (más de 32 MB)"));
                     return true;
                 }
                 Some((_, _, data)) => data.extend_from_slice(&b),

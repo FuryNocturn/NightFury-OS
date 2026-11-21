@@ -1555,4 +1555,44 @@ mod tests {
         // Una carpeta como destino se rechaza antes de descargar.
         assert_eq!(r.orden("curl -o Documentos ejemplo.com"), [FsError::IsDir.message()]);
     }
+
+    /// La Terminal como programa en modo usuario: la red le llega por `RemoteNet` + `serve`.
+    #[test]
+    fn ping_y_curl_por_el_servicio() {
+        use crate::service::tests::{prog, Prog};
+        let (real, mut p) = prog(true);
+        let mut lan = Lan::up();
+        lan.router.names.push((String::from("ejemplo.com"), vec![SRV], 300));
+        let cuerpo = "hola\nmundo\n";
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{cuerpo}", cuerpo.len());
+        lan.router.srv.listen(80, resp.as_bytes(), true, false);
+        real.borrow_mut().net = Some(core::mem::replace(&mut lan.net, Net::new([0; 32])));
+        let (mut t, mut th) = (Terminal::new(), Theme::default());
+        let mut orden = |l: &str, t: &mut Terminal, p: &mut Prog| -> Vec<String> {
+            let n = t.out.len();
+            for c in l.chars().map(|c| ev(Key::Char(c), Some(c))).chain([ev(Key::Enter, Some('\n'))]) {
+                t.key(&c, &mut Ctx::new(p, &mut th, lan.now));
+            }
+            for _ in 0..3000 {
+                if t.job.is_none() {
+                    return t.out[n + 1..].to_vec();
+                }
+                lan.now += 20;
+                {
+                    let mut r = real.borrow_mut();
+                    let net = r.net.as_mut().unwrap();
+                    core::mem::swap(&mut lan.net, net);
+                    lan.pump();
+                    core::mem::swap(&mut lan.net, net);
+                }
+                t.tick(&mut Ctx::new(p, &mut th, lan.now));
+            }
+            panic!("la orden no termina: {:?}", &t.out[n..]);
+        };
+        let o = orden("ping -n 1 ejemplo.com", &mut t, &mut p);
+        assert!(o.iter().any(|l| l.starts_with("Respuesta desde 93.184.216.34")), "{o:?}");
+        assert_eq!(orden("curl http://ejemplo.com/", &mut t, &mut p), ["hola", "mundo"]);
+        assert_eq!(orden("nslookup ejemplo.com", &mut t, &mut p)[3], "Dirección: 93.184.216.34");
+        assert_eq!(orden("ipconfig", &mut t, &mut p)[4], "   Dirección IPv4. . . . . . . . . . . . . . : 192.168.1.50");
+    }
 }
