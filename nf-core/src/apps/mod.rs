@@ -22,6 +22,8 @@ mod explorer;
 #[cfg(not(feature = "apps"))]
 mod missing;
 #[cfg(feature = "apps")]
+mod netcmd;
+#[cfg(feature = "apps")]
 mod notepad;
 #[cfg(feature = "apps")]
 mod settings;
@@ -72,6 +74,9 @@ pub enum MouseEv {
 pub struct DragRequest {
     pub paths: Vec<String>,
 }
+
+/// Ruta especial para `App::open_path` de Configuración: abre la página Red.
+pub const NET_PAGE: &str = "red";
 
 /// Lo que una app puede usar y pedir al atender un evento. Se crea con `Ctx::new`.
 /// Los archivos se usan con `cx.sys.files()`.

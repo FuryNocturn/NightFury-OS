@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Terminal: consola de órdenes del sistema. CONTRATO: `pub fn new() -> Box<dyn App>`.
+use super::netcmd::{self, Job, NetCmd};
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::font;
 use crate::geom::Rect;
@@ -35,6 +36,8 @@ enum Action {
     Close,
     /// Abrir esta ruta (un programa `.nfx`) con el escritorio.
     Open(String),
+    /// Orden de red: el Terminal la empieza y `tick` la avanza.
+    Net(NetCmd),
 }
 
 fn prompt(cwd: &str) -> String {
@@ -77,7 +80,7 @@ fn first_token(s: &str) -> Option<(String, &str)> {
     Some((tok, ""))
 }
 
-fn tokens(s: &str) -> Vec<String> {
+pub(super) fn tokens(s: &str) -> Vec<String> {
     let (mut v, mut r) = (Vec::new(), s);
     while let Some((t, rest)) = first_token(r) {
         v.push(t);
@@ -253,6 +256,7 @@ fn modifies_system(line: &str, sys: &mut dyn Platform, cwd: &str) -> bool {
         "copiar" | "mover" => a.into_iter().take(2).collect(),
         "borrar" => a.into_iter().filter(|t| !t.eq_ignore_ascii_case("/todo")).take(1).collect(),
         "escribir" => first_token(args).map(|t| t.0).into_iter().collect(),
+        "curl" => a.iter().position(|t| t == "-o").and_then(|i| a.get(i + 1)).cloned().into_iter().collect(),
         _ => Vec::new(),
     };
     paths.iter().any(|p| resolve(cwd, p).is_ok_and(|p| in_system(&p)))
@@ -299,6 +303,11 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
             "Programas:",
             "  programas: Lista los programas instalados",
             "  ejecutar nombre|ruta.nfx: Abre un programa",
+            "Red:",
+            "  ping [-n N] [-t] destino: Comprueba si un equipo responde (-t sin parar; Ctrl+C corta)",
+            "  ipconfig [/all|/renew]: Muestra o renueva la dirección IP",
+            "  nslookup host: Busca la dirección de un nombre",
+            "  curl [-o nombre] [-I] [-L] URL: Descarga una página (-I cabeceras, -L redirecciones)",
             "Modificar algo dentro de C:\\Sistema pide confirmación: escribe si para continuar.",
         ]
         .iter()
@@ -367,6 +376,13 @@ fn run(line: &str, sys: &mut dyn Platform, cwd: &mut String) -> (Vec<String>, Ac
                 _ => one(format!("No hay ningún programa llamado '{name}'")),
             }
         }
+        "ping" | "ipconfig" | "nslookup" | "curl" => match netcmd::parse(&lc, args, cwd, sys) {
+            Ok(c) => {
+                act = Action::Net(c);
+                Vec::new()
+            }
+            Err(v) => v,
+        },
         _ => match archivos(&lc, args, sys, cwd) {
             Some(v) => v,
             None => one(format!("'{}' no es una orden conocida. Escribe 'ayuda'.", cmd)),
@@ -413,6 +429,8 @@ pub struct Terminal {
     focused: bool,
     t0: u64,
     shown: bool,
+    /// Orden de red en marcha: mientras dura, el teclado solo atiende Ctrl+C.
+    job: Option<Job>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -437,6 +455,7 @@ impl Terminal {
             focused: false,
             t0: 0,
             shown: true,
+            job: None,
         };
         t.push(format!("{} {}", NAME, VERSION));
         t.push(String::from("Escribe 'ayuda' para ver las órdenes."));
@@ -469,7 +488,18 @@ impl Terminal {
         }
     }
 
-    fn submit(&mut self, sys: &mut dyn Platform) -> Action {
+    /// Si la orden era de red, la empieza (lo que escriba de inmediato va a la pantalla).
+    fn net_job(&mut self, act: Action, sys: &mut dyn Platform, now: u64) -> Action {
+        let Action::Net(cmd) = act else { return act };
+        let mut out = Vec::new();
+        self.job = Job::start(cmd, sys, now, &mut out);
+        for l in out {
+            self.push(l);
+        }
+        Action::Nothing
+    }
+
+    fn submit(&mut self, sys: &mut dyn Platform, now: u64) -> Action {
         self.ready(sys);
         let line = core::mem::take(&mut self.input);
         self.push(format!("{}{}", prompt(&self.cwd), line));
@@ -485,7 +515,7 @@ impl Terminal {
             for l in lines {
                 self.push(l);
             }
-            return act;
+            return self.net_job(act, sys, now);
         }
         if !cmd.is_empty() && self.history.last().map(String::as_str) != Some(cmd) {
             self.history.push(cmd.to_string());
@@ -503,7 +533,7 @@ impl Terminal {
         for l in lines {
             self.push(l);
         }
-        act
+        self.net_job(act, sys, now)
     }
 }
 
@@ -541,7 +571,8 @@ impl App for Terminal {
             for l in &self.out {
                 rows.extend(wrap(l, max_w));
             }
-            let input_rows = wrap(&format!("{}{} ", prompt(&self.cwd), self.input), max_w);
+            // Con una orden de red en marcha no hay indicador ni cursor.
+            let input_rows = if self.job.is_some() { Vec::new() } else { wrap(&format!("{}{} ", prompt(&self.cwd), self.input), max_w) };
             let n_input = input_rows.len();
             rows.extend(input_rows);
             if sbw > 0 || rows.len() <= self.vis {
@@ -576,12 +607,26 @@ impl App for Terminal {
     }
 
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
+        if self.job.is_some() && !matches!(ev.key, Key::PageUp | Key::PageDown) {
+            if ev.ctrl && ev.key == Key::Char('c') {
+                let mut out = Vec::new();
+                if let Some(mut j) = self.job.take() {
+                    j.cancel(&mut *cx.sys, &mut out);
+                }
+                for l in out {
+                    self.push(l);
+                }
+                self.scroll = 0;
+                cx.redraw = true;
+            }
+            return;
+        }
         match ev.key {
             Key::PageUp => self.scroll = (self.scroll + self.vis.saturating_sub(1).max(1)).min(self.max_scroll),
             Key::PageDown => self.scroll = self.scroll.saturating_sub(self.vis.saturating_sub(1).max(1)),
             Key::Enter => {
                 self.scroll = 0;
-                match self.submit(&mut *cx.sys) {
+                match self.submit(&mut *cx.sys, cx.now_ms) {
                     Action::Close => cx.close = true,
                     Action::Open(p) => cx.open = Some(p),
                     _ => {}
@@ -644,6 +689,20 @@ impl App for Terminal {
     }
 
     fn tick(&mut self, cx: &mut Ctx) {
+        if let Some(mut job) = self.job.take() {
+            let mut out = Vec::new();
+            let done = job.step(&mut *cx.sys, cx.now_ms, &mut out);
+            if !done {
+                self.job = Some(job);
+            }
+            if done || !out.is_empty() {
+                for l in out {
+                    self.push(l);
+                }
+                self.scroll = 0;
+                cx.redraw = true;
+            }
+        }
         if let Some(p) = self.sb.tick(&self.metrics(), cx.now_ms) {
             self.scroll = self.max_scroll.saturating_sub(p as usize);
             cx.redraw = true;
@@ -1222,5 +1281,278 @@ mod tests {
             t.tick(cx);
             assert!(cx.redraw && !t.shown);
         });
+    }
+
+    // ---- órdenes de red (Lan: el router simulado de la pila) ----
+
+    use crate::net::tests::{Lan, SRV};
+    use crate::net::Net;
+
+    struct Red {
+        t: Terminal,
+        sys: TestPlatform,
+        lan: Lan,
+        th: Theme,
+    }
+
+    impl Red {
+        fn new(lan: Lan) -> Red {
+            Red::con(TestPlatform::default(), lan)
+        }
+        /// La pila vive en la plataforma; `lan` guarda una vacía y la toma prestada en cada paso.
+        fn con(mut sys: TestPlatform, mut lan: Lan) -> Red {
+            let mut net = Net::new([0; 32]);
+            core::mem::swap(&mut lan.net, &mut net);
+            sys.net = Some(net);
+            Red { t: Terminal::new(), sys, lan, th: Theme::default() }
+        }
+        fn paso(&mut self) {
+            core::mem::swap(&mut self.lan.net, self.sys.net.as_mut().unwrap());
+            self.lan.pump();
+            core::mem::swap(&mut self.lan.net, self.sys.net.as_mut().unwrap());
+            let mut cx = Ctx::new(&mut self.sys, &mut self.th, self.lan.now);
+            self.t.tick(&mut cx);
+        }
+        fn corre(&mut self, ms: u64) {
+            for _ in 0..ms / 20 {
+                self.lan.now += 20;
+                self.paso();
+            }
+        }
+        fn tecla(&mut self, e: KeyEvent) {
+            let mut cx = Ctx::new(&mut self.sys, &mut self.th, self.lan.now);
+            self.t.key(&e, &mut cx);
+        }
+        fn ctrl_c(&mut self) {
+            self.tecla(KeyEvent { key: Key::Char('c'), ch: None, down: true, shift: false, ctrl: true, alt: false });
+        }
+        /// Escribe la orden y pulsa Intro.
+        fn lanza(&mut self, l: &str) {
+            for c in l.chars() {
+                self.tecla(ev(Key::Char(c), Some(c)));
+            }
+            self.tecla(ev(Key::Enter, Some('\n')));
+        }
+        /// Escribe la orden, espera a que acabe y devuelve lo que salió (sin la línea de la orden).
+        fn orden(&mut self, l: &str) -> Vec<String> {
+            let n = self.t.out.len();
+            self.lanza(l);
+            for _ in 0..3000 {
+                if self.t.job.is_none() {
+                    return self.t.out[n + 1..].to_vec();
+                }
+                self.corre(20);
+            }
+            panic!("la orden no termina: {:?}", &self.t.out[n..]);
+        }
+    }
+
+    fn con_red() -> Red {
+        let mut lan = Lan::up();
+        lan.router.names.push((String::from("ejemplo.com"), vec![SRV], 300));
+        Red::new(lan)
+    }
+
+    #[test]
+    fn ipconfig_con_y_sin_cable() {
+        let mut r = con_red();
+        assert_eq!(
+            r.orden("ipconfig"),
+            [
+                "Configuración IP de NightFury",
+                "",
+                "Adaptador de Ethernet Ethernet:",
+                "",
+                "   Dirección IPv4. . . . . . . . . . . . . . : 192.168.1.50",
+                "   Máscara de subred . . . . . . . . . . . . : 255.255.255.0",
+                "   Puerta de enlace predeterminada . . . . . : 192.168.1.1",
+            ]
+        );
+        let all = r.orden("ipconfig /all");
+        assert_eq!(all[4], "   Descripción . . . . . . . . . . . . . . . : Prueba");
+        assert_eq!(all[5], "   Dirección física. . . . . . . . . . . . . : 02-00-00-00-00-01");
+        assert_eq!(all[6], "   DHCP habilitado . . . . . . . . . . . . . : sí");
+        assert_eq!(all[7], "   Velocidad . . . . . . . . . . . . . . . . : 1 Gb/s, dúplex completo");
+        assert_eq!(all[8], "   Dirección IPv4. . . . . . . . . . . . . . : 192.168.1.50");
+        assert_eq!(all[11], "   Servidor DHCP . . . . . . . . . . . . . . : 192.168.1.1");
+        assert!(all[12].starts_with("   Concesión") && (all[12].ends_with(" h 59 min") || all[12].ends_with(" h 0 min")), "{:?}", all[12]);
+        assert_eq!(all[13], "   Servidores DNS. . . . . . . . . . . . . . : 192.168.1.1");
+        assert_eq!(all[14], format!("{:47}192.168.1.2", ""));
+        assert_eq!(r.orden("ipconfig /x"), ["Uso: ipconfig [/all | /renew]"]);
+        // Sin cable.
+        r.lan.wire.borrow_mut().link = None;
+        r.corre(100);
+        let s = r.orden("ipconfig");
+        assert_eq!(s[4], "   Estado de los medios. . . . . . . . . . . : medios desconectados");
+        assert_eq!(s.len(), 5);
+        assert!(r.orden("ipconfig /all").iter().all(|l| !l.contains("IPv4") && !l.contains("Velocidad")));
+        assert_eq!(r.orden("ping 93.184.216.34"), ["El cable de red está desconectado."]);
+        assert_eq!(r.orden("ipconfig /renew"), ["El cable de red está desconectado."]);
+    }
+
+    #[test]
+    fn sin_tarjeta_y_sin_direccion() {
+        con_cx(|cx| {
+            let mut t = Terminal::new();
+            for o in ["ping 1.1.1.1", "ipconfig", "nslookup a.org", "curl http://a.org/"] {
+                assert_eq!(teclea(&mut t, cx, o), ["No hay ninguna tarjeta de red."], "{o}");
+            }
+        });
+        let mut lan = Lan::new();
+        lan.router.dhcp_on = false;
+        let mut r = Red::new(lan);
+        r.corre(100);
+        assert_eq!(r.orden("ping 1.1.1.1"), ["Todavía no hay dirección IP."]);
+        assert_eq!(r.orden("nslookup a.org"), ["Todavía no hay dirección IP."]);
+        assert_eq!(r.orden("ipconfig")[4], "   Pidiendo dirección…");
+    }
+
+    #[test]
+    fn renovar_la_direccion() {
+        let mut r = con_red();
+        let lineas = r.orden("ipconfig");
+        r.lanza("ipconfig /renew");
+        assert!(r.t.job.is_some(), "espera mientras se configura");
+        let n = r.t.out.len();
+        for _ in 0..3000 {
+            if r.t.job.is_none() {
+                break;
+            }
+            r.corre(20);
+        }
+        assert_eq!(r.t.out[n..], lineas);
+        // Sin servidor DHCP: se rinde.
+        r.lan.router.dhcp_on = false;
+        assert_eq!(r.orden("ipconfig /renew"), ["No se pudo renovar la dirección."]);
+    }
+
+    #[test]
+    fn ping_con_respuestas_y_con_tiempo_agotado() {
+        let mut r = con_red();
+        let t0 = r.lan.now;
+        let o = r.orden("ping 93.184.216.34");
+        assert!(r.lan.now - t0 >= 3000, "uno por segundo");
+        assert_eq!(o[0], "Haciendo ping a 93.184.216.34 con 32 bytes de datos:");
+        for l in &o[1..5] {
+            assert!(l.starts_with("Respuesta desde 93.184.216.34: bytes=32 tiempo") && l.ends_with("TTL=64"), "{l}");
+        }
+        assert_eq!(o[5], "");
+        assert_eq!(o[6], "Estadísticas de ping para 93.184.216.34:");
+        assert_eq!(o[7], "    Paquetes: enviados = 4, recibidos = 4, perdidos = 0");
+        assert_eq!(o[8], "    (0% perdidos),");
+        assert_eq!(o[9], "Tiempos aproximados de ida y vuelta en milisegundos:");
+        assert!(o[10].starts_with("    Mínimo = ") && o[10].contains("Máximo = ") && o[10].contains("Media = "));
+        // Por nombre, con -n.
+        let o = r.orden("ping -n 1 ejemplo.com");
+        assert_eq!(o[0], "Haciendo ping a ejemplo.com [93.184.216.34] con 32 bytes de datos:");
+        assert!(o[1].starts_with("Respuesta desde 93.184.216.34") && o[4].contains("enviados = 1, recibidos = 1"));
+        // Nadie contesta.
+        let o = r.orden("ping -n 1 8.8.8.8");
+        assert_eq!(o[1], "Tiempo de espera agotado para esta solicitud.");
+        assert_eq!(o[4], "    Paquetes: enviados = 1, recibidos = 0, perdidos = 1");
+        assert_eq!(o[5], "    (100% perdidos),");
+        assert_eq!(o.len(), 6, "sin recibidos no hay bloque de tiempos");
+        // Destino inaccesible.
+        r.lan.router.unreach.push([10, 9, 9, 9]);
+        let o = r.orden("ping -n 1 10.9.9.9");
+        assert_eq!(o[1], "Respuesta desde 192.168.1.1: Host de destino inaccesible.");
+        // Nombre que no existe y opciones mal puestas.
+        assert_eq!(r.orden("ping noexiste.invalid"), ["La solicitud de ping no pudo encontrar el host noexiste.invalid. Compruebe el nombre y vuelva a intentarlo."]);
+        for o in ["ping", "ping -n", "ping -n 0 a", "ping -n x a", "ping -z a", "ping a b"] {
+            assert_eq!(r.orden(o), ["Uso: ping [-n N] [-t] destino"], "{o}");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_corta_un_ping_sin_fin() {
+        let mut r = con_red();
+        let n = r.t.out.len();
+        r.lanza("ping -t 93.184.216.34");
+        r.corre(2500);
+        assert!(r.t.job.is_some());
+        // Mientras dura, el teclado no escribe.
+        r.tecla(ev(Key::Char('x'), Some('x')));
+        assert!(r.t.input.is_empty());
+        r.ctrl_c();
+        assert!(r.t.job.is_none());
+        let o = &r.t.out[n + 1..];
+        let k = o.len();
+        assert_eq!((o[k - 2].as_str(), o[k - 1].as_str()), ("Control-C", "^C"));
+        assert!(o.iter().any(|l| l == "Estadísticas de ping para 93.184.216.34:"));
+        assert!(o.iter().filter(|l| l.starts_with("Respuesta desde")).count() >= 3);
+        // Vuelve el indicador y se puede escribir.
+        r.tecla(ev(Key::Char('y'), Some('y')));
+        assert_eq!(r.t.input, "y");
+        // La orden no se queda corriendo.
+        let n = r.t.out.len();
+        r.corre(3000);
+        assert_eq!(r.t.out.len(), n);
+    }
+
+    #[test]
+    fn nslookup_resuelve_y_cuenta_los_fallos() {
+        let mut r = con_red();
+        r.lan.router.names.push((String::from("multi.org"), vec![SRV, [93, 184, 216, 35]], 300));
+        assert_eq!(r.orden("nslookup ejemplo.com"), ["Servidor:  192.168.1.1", "", "Nombre:    ejemplo.com", "Dirección: 93.184.216.34"]);
+        assert_eq!(r.orden("nslookup multi.org")[3..], ["Direcciones: 93.184.216.34", "             93.184.216.35"]);
+        assert_eq!(r.orden("nslookup 1.2.3.4")[2..], ["Nombre:    1.2.3.4", "Dirección: 1.2.3.4"]);
+        assert_eq!(r.orden("nslookup ejemplo.invalid"), ["*** 192.168.1.1 no encuentra ejemplo.invalid: el dominio no existe"]);
+        assert_eq!(r.orden("nslookup"), ["Uso: nslookup host"]);
+        r.lan.router.dns_hook = Some(Box::new(|_, _, _| Vec::new()));
+        assert_eq!(r.orden("nslookup otro.org"), ["*** Se agotó el tiempo de espera de la solicitud a 192.168.1.1"]);
+    }
+
+    #[test]
+    fn curl_cuerpo_cabeceras_y_guardado() {
+        let mut r = con_red();
+        let cuerpo = "hola\nmundo\u{1}\tx\n";
+        let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{cuerpo}", cuerpo.len());
+        r.lan.router.srv.listen(80, resp.as_bytes(), true, false);
+        assert_eq!(r.orden("curl http://ejemplo.com/"), ["hola", "mundo.    x"]);
+        assert_eq!(r.orden("curl -L ejemplo.com"), ["hola", "mundo.    x"]);
+        assert_eq!(r.orden("curl -I http://ejemplo.com/"), ["HTTP/1.1 200 OK", "Content-Type: text/plain", &format!("Content-Length: {}", cuerpo.len())]);
+        assert_eq!(r.orden("curl -o pagina.txt http://ejemplo.com/"), [format!("Guardado pagina.txt ({} bytes)", cuerpo.len())]);
+        assert_eq!(r.sys.fs().read(&h("pagina.txt")).unwrap(), cuerpo.as_bytes());
+        // HTTPS, URL mala, errores de conexión y de uso.
+        assert_eq!(r.orden("curl https://ejemplo.com/"), ["HTTPS llega en una versión próxima"]);
+        assert_eq!(r.orden("curl http://"), ["curl: (3) URL no válida"]);
+        assert_eq!(r.orden("curl http://noexiste.invalid/"), ["curl: (6) No se pudo resolver el host: noexiste.invalid"]);
+        assert_eq!(r.orden("curl http://ejemplo.com:81/"), ["curl: (7) No se pudo conectar con ejemplo.com puerto 81"]);
+        for o in ["curl", "curl -o", "curl -x a", "curl a b", "curl -I -o f a"] {
+            let l = r.orden(o);
+            assert!(l[0].starts_with("Uso: curl") || l[0].starts_with("curl: -I"), "{o}");
+        }
+        // Ctrl+C mientras conecta.
+        r.lan.router.srv.ignore_syn = u32::MAX;
+        let n = r.t.out.len();
+        r.lanza("curl http://ejemplo.com/");
+        r.corre(500);
+        assert!(r.t.job.is_some());
+        r.ctrl_c();
+        assert!(r.t.job.is_none() && r.t.out[n + 1..] == ["^C"]);
+    }
+
+    #[test]
+    fn curl_cuerpo_con_fallo_a_medias() {
+        let mut r = con_red();
+        // Promete más de lo que envía y corta: error de respuesta incompleta, con lo recibido ya escrito.
+        r.lan.router.srv.listen(80, b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nuna linea\nsin fin", true, false);
+        let o = r.orden("curl ejemplo.com");
+        assert_eq!(o[0], "una linea");
+        assert!(o[1] == "sin fin" && o[2].starts_with("curl: (8) Respuesta no válida"), "{o:?}");
+    }
+
+    #[test]
+    fn curl_a_sistema_pide_confirmacion() {
+        let mut lan = Lan::up();
+        lan.router.names.push((String::from("ejemplo.com"), vec![SRV], 300));
+        lan.router.srv.listen(80, b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", true, false);
+        let mut r = Red::con(con_disco("Ana"), lan);
+        assert_eq!(r.orden("curl -o C:\\Sistema\\temp\\x.bin ejemplo.com"), [CONFIRM]);
+        assert!(!r.sys.fs().exists("C:\\Sistema\\temp\\x.bin"));
+        assert_eq!(r.orden("si"), ["Guardado C:\\Sistema\\temp\\x.bin (3 bytes)"]);
+        assert_eq!(r.sys.fs().read("C:\\Sistema\\temp\\x.bin").unwrap(), b"abc");
+        // Una carpeta como destino se rechaza antes de descargar.
+        assert_eq!(r.orden("curl -o Documentos ejemplo.com"), [FsError::IsDir.message()]);
     }
 }
