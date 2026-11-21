@@ -396,6 +396,62 @@ impl Net {
     }
 }
 
+/// Lo que las apps usan de la pila. La implementa `Net` (el sistema) y `RemoteNet` (un programa en
+/// modo usuario, que lo pide al sistema por `SERVICE`). Mismas reglas que los métodos de `Net`.
+pub trait NetApi {
+    fn status(&mut self) -> NetStatus;
+    fn renew(&mut self);
+    fn ping(&mut self, dst: Ipv4, bytes: u16, ttl: u8) -> Result<PingId, NetError>;
+    fn ping_poll(&mut self, id: PingId) -> Option<Result<PingReply, NetError>>;
+    fn resolve(&mut self, name: &str) -> Result<QueryId, NetError>;
+    fn resolve_poll(&mut self, id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>>;
+    fn tcp_connect(&mut self, dst: Ipv4, port: u16) -> Result<SockId, NetError>;
+    fn tcp_state(&mut self, s: SockId) -> TcpState;
+    fn tcp_send(&mut self, s: SockId, data: &[u8]) -> Result<usize, NetError>;
+    fn tcp_recv(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError>;
+    fn tcp_close(&mut self, s: SockId);
+    fn tcp_abort(&mut self, s: SockId);
+}
+
+impl NetApi for Net {
+    fn status(&mut self) -> NetStatus {
+        Net::status(self)
+    }
+    fn renew(&mut self) {
+        Net::renew(self)
+    }
+    fn ping(&mut self, dst: Ipv4, bytes: u16, ttl: u8) -> Result<PingId, NetError> {
+        Net::ping(self, dst, bytes, ttl)
+    }
+    fn ping_poll(&mut self, id: PingId) -> Option<Result<PingReply, NetError>> {
+        Net::ping_poll(self, id)
+    }
+    fn resolve(&mut self, name: &str) -> Result<QueryId, NetError> {
+        Net::resolve(self, name)
+    }
+    fn resolve_poll(&mut self, id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>> {
+        Net::resolve_poll(self, id)
+    }
+    fn tcp_connect(&mut self, dst: Ipv4, port: u16) -> Result<SockId, NetError> {
+        Net::tcp_connect(self, dst, port)
+    }
+    fn tcp_state(&mut self, s: SockId) -> TcpState {
+        Net::tcp_state(self, s)
+    }
+    fn tcp_send(&mut self, s: SockId, data: &[u8]) -> Result<usize, NetError> {
+        Net::tcp_send(self, s, data)
+    }
+    fn tcp_recv(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError> {
+        Net::tcp_recv(self, s, buf)
+    }
+    fn tcp_close(&mut self, s: SockId) {
+        Net::tcp_close(self, s)
+    }
+    fn tcp_abort(&mut self, s: SockId) {
+        Net::tcp_abort(self, s)
+    }
+}
+
 /// Lee «a.b.c.d» (cuatro números de 0 a 255, sin ceros a la izquierda raros ni espacios).
 pub fn parse_ip(s: &str) -> Option<Ipv4> {
     let mut ip = [0u8; 4];

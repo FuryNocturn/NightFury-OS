@@ -4,7 +4,7 @@
 //! se llama a `poll` en cada tick hasta que devuelve `Done` o `Error`.
 //!
 //! CONTRATO: las firmas públicas no cambian.
-use super::{Net, NetError, QueryId, SockId, TcpState};
+use super::{NetApi, NetError, QueryId, SockId, TcpState};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -238,7 +238,7 @@ pub(super) fn parse_head(h: &[u8]) -> Result<(u16, String, Vec<(String, String)>
 }
 
 impl HttpGet {
-    pub fn start(net: &mut Net, url: &str, head_only: bool, follow: bool) -> Result<HttpGet, NetError> {
+    pub fn start(net: &mut dyn NetApi, url: &str, head_only: bool, follow: bool) -> Result<HttpGet, NetError> {
         let url = parse_url(url)?;
         let q = net.resolve(&url.host)?;
         let mut g = HttpGet { head_only, follow, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, last: None };
@@ -261,20 +261,20 @@ impl HttpGet {
     }
 
     /// Cancela (Ctrl+C en la Terminal) y libera la conexión.
-    pub fn cancel(&mut self, net: &mut Net) {
+    pub fn cancel(&mut self, net: &mut dyn NetApi) {
         if let Some(s) = self.sock() {
             net.tcp_abort(s);
         }
         self.stage = Stage::Over;
     }
 
-    fn fail(&mut self, net: &mut Net, e: NetError, ev: &mut Vec<HttpEvent>) -> bool {
+    fn fail(&mut self, net: &mut dyn NetApi, e: NetError, ev: &mut Vec<HttpEvent>) -> bool {
         self.cancel(net);
         ev.push(HttpEvent::Error(e));
         false
     }
 
-    fn finish(&mut self, net: &mut Net, ev: &mut Vec<HttpEvent>) -> bool {
+    fn finish(&mut self, net: &mut dyn NetApi, ev: &mut Vec<HttpEvent>) -> bool {
         if let Some(s) = self.sock() {
             net.tcp_close(s);
         }
@@ -285,7 +285,7 @@ impl HttpGet {
 
     /// Avanza y devuelve lo que haya pasado desde la última llamada (vacío si nada). Tras `Done` o
     /// `Error`, la conexión ya está cerrada y no devuelve nada más.
-    pub fn poll(&mut self, net: &mut Net, now_ms: u64) -> Vec<HttpEvent> {
+    pub fn poll(&mut self, net: &mut dyn NetApi, now_ms: u64) -> Vec<HttpEvent> {
         let mut ev = Vec::new();
         let last = *self.last.get_or_insert(now_ms);
         // tope de pasos por llamada: nunca se queda dando vueltas
@@ -302,7 +302,7 @@ impl HttpGet {
     }
 
     /// Un paso; `true` si hubo avance y conviene otro.
-    fn step(&mut self, net: &mut Net, ev: &mut Vec<HttpEvent>) -> bool {
+    fn step(&mut self, net: &mut dyn NetApi, ev: &mut Vec<HttpEvent>) -> bool {
         match self.stage {
             Stage::Over => false,
             Stage::Resolving(q) => match net.resolve_poll(q) {
@@ -360,7 +360,7 @@ impl HttpGet {
     }
 
     /// El servidor cerró y ya no queda nada por leer.
-    fn eof(&mut self, net: &mut Net, ev: &mut Vec<HttpEvent>) -> bool {
+    fn eof(&mut self, net: &mut dyn NetApi, ev: &mut Vec<HttpEvent>) -> bool {
         match (&self.stage, &self.mode) {
             (Stage::Body(_), Mode::Close) => self.finish(net, ev),
             (Stage::Body(_), _) => self.fail(net, NetError::Protocol("respuesta incompleta"), ev),
@@ -369,7 +369,7 @@ impl HttpGet {
     }
 
     /// Mira si el búfer ya trae las cabeceras completas y, si es así, las procesa.
-    fn on_head_bytes(&mut self, net: &mut Net, s: SockId, ev: &mut Vec<HttpEvent>) -> bool {
+    fn on_head_bytes(&mut self, net: &mut dyn NetApi, s: SockId, ev: &mut Vec<HttpEvent>) -> bool {
         loop {
             let Some(end) = find(&self.buf, b"\r\n\r\n") else {
                 if self.buf.len() > MAX_HEAD {
@@ -399,7 +399,7 @@ impl HttpGet {
         }
     }
 
-    fn redirect(&mut self, net: &mut Net, s: SockId, loc: &str, ev: &mut Vec<HttpEvent>) -> bool {
+    fn redirect(&mut self, net: &mut dyn NetApi, s: SockId, loc: &str, ev: &mut Vec<HttpEvent>) -> bool {
         self.redirects += 1;
         if self.redirects > MAX_REDIRECTS {
             return self.fail(net, NetError::Protocol("demasiadas redirecciones"), ev);
@@ -435,7 +435,7 @@ impl HttpGet {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_body(&mut self, net: &mut Net, s: SockId, status: u16, reason: String, headers: Vec<(String, String)>, rest: Vec<u8>, ev: &mut Vec<HttpEvent>) -> bool {
+    fn start_body(&mut self, net: &mut dyn NetApi, s: SockId, status: u16, reason: String, headers: Vec<(String, String)>, rest: Vec<u8>, ev: &mut Vec<HttpEvent>) -> bool {
         let chunked = header(&headers, "transfer-encoding").last().is_some_and(|v| v.rsplit(',').next().is_some_and(|t| t.trim().eq_ignore_ascii_case("chunked")));
         let mut len = None;
         if !chunked {
@@ -462,7 +462,7 @@ impl HttpGet {
     }
 
     /// Procesa bytes del cuerpo según la codificación.
-    fn body(&mut self, net: &mut Net, data: &[u8], ev: &mut Vec<HttpEvent>) -> bool {
+    fn body(&mut self, net: &mut dyn NetApi, data: &[u8], ev: &mut Vec<HttpEvent>) -> bool {
         let mut out = Vec::new();
         let done = match &mut self.mode {
             Mode::Close => {

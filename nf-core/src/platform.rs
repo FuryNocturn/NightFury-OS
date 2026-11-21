@@ -71,7 +71,7 @@ pub trait Platform {
         false
     }
     /// La red (v0.12), solo para las apps del sistema. `None` si el equipo no tiene pila de red.
-    fn net(&mut self) -> Option<&mut crate::net::Net> {
+    fn net(&mut self) -> Option<&mut dyn crate::net::NetApi> {
         None
     }
 }
@@ -124,7 +124,7 @@ impl Platform for TestPlatform {
     fn pool(&mut self) -> &mut Pool {
         &mut self.pool
     }
-    fn net(&mut self) -> Option<&mut crate::net::Net> {
-        self.net.as_mut()
+    fn net(&mut self) -> Option<&mut dyn crate::net::NetApi> {
+        self.net.as_mut().map(|n| n as &mut dyn crate::net::NetApi)
     }
 }

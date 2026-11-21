@@ -224,7 +224,7 @@ impl Platform for Plat {
             core::arch::asm!("sti", options(nomem, nostack));
         }
     }
-    fn net(&mut self) -> Option<&mut nf_core::net::Net> {
+    fn net(&mut self) -> Option<&mut dyn nf_core::net::NetApi> {
         Some(&mut self.net)
     }
     fn is_system_binary(&self, nfx: &[u8]) -> bool {

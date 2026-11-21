@@ -2203,7 +2203,7 @@ impl Desktop {
             self.dmg_all();
         }
         if close {
-            self.close(id);
+            self.close(id, sys);
         } else if let Some(req) = dialog {
             self.open_dialog(Some(id), req, sys);
         }
@@ -2293,7 +2293,7 @@ impl Desktop {
     /// Cierra el diálogo y entrega su respuesta a la ventana dueña o al sistema.
     fn finish_dialog(&mut self, id: u32, res: DialogResult, sys: &mut dyn Platform) {
         let owner = self.pos(id).and_then(|i| self.wins[i].owner);
-        self.close(id);
+        self.close(id, sys);
         match owner {
             Some(o) => {
                 self.with_app(o, sys, |a, cx| a.dialog_result(res, cx));
@@ -2321,7 +2321,7 @@ impl Desktop {
                     // formatea al final. Se descarta ya la sesión de la unidad en memoria.
                     let ids: Vec<u32> = self.wins.iter().map(|w| w.id).collect();
                     for id in ids {
-                        self.close(id);
+                        self.close(id, sys);
                     }
                     self.login.start_new_disk();
                     self.screen_on();
@@ -2443,7 +2443,7 @@ impl Desktop {
         let mut ok = false;
         self.with_app(id, sys, |a, cx| ok = a.request_close(cx));
         if ok {
-            self.close(id);
+            self.close(id, sys);
         }
     }
 
@@ -2475,7 +2475,7 @@ impl Desktop {
         self.dmg_all();
     }
 
-    fn close(&mut self, id: u32) {
+    fn close(&mut self, id: u32, sys: &mut dyn Platform) {
         self.close_dialogs_of(id);
         if let Some(d) = self.dnd.as_mut() {
             d.dead |= d.src == Some(id);
@@ -2484,7 +2484,8 @@ impl Desktop {
             }
         }
         if let Some(i) = self.pos(id) {
-            self.wins.remove(i);
+            let mut w = self.wins.remove(i);
+            w.app.release(sys);
             self.forget(id);
             self.dmg_all();
         }
@@ -4340,6 +4341,10 @@ mod modal_tests {
         fn min_size(&self) -> (i32, i32) {
             (100, 100)
         }
+        /// Marca la liberación al quitar la ventana: suma 1000 a `downs`.
+        fn release(&mut self, _sys: &mut dyn Platform) {
+            self.downs.set(self.downs.get() + 1000);
+        }
         fn draw(&mut self, s: &mut Surface, _theme: &Theme, _sys: &mut dyn Platform, _focused: bool) {
             let b = s.bounds();
             s.fill_rect(b, 0xEEEEEE);
@@ -4453,6 +4458,17 @@ mod modal_tests {
     }
 
     #[test]
+    fn quitar_la_ventana_libera_la_app() {
+        let (mut d, mut sys) = setup();
+        let (p, log) = probe(None, false);
+        d.launch_app(p, &mut sys);
+        let id = d.wins[0].id;
+        assert_eq!(log.1.get(), 0);
+        d.close(id, &mut sys);
+        assert_eq!((d.window_count(), log.1.get()), (0, 1000));
+    }
+
+    #[test]
     fn closing_owner_closes_its_dialog_and_taskbar_ignores_dialogs() {
         let (mut d, mut sys) = setup();
         let (p, _) = probe(Some(msg(1, Buttons::Ok)), false);
@@ -4460,7 +4476,7 @@ mod modal_tests {
         key(&mut d, &mut sys, Key::Enter, None, false);
         assert_eq!(d.task_ids().len(), 1);
         let id = d.wins[0].id;
-        d.close(id);
+        d.close(id, &mut sys);
         assert_eq!((d.window_count(), d.dialog_count()), (0, 0));
         // Minimizar la dueña minimiza también el diálogo; restaurar los trae a los dos.
         let (p, _) = probe(Some(msg(1, Buttons::Ok)), false);
@@ -4838,7 +4854,7 @@ mod modal_tests {
         assert!(m.rect().right() <= 1280 && m.rect().bottom() <= 800 - BAR_H);
         // Si la ventana dueña se cierra, el menú también.
         let id = d.wins[0].id;
-        d.close(id);
+        d.close(id, &mut sys);
         assert!(d.menu().is_none());
         // Y si se minimiza.
         menu_app(&mut d, &mut sys);
@@ -5087,7 +5103,7 @@ mod menu_tests {
         assert!(d.menu().is_none());
         assert_eq!(d.wins.last().unwrap().kind, AppKind::Notepad);
         // Sobre el fondo: menú del fondo y sin selección.
-        d.close(d.wins[0].id);
+        d.close(d.wins[0].id, &mut sys);
         right_click(&mut d, &mut sys, (900, 500));
         assert!(d.menu().is_some() && d.sel.is_empty());
         d.close_menu();
@@ -5330,7 +5346,7 @@ mod menu_tests {
         d.launch(AppKind::Calc, &mut sys);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
         assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "otra.txt")));
-        d.close(d.wins[0].id);
+        d.close(d.wins[0].id, &mut sys);
         key(&mut d, &mut sys, Key::Char('z'), None, true);
         assert!(sys.files.exists(&sp(&sys.files, Std::Desktop, "nota.txt")));
         // Supr sobre el icono seleccionado: a la Papelera.
@@ -6754,7 +6770,7 @@ mod dnd_tests {
         let ((a, _), (b, lb)) = two(&mut d, &mut sys, vec![f.clone()], true);
         start_from(&mut d, &mut sys, a);
         go(&mut d, &mut sys, b, 10, 10);
-        d.close(a);
+        d.close(a, &mut sys);
         go(&mut d, &mut sys, b, 11, 10);
         assert!(d.dnd.is_none());
         d.left_button(false, &mut sys);
