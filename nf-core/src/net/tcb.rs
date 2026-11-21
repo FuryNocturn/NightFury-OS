@@ -141,6 +141,8 @@ pub struct Sock {
     pub released: bool,
     /// v0.12.1: conexión entrante aún en la cola del puerto a la escucha con ese id (sin aceptar).
     pub listener: Option<u32>,
+    /// v0.12.1: proceso dueño, para el Administrador de tareas (0 = el sistema).
+    pub owner: u64,
     /// Bytes de datos recibidos y puestos en el búfer de envío, para `connections`.
     pub rx: u64,
     pub tx: u64,
@@ -182,6 +184,7 @@ impl Sock {
             fail: None,
             released: false,
             listener: None,
+            owner: 0,
             rx: 0,
             tx: 0,
             iss,

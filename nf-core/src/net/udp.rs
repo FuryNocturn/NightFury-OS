@@ -21,11 +21,13 @@ pub(super) struct Udp {
     sent_to: Vec<(Ipv4, u16)>,
     rx: u64,
     tx: u64,
+    owner: u64,
 }
 
 pub(super) struct Listener {
     pub(super) id: u32,
     pub(super) port: u16,
+    owner: u64,
 }
 
 impl Net {
@@ -58,7 +60,7 @@ impl Net {
             port
         };
         self.next_udp = self.next_udp.wrapping_add(1);
-        self.udps.push(Udp { id: self.next_udp, port, fixed, queue: VecDeque::new(), sent_to: Vec::new(), rx: 0, tx: 0 });
+        self.udps.push(Udp { id: self.next_udp, port, fixed, queue: VecDeque::new(), sent_to: Vec::new(), rx: 0, tx: 0, owner: 0 });
         Ok(UdpId(self.next_udp))
     }
 
@@ -118,7 +120,7 @@ impl Net {
             return Err(NetError::Busy);
         }
         self.next_listen = self.next_listen.wrapping_add(1);
-        self.listens.push(Listener { id: self.next_listen, port });
+        self.listens.push(Listener { id: self.next_listen, port, owner: 0 });
         Ok(ListenId(self.next_listen))
     }
 
@@ -151,6 +153,14 @@ impl Net {
         }
     }
 
+    pub(super) fn owner_set(&mut self, proto: Proto, id: u32, owner: u64) {
+        match proto {
+            Proto::Tcp => self.socks.iter_mut().filter(|k| k.id == id).for_each(|k| k.owner = owner),
+            Proto::Udp => self.udps.iter_mut().filter(|u| u.id == id).for_each(|u| u.owner = owner),
+            Proto::TcpListen => self.listens.iter_mut().filter(|l| l.id == id).for_each(|l| l.owner = owner),
+        }
+    }
+
     pub(super) fn conn_list(&self) -> Vec<ConnInfo> {
         let mut v = Vec::new();
         for k in self.socks.iter().filter(|k| !k.released && k.listener.is_none()) {
@@ -160,13 +170,13 @@ impl Net {
                 St::Closed => "Cerrada",
                 _ => "Cerrando",
             };
-            v.push(ConnInfo { proto: Proto::Tcp, id: k.id, local_port: k.lport, remote: Some((k.remote, k.rport)), state, rx: k.rx, tx: k.tx });
+            v.push(ConnInfo { proto: Proto::Tcp, id: k.id, local_port: k.lport, remote: Some((k.remote, k.rport)), state, rx: k.rx, tx: k.tx, owner: k.owner });
         }
         for l in &self.listens {
-            v.push(ConnInfo { proto: Proto::TcpListen, id: l.id, local_port: l.port, remote: None, state: "Escuchando", rx: 0, tx: 0 });
+            v.push(ConnInfo { proto: Proto::TcpListen, id: l.id, local_port: l.port, remote: None, state: "Escuchando", rx: 0, tx: 0, owner: l.owner });
         }
         for u in &self.udps {
-            v.push(ConnInfo { proto: Proto::Udp, id: u.id, local_port: u.port, remote: None, state: "—", rx: u.rx, tx: u.tx });
+            v.push(ConnInfo { proto: Proto::Udp, id: u.id, local_port: u.port, remote: None, state: "—", rx: u.rx, tx: u.tx, owner: u.owner });
         }
         v
     }

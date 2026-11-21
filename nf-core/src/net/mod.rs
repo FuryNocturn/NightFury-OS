@@ -157,6 +157,8 @@ pub struct ConnInfo {
     /// Bytes de datos recibidos y enviados (sin cabeceras) desde que se abrió.
     pub rx: u64,
     pub tx: u64,
+    /// Proceso que lo abrió (`ProcInfo::id`); 0 = el sistema (Terminal, bandeja…).
+    pub owner: u64,
 }
 
 /// Respuesta a un `ping`.
@@ -473,6 +475,11 @@ impl Net {
         self.conn_list()
     }
 
+    /// Apunta el proceso dueño de algo ya abierto (lo hace el servicio); un id que no existe se ignora.
+    pub fn set_owner(&mut self, proto: Proto, id: u32, owner: u64) {
+        self.owner_set(proto, id, owner)
+    }
+
     /// 32 bits impredecibles: SHA-256(secreto ‖ contador).
     pub(crate) fn rand(&mut self) -> u32 {
         let mut m = [0u8; 40];
@@ -541,6 +548,8 @@ pub trait NetApi {
     fn tcp_accept(&mut self, l: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError>;
     fn tcp_unlisten(&mut self, l: ListenId);
     fn connections(&mut self) -> Vec<ConnInfo>;
+    /// Solo el servicio del sistema; en un programa no hace nada.
+    fn set_owner(&mut self, proto: Proto, id: u32, owner: u64);
 }
 
 impl NetApi for Net {
@@ -603,6 +612,9 @@ impl NetApi for Net {
     }
     fn connections(&mut self) -> Vec<ConnInfo> {
         Net::connections(self)
+    }
+    fn set_owner(&mut self, proto: Proto, id: u32, owner: u64) {
+        Net::set_owner(self, proto, id, owner)
     }
 }
 

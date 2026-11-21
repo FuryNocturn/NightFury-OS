@@ -434,7 +434,7 @@ impl Wire for ConnInfo {
         };
         w.put(&p).put(&self.id).put(&self.local_port).put(&self.remote);
         w.put(&(CONN_STATES.iter().position(|s| *s == self.state).unwrap_or(5) as u8));
-        w.put(&self.rx).put(&self.tx);
+        w.put(&self.rx).put(&self.tx).put(&self.owner);
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
         let proto = match u8::get(r)? {
@@ -451,6 +451,7 @@ impl Wire for ConnInfo {
             state: CONN_STATES.get(u8::get(r)? as usize).copied().unwrap_or("—"),
             rx: r.get()?,
             tx: r.get()?,
+            owner: r.get()?,
         })
     }
 }
@@ -601,9 +602,16 @@ pub struct NetOwn {
     /// Aviso pendiente de respuesta, y si ya está en pantalla.
     ask: Option<Kind>,
     shown: bool,
+    /// Proceso dueño (`ProcInfo::id`) para el Administrador de tareas; 0 sin proceso.
+    pid: u64,
 }
 
 impl NetOwn {
+    /// Proceso al que se apunta lo que abra (`ProcApp`).
+    pub fn set_pid(&mut self, pid: u64) {
+        self.pid = pid;
+    }
+
     /// Programa de terceros con esta identidad (`ProcApp`, al cargarlo).
     pub fn set_program(&mut self, hash: [u8; 32], name: &str) {
         self.id = Some((hash, String::from(name)));
@@ -942,7 +950,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
                 // un programa de terceros no la ve.
                 Some(_) if !system && matches!(call, NetRenew) => encode(&()),
                 Some(net) if !system && matches!(call, NetStatus) => encode(&crate::net::NetStatus { mac: [0; 6], ..net.status() }),
-                Some(net) => net_run(net, call, own),
+                Some(net) => net_run(net, call, own, system),
                 None => no_net(&call),
             }
         }
@@ -951,7 +959,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
 
 /// Las llamadas de red, con la pila ya a mano. Cada programa solo toca los identificadores que
 /// abrió él; uno ajeno es uno que «ya no existe».
-fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
+fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool) -> Vec<u8> {
     use Call::*;
     match call {
         NetStatus => encode(&net.status()),
@@ -1010,6 +1018,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             let r = if own.socks.len() >= MAX_SOCKS { Err(NetError::Busy) } else { net.tcp_connect(dst, port) };
             if let Ok(id) = r {
                 own.socks.push(id);
+                net.set_owner(Proto::Tcp, id.0, own.pid);
             }
             encode(&r)
         }
@@ -1047,6 +1056,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             let r = if own.udps.len() >= MAX_UDP { Err(NetError::Busy) } else { net.udp_bind(port) };
             if let Ok(id) = r {
                 own.udps.push(id);
+                net.set_owner(Proto::Udp, id.0, own.pid);
             }
             encode(&r)
         }
@@ -1071,6 +1081,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             let r = if own.listens.len() >= MAX_LISTEN { Err(NetError::Busy) } else { net.tcp_listen(port) };
             if let Ok(id) = r {
                 own.listens.push(id);
+                net.set_owner(Proto::TcpListen, id.0, own.pid);
             }
             encode(&r)
         }
@@ -1088,6 +1099,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             let r = net.tcp_accept(id);
             if let Ok(Some((s, _, _))) = r {
                 own.socks.push(s);
+                net.set_owner(Proto::Tcp, s.0, own.pid);
             }
             encode(&r)
         }
@@ -1098,7 +1110,8 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             }
             encode(&())
         }
-        // Solo lo del propio programa (el Administrador de tareas, que es del sistema, ve todo con `Net`).
+        // Un programa del sistema (el Administrador de tareas) ve todo; uno de terceros, solo lo suyo.
+        NetConnections if system => encode(&net.connections()),
         NetConnections => {
             let mine = |c: &ConnInfo| match c.proto {
                 Proto::Tcp => own.socks.contains(&SockId(c.id)),
@@ -1414,6 +1427,7 @@ impl<T: Transport> NetApi for RemoteNet<T> {
     fn connections(&mut self) -> Vec<ConnInfo> {
         ask(&mut self.0, Call::NetConnections, Vec::new())
     }
+    fn set_owner(&mut self, _proto: Proto, _id: u32, _owner: u64) {}
 }
 
 #[cfg(test)]

@@ -540,6 +540,7 @@ const DRAG_SPINS: u32 = 100_000;
 
 impl ProcApp {
     pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>, system: bool) -> Self {
+        let pid = proc.id();
         ProcApp {
             proc,
             name: String::from(name),
@@ -560,7 +561,11 @@ impl ProcApp {
             src_ans: None,
             last_over: false,
             system,
-            net_own: NetOwn::default(),
+            net_own: {
+                let mut own = NetOwn::default();
+                own.set_pid(pid);
+                own
+            },
         }
     }
 
