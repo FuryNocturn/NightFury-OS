@@ -24,7 +24,7 @@ mod pkt;
 mod tcb;
 mod tcp;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Dirección IPv4, en el orden en que se escribe (`[192, 168, 1, 1]`).
 pub type Ipv4 = [u8; 4];
