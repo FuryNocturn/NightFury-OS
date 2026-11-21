@@ -240,6 +240,10 @@ pub struct Net {
     dns_cache: Vec<dns::CacheEntry>,
     socks: Vec<tcb::Sock>,
     next_sock: u32,
+    udps: Vec<udp::Udp>,
+    next_udp: u32,
+    listens: Vec<udp::Listener>,
+    next_listen: u32,
 }
 
 impl Net {
@@ -266,6 +270,10 @@ impl Net {
             dns_cache: Vec::new(),
             socks: Vec::new(),
             next_sock: 0,
+            udps: Vec::new(),
+            next_udp: 0,
+            listens: Vec::new(),
+            next_listen: 0,
         }
     }
 
@@ -486,7 +494,8 @@ impl Net {
         self.cfg.as_ref().map(|c| c.ip).ok_or(NetError::NoAddress)
     }
 
-    /// Se pierde la dirección (cable, caducidad o `renew`): caen ARP y conexiones.
+    /// Se pierde la dirección (cable, caducidad o `renew`): caen ARP y conexiones (los sockets UDP y
+    /// los puertos a la escucha siguen abiertos).
     pub(crate) fn lose_config(&mut self) {
         self.cfg = None;
         self.arp = ip::ArpState::default();
@@ -494,7 +503,7 @@ impl Net {
         for s in self.socks.iter_mut() {
             s.kill(NetError::Reset);
         }
-        self.socks.retain(|s| !s.released);
+        self.socks.retain(|s| !s.released && s.listener.is_none());
     }
 
     fn rx_all(&mut self) {

@@ -3,8 +3,8 @@
 //! TCP dentro de `Net`: tabla de conexiones, puertos, números de secuencia iniciales (RFC 6528),
 //! reparto de segmentos recibidos y salida de los que producen los `Sock` (ver `tcb.rs`).
 use super::pkt::*;
-use super::tcb::{self, Seg, Sock, St, RST};
-use super::{Ipv4, Net, NetError, SockId, MAX_SOCKS};
+use super::tcb::{self, Seg, Sock, St, ACK, RST, SYN};
+use super::{Ipv4, Net, NetError, SockId, LISTEN_BACKLOG, MAX_SOCKS};
 use alloc::vec::Vec;
 
 impl Net {
@@ -24,7 +24,7 @@ impl Net {
         u32::from_be_bytes([h[0], h[1], h[2], h[3]]).wrapping_add((self.now as u32).wrapping_mul(250))
     }
 
-    fn tcp_emit(&mut self, remote: Ipv4, rport: u16, lport: u16, segs: Vec<Seg>) {
+    pub(super) fn tcp_emit(&mut self, remote: Ipv4, rport: u16, lport: u16, segs: Vec<Seg>) {
         let Some(me) = self.cfg.as_ref().map(|c| c.ip) else { return };
         for s in segs {
             let b = tcb::build(me, remote, lport, rport, &s);
@@ -34,7 +34,8 @@ impl Net {
 
     pub(super) fn tcp_open(&mut self, dst: Ipv4, port: u16) -> Result<SockId, NetError> {
         let me = self.ready()?;
-        if self.socks.len() >= MAX_SOCKS {
+        // las entrantes sin aceptar (en la cola de un listener) no cuentan
+        if self.socks.iter().filter(|s| s.listener.is_none()).count() >= MAX_SOCKS {
             return Err(NetError::Busy);
         }
         if port == 0 {
@@ -44,7 +45,7 @@ impl Net {
         let mut lport = 0;
         for _ in 0..64 {
             let p = 49152 + (self.rand() % 16384) as u16;
-            if !self.socks.iter().any(|s| s.lport == p) {
+            if !self.socks.iter().any(|s| s.lport == p) && !self.listens.iter().any(|l| l.port == p) {
                 lport = p;
                 break;
             }
@@ -111,7 +112,7 @@ impl Net {
         }
         let (r, rp, lp) = (k.remote, k.rport, k.lport);
         self.tcp_emit(r, rp, lp, out);
-        self.socks.retain(|s| !(s.st == St::Closed && s.released));
+        self.socks.retain(|s| !s.dead());
     }
 
     pub(super) fn tcp_tick(&mut self) {
@@ -127,7 +128,7 @@ impl Net {
         for (r, rp, lp, out) in jobs {
             self.tcp_emit(r, rp, lp, out);
         }
-        self.socks.retain(|s| !(s.st == St::Closed && s.released));
+        self.socks.retain(|s| !s.dead());
     }
 
     pub(super) fn tcp_input(&mut self, ip: &Ip) {
@@ -141,11 +142,30 @@ impl Net {
                 let mut out = Vec::new();
                 k.on_segment(&t, now, &mut out);
                 self.tcp_emit(ip.src, t.sp, t.dp, out);
-                self.socks.retain(|s| !(s.st == St::Closed && s.released));
+                self.socks.retain(|s| !s.dead());
             }
-            // conexión que no existe (no escuchamos en ningún puerto): RST, salvo a otro RST
-            None if t.flags & RST == 0 => self.tcp_emit(ip.src, t.sp, t.dp, alloc::vec![tcb::rst_for(&t)]),
-            None => {}
+            None if t.flags & RST != 0 => {}
+            None if t.flags & (SYN | ACK) == SYN => self.tcp_syn(ip, &t),
+            // conexión que no existe: RST
+            None => self.tcp_emit(ip.src, t.sp, t.dp, alloc::vec![tcb::rst_for(&t)]),
         }
+    }
+
+    /// SYN de una conexión nueva. A un puerto a la escucha y de la red local: SYN-ACK (con la cola
+    /// llena, contando las de medio saludo, se ignora). Si no, RST como a un puerto cerrado.
+    fn tcp_syn(&mut self, ip: &Ip, t: &tcb::TcpIn) {
+        let l = self.listens.iter().find(|l| l.port == t.dp).map(|l| l.id).filter(|_| self.is_local(ip.src));
+        let Some(l) = l else {
+            return self.tcp_emit(ip.src, t.sp, t.dp, alloc::vec![tcb::rst_for(t)]);
+        };
+        if self.socks.iter().filter(|s| s.listener == Some(l)).count() >= LISTEN_BACKLOG {
+            return;
+        }
+        let Some(me) = self.cfg.as_ref().map(|c| c.ip) else { return };
+        self.next_sock = self.next_sock.wrapping_add(1);
+        let mut s = Sock::passive(self.next_sock, ip.src, t.sp, t.dp, self.isn(me, t.dp, ip.src, t.sp), t, self.now, l);
+        let synack = s.synack_seg();
+        self.socks.push(s);
+        self.tcp_emit(ip.src, t.sp, t.dp, alloc::vec![synack]);
     }
 }
