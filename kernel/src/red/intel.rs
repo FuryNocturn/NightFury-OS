@@ -5,12 +5,15 @@
 //! - 82576 e I210/I211: descriptores avanzados de un búfer, según las hojas del 82576 y del I210.
 //! - I225/I226: descriptores avanzados, a partir de la especificación de sala limpia
 //!   (`especificaciones\intel-ethernet`, familia B, con sus erratas).
+//! - I217/I218/I219 (familia A, integrados en el PCH): recepción extendida y envío legado; su
+//!   arranque, PHY y ajustes de enlace están en `intel/pch.rs`.
 use super::{rd, wr};
 use crate::serial::traza;
 use crate::usb::{esperar, espera_ms, Dma};
 use crate::{paging, pci};
 use alloc::boxed::Box;
 use alloc::string::String;
+use core::cell::Cell;
 use core::sync::atomic::{fence, Ordering::SeqCst};
 use nf_core::net::{Link, NetDev};
 
@@ -37,6 +40,8 @@ const TXPBS: usize = 0x3404;
 const SWSM: usize = 0x5B50;
 const SW_FW_SYNC: usize = 0x5B5C;
 
+mod pch;
+
 const CTRL_SLU: u32 = 1 << 6;
 const CTRL_ASDE: u32 = 1 << 5;
 const CTRL_FRCSPD_DPX: u32 = 1 << 11 | 1 << 12;
@@ -58,9 +63,18 @@ enum Fam {
     Igb,
     I225,
     I226,
+    /// I217/I218/I219; el número es la generación de la plataforma (0 LPT … 6 PTP).
+    Pch(u8),
 }
 
 impl Fam {
+    fn pch(self) -> bool {
+        matches!(self, Fam::Pch(_))
+    }
+    /// Formato de reescritura de recepción con estado en +8 y longitud en +12.
+    fn rx_ext(self) -> bool {
+        self.avanzado() || self.pch()
+    }
     fn avanzado(self) -> bool {
         matches!(self, Fam::Igb | Fam::I225 | Fam::I226)
     }
@@ -95,7 +109,7 @@ const MODELOS: &[(u16, &str, Fam)] = &[
 ];
 
 fn modelo(dev: u16) -> Option<(&'static str, Fam)> {
-    MODELOS.iter().find(|m| m.0 == dev).map(|m| (m.1, m.2))
+    MODELOS.iter().find(|m| m.0 == dev).map(|m| (m.1, m.2)).or_else(|| pch::modelo(dev).map(|(n, g)| (n, Fam::Pch(g))))
 }
 
 pub fn soporta(vendor: u16, dev: u16) -> bool {
@@ -143,6 +157,13 @@ pub struct Intel {
     tx_sig: usize,
     tx_limpio: usize,
     ipgt: u32,
+    /// Id de dispositivo y posición PCI (la familia A los necesita para sus erratas).
+    dev: u16,
+    bdf: (u8, u8, u8),
+    /// Familia A: reintentos de los accesos a la PHY (se apagan donde un error es esperado).
+    reint: Cell<bool>,
+    /// Familia A: enlace por el que ya se hicieron los ajustes de F9.
+    ultimo: Option<(u32, bool)>,
 }
 
 impl Intel {
@@ -318,26 +339,39 @@ pub fn iniciar(bus: u8, dev: u8, fun: u8) -> Option<Box<dyn NetDev>> {
         tx_sig: 0,
         tx_limpio: 0,
         ipgt: 8,
+        dev: (id >> 16) as u16,
+        bdf: (bus, dev, fun),
+        reint: Cell::new(true),
+        ultimo: None,
     };
+    let pch = fam.pch();
     // Si algo falla a partir de aquí, el `Drop` detiene el DMA.
     if fam.b() {
         t.sin_l12(bus, dev, fun);
     }
     // Reinicio (F4): sin maestro PCIe, sin interrupciones, RX/TX parados y CTRL.RST. No se escribe IMS jamás.
     let (icr, imc) = if fam.avanzado() { (0x1500, 0x150C) } else { (0xC0, 0xD8) };
-    t.wr(CTRL, t.rd(CTRL) | CTRL_MASTER_OFF);
-    esperar(50, || t.rd(STATUS) & STATUS_MASTER_ON == 0); // sin respuesta no es fatal
-    t.wr(imc, !0);
-    t.wr(RCTL, 0);
-    t.wr(TCTL, 1 << 3);
-    t.rd(STATUS);
-    espera_ms(15);
-    t.wr(CTRL, t.rd(CTRL) | CTRL_RST);
-    espera_ms(20);
-    if !esperar(1_000, || t.rd(CTRL) & CTRL_RST == 0) {
-        traza!("NF intel: {} tarda en salir del reinicio", nombre); // si de verdad no responde, la MAC lo delata
+    if pch {
+        if !t.pch_antes() {
+            traza!("NF intel: {} no deja la PHY accesible", nombre);
+            return None;
+        }
+        t.pch_reset();
+    } else {
+        t.wr(CTRL, t.rd(CTRL) | CTRL_MASTER_OFF);
+        esperar(50, || t.rd(STATUS) & STATUS_MASTER_ON == 0); // sin respuesta no es fatal
+        t.wr(imc, !0);
+        t.wr(RCTL, 0);
+        t.wr(TCTL, 1 << 3);
+        t.rd(STATUS);
+        espera_ms(15);
+        t.wr(CTRL, t.rd(CTRL) | CTRL_RST);
+        espera_ms(20);
+        if !esperar(1_000, || t.rd(CTRL) & CTRL_RST == 0) {
+            traza!("NF intel: {} tarda en salir del reinicio", nombre); // si de verdad no responde, la MAC lo delata
+        }
+        esperar(10, || t.rd(EECD) & 1 << 9 != 0); // carga automática; sin NVM no es fatal
     }
-    esperar(10, || t.rd(EECD) & 1 << 9 != 0); // carga automática; sin NVM no es fatal
     t.wr(imc, !0);
     t.rd(icr);
 
@@ -357,7 +391,7 @@ pub fn iniciar(bus: u8, dev: u8, fun: u8) -> Option<Box<dyn NetDev>> {
         t.wr(RAL0 + 8 * i, 0);
         t.wr(RAL0 + 8 * i + 4, 0);
     }
-    for i in 0..128 {
+    for i in 0..if pch { 32 } else { 128 } {
         t.wr(MTA + 4 * i, 0);
         if fam.avanzado() {
             t.wr(UTA + 4 * i, 0);
@@ -368,10 +402,13 @@ pub fn iniciar(bus: u8, dev: u8, fun: u8) -> Option<Box<dyn NetDev>> {
         t.wr(TXPBS, 0x0400_0014);
         t.wr(RFCTL, 1 << 16); // E6: cabeceras IPv6 mal formadas
     }
+    if pch {
+        t.pch_config();
+    }
     t.wr(TIPG, TIPG_COBRE);
     // Enlace automático (SLU), sin forzar velocidad ni dúplex, sin control de flujo ni VLAN.
     let ctrl = t.rd(CTRL) & !(CTRL_FRCSPD_DPX | CTRL_RFCE_TFCE_VME) | CTRL_SLU;
-    t.wr(CTRL, if fam.avanzado() { ctrl } else { ctrl | CTRL_ASDE });
+    t.wr(CTRL, if fam.rx_ext() { ctrl } else { ctrl | CTRL_ASDE });
     if fam != Fam::E8254x {
         t.wr(CTRL_EXT, t.rd(CTRL_EXT) | DRV_LOAD);
     }
@@ -415,6 +452,8 @@ pub fn iniciar(bus: u8, dev: u8, fun: u8) -> Option<Box<dyn NetDev>> {
         t.negociar();
     } else if fam == Fam::Igb && t.phy_rmw(0, 0x1200, 0).is_none() {
         traza!("NF intel: {} no se pudo reiniciar la autonegociacion", nombre); // AN activa y reiniciada
+    } else if pch {
+        t.pch_enlace_inicio();
     }
     Some(Box::new(t))
 }
@@ -437,6 +476,9 @@ impl NetDev for Intel {
     fn link(&mut self) -> Option<Link> {
         let s = self.rd(STATUS);
         if s == !0 || s & 2 == 0 {
+            if self.ultimo.take().is_some() {
+                self.pch_sin_enlace();
+            }
             return None;
         }
         let mbps = match s {
@@ -445,6 +487,14 @@ impl NetDev for Intel {
             _ if s & 1 << 6 != 0 => 100,
             _ => 10,
         };
+        let full = s & 1 != 0;
+        if self.fam.pch() {
+            if self.ultimo != Some((mbps, full)) {
+                self.pch_enlace(mbps, full);
+                self.ultimo = Some((mbps, full));
+            }
+            return Some(Link { speed_mbps: mbps, full_duplex: full });
+        }
         // E2: el I225 anterior a la revisión 2 necesita IPGT = 0xB a 2,5 Gb/s; el resto, 8.
         let ipgt = if self.fam == Fam::I225 && self.rev < 2 && mbps == 2500 { 0xB } else { 8 };
         if ipgt != self.ipgt {
@@ -489,7 +539,7 @@ impl NetDev for Intel {
     }
 
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let adv = self.fam.avanzado();
+        let adv = self.fam.rx_ext();
         for _ in 0..N {
             let i = self.rx_sig;
             let d = self.rx.d(i);
@@ -500,7 +550,11 @@ impl NetDev for Intel {
             fence(SeqCst);
             let largo = rd::<u16>(d + if adv { 12 } else { 8 }) as usize;
             // Error de trama: RXE (bit 31) en el avanzado; cualquier bit del byte de errores en el legado.
-            let error = if adv { est >> 31 != 0 } else { rd::<u8>(d + 13) != 0 };
+            let error = match self.fam {
+                Fam::Pch(_) => est & 0x9700_0000 != 0, // CE, SE, SEQ, CXE y RXE
+                _ if adv => est >> 31 != 0,
+                _ => rd::<u8>(d + 13) != 0,
+            };
             let eop = est & 2 != 0;
             let bueno = eop && !self.saltando && !error && (14..=BUF).contains(&largo) && largo <= buf.len();
             if bueno {
