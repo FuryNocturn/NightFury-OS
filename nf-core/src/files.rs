@@ -1523,6 +1523,26 @@ impl Files {
         r
     }
 
+    /// Configuración → Red: cambia (o, con los dos a `None`, olvida) los permisos de un programa ya
+    /// apuntado. Solo un administrador; un programa que no está es `NotFound`.
+    pub fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, now: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Invalid);
+        }
+        let mut perms = self.net_perms();
+        let i = perms.iter().position(|p| p.hash == hash).ok_or(FsError::NotFound)?;
+        if out.is_none() && inn.is_none() {
+            perms.remove(i);
+        } else {
+            perms[i].out = out;
+            perms[i].inn = inn;
+        }
+        self.set_net_perms(&perms, now)?;
+        let name = perms.get(i).filter(|p| p.hash == hash).map_or_else(|| String::from("un programa"), |p| alloc::format!("«{}»", p.name));
+        self.log(&alloc::format!("Red: permisos de {name} cambiados en Configuración"), now);
+        Ok(())
+    }
+
     /// Al montar un disco: estructura, migración pendiente y limpieza. Nunca falla hacia fuera;
     /// lo que no pueda hacer ahora lo reintenta el siguiente arranque.
     fn startup(&mut self, now: DateTime) {

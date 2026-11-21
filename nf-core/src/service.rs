@@ -150,6 +150,8 @@ calls! {
     TcpAccept { id: ListenId } = 80,
     TcpUnlisten { id: ListenId } = 81,
     NetConnections = 82,
+    NetPerms = 83,
+    SetNetPerm { hash: [u8; 32], out: Option<bool>, inn: Option<bool> } = 84,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -396,6 +398,26 @@ impl Wire for [u8; 6] {
         let mut a = [0u8; 6];
         a.copy_from_slice(r.take(6)?);
         Ok(a)
+    }
+}
+
+impl Wire for [u8; 32] {
+    fn put(&self, w: &mut Writer) {
+        w.buf.extend_from_slice(self);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(r.take(32)?);
+        Ok(a)
+    }
+}
+
+impl Wire for netperm::Perm {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.hash).put(&self.name).put(&self.out).put(&self.inn);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(netperm::Perm { hash: r.get()?, name: r.get()?, out: r.get()?, inn: r.get()? })
     }
 }
 
@@ -927,6 +949,11 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         UnlockDrive { letter, secret, recovery } => gate(system, Err(no_key), || sys.files().unlock_drive(letter, &secret, recovery)),
         DriveAction { letter, req } => gate(system, Err(denied), || sys.files().request_drive_action(letter, req)),
         DriveResult => gate(system, None, || sys.files().drive_result()),
+        NetPerms => gate(system, Vec::new(), || sys.files().net_perms()),
+        SetNetPerm { hash, out, inn } => {
+            let now = sys.now();
+            gate(system, Err(denied), || sys.files().set_net_perm(hash, out, inn, now))
+        }
         NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             if !system {
@@ -1333,6 +1360,12 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     }
     fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError> {
         self.fs(Call::DriveAction { letter, req })
+    }
+    fn net_perms(&mut self) -> Vec<netperm::Perm> {
+        self.ask(Call::NetPerms, Vec::new())
+    }
+    fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, _now: DateTime) -> Result<(), FsError> {
+        self.fs(Call::SetNetPerm { hash, out, inn })
     }
     fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
         self.ask(Call::DriveResult, None)

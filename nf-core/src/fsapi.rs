@@ -109,4 +109,8 @@ api! {
     fn unlock_drive(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError>;
     fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError>;
     fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>>;
+    // ---- Permisos de red de los programas (v0.12.1): solo el sistema; cambiarlos, solo un administrador ----
+    fn net_perms(&mut self) -> Vec<crate::netperm::Perm>;
+    /// Cambia los dos permisos de un programa ya apuntado; con los dos a `None`, lo olvida.
+    fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, now: DateTime) -> Result<(), FsError>;
 }
