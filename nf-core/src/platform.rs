@@ -70,6 +70,10 @@ pub trait Platform {
     fn is_system_binary(&self, _nfx: &[u8]) -> bool {
         false
     }
+    /// La red (v0.12), solo para las apps del sistema. `None` si el equipo no tiene pila de red.
+    fn net(&mut self) -> Option<&mut dyn crate::net::NetApi> {
+        None
+    }
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
@@ -84,6 +88,8 @@ pub struct TestPlatform {
     /// Contador para `entropy` (determinista en las pruebas).
     pub seed: u64,
     pub pool: Pool,
+    /// Red de pruebas (los tests le enganchan una tarjeta en memoria).
+    pub net: Option<crate::net::Net>,
 }
 
 impl Platform for TestPlatform {
@@ -117,5 +123,8 @@ impl Platform for TestPlatform {
     }
     fn pool(&mut self) -> &mut Pool {
         &mut self.pool
+    }
+    fn net(&mut self) -> Option<&mut dyn crate::net::NetApi> {
+        self.net.as_mut().map(|n| n as &mut dyn crate::net::NetApi)
     }
 }

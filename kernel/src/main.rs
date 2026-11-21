@@ -17,6 +17,7 @@ mod nvme;
 mod paging;
 mod pci;
 mod ps2;
+mod red;
 mod rtc;
 mod serial;
 mod uefi;
@@ -135,6 +136,7 @@ struct Plat {
     info: boot::BootInfo,
     files: Files,
     pool: nf_core::keys::Pool,
+    net: nf_core::net::Net,
 }
 
 fn cpu_name() -> String {
@@ -222,27 +224,39 @@ impl Platform for Plat {
             core::arch::asm!("sti", options(nomem, nostack));
         }
     }
+    fn net(&mut self) -> Option<&mut dyn nf_core::net::NetApi> {
+        Some(&mut self.net)
+    }
     fn is_system_binary(&self, nfx: &[u8]) -> bool {
         PROGRAMAS_SISTEMA.iter().flat_map(|(_, items)| items.iter()).any(|(n, b)| *n == "programa.nfx" && *b == nfx)
     }
     fn entropy(&mut self) -> u64 {
-        use core::arch::x86_64::{__cpuid, _rdtsc};
-        // Contador de ciclos del procesador y reloj del sistema: siempre disponibles.
-        #[allow(unused_unsafe)]
-        let mut v = unsafe { _rdtsc() } ^ arch::TICKS.load(Relaxed).rotate_left(40);
-        // RDRAND (Intel SDM vol. 2, CPUID.01H:ECX bit 30) si el procesador lo tiene.
-        #[allow(unused_unsafe)]
-        let has = unsafe { __cpuid(1) }.ecx & (1 << 30) != 0;
-        if has {
+        entropia()
+    }
+}
+
+/// 64 bits impredecibles: ver `Platform::entropy`.
+fn entropia() -> u64 {
+    use core::arch::x86_64::{__cpuid, _rdtsc};
+    // Contador de ciclos del procesador y reloj del sistema: siempre disponibles.
+    #[allow(unused_unsafe)]
+    let mut v = unsafe { _rdtsc() } ^ arch::TICKS.load(Relaxed).rotate_left(40);
+    // RDRAND (Intel SDM vol. 2, CPUID.01H:ECX bit 30) si el procesador lo tiene.
+    #[allow(unused_unsafe)]
+    let has = unsafe { __cpuid(1) }.ecx & (1 << 30) != 0;
+    if has {
+        // hasta 10 intentos, como recomienda Intel: RDRAND puede fallar un momento si se agota
+        for _ in 0..10 {
             let r: u64;
             let ok: u8;
             unsafe { core::arch::asm!("rdrand {r}", "setc {ok}", r = out(reg) r, ok = out(reg_byte) ok, options(nomem, nostack)) };
             if ok != 0 {
                 v ^= r;
+                break;
             }
         }
-        v
     }
+    v
 }
 
 // ---------- Disco de datos ----------
@@ -320,7 +334,20 @@ extern "C" fn kmain() -> ! {
     if TRAZA {
         traza!("NF archivos: persistente={} formato_pendiente={}", files.persistent(), files.pending_format());
     }
-    let mut plat = Plat { info, files, pool: nf_core::keys::Pool::new() };
+    // Secreto de la red: el acumulador todavía no tiene movimientos del ratón, así que se mezclan
+    // 32 lecturas del generador del procesador y del reloj fino.
+    let mut pool = nf_core::keys::Pool::new();
+    for _ in 0..32 {
+        pool.add(&entropia().to_le_bytes());
+    }
+    let mut secreto = [0u8; 32];
+    pool.take(&mut secreto);
+    let mut net = nf_core::net::Net::new(secreto);
+    if let Some(dev) = red::sondear() {
+        traza!("NF red: {} {}", dev.name(), nf_core::net::mac_text(dev.mac()));
+        net.attach(dev);
+    }
+    let mut plat = Plat { info, files, pool, net };
     let (w, h) = (info.width as i32, info.height as i32);
     let mut desk = Desktop::new(w, h, &mut plat);
 
@@ -358,6 +385,7 @@ extern "C" fn kmain() -> ! {
     let mut usb_mandos: Vec<nf_core::gamepad::PadEvent> = Vec::new();
     let mut ultimo = u64::MAX;
     let mut programas_listos = false;
+    let mut estado_red = None;
     loop {
         // Programas del sistema: se instalan (o actualizan) en cuanto el disco está listo.
         if !programas_listos && !plat.files.disk_locked() && !plat.files.pending_format() {
@@ -388,6 +416,15 @@ extern "C" fn kmain() -> ! {
         // USB: sondeo del xHCI; el teclado entra por el mismo decodificador que el PS/2.
         usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton, &mut usb_mandos);
         unidades.sondear(&mut plat.files, &mut plat.pool);
+        plat.net.poll(arch::TICKS.load(Relaxed) * 10);
+        if TRAZA {
+            let st = plat.net.status();
+            if Some(st.state) != estado_red {
+                estado_red = Some(st.state);
+                let ip = |x: Option<nf_core::net::Ipv4>| x.map_or(String::from("-"), nf_core::net::ip_text);
+                traza!("NF red: {:?} ip={} puerta={} dns={:?}", st.state, ip(st.ip), ip(st.gateway), st.dns);
+            }
+        }
         for b in usb_teclado.drain(..) {
             if let Some(k) = teclado.feed(b) {
                 desk.event(Event::Key(k), &mut plat);

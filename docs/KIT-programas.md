@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.11.1)
+# Kit de programas de NightFury (v0.12.0)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -135,6 +135,14 @@ Configuración y Explorador), que el sistema reconoce por su binario exacto.
     la cruceta `UP DOWN LEFT RIGHT` y `EXTRA` (panel táctil o captura).
   - Ejes `state.axes[AXIS_LX..=AXIS_RT]`: sticks de −32768 a 32767 (Y negativa = arriba) y gatillos de 0 a
     32767. En el ABI son los eventos `EV_GAMEPAD` (20) y `EV_GAMEPADS` (21); ver `nf-core\src\abi.rs`.
+
+### Red (v0.12)
+
+- En la v0.12.0 la red (`cx.sys.net()`, trait `nf_core::net::NetApi`) solo la usan los programas del sistema:
+  la Terminal (`ping`, `ipconfig`, `nslookup`, `curl`), Configuración → Red y el icono de la bandeja.
+- Un programa de terceros recibe `Some(...)`, pero cada llamada le contesta como si no hubiera tarjeta
+  (`NetError::NoAdapter`, estado sin adaptador). No falla ni se cuelga.
+- Los sockets para todos los programas, con el aviso «¿Permitir que X use la red?», llegan en la v0.12.1.
 
 ## Guardar un archivo (`SAVE_AS`)
 

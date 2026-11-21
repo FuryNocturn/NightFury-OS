@@ -1,8 +1,8 @@
 # NightFury-OS
 
-**ES** · Sistema operativo x86_64 con arranque UEFI, escrito desde cero en Rust (*clean room*): núcleo, escritorio, ventanas, tipografía, iconos, sistema de archivos, cuentas, cifrado de disco y USB propios. Sin crates de terceros.
+**ES** · Sistema operativo x86_64 con arranque UEFI, escrito desde cero en Rust (*clean room*): núcleo, escritorio, ventanas, tipografía, iconos, sistema de archivos, cuentas, cifrado de disco, USB y red propios. Sin crates de terceros.
 
-**EN** · An x86_64 UEFI operating system written from scratch in Rust (*clean room*): its own kernel, desktop, windowing, font, icons, file system, user accounts, disk encryption and USB stack. No third-party crates.
+**EN** · An x86_64 UEFI operating system written from scratch in Rust (*clean room*): its own kernel, desktop, windowing, font, icons, file system, user accounts, disk encryption, USB and network stacks. No third-party crates.
 
 ![Escritorio / Desktop](docs/img/escritorio.png)
 
@@ -11,8 +11,8 @@
 | ![Explorador](docs/img/explorador.png) | ![Terminal](docs/img/terminal.png) |
 
 ## Estado / Status
-Versión 0.11.1, en desarrollo: USB propio (teclado, ratón, pendrives FAT/exFAT/ISO/UDF y mandos) y lectura de discos de Windows (NTFS) y de Linux (ext2/3/4), también los discos internos SATA y NVMe en solo lectura. Probado en QEMU; en hardware real todavía no.
-Version 0.11.1, work in progress: native USB (keyboard, mouse, FAT/exFAT/ISO/UDF drives and gamepads) and read-only Windows (NTFS) and Linux (ext2/3/4) disks, including internal SATA and NVMe drives. Tested in QEMU; not yet on real hardware.
+Versión 0.12.0, en desarrollo: red por cable (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 e I225/I226; Realtek RTL8111/8168; virtio-net), con DHCP, DNS y, en la Terminal, `ping`, `ipconfig`, `nslookup` y `curl` (HTTP; HTTPS en una versión próxima). Ya estaban el USB propio y la lectura de discos NTFS y ext2/3/4. Probado en QEMU; en hardware real todavía no.
+Version 0.12.0, work in progress: wired networking (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 and I225/I226; Realtek RTL8111/8168; virtio-net) with DHCP, DNS and, in the Terminal, `ping`, `ipconfig`, `nslookup` and `curl` (HTTP; HTTPS coming soon). Native USB and read-only NTFS and ext2/3/4 disks were already there. Tested in QEMU; not yet on real hardware.
 
 > **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS) es una implementación propia **no auditada**. No protejas con ella nada importante.
 > The cryptography is a custom, **unaudited** implementation. Do not rely on it for anything important.

@@ -21,6 +21,7 @@ use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
+use crate::net::{Ipv4, NetApi, NetError, NetStatus, PingId, PingReply, QueryId, SockId, State, TcpState, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, TCP_BUF};
 use crate::platform::{DateTime, MemInfo, Platform};
 use crate::wire::{decode, encode, Bad, Reader, Wire, WireResult, Writer};
 use alloc::string::String;
@@ -128,7 +129,25 @@ calls! {
     DriveAction { letter: char, req: FormatRequest } = 60,
     DriveResult = 61,
     ListView { dir: String } = 62,
+    NetStatus = 63,
+    NetRenew = 64,
+    NetPing { dst: Ipv4, bytes: u16, ttl: u8 } = 65,
+    NetPingPoll { id: PingId } = 66,
+    NetResolve { name: String } = 67,
+    NetResolvePoll { id: QueryId } = 68,
+    NetConnect { dst: Ipv4, port: u16 } = 69,
+    NetState { id: SockId } = 70,
+    NetSend { id: SockId, data: Blob } = 71,
+    NetRecv { id: SockId, max: u32 } = 72,
+    NetClose { id: SockId } = 73,
+    NetAbort { id: SockId } = 74,
 }
+
+/// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
+/// que quiera más manda o lee en varias vueltas, como con cualquier `tcp_send`/`tcp_recv`.
+pub const NET_CHUNK: usize = TCP_BUF;
+/// Longitud máxima de un nombre DNS (RFC 1035).
+const NET_NAME_MAX: usize = 253;
 
 // ---------- Wire de los tipos que viajan ----------
 
@@ -347,13 +366,218 @@ impl Wire for MemInfo {
     }
 }
 
+// ---------- Wire de la red ----------
+
+impl Wire for [u8; 4] {
+    fn put(&self, w: &mut Writer) {
+        w.buf.extend_from_slice(self);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let mut a = [0u8; 4];
+        a.copy_from_slice(r.take(4)?);
+        Ok(a)
+    }
+}
+
+impl Wire for [u8; 6] {
+    fn put(&self, w: &mut Writer) {
+        w.buf.extend_from_slice(self);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let mut a = [0u8; 6];
+        a.copy_from_slice(r.take(6)?);
+        Ok(a)
+    }
+}
+
+macro_rules! net_id {
+    ($($t:ident),*) => {$(
+        impl Wire for $t {
+            fn put(&self, w: &mut Writer) {
+                w.put(&self.0);
+            }
+            fn get(r: &mut Reader) -> WireResult<Self> {
+                Ok($t(r.get()?))
+            }
+        }
+    )*};
+}
+net_id!(PingId, QueryId, SockId);
+
+const STATES: [State; 5] = [State::NoAdapter, State::NoCable, State::Configuring, State::NoInternet, State::Connected];
+
+impl Wire for State {
+    fn put(&self, w: &mut Writer) {
+        w.put(&(STATES.iter().position(|s| s == self).unwrap_or(0) as u8));
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        STATES.get(u8::get(r)? as usize).copied().ok_or(Bad)
+    }
+}
+
+impl Wire for NetStatus {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.state).put(&self.adapter).put(&self.mac).put(&self.speed_mbps).put(&self.full_duplex);
+        w.put(&self.ip).put(&self.mask).put(&self.gateway).put(&self.dns).put(&self.dhcp_server);
+        w.put(&self.lease_s).put(&self.lease_since_ms);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(NetStatus {
+            state: r.get()?,
+            adapter: r.get()?,
+            mac: r.get()?,
+            speed_mbps: r.get()?,
+            full_duplex: r.get()?,
+            ip: r.get()?,
+            mask: r.get()?,
+            gateway: r.get()?,
+            dns: r.get()?,
+            dhcp_server: r.get()?,
+            lease_s: r.get()?,
+            lease_since_ms: r.get()?,
+        })
+    }
+}
+
+/// Motivos de `NetError::Protocol` que viajan por su posición (el texto es `&'static str`, así que
+/// al recibir se vuelve a uno de estos y nunca se crea un texto nuevo). Solo se añade al final.
+const PROTOCOL: [&str; 10] = [
+    "Content-Length no válido",
+    "cabeceras demasiado grandes",
+    "conexión cerrada antes de las cabeceras",
+    "conexión cerrada",
+    "demasiadas redirecciones",
+    "la conexión no está abierta",
+    "respuesta incompleta",
+    "sin servidor DNS",
+    "tamaño de bloque no válido",
+    "tamaño de eco excesivo",
+];
+const PROTOCOL_UNKNOWN: &str = "respuesta no válida";
+
+impl Wire for NetError {
+    fn put(&self, w: &mut Writer) {
+        use NetError::*;
+        match self {
+            NoAdapter => w.put(&0u8),
+            NoCable => w.put(&1u8),
+            NoAddress => w.put(&2u8),
+            NotFound => w.put(&3u8),
+            Timeout => w.put(&4u8),
+            Refused => w.put(&5u8),
+            Reset => w.put(&6u8),
+            Unreachable(ip) => w.put(&7u8).put(ip),
+            TtlExpired(ip) => w.put(&8u8).put(ip),
+            Busy => w.put(&9u8),
+            Gone => w.put(&10u8),
+            BadUrl => w.put(&11u8),
+            HttpsNotYet => w.put(&12u8),
+            Protocol(t) => w.put(&13u8).put(&(PROTOCOL.iter().position(|p| p == t).map_or(255, |i| i as u8))),
+        };
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        use NetError::*;
+        Ok(match u8::get(r)? {
+            0 => NoAdapter,
+            1 => NoCable,
+            2 => NoAddress,
+            3 => NotFound,
+            4 => Timeout,
+            5 => Refused,
+            6 => Reset,
+            7 => Unreachable(r.get()?),
+            8 => TtlExpired(r.get()?),
+            9 => Busy,
+            10 => Gone,
+            11 => BadUrl,
+            12 => HttpsNotYet,
+            13 => Protocol(PROTOCOL.get(u8::get(r)? as usize).copied().unwrap_or(PROTOCOL_UNKNOWN)),
+            _ => return Err(Bad),
+        })
+    }
+}
+
+impl Wire for PingReply {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.from).put(&self.bytes).put(&self.rtt_ms).put(&self.ttl);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(PingReply { from: r.get()?, bytes: r.get()?, rtt_ms: r.get()?, ttl: r.get()? })
+    }
+}
+
+impl Wire for TcpState {
+    fn put(&self, w: &mut Writer) {
+        match self {
+            TcpState::Connecting => w.put(&0u8),
+            TcpState::Open => w.put(&1u8),
+            TcpState::PeerClosed => w.put(&2u8),
+            TcpState::Closed => w.put(&3u8),
+            TcpState::Failed(e) => w.put(&4u8).put(e),
+        };
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(match u8::get(r)? {
+            0 => TcpState::Connecting,
+            1 => TcpState::Open,
+            2 => TcpState::PeerClosed,
+            3 => TcpState::Closed,
+            4 => TcpState::Failed(r.get()?),
+            _ => return Err(Bad),
+        })
+    }
+}
+
+/// Lo que un programa ha abierto en la pila: solo usa lo suyo, y al irse se libera.
+#[derive(Default)]
+pub struct NetOwn {
+    pings: Vec<PingId>,
+    queries: Vec<QueryId>,
+    socks: Vec<SockId>,
+}
+
+impl NetOwn {
+    /// El programa se va: corta sus conexiones y recoge sus pings y consultas (los que siguen en
+    /// marcha vencen solos por plazo y la pila los borra poco después).
+    pub fn release(&mut self, sys: &mut dyn Platform) {
+        if let Some(net) = sys.net() {
+            for s in self.socks.drain(..) {
+                net.tcp_abort(s);
+            }
+            for p in self.pings.drain(..) {
+                net.ping_poll(p);
+            }
+            for q in self.queries.drain(..) {
+                net.resolve_poll(q);
+            }
+        }
+        *self = NetOwn::default();
+    }
+}
+
+/// Lo que ve quien no tiene red (programa de terceros o equipo sin pila): no hay tarjeta.
+fn no_net(call: &Call) -> Vec<u8> {
+    let e = NetError::NoAdapter;
+    match call {
+        Call::NetStatus => encode(&no_status()),
+        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
+        Call::NetPingPoll { .. } | Call::NetResolvePoll { .. } => encode(&Some(Err::<u8, _>(e))),
+        Call::NetState { .. } => encode(&TcpState::Failed(e)),
+        _ => encode(&()),
+    }
+}
+
+fn no_status() -> NetStatus {
+    NetStatus { state: State::NoAdapter, adapter: String::new(), mac: [0; 6], speed_mbps: 0, full_duplex: false, ip: None, mask: None, gateway: None, dns: Vec::new(), dhcp_server: None, lease_s: 0, lease_since_ms: 0 }
+}
+
 // ---------- Lado del sistema ----------
 
 /// Atiende una petición. Respuesta: `0` + el valor, o `1` si no se entiende (nunca un pánico).
-pub fn serve(sys: &mut dyn Platform, req: &[u8], system: bool) -> Vec<u8> {
+pub fn serve(sys: &mut dyn Platform, req: &[u8], system: bool, own: &mut NetOwn) -> Vec<u8> {
     let Ok(call) = decode::<Call>(req) else { return vec![1] };
     let mut out = vec![0];
-    out.extend(run(sys, call, system));
+    out.extend(run(sys, call, system, own));
     out
 }
 
@@ -396,7 +620,7 @@ fn salt(sys: &mut dyn Platform) -> [u8; 16] {
     salt_from(a, b)
 }
 
-fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
+fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Vec<u8> {
     use Call::*;
     let denied = FsError::Denied;
     let no_admin = AccountError::NotAdmin;
@@ -546,6 +770,111 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
         UnlockDrive { letter, secret, recovery } => gate(system, Err(no_key), || sys.files().unlock_drive(letter, &secret, recovery)),
         DriveAction { letter, req } => gate(system, Err(denied), || sys.files().request_drive_action(letter, req)),
         DriveResult => gate(system, None, || sys.files().drive_result()),
+        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. } => {
+            // En esta versión solo los programas del sistema usan la red (los de terceros, con permiso, en v0.12.1).
+            match if system { sys.net() } else { None } {
+                Some(net) => net_run(net, call, own),
+                None => no_net(&call),
+            }
+        }
+    }
+}
+
+/// Las llamadas de red, con la pila ya a mano. Cada programa solo toca los identificadores que
+/// abrió él; uno ajeno es uno que «ya no existe».
+fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
+    use Call::*;
+    match call {
+        NetStatus => encode(&net.status()),
+        NetRenew => encode(&net.renew()),
+        NetPing { dst, bytes, ttl } => {
+            // Con la lista llena se tiran los ya caducados (la pila los borra sola).
+            if own.pings.len() >= MAX_PINGS {
+                own.pings.retain(|&p| net.ping_poll(p).is_none());
+            }
+            let r = if own.pings.len() >= MAX_PINGS { Err(NetError::Busy) } else { net.ping(dst, bytes, ttl) };
+            if let Ok(id) = r {
+                own.pings.push(id);
+            }
+            encode(&r)
+        }
+        NetPingPoll { id } => {
+            if !own.pings.contains(&id) {
+                return encode(&Some(Err::<PingReply, _>(NetError::Gone)));
+            }
+            let r = net.ping_poll(id);
+            if r.is_some() {
+                own.pings.retain(|&p| p != id);
+            }
+            encode(&r)
+        }
+        NetResolve { name } => {
+            if own.queries.len() >= MAX_QUERIES {
+                own.queries.retain(|&q| net.resolve_poll(q).is_none());
+            }
+            let r = if name.len() > NET_NAME_MAX {
+                Err(NetError::NotFound)
+            } else if own.queries.len() >= MAX_QUERIES {
+                Err(NetError::Busy)
+            } else {
+                net.resolve(&name)
+            };
+            if let Ok(id) = r {
+                own.queries.push(id);
+            }
+            encode(&r)
+        }
+        NetResolvePoll { id } => {
+            if !own.queries.contains(&id) {
+                return encode(&Some(Err::<Vec<Ipv4>, _>(NetError::Gone)));
+            }
+            let r = net.resolve_poll(id);
+            if r.is_some() {
+                own.queries.retain(|&q| q != id);
+            }
+            encode(&r)
+        }
+        NetConnect { dst, port } => {
+            if own.socks.len() >= MAX_SOCKS {
+                own.socks.retain(|&s| net.tcp_state(s) != TcpState::Failed(NetError::Gone));
+            }
+            let r = if own.socks.len() >= MAX_SOCKS { Err(NetError::Busy) } else { net.tcp_connect(dst, port) };
+            if let Ok(id) = r {
+                own.socks.push(id);
+            }
+            encode(&r)
+        }
+        NetState { id } => encode(&if own.socks.contains(&id) { net.tcp_state(id) } else { TcpState::Failed(NetError::Gone) }),
+        NetSend { id, data } => {
+            let n = data.0.len().min(NET_CHUNK);
+            encode(&if own.socks.contains(&id) { net.tcp_send(id, &data.0[..n]).map(|n| n as u64) } else { Err(NetError::Gone) })
+        }
+        NetRecv { id, max } => {
+            if !own.socks.contains(&id) {
+                return encode(&Err::<Blob, _>(NetError::Gone));
+            }
+            let mut buf = vec![0u8; (max as usize).min(NET_CHUNK)];
+            encode(&net.tcp_recv(id, &mut buf).map(|n| {
+                buf.truncate(n);
+                Blob(buf)
+            }))
+        }
+        // Ambas liberan el identificador: el programa ya no lo tiene.
+        NetClose { id } => {
+            if let Some(i) = own.socks.iter().position(|&s| s == id) {
+                own.socks.swap_remove(i);
+                net.tcp_close(id);
+            }
+            encode(&())
+        }
+        NetAbort { id } => {
+            if let Some(i) = own.socks.iter().position(|&s| s == id) {
+                own.socks.swap_remove(i);
+                net.tcp_abort(id);
+            }
+            encode(&())
+        }
+        _ => encode(&()),
     }
 }
 
@@ -554,6 +883,13 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool) -> Vec<u8> {
 /// Cómo llega una petición al sistema (en un programa, `SYS_SERVICE` + `SYS_TAKE_REPLY`).
 pub trait Transport {
     fn call(&mut self, req: &[u8]) -> Vec<u8>;
+}
+
+fn ask<T: Transport, R: Wire>(t: &mut T, c: Call, bad: R) -> R {
+    match t.call(&encode(&c)).split_first() {
+        Some((0, rest)) => decode(rest).unwrap_or(bad),
+        _ => bad,
+    }
 }
 
 /// `FilesApi` que lo pide todo al sistema. Con una respuesta rota o perdida devuelve un error de
@@ -565,10 +901,7 @@ const UNDO_LABELS: [&str; 5] = ["Cambiar nombre", "Mover", "Copiar", "Nuevo", "E
 impl<T: Transport> RemoteFiles<T> {
     /// Hace la petición; `bad` es lo que sale si la respuesta no vale.
     pub fn ask<R: Wire>(&mut self, c: Call, bad: R) -> R {
-        match self.0.call(&encode(&c)).split_first() {
-            Some((0, rest)) => decode(rest).unwrap_or(bad),
-            _ => bad,
-        }
+        ask(&mut self.0, c, bad)
     }
     fn fs<R: Wire>(&mut self, c: Call) -> Result<R, FsError> {
         self.ask(c, Err(FsError::Disk))
@@ -760,8 +1093,66 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     }
 }
 
+/// `NetApi` de un programa: cada método es un viaje al sistema. Sin respuesta o con una rota, no
+/// hay tarjeta de red (nunca un pánico).
+pub struct RemoteNet<T: Transport>(pub T);
+
+impl<T: Transport> RemoteNet<T> {
+    fn net<R: Wire>(&mut self, c: Call) -> Result<R, NetError> {
+        ask(&mut self.0, c, Err(NetError::NoAdapter))
+    }
+    fn poll<R: Wire>(&mut self, c: Call) -> Option<Result<R, NetError>> {
+        ask(&mut self.0, c, Some(Err(NetError::NoAdapter)))
+    }
+}
+
+impl<T: Transport> NetApi for RemoteNet<T> {
+    fn status(&mut self) -> NetStatus {
+        ask(&mut self.0, Call::NetStatus, no_status())
+    }
+    fn renew(&mut self) {
+        ask(&mut self.0, Call::NetRenew, ())
+    }
+    fn ping(&mut self, dst: Ipv4, bytes: u16, ttl: u8) -> Result<PingId, NetError> {
+        self.net(Call::NetPing { dst, bytes, ttl })
+    }
+    fn ping_poll(&mut self, id: PingId) -> Option<Result<PingReply, NetError>> {
+        self.poll(Call::NetPingPoll { id })
+    }
+    fn resolve(&mut self, name: &str) -> Result<QueryId, NetError> {
+        self.net(Call::NetResolve { name: s(name) })
+    }
+    fn resolve_poll(&mut self, id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>> {
+        self.poll(Call::NetResolvePoll { id })
+    }
+    fn tcp_connect(&mut self, dst: Ipv4, port: u16) -> Result<SockId, NetError> {
+        self.net(Call::NetConnect { dst, port })
+    }
+    fn tcp_state(&mut self, id: SockId) -> TcpState {
+        ask(&mut self.0, Call::NetState { id }, TcpState::Failed(NetError::NoAdapter))
+    }
+    fn tcp_send(&mut self, id: SockId, data: &[u8]) -> Result<usize, NetError> {
+        let n = data.len().min(NET_CHUNK);
+        self.net::<u64>(Call::NetSend { id, data: Blob(data[..n].to_vec()) }).map(|n| (n as usize).min(data.len()))
+    }
+    fn tcp_recv(&mut self, id: SockId, buf: &mut [u8]) -> Result<usize, NetError> {
+        let max = buf.len().min(NET_CHUNK) as u32;
+        let b: Blob = self.net(Call::NetRecv { id, max })?;
+        // Un sistema que mintiera con más bytes de los pedidos no desborda el búfer.
+        let n = b.0.len().min(buf.len());
+        buf[..n].copy_from_slice(&b.0[..n]);
+        Ok(n)
+    }
+    fn tcp_close(&mut self, id: SockId) {
+        ask(&mut self.0, Call::NetClose { id }, ())
+    }
+    fn tcp_abort(&mut self, id: SockId) {
+        ask(&mut self.0, Call::NetAbort { id }, ())
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::apps::{self, AppKind, Ctx};
     use crate::dialogs::{Answer, DialogRequest, DialogResult};
@@ -785,20 +1176,23 @@ mod tests {
     struct Via {
         real: Real,
         system: bool,
+        own: Rc<RefCell<NetOwn>>,
     }
 
     impl Transport for Via {
         fn call(&mut self, req: &[u8]) -> Vec<u8> {
-            serve(&mut *self.real.borrow_mut(), req, self.system)
+            serve(&mut *self.real.borrow_mut(), req, self.system, &mut self.own.borrow_mut())
         }
     }
 
     /// Plataforma de un programa: lo suyo es local y los archivos van por `RemoteFiles`.
-    struct Prog {
+    pub(crate) struct Prog {
         real: Real,
         fs: RemoteFiles<Via>,
         dummy: Files,
         pool: Pool,
+        net: RemoteNet<Via>,
+        own: Rc<RefCell<NetOwn>>,
     }
 
     impl Platform for Prog {
@@ -831,11 +1225,16 @@ mod tests {
         fn pool(&mut self) -> &mut Pool {
             &mut self.pool
         }
+        fn net(&mut self) -> Option<&mut dyn NetApi> {
+            Some(&mut self.net)
+        }
     }
 
-    fn prog(system: bool) -> (Real, Prog) {
+    pub(crate) fn prog(system: bool) -> (Real, Prog) {
         let real: Real = Rc::new(RefCell::new(TestPlatform::default()));
-        let p = Prog { real: real.clone(), fs: RemoteFiles(Via { real: real.clone(), system }), dummy: Files::default(), pool: Pool::new() };
+        let own = Rc::new(RefCell::new(NetOwn::default()));
+        let via = || Via { real: real.clone(), system, own: own.clone() };
+        let p = Prog { real: real.clone(), fs: RemoteFiles(via()), dummy: Files::default(), pool: Pool::new(), net: RemoteNet(via()), own: own.clone() };
         (real, p)
     }
 
@@ -860,10 +1259,10 @@ mod tests {
     #[test]
     fn mensajes_rotos_no_hacen_panico() {
         let mut sys = TestPlatform::default();
-        assert_eq!(serve(&mut sys, &[], true), [1]);
-        assert_eq!(serve(&mut sys, &[250], true), [1], "llamada que no existe");
-        assert_eq!(serve(&mut sys, &[2, 255, 255, 255, 255], true), [1], "longitud que miente");
-        assert_eq!(serve(&mut sys, &[15, 0], true), [1], "sobra un byte");
+        assert_eq!(serve(&mut sys, &[], true, &mut NetOwn::default()), [1]);
+        assert_eq!(serve(&mut sys, &[250], true, &mut NetOwn::default()), [1], "llamada que no existe");
+        assert_eq!(serve(&mut sys, &[2, 255, 255, 255, 255], true, &mut NetOwn::default()), [1], "longitud que miente");
+        assert_eq!(serve(&mut sys, &[15, 0], true, &mut NetOwn::default()), [1], "sobra un byte");
         // Respuestas rotas al otro lado: error de E/S o valor neutro.
         struct Roto(Vec<u8>);
         impl Transport for Roto {
@@ -1121,5 +1520,200 @@ mod tests {
         let c = Call::DriveAction { letter: 'E', req: FormatRequest::Encrypt { label: s("x"), password: s("y") } };
         assert!(matches!(decode::<Call>(&encode(&c)), Ok(Call::DriveAction { letter: 'E', req: FormatRequest::Encrypt { .. } })));
         assert!(decode::<FormatRequest>(&[9]).is_err() && decode::<char>(&0xD800u32.to_le_bytes()).is_err());
+    }
+
+    // ---------- Red por el servicio ----------
+
+    use crate::net::tests::{Lan, SRV};
+    use crate::net::Net;
+
+    /// Un programa con la pila de la `Lan` ya en el sistema. La pila vive en `real`; `lan` guarda una
+    /// vacía y se la presta a `corre` para avanzar el tiempo.
+    fn con_lan(system: bool) -> (Real, Prog, Lan) {
+        let (real, p) = prog(system);
+        let mut lan = Lan::up();
+        lan.router.names.push((s("ejemplo.com"), vec![SRV], 300));
+        lan.router.srv.listen(80, b"hola", true, false);
+        real.borrow_mut().net = Some(core::mem::replace(&mut lan.net, Net::new([0; 32])));
+        (real, p, lan)
+    }
+
+    fn corre(real: &Real, lan: &mut Lan, ms: u64) {
+        let mut r = real.borrow_mut();
+        let n = r.net.as_mut().unwrap();
+        core::mem::swap(&mut lan.net, n);
+        lan.run(ms);
+        core::mem::swap(&mut lan.net, n);
+    }
+
+    /// Otro programa sobre el mismo sistema, con sus propios identificadores.
+    fn otro(real: &Real, system: bool) -> RemoteNet<Via> {
+        RemoteNet(Via { real: real.clone(), system, own: Rc::new(RefCell::new(NetOwn::default())) })
+    }
+
+    #[test]
+    fn red_ping_dns_y_tcp_por_el_servicio() {
+        let (real, mut p, mut lan) = con_lan(true);
+        let st = p.net.status();
+        assert_eq!((st.state, st.ip, st.adapter.as_str()), (State::Connected, Some([192, 168, 1, 50]), "Prueba"));
+        let id = p.net.ping(SRV, 32, 64).unwrap();
+        let rep = (0..200).find_map(|_| {
+            corre(&real, &mut lan, 20);
+            p.net.ping_poll(id)
+        });
+        assert_eq!(rep.unwrap().unwrap().from, SRV);
+        assert_eq!(p.net.ping_poll(id), Some(Err(NetError::Gone)), "ya recogido");
+        let q = p.net.resolve("ejemplo.com").unwrap();
+        let ips = (0..300).find_map(|_| {
+            corre(&real, &mut lan, 20);
+            p.net.resolve_poll(q)
+        });
+        assert_eq!(ips, Some(Ok(vec![SRV])));
+        assert_eq!(p.net.resolve(&"a".repeat(300)), Err(NetError::NotFound));
+        let sk = p.net.tcp_connect(SRV, 80).unwrap();
+        while p.net.tcp_state(sk) == TcpState::Connecting {
+            corre(&real, &mut lan, 20);
+        }
+        assert_eq!(p.net.tcp_state(sk), TcpState::Open);
+        assert_eq!(p.net.tcp_send(sk, b"GET / HTTP/1.1\r\n\r\n"), Ok(18));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        for _ in 0..100 {
+            corre(&real, &mut lan, 20);
+            let n = p.net.tcp_recv(sk, &mut buf).unwrap();
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"hola");
+        p.net.tcp_close(sk);
+        assert_eq!(p.net.tcp_state(sk), TcpState::Failed(NetError::Gone), "ya no es suyo");
+        p.net.renew();
+    }
+
+    #[test]
+    fn red_denegada_a_programas_de_terceros() {
+        let (_real, mut p, _lan) = con_lan(false);
+        assert_eq!(p.net.status().state, State::NoAdapter);
+        assert_eq!(p.net.ping(SRV, 32, 64), Err(NetError::NoAdapter));
+        assert_eq!(p.net.ping_poll(PingId(0)), Some(Err(NetError::NoAdapter)));
+        assert_eq!(p.net.resolve("ejemplo.com"), Err(NetError::NoAdapter));
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::NoAdapter));
+        assert_eq!(p.net.tcp_state(SockId(0)), TcpState::Failed(NetError::NoAdapter));
+        assert_eq!(p.net.tcp_send(SockId(0), b"x"), Err(NetError::NoAdapter));
+        assert_eq!(p.net.tcp_recv(SockId(0), &mut [0u8; 4]), Err(NetError::NoAdapter));
+        // Sin pila en el sistema, igual.
+        let (_real, mut p) = prog(true);
+        assert_eq!(p.net.status().state, State::NoAdapter);
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::NoAdapter));
+    }
+
+    #[test]
+    fn red_un_programa_no_toca_lo_de_otro() {
+        let (real, mut a, mut lan) = con_lan(true);
+        let mut b = otro(&real, true);
+        let sk = a.net.tcp_connect(SRV, 80).unwrap();
+        let ping = a.net.ping(SRV, 8, 64).unwrap();
+        let q = a.net.resolve("ejemplo.com").unwrap();
+        corre(&real, &mut lan, 100);
+        let gone = TcpState::Failed(NetError::Gone);
+        assert_eq!((b.tcp_state(sk), b.tcp_send(sk, b"x"), b.tcp_recv(sk, &mut [0u8; 4])), (gone, Err(NetError::Gone), Err(NetError::Gone)));
+        b.tcp_abort(sk);
+        b.tcp_close(sk);
+        assert_eq!(b.ping_poll(ping), Some(Err(NetError::Gone)));
+        assert_eq!(b.resolve_poll(q), Some(Err(NetError::Gone)));
+        // Lo de A sigue en pie.
+        assert_eq!(a.net.tcp_state(sk), TcpState::Open);
+        assert!(matches!(a.net.ping_poll(ping), Some(Ok(_))));
+        assert_eq!(a.net.resolve_poll(q), Some(Ok(vec![SRV])));
+    }
+
+    #[test]
+    fn red_al_quitar_la_ventana_se_libera_todo() {
+        let (real, mut p, mut lan) = con_lan(true);
+        let socks: Vec<SockId> = (0..3).map(|_| p.net.tcp_connect(SRV, 80).unwrap()).collect();
+        let q = p.net.resolve("ejemplo.com").unwrap();
+        let ping = p.net.ping(SRV, 8, 64).unwrap();
+        corre(&real, &mut lan, 200);
+        // Una consulta y un ping ya hechos que nadie recogió, y otro ping aún en marcha.
+        p.net.ping([10, 9, 9, 9], 8, 64).unwrap();
+        p.own.borrow_mut().release(&mut *real.borrow_mut());
+        {
+            let mut r = real.borrow_mut();
+            let n = r.net.as_mut().unwrap();
+            for sk in &socks {
+                assert_eq!(n.tcp_state(*sk), TcpState::Failed(NetError::Gone));
+            }
+            assert_eq!(n.resolve_poll(q), Some(Err(NetError::Gone)));
+            assert_eq!(n.ping_poll(ping), Some(Err(NetError::Gone)));
+        }
+        // El programa ya no tiene nada suyo y los huecos vuelven.
+        assert_eq!(p.net.tcp_state(socks[0]), TcpState::Failed(NetError::Gone));
+        assert!(p.own.borrow().socks.is_empty() && p.own.borrow().pings.is_empty() && p.own.borrow().queries.is_empty());
+        for _ in 0..MAX_SOCKS {
+            assert!(p.net.tcp_connect(SRV, 80).is_ok());
+        }
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Busy));
+    }
+
+    #[test]
+    fn red_mensajes_rotos_y_tipos() {
+        let (real, _p, mut lan) = con_lan(true);
+        // Un `max` descomunal no reserva memoria de más aunque la conexión sea suya.
+        let mut b = otro(&real, true);
+        let sk = b.tcp_connect(SRV, 80).unwrap();
+        corre(&real, &mut lan, 100);
+        let mut buf = vec![0u8; 3 * NET_CHUNK];
+        assert!(b.tcp_recv(sk, &mut buf).is_ok());
+        assert_eq!(b.tcp_send(sk, &vec![0u8; 3 * NET_CHUNK]).map(|n| n <= NET_CHUNK), Ok(true));
+        let calls = [
+            Call::NetStatus,
+            Call::NetRenew,
+            Call::NetPing { dst: SRV, bytes: 1, ttl: 2 },
+            Call::NetPingPoll { id: PingId(1) },
+            Call::NetResolve { name: s("ejemplo.com") },
+            Call::NetResolvePoll { id: QueryId(1) },
+            Call::NetConnect { dst: SRV, port: 80 },
+            Call::NetState { id: SockId(1) },
+            Call::NetSend { id: SockId(1), data: Blob(vec![1, 2]) },
+            Call::NetRecv { id: SockId(1), max: u32::MAX },
+            Call::NetClose { id: SockId(1) },
+            Call::NetAbort { id: SockId(1) },
+        ];
+        for c in &calls {
+            let bytes = encode(c);
+            let mut own = NetOwn::default();
+            // Ningún prefijo ni un byte de más se entiende; solo el mensaje entero.
+            for n in 1..bytes.len() {
+                assert_eq!(serve(&mut *real.borrow_mut(), &bytes[..n], true, &mut own), [1], "{n} de {}", bytes.len());
+            }
+            let mut largo = bytes.clone();
+            largo.push(0);
+            assert_eq!(serve(&mut *real.borrow_mut(), &largo, true, &mut own), [1]);
+            assert_eq!(serve(&mut *real.borrow_mut(), &bytes, true, &mut own)[0], 0);
+        }
+        // Tipos.
+        let st = NetStatus { dns: vec![[1, 1, 1, 1], [8, 8, 8, 8]], ip: Some([10, 0, 0, 2]), adapter: s("Ñ"), mac: [1, 2, 3, 4, 5, 6], ..no_status() };
+        assert_eq!(decode::<NetStatus>(&encode(&st)), Ok(st));
+        for e in [NetError::NoAdapter, NetError::Unreachable([1, 2, 3, 4]), NetError::TtlExpired([5, 6, 7, 8]), NetError::Busy, NetError::HttpsNotYet, NetError::Protocol("sin servidor DNS")] {
+            assert_eq!(decode::<NetError>(&encode(&e)), Ok(e));
+        }
+        assert_eq!(decode::<NetError>(&encode(&NetError::Protocol("texto que no existe"))), Ok(NetError::Protocol(PROTOCOL_UNKNOWN)));
+        assert_eq!(decode::<NetError>(&[13, 200]), Ok(NetError::Protocol(PROTOCOL_UNKNOWN)));
+        assert!(decode::<NetError>(&[99]).is_err() && decode::<TcpState>(&[9]).is_err() && decode::<State>(&[9]).is_err());
+        let t = TcpState::Failed(NetError::Reset);
+        assert_eq!(decode::<TcpState>(&encode(&t)), Ok(t));
+        let r = PingReply { from: SRV, bytes: 32, rtt_ms: 7, ttl: 60 };
+        assert_eq!(decode::<PingReply>(&encode(&r)), Ok(r));
+        // Respuestas rotas al otro lado: no hay tarjeta.
+        struct Roto;
+        impl Transport for Roto {
+            fn call(&mut self, _: &[u8]) -> Vec<u8> {
+                vec![0, 9]
+            }
+        }
+        let mut n = RemoteNet(Roto);
+        assert_eq!(n.status().state, State::NoAdapter);
+        assert_eq!(n.tcp_connect(SRV, 80), Err(NetError::NoAdapter));
+        assert_eq!(n.tcp_recv(SockId(1), &mut [0u8; 4]), Err(NetError::NoAdapter));
+        assert_eq!(n.tcp_state(SockId(1)), TcpState::Failed(NetError::NoAdapter));
     }
 }

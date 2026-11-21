@@ -19,7 +19,8 @@ use nf_core::files::{self, Files};
 use nf_core::fsapi::FilesApi;
 use nf_core::keys::Pool;
 use nf_core::platform::{DateTime, MemInfo, Platform};
-use nf_core::service::{Call, RemoteFiles, Transport};
+use nf_core::net::NetApi;
+use nf_core::service::{Call, RemoteFiles, RemoteNet, Transport};
 use nf_core::wire::Wire;
 use nf_core::surface::Surface;
 use nf_core::sync::SpinLock;
@@ -168,6 +169,8 @@ struct PlataformaPrograma<'a> {
     files: Files,
     fs: RemoteFiles<Red<'a>>,
     net: Red<'a>,
+    /// La red: se pide al sistema por `SERVICE` (solo la tienen los programas del sistema).
+    remota: RemoteNet<Red<'a>>,
     pool: Pool,
     semilla: u64,
 }
@@ -219,6 +222,9 @@ impl Platform for PlataformaPrograma<'_> {
     }
     fn pool(&mut self) -> &mut Pool {
         &mut self.pool
+    }
+    fn net(&mut self) -> Option<&mut dyn NetApi> {
+        Some(&mut self.remota)
     }
 }
 
@@ -403,6 +409,7 @@ pub fn ejecutar(c: &mut impl Llamadas, app: Box<dyn App>, tick_ms: Option<u64>) 
             files: Files::default(),
             fs: RemoteFiles(red.clone()),
             net: red.clone(),
+            remota: RemoteNet(red.clone()),
             pool: Pool::new(),
             semilla: 0x2545_F491_4F6C_DD1D,
         },
