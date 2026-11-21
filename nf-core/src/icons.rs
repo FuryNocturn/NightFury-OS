@@ -70,6 +70,10 @@ pub enum Icon {
     Equipo,
     /// Mando de juego.
     Mando,
+    /// Red: monitor con cable (conectado), con una X roja (sin cable) y globo con aviso (sin Internet).
+    RedConectada,
+    RedSinCable,
+    RedSinInternet,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -486,6 +490,35 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
                 s.fill_circle(px, py, 0.9 * k, c, 255);
             }
         }
+        Icon::RedConectada | Icon::RedSinCable => {
+            // Monitor sobre un cable que baja a una regleta con dos conectores.
+            cell(s, o, k, (1.0, 1.0, 15.0, 10.0), OSCURO);
+            cell(s, o, k, (2.0, 2.0, 14.0, 9.0), rgb(0x8F, 0xBE, 0xF0));
+            cell(s, o, k, (7.4, 10.0, 8.6, 13.0), GRIS);
+            cell(s, o, k, (3.0, 12.4, 13.0, 13.6), GRIS);
+            cell(s, o, k, (2.5, 13.6, 4.5, 15.5), OSCURO);
+            cell(s, o, k, (11.5, 13.6, 13.5, 15.5), OSCURO);
+            if icon == Icon::RedSinCable {
+                let t = tw(1.9);
+                s.stroke(&[p(4.5, 3.0), p(11.5, 8.0)], t, ROJO);
+                s.stroke(&[p(11.5, 3.0), p(4.5, 8.0)], t, ROJO);
+            }
+        }
+        Icon::RedSinInternet => {
+            // Globo con meridianos y, abajo a la derecha, un triángulo amarillo con «!».
+            let (gx, gy) = p(7.0, 7.0);
+            s.fill_circle(gx, gy, 6.2 * k, AZUL, 255);
+            s.fill_circle(gx, gy, 5.4 * k, rgb(0x8F, 0xBE, 0xF0), 255);
+            cell(s, o, k, (1.0, 6.6, 13.0, 7.4), AZUL);
+            cell(s, o, k, (6.6, 1.0, 7.4, 13.0), AZUL);
+            s.arc(gx, gy, 3.0 * k, 0.0, 360.0, tw(0.8), AZUL);
+            for i in 0..7 {
+                let (y0, hw) = (8.0 + i as f32, 0.6 + i as f32 * 0.5);
+                cell(s, o, k, (12.0 - hw, y0, 12.0 + hw, y0 + 1.0), rgb(0xF2, 0xB0, 0x1E));
+            }
+            cell(s, o, k, (11.5, 10.6, 12.5, 13.2), OSCURO);
+            cell(s, o, k, (11.5, 13.6, 12.5, 14.6), OSCURO);
+        }
         Icon::Cerrar => {
             cell(s, o, k, (1.0, 2.0, 15.0, 14.0), GRIS);
             cell(s, o, k, (2.0, 5.0, 14.0, 13.0), 0xFFFFFF);
@@ -502,7 +535,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 48] = [
+    const ALL: [Icon; 51] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -551,6 +584,9 @@ mod tests {
         Icon::UsbSeguro,
         Icon::Equipo,
         Icon::Mando,
+        Icon::RedConectada,
+        Icon::RedSinCable,
+        Icon::RedSinInternet,
     ];
     const SENT: u32 = 0x123456;
 

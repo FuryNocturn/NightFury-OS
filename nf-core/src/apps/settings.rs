@@ -23,6 +23,7 @@ use crate::gamepad::*;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::KeyEvent;
+use crate::net::{ip_text, mac_text, Ipv4, NetStatus, State};
 use crate::keys::{self, Pool};
 use crate::platform::{DateTime, Platform};
 use crate::programs::{self, Program};
@@ -38,19 +39,21 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 6] = [
+const SECTIONS: [(&str, Icon); 7] = [
     ("Personalización", Icon::Palette),
     ("Cuentas", Icon::Cuentas),
     ("Aplicaciones", Icon::VistaIconosGrandes),
     ("Disco", Icon::DiscoSeguro),
     ("Dispositivos", Icon::Mando),
+    ("Red", Icon::RedConectada),
     ("Acerca de", Icon::Info),
 ];
 const PAGE_ACCOUNTS: usize = 1;
 const PAGE_APPS: usize = 2;
 const PAGE_DISK: usize = 3;
 const PAGE_DEVICES: usize = 4;
-const PAGE_ABOUT: usize = 5;
+const PAGE_NET: usize = 5;
+const PAGE_ABOUT: usize = 6;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -104,6 +107,8 @@ enum Act {
     /// Probar el mando `i` de `Settings::pads` y volver a la lista.
     PadTest(usize),
     PadBack,
+    /// Red: pedir la dirección otra vez.
+    NetRenew,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -187,6 +192,8 @@ struct Settings {
     pads: Vec<PadInfo>,
     testing: Option<u32>,
     pad_state: PadState,
+    /// Estado de la red tal como se vio al dibujar la página Red (para redibujar cuando cambia).
+    net_seen: Option<NetStatus>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -213,6 +220,7 @@ fn init() -> Settings {
         pads: Vec::new(),
         testing: None,
         pad_state: PadState::default(),
+        net_seen: None,
     }
 }
 
@@ -280,6 +288,46 @@ impl Settings {
             }
             self.hits.push((r, Hit::Accent(i)));
         }
+    }
+
+    fn net_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let mut y = if compact { 14 } else { 24 };
+        font::draw(s, x0, y, "Red", 18, false, TEXT);
+        y += font::line_h(18) + if compact { 8 } else { 16 };
+        let st = sys.net().map(|n| n.status());
+        self.net_seen = st.clone();
+        let some = |f: &dyn Fn(&NetStatus) -> Option<String>| st.as_ref().and_then(f).unwrap_or_else(|| String::from("—"));
+        let ipt = |v: Option<Ipv4>| v.map(ip_text);
+        let state = match st.as_ref().map(|s| s.state) {
+            Some(State::Connected) => "Conectado",
+            Some(State::NoCable) => "Sin cable",
+            Some(State::Configuring) => "Obteniendo dirección…",
+            Some(State::NoInternet) => "Sin Internet",
+            Some(State::NoAdapter) | None => "Sin tarjeta",
+        };
+        let rows = [
+            ("Tarjeta", st.as_ref().map_or(String::from("No hay ninguna tarjeta de red"), |s| s.adapter.clone())),
+            ("Estado", String::from(state)),
+            ("Velocidad", some(&|s| (s.speed_mbps > 0).then(|| super::netcmd::speed_text(s.speed_mbps, s.full_duplex)))),
+            ("Dirección física (MAC)", some(&|s| (!s.adapter.is_empty()).then(|| mac_text(s.mac)))),
+            ("Dirección IPv4", some(&|s| ipt(s.ip))),
+            ("Máscara de subred", some(&|s| ipt(s.mask))),
+            ("Puerta de enlace", some(&|s| ipt(s.gateway))),
+            ("Servidores DNS", some(&|s| (!s.dns.is_empty()).then(|| s.dns.iter().map(|d| ip_text(*d)).collect::<Vec<_>>().join(", ")))),
+            ("Servidor DHCP", some(&|s| ipt(s.dhcp_server))),
+        ];
+        let row_h = if compact { 22 } else { 28 };
+        for (label, value) in rows.iter() {
+            font::draw_in(s, Rect::new(x0, y, 170, row_h), label, 9, false, GRAY, Align::Left);
+            font::draw_in(s, Rect::new(x0 + 170, y, (s.w - x0 - 170).max(0), row_h), value, 9, false, TEXT, Align::Left);
+            y += row_h;
+        }
+        y += if compact { 6 } else { 14 };
+        let on = matches!(st.map(|s| s.state), Some(State::Configuring | State::NoInternet | State::Connected));
+        let right = (s.w - 8).max(x0 + 1);
+        self.button_if(s, &mut (x0, y), x0, right, "Renovar dirección", Act::NetRenew, on, theme);
     }
 
     fn about(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
@@ -875,6 +923,13 @@ impl Settings {
                 cx.redraw = true;
                 return;
             }
+            Act::NetRenew => {
+                if let Some(n) = cx.sys.net() {
+                    n.renew();
+                }
+                cx.redraw = true;
+                return;
+            }
             _ => {}
         }
         let crypto = match act {
@@ -907,7 +962,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -1226,6 +1281,7 @@ impl App for Settings {
                 PAGE_DISK => self.disk_page(s, theme, sys),
                 PAGE_APPS => self.apps_page(s, theme, sys),
                 PAGE_DEVICES => self.devices_page(s, theme, sys, focused),
+                PAGE_NET => self.net_page(s, theme, sys),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
@@ -1242,6 +1298,16 @@ impl App for Settings {
     }
 
     fn key(&mut self, _ev: &KeyEvent, _cx: &mut Ctx) {}
+
+    /// `NET_PAGE` (el icono de red de la bandeja) abre la página Red.
+    fn open_path(&mut self, path: &str, cx: &mut Ctx) {
+        if path == super::NET_PAGE {
+            self.page = PAGE_NET;
+            self.scroll = 0;
+            self.hits.clear();
+            cx.redraw = true;
+        }
+    }
 
     fn mouse(&mut self, ev: MouseEv, cx: &mut Ctx) {
         let at = |s: &Self, x: i32, y: i32| s.hits.iter().find(|(r, _)| r.contains(x, y)).map(|h| h.1);
@@ -1364,6 +1430,10 @@ impl App for Settings {
             PAGE_ACCOUNTS => cx.sys.fs().home_conversion().is_some(),
             _ => false,
         };
+        // La página Red se pone al día sola cuando cambia el estado de la red.
+        if self.page == PAGE_NET && cx.sys.net().map(|n| n.status()) != self.net_seen {
+            cx.redraw = true;
+        }
         if moving && sec != self.last_sec {
             self.last_sec = sec;
             cx.redraw = true;
@@ -2544,5 +2614,64 @@ mod tests {
         assert_eq!(b.mensaje(), "Se está descifrando tu carpeta.");
         while !b.files().home_convert_step(10, AHORA).unwrap() {}
         assert!(!b.files().home_encrypted() && b.hay(Act::HomeEnc));
+    }
+
+    // ---- Red ----
+
+    fn tick_banco(b: &mut Banco) -> bool {
+        let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 0);
+        b.app.tick(&mut cx);
+        cx.redraw
+    }
+
+    /// Deja correr la red simulada de `lan` con la pila que tiene el banco.
+    fn corre_red(b: &mut Banco, lan: &mut crate::net::tests::Lan, ms: u64) {
+        core::mem::swap(&mut lan.net, b.sys.net.as_mut().unwrap());
+        lan.run(ms);
+        core::mem::swap(&mut lan.net, b.sys.net.as_mut().unwrap());
+    }
+
+    #[test]
+    fn red_muestra_el_estado_y_renueva_la_direccion() {
+        use crate::net::tests::{Lan, LINK};
+        use crate::net::Net;
+        let mut b = Banco::new();
+        // Se llega a la página desde el icono de la bandeja y desde la lista; sin tarjeta no se puede renovar.
+        let mut cx = Ctx::new(&mut b.sys, &mut b.theme, 0);
+        b.app.open_path("C:\\x", &mut cx);
+        assert_eq!(b.app.page, 0, "una ruta cualquiera no cambia de página");
+        b.app.open_path(super::super::NET_PAGE, &mut cx);
+        assert_eq!(b.app.page, PAGE_NET);
+        assert!(cx.redraw);
+        assert!(!b.hay(Act::NetRenew));
+        assert_eq!(b.app.net_seen, None);
+        assert!(!tick_banco(&mut b), "sin tarjeta y sin cambios no redibuja");
+        // Conectada: aparece el botón y el estado queda visto.
+        let mut lan = Lan::up();
+        b.sys.net = Some(core::mem::replace(&mut lan.net, Net::new([0; 32])));
+        assert!(tick_banco(&mut b), "ha cambiado el estado");
+        assert!(b.hay(Act::NetRenew));
+        let st = b.app.net_seen.clone().unwrap();
+        assert_eq!((st.state, st.ip), (State::Connected, Some([192, 168, 1, 50])));
+        assert!(!tick_banco(&mut b));
+        // Renovar pide la dirección otra vez; el tick lo ve y la página se rehace sola.
+        b.pulsa(Act::NetRenew);
+        assert_eq!(b.sys.net.as_ref().unwrap().status().state, State::Configuring);
+        assert!(tick_banco(&mut b));
+        b.dibuja(780, 520);
+        corre_red(&mut b, &mut lan, 600);
+        assert!(tick_banco(&mut b));
+        assert_eq!(b.sys.net.as_ref().unwrap().status().state, State::Connected);
+        // Sin cable no se puede renovar.
+        lan.wire.borrow_mut().link = None;
+        corre_red(&mut b, &mut lan, 100);
+        assert!(tick_banco(&mut b));
+        assert!(!b.hay(Act::NetRenew));
+        assert_eq!(b.app.net_seen.as_ref().unwrap().state, State::NoCable);
+        lan.wire.borrow_mut().link = Some(LINK);
+        // Fuera de la página Red no se redibuja por la red.
+        b.pagina(0);
+        corre_red(&mut b, &mut lan, 600);
+        assert!(!tick_banco(&mut b));
     }
 }

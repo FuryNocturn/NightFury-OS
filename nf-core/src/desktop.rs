@@ -18,6 +18,7 @@ use crate::input::{Event, Key, KeyEvent};
 use crate::keys::KeyError;
 use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
+use crate::net::{self, State};
 use crate::platform::{DateTime, Platform};
 use crate::programs::{self, Program};
 use crate::surface::{blend, lighten, Surface};
@@ -96,6 +97,33 @@ fn resize_cursor(edge: u8) -> u8 {
     }
 }
 
+/// Icono de la bandeja para cada estado de la red (sin tarjeta cuenta como sin cable; configurando, como sin Internet).
+fn net_icon(s: State) -> Icon {
+    match s {
+        State::Connected => Icon::RedConectada,
+        State::NoAdapter | State::NoCable => Icon::RedSinCable,
+        State::Configuring | State::NoInternet => Icon::RedSinInternet,
+    }
+}
+
+/// Elementos del panel de red: estado, dirección IP (si hay) y el enlace a Configuración.
+fn net_items(st: &net::NetStatus) -> Vec<MenuItem> {
+    let head = match st.state {
+        State::NoAdapter => "No hay ninguna tarjeta de red",
+        State::NoCable => "Ethernet — Sin cable",
+        State::Configuring => "Ethernet — Obteniendo dirección…",
+        State::NoInternet => "Ethernet — Sin Internet",
+        State::Connected => "Ethernet — Conectado",
+    };
+    let mut items = vec![MenuItem::new(0, head).bold().disabled(true)];
+    if let Some(ip) = st.ip {
+        items.push(MenuItem::new(0, &format!("Dirección IP: {}", net::ip_text(ip))).disabled(true));
+    }
+    items.push(MenuItem::sep());
+    items.push(MenuItem::new(M_NETCFG, "Configuración de red"));
+    items
+}
+
 /// Qué hay bajo el puntero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Hit {
@@ -106,6 +134,8 @@ enum Hit {
     Show,
     /// «Quitar hardware de forma segura» de la bandeja y el globo de unidades.
     Tray,
+    /// Icono de red de la bandeja.
+    Net,
     Tip,
     Bar,
     Row(usize),
@@ -307,6 +337,9 @@ const MENU_DESK: u32 = 2;
 /// Menú de «Quitar hardware de forma segura»: cada entrada es `M_EJECT + letra - 'A'`.
 const MENU_TRAY: u32 = 4;
 const M_EJECT: u32 = 100;
+/// Panel del icono de red de la bandeja; su único elemento elegible abre Configuración en Red.
+const MENU_NET: u32 = 5;
+const M_NETCFG: u32 = 1;
 /// Cuánto se ve el globo de una unidad.
 const TIP_MS: u64 = 6000;
 /// Menú que sale al soltar un arrastre con el botón derecho.
@@ -500,6 +533,8 @@ pub struct Desktop {
     /// generación de `Files` en que se leyeron.
     drv: Option<Vec<DriveInfo>>,
     drv_gen: u64,
+    /// Icono de red de la bandeja (`None` = no hay pila de red: no se dibuja).
+    net_ico: Option<Icon>,
     tip: Option<Tip>,
     /// Mandos conectados y su último estado, y la ventana que recibe sus estados.
     pads: Vec<(crate::gamepad::PadInfo, crate::gamepad::PadState)>,
@@ -803,6 +838,7 @@ impl Desktop {
             pending_del: None,
             drv: None,
             drv_gen: 0,
+            net_ico: None,
             tip: None,
         };
         d.login.set_clock(d.clock);
@@ -1017,6 +1053,33 @@ impl Desktop {
         self.raise(id);
         let path = format!("{l}:\\");
         self.with_app(id, sys, |a, cx| a.open_path(&path, cx));
+    }
+
+    /// Mira el estado de la red; si cambia el icono, repinta la bandeja (y el panel si está abierto).
+    fn net_tick(&mut self, sys: &mut dyn Platform) {
+        let ico = sys.net().map(|n| net_icon(n.status().state));
+        if ico == self.net_ico {
+            return;
+        }
+        self.dmg(self.tray_zone());
+        self.net_ico = ico;
+        self.dmg(self.tray_zone());
+        if self.menu.as_ref().is_some_and(|m| m.tag == MENU_NET) {
+            self.net_menu(sys);
+        }
+    }
+
+    /// Panel del icono de red: estado, dirección IP y enlace a Configuración.
+    fn net_menu(&mut self, sys: &mut dyn Platform) {
+        let Some(st) = sys.net().map(|n| n.status()) else { return self.close_menu() };
+        let r = self.net_rect();
+        self.open_menu(None, MENU_NET, r.x, r.y, net_items(&st));
+    }
+
+    /// Abre Configuración (o la trae al frente) en la página Red.
+    fn open_net_settings(&mut self, sys: &mut dyn Platform) {
+        let id = self.launch_id(AppKind::Settings, sys);
+        self.with_app(id, sys, |a, cx| a.open_path(apps::NET_PAGE, cx));
     }
 
     /// Menú de la bandeja: una entrada «Expulsar …» por cada unidad extraíble.
@@ -1664,6 +1727,10 @@ impl Desktop {
         } else if tag == MENU_TRAY {
             if let Some(l) = char::from_u32('A' as u32 + id.wrapping_sub(M_EJECT)).filter(|c| c.is_ascii_uppercase()) {
                 self.eject(l, sys);
+            }
+        } else if tag == MENU_NET {
+            if id == M_NETCFG {
+                self.open_net_settings(sys);
             }
         } else if tag == MENU_ICON {
             if self.sel.len() > 1 {
@@ -2523,9 +2590,18 @@ impl Desktop {
     fn clock_rect(&self) -> Rect {
         Rect::new(self.w - 92, self.bar_y(), 86, BAR_H)
     }
-    /// Icono «Quitar hardware de forma segura»: a la izquierda del reloj.
-    fn tray_rect(&self) -> Rect {
+    /// Icono de red: pegado al reloj.
+    fn net_rect(&self) -> Rect {
         Rect::new(self.w - 92 - 36, self.bar_y(), 34, BAR_H)
+    }
+    /// Icono «Quitar hardware de forma segura»: a la izquierda del reloj (y del icono de red, si lo hay).
+    fn tray_rect(&self) -> Rect {
+        let shift = if self.net_ico.is_some() { 36 } else { 0 };
+        Rect::new(self.w - 92 - 36 - shift, self.bar_y(), 34, BAR_H)
+    }
+    /// Todo el sitio de los iconos de la bandeja.
+    fn tray_zone(&self) -> Rect {
+        Rect::new(self.w - 92 - 72, self.bar_y(), 72, BAR_H)
     }
     /// Unidades extraíbles conectadas (de la última lectura).
     fn removable(&self) -> Vec<&DriveInfo> {
@@ -2669,6 +2745,9 @@ impl Desktop {
             if self.show_rect().contains(x, y) {
                 return Hit::Show;
             }
+            if self.net_ico.is_some() && self.net_rect().contains(x, y) {
+                return Hit::Net;
+            }
             if !self.removable().is_empty() && self.tray_rect().contains(x, y) {
                 return Hit::Tray;
             }
@@ -2715,7 +2794,7 @@ impl Desktop {
     /// Solo los elementos que cambian de aspecto al pasar el ratón.
     fn hot_of(h: Hit) -> Hit {
         match h {
-            Hit::Start | Hit::Task(_) | Hit::Show | Hit::Tray | Hit::Row(_) | Hit::Tile(_) | Hit::MSettings | Hit::MPower | Hit::Shut(_) | Hit::Cap(..) => h,
+            Hit::Start | Hit::Task(_) | Hit::Show | Hit::Tray | Hit::Net | Hit::Row(_) | Hit::Tile(_) | Hit::MSettings | Hit::MPower | Hit::Shut(_) | Hit::Cap(..) => h,
             _ => Hit::None,
         }
     }
@@ -2726,6 +2805,7 @@ impl Desktop {
             Hit::Task(id) => self.task_ids().iter().position(|&t| t == id).map_or(Rect::default(), |i| self.task_rect(i)),
             Hit::Show => self.show_rect(),
             Hit::Tray => self.tray_rect(),
+            Hit::Net => self.net_rect(),
             Hit::Row(i) => self.row_rect(i),
             Hit::Tile(i) => self.tile_rect(i),
             Hit::MSettings => self.msettings_rect(),
@@ -2809,6 +2889,7 @@ impl Desktop {
                 }
             }
             Hit::Tray => self.tray_menu(),
+            Hit::Net => self.net_menu(sys),
             Hit::Tip => {
                 if let Some(t) = self.tip.take() {
                     self.dmg(self.tip_rect());
@@ -3321,6 +3402,7 @@ impl Desktop {
                 self.clock = t;
                 self.dmg(self.clock_rect());
             }
+            self.net_tick(sys);
             self.login.set_clock(t);
             self.flush_login();
         }
@@ -3507,6 +3589,13 @@ impl Desktop {
         let t = &self.clock;
         text_in(s, Rect::new(c.x, y0, c.w, lh), &format!("{:02}:{:02}", t.hour, t.minute), 8, 0xFFFFFF, Align::Center);
         text_in(s, Rect::new(c.x, y0 + lh, c.w, lh), &format!("{}/{}/{}", t.day, t.month, t.year), 8, 0xFFFFFF, Align::Center);
+        if let Some(ico) = self.net_ico {
+            let r = self.net_rect();
+            if self.hot == Hit::Net || self.menu.as_ref().is_some_and(|m| m.tag == MENU_NET) {
+                s.fill_rect(r, HOVER_BAR);
+            }
+            icons::draw(s, ico, r.x + 7, r.y + 10, 20, 0xFFFFFF);
+        }
         if !self.removable().is_empty() {
             let r = self.tray_rect();
             if self.hot == Hit::Tray || self.menu.as_ref().is_some_and(|m| m.tag == MENU_TRAY) {
@@ -3764,6 +3853,94 @@ mod tests {
         // Al quitarse, queda solo la E: y su entrada.
         d.tick(9000, &mut sys);
         assert_eq!(d.removable().iter().map(|x| x.letter).collect::<Vec<_>>(), ['E']);
+    }
+
+    /// Mueve la pila de `lan` a la plataforma y deja una vacía en su sitio.
+    fn pon_red(sys: &mut TestPlatform, lan: &mut crate::net::tests::Lan) {
+        sys.net = Some(core::mem::replace(&mut lan.net, net::Net::new([0; 32])));
+    }
+
+    /// Deja correr `ms` de la red simulada de `lan` con la pila de `sys`.
+    fn corre_red(sys: &mut TestPlatform, lan: &mut crate::net::tests::Lan, ms: u64) {
+        core::mem::swap(&mut lan.net, sys.net.as_mut().unwrap());
+        lan.run(ms);
+        core::mem::swap(&mut lan.net, sys.net.as_mut().unwrap());
+    }
+
+    #[test]
+    fn icono_de_red_segun_el_estado() {
+        assert_eq!(net_icon(State::Connected), Icon::RedConectada);
+        assert_eq!(net_icon(State::NoCable), Icon::RedSinCable);
+        assert_eq!(net_icon(State::NoAdapter), Icon::RedSinCable);
+        assert_eq!(net_icon(State::NoInternet), Icon::RedSinInternet);
+        assert_eq!(net_icon(State::Configuring), Icon::RedSinInternet);
+    }
+
+    #[test]
+    fn bandeja_de_red_sigue_el_estado_y_abre_su_panel() {
+        use crate::net::tests::Lan;
+        let (mut d, mut sys) = setup(1280, 800);
+        d.tick(1000, &mut sys);
+        assert_eq!(d.net_ico, None);
+        assert_ne!(d.hit(center(d.net_rect()).0, center(d.net_rect()).1), Hit::Net, "sin pila de red no hay icono");
+        // Conectada.
+        let mut lan = Lan::up();
+        pon_red(&mut sys, &mut lan);
+        d.tick(1300, &mut sys);
+        assert_eq!(d.net_ico, Some(Icon::RedConectada));
+        assert_eq!(d.hit(center(d.net_rect()).0, center(d.net_rect()).1), Hit::Net);
+        let mut s = Surface::new(1280, 800, 0);
+        d.paint(&mut s, None);
+        // Con una unidad USB, cada icono tiene su sitio y su clic.
+        sys.files.attach(1, "Pendrive", usb_vol("DATOS"));
+        d.tick(1600, &mut sys);
+        assert!(d.net_rect().right() <= d.clock_rect().x && d.tray_rect().right() <= d.net_rect().x);
+        assert_eq!(d.hit(center(d.net_rect()).0, center(d.net_rect()).1), Hit::Net);
+        assert_eq!(d.hit(center(d.tray_rect()).0, center(d.tray_rect()).1), Hit::Tray);
+        click!(d, sys, center(d.tray_rect()));
+        assert_eq!(d.menu.as_ref().map(|m| m.tag), Some(MENU_TRAY));
+        // Sin cable: otro icono; el estado solo se mira cada 250 ms y no cambia nada si sigue igual.
+        sys.files.attach(2, "Otro", usb_vol(""));
+        lan.wire.borrow_mut().link = None;
+        corre_red(&mut sys, &mut lan, 100);
+        d.tick(1700, &mut sys);
+        assert_eq!(d.net_ico, Some(Icon::RedConectada), "todavía no toca mirar");
+        d.tick(2000, &mut sys);
+        assert_eq!(d.net_ico, Some(Icon::RedSinCable));
+        // El clic abre el panel encima de la barra: estado, enlace a Configuración.
+        d.close_menu();
+        click!(d, sys, center(d.net_rect()));
+        let m = d.menu.as_ref().expect("panel de red");
+        assert_eq!(m.tag, MENU_NET);
+        assert!(m.menu.rect().bottom() <= d.bar_y());
+        let st = sys.net.as_ref().unwrap().status();
+        let it = net_items(&st);
+        assert_eq!((it[0].text.as_str(), it[0].disabled), ("Ethernet — Sin cable", true));
+        assert_eq!(it.len(), 3, "sin IP no hay línea de dirección");
+        // Vuelve el cable: el panel abierto se rehace con la dirección.
+        lan.wire.borrow_mut().link = Some(crate::net::tests::LINK);
+        corre_red(&mut sys, &mut lan, 600);
+        d.tick(2300, &mut sys);
+        assert_eq!(d.net_ico, Some(Icon::RedConectada));
+        let it = net_items(&sys.net.as_ref().unwrap().status());
+        assert_eq!((it[0].text.as_str(), it[1].text.as_str(), it[3].text.as_str()), ("Ethernet — Conectado", "Dirección IP: 192.168.1.50", "Configuración de red"));
+        let m = d.menu.as_ref().expect("el panel sigue abierto");
+        assert_eq!(m.tag, MENU_NET);
+        // Elegir «Configuración de red» abre Configuración.
+        assert!(!d.wins.iter().any(|w| w.kind == AppKind::Settings));
+        click!(d, sys, center(d.menu.as_ref().unwrap().menu.item_rect(3)));
+        assert!(d.wins.iter().any(|w| w.kind == AppKind::Settings));
+        // Sin Internet y sin tarjeta.
+        let mut lan = Lan::new();
+        lan.router.dhcp_on = false;
+        pon_red(&mut sys, &mut lan);
+        corre_red(&mut sys, &mut lan, 100);
+        d.tick(3000, &mut sys);
+        assert_eq!(d.net_ico, Some(Icon::RedSinInternet));
+        assert_eq!(net_items(&net::NetStatus { state: State::NoAdapter, adapter: String::new(), mac: [0; 6], speed_mbps: 0, full_duplex: false, ip: None, mask: None, gateway: None, dns: Vec::new(), dhcp_server: None, lease_s: 0, lease_since_ms: 0 })[0].text, "No hay ninguna tarjeta de red");
+        sys.net = None;
+        d.tick(3300, &mut sys);
+        assert_eq!(d.net_ico, None);
     }
 
     /// Volumen de prueba con aviso (como un ext con el diario a medias).
