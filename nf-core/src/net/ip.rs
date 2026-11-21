@@ -230,8 +230,10 @@ impl Net {
                 if let Some((sp, dp, data)) = parse_udp(&ip) {
                     if sp == 67 && dp == 68 {
                         self.dhcp_input(ip.src, data);
-                    } else if sp == 53 {
+                    } else if self.dns_port(dp) {
                         self.dns_input(ip.src, dp, data);
+                    } else {
+                        self.udp_input(&ip, sp, dp, data);
                     }
                 }
             }

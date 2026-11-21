@@ -207,7 +207,7 @@ impl Net {
                 // puertos efímeros 49152-65535, sin repetir uno en uso
                 q.port = loop {
                     let p = 49152 + (self.rand() % 16384) as u16;
-                    if !self.queries.iter().any(|o| o.port == p) {
+                    if !self.queries.iter().any(|o| o.port == p) && !self.udps.iter().any(|u| u.port == p) {
                         break p;
                     }
                 };
@@ -221,6 +221,11 @@ impl Net {
             self.dns_send(self.queries.len() - 1);
         }
         Ok(QueryId(self.next_query))
+    }
+
+    /// ¿Hay una consulta en curso que espera respuesta en este puerto?
+    pub(super) fn dns_port(&self, port: u16) -> bool {
+        self.queries.iter().any(|q| q.done.is_none() && q.port == port)
     }
 
     pub(super) fn dns_result(&mut self, id: QueryId) -> Option<Result<Vec<Ipv4>, NetError>> {

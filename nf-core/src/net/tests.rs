@@ -15,6 +15,7 @@ mod dns_tests;
 mod fuzz;
 mod http_tests;
 mod tcp_tests;
+mod udp_tests;
 
 pub const HOST_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
 pub const R_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0xAA];

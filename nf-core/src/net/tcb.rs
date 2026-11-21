@@ -118,6 +118,8 @@ pub fn rst_for(t: &TcpIn) -> Seg {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum St {
     SynSent,
+    /// Lado pasivo: llegó el SYN y se envió el SYN-ACK; falta el ACK.
+    SynRcvd,
     Est,
     FinWait1,
     FinWait2,
@@ -137,6 +139,11 @@ pub struct Sock {
     pub fail: Option<NetError>,
     /// La app ya soltó el identificador: la pila termina el cierre sola.
     pub released: bool,
+    /// v0.12.1: conexión entrante aún en la cola del puerto a la escucha con ese id (sin aceptar).
+    pub listener: Option<u32>,
+    /// Bytes de datos recibidos y puestos en el búfer de envío, para `connections`.
+    pub rx: u64,
+    pub tx: u64,
     pub iss: u32,
     snd_una: u32,
     snd_nxt: u32,
@@ -174,6 +181,9 @@ impl Sock {
             st: St::SynSent,
             fail: None,
             released: false,
+            listener: None,
+            rx: 0,
+            tx: 0,
             iss,
             snd_una: iss,
             snd_nxt: iss.wrapping_add(1),
@@ -200,12 +210,28 @@ impl Sock {
         }
     }
 
+    /// Lado pasivo: nace en SYN_RECEIVED con el SYN del otro (`irs` = su número de secuencia).
+    pub fn passive(id: u32, remote: Ipv4, rport: u16, lport: u16, iss: u32, t: &TcpIn, now: u64, listener: u32) -> Sock {
+        let mut s = Sock::new(id, remote, rport, lport, iss, now);
+        s.st = St::SynRcvd;
+        s.listener = Some(listener);
+        s.rcv_nxt = t.seq.wrapping_add(1);
+        s.snd_wnd = t.win as u32;
+        s.mss = (t.mss.unwrap_or(536) as usize).clamp(64, MY_MSS as usize);
+        s
+    }
+
+    /// Cola de entrantes sin aceptar que ya murió (reset, plazo…): se puede quitar.
+    pub fn dead(&self) -> bool {
+        self.st == St::Closed && (self.released || self.listener.is_some())
+    }
+
     pub fn state(&self) -> TcpState {
         if let Some(e) = &self.fail {
             return TcpState::Failed(e.clone());
         }
         match self.st {
-            St::SynSent => TcpState::Connecting,
+            St::SynSent | St::SynRcvd => TcpState::Connecting,
             St::Est => TcpState::Open,
             St::CloseWait => TcpState::PeerClosed,
             _ => TcpState::Closed,
@@ -229,6 +255,12 @@ impl Sock {
         s
     }
 
+    pub fn synack_seg(&mut self) -> Seg {
+        let mut s = self.mk(self.iss, SYN | ACK, Vec::new());
+        s.mss = Some(MY_MSS);
+        s
+    }
+
     fn ack_seg(&mut self) -> Seg {
         self.mk(self.snd_nxt, ACK, Vec::new())
     }
@@ -245,6 +277,7 @@ impl Sock {
     pub fn queue(&mut self, data: &[u8]) -> usize {
         let n = data.len().min(self.send_free());
         self.sendq.extend_from_slice(&data[..n]);
+        self.tx += n as u64;
         n
     }
 
@@ -376,6 +409,11 @@ impl Sock {
             out.push(s);
             return;
         }
+        if self.st == St::SynRcvd {
+            let s = self.synack_seg();
+            out.push(s);
+            return;
+        }
         let inflight = self.inflight();
         if inflight > 0 {
             self.recover = Some(self.snd_nxt);
@@ -400,7 +438,7 @@ impl Sock {
                 }
                 return;
             }
-            St::SynSent if now.saturating_sub(self.created) >= CONNECT_TIMEOUT_MS => {
+            St::SynSent | St::SynRcvd if now.saturating_sub(self.created) >= CONNECT_TIMEOUT_MS => {
                 self.fail = Some(NetError::Timeout);
                 self.st = St::Closed;
                 return;
@@ -442,6 +480,9 @@ impl Sock {
             return self.syn_sent(t, now, out);
         }
         if self.st == St::Closed {
+            return;
+        }
+        if self.st == St::SynRcvd && !self.syn_rcvd(t, now, out) {
             return;
         }
         let wnd = self.adv_win() as u32;
@@ -542,6 +583,38 @@ impl Sock {
         }
     }
 
+    /// Segmento recibido en SYN_RECEIVED. `true` si ya está establecida y hay que seguir procesándolo
+    /// (el ACK puede traer datos).
+    fn syn_rcvd(&mut self, t: &TcpIn, now: u64, out: &mut Vec<Seg>) -> bool {
+        if t.flags & RST != 0 {
+            if t.seq == self.rcv_nxt {
+                self.reset();
+            }
+            return false;
+        }
+        if t.flags & SYN != 0 {
+            let s = self.synack_seg();
+            out.push(s);
+            return false;
+        }
+        if t.flags & ACK == 0 {
+            return false;
+        }
+        if t.ack != self.snd_nxt {
+            out.push(Seg { seq: t.ack, ack: 0, flags: RST, win: 0, mss: None, data: Vec::new() });
+            return false;
+        }
+        self.snd_una = t.ack;
+        self.snd_wnd = t.win as u32;
+        if let Some((_, t0)) = self.probe.take() {
+            self.sample(now.saturating_sub(t0));
+        }
+        self.timer = None;
+        self.retries = 0;
+        self.st = St::Est;
+        true
+    }
+
     fn syn_sent(&mut self, t: &TcpIn, now: u64, out: &mut Vec<Seg>) {
         let ack_ok = t.flags & ACK != 0 && lt(self.iss, t.ack) && le(t.ack, self.snd_nxt);
         if t.flags & ACK != 0 && !ack_ok {
@@ -624,6 +697,7 @@ impl Sock {
         }
         let n = data.len().min(TCP_BUF.saturating_sub(self.recvq.len()));
         self.recvq.extend(data[..n].iter().copied());
+        self.rx += n as u64;
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
         if fin && n == data.len() {
             self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
