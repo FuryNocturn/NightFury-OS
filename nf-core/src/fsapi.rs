@@ -113,4 +113,8 @@ api! {
     fn net_perms(&mut self) -> Vec<crate::netperm::Perm>;
     /// Cambia los dos permisos de un programa ya apuntado; con los dos a `None`, lo olvida.
     fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, now: DateTime) -> Result<(), FsError>;
+    // ---- Raíces de confianza propias (v0.12.2): verlas, cualquiera; añadir y quitar, solo un administrador ----
+    fn custom_roots(&mut self) -> Vec<Vec<u8>>;
+    fn add_root(&mut self, der: Vec<u8>, now: DateTime) -> Result<(), FsError>;
+    fn remove_root(&mut self, sha: [u8; 32], now: DateTime) -> Result<(), FsError>;
 }

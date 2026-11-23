@@ -35,6 +35,7 @@ pub mod netperm;
 pub mod nfx;
 pub mod pk;
 pub mod platform;
+pub mod raices;
 pub mod proc;
 pub mod request;
 pub mod programs;

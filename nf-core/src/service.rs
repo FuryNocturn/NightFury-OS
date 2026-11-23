@@ -152,6 +152,9 @@ calls! {
     NetConnections = 82,
     NetPerms = 83,
     SetNetPerm { hash: [u8; 32], out: Option<bool>, inn: Option<bool> } = 84,
+    CustomRoots = 85,
+    AddRoot { der: Blob } = 86,
+    RemoveRoot { sha: [u8; 32] } = 87,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -954,6 +957,15 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
             let now = sys.now();
             gate(system, Err(denied), || sys.files().set_net_perm(hash, out, inn, now))
         }
+        CustomRoots => gate(system, Vec::new(), || sys.files().custom_roots()),
+        AddRoot { der } => {
+            let now = sys.now();
+            gate(system, Err(denied), || sys.files().add_root(der.0, now))
+        }
+        RemoveRoot { sha } => {
+            let now = sys.now();
+            gate(system, Err(denied), || sys.files().remove_root(sha, now))
+        }
         NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             if !system {
@@ -1366,6 +1378,15 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     }
     fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, _now: DateTime) -> Result<(), FsError> {
         self.fs(Call::SetNetPerm { hash, out, inn })
+    }
+    fn custom_roots(&mut self) -> Vec<Vec<u8>> {
+        self.ask(Call::CustomRoots, Vec::new())
+    }
+    fn add_root(&mut self, der: Vec<u8>, _now: DateTime) -> Result<(), FsError> {
+        self.fs(Call::AddRoot { der: Blob(der) })
+    }
+    fn remove_root(&mut self, sha: [u8; 32], _now: DateTime) -> Result<(), FsError> {
+        self.fs(Call::RemoveRoot { sha })
     }
     fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
         self.ask(Call::DriveResult, None)

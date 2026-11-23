@@ -98,6 +98,8 @@ pub struct Name {
 pub struct CertInfo {
     pub cn: String,
     pub org: String,
+    /// Quién lo emitió (CN y O).
+    pub issuer: Name,
     pub not_before: Time,
     pub not_after: Time,
     pub sha256: [u8; 32],
@@ -332,6 +334,7 @@ pub struct Cert {
     issuer: Vec<u8>,
     subject: Vec<u8>,
     subject_name: Name,
+    issuer_name: Name,
     not_before: Time,
     not_after: Time,
     key: Option<PubKey>,
@@ -385,7 +388,7 @@ impl Cert {
         }
         let sig_alg = parse_sig_alg(alg_in)?;
         let issuer = t.expect(0x30)?;
-        parse_name(issuer.content)?;
+        let issuer_name = parse_name(issuer.content)?;
         let mut v = Reader::new(t.expect(0x30)?.content);
         let not_before = parse_time(v.read()?)?;
         let not_after = parse_time(v.read()?)?;
@@ -407,6 +410,7 @@ impl Cert {
             issuer: issuer.raw.to_vec(),
             subject: subject.raw.to_vec(),
             subject_name,
+            issuer_name,
             not_before,
             not_after,
             key,
@@ -541,10 +545,21 @@ impl Cert {
         &self.der[self.tbs.0..self.tbs.1]
     }
 
+    /// ¿Puede actuar como autoridad (basicConstraints cA=true)?
+    pub fn is_ca(&self) -> bool {
+        matches!(self.bc, Some((true, _)))
+    }
+
+    /// ¿Lo firma él mismo (emisor = titular)?
+    pub fn is_self_issued(&self) -> bool {
+        self.issuer == self.subject
+    }
+
     pub fn info(&self) -> CertInfo {
         CertInfo {
             cn: self.subject_name.cn.clone(),
             org: self.subject_name.org.clone(),
+            issuer: self.issuer_name.clone(),
             not_before: self.not_before,
             not_after: self.not_after,
             sha256: self.sha256,

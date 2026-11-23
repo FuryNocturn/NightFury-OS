@@ -393,6 +393,8 @@ pub struct Files {
     hc: Home,
     /// Unidades extraíbles D:, E:… (v0.11).
     xd: XDrives,
+    /// Raíces de confianza ya montadas (`raices::store`); se rehace al añadir o quitar una.
+    roots: Option<alloc::sync::Arc<crate::x509::RootStore>>,
 }
 
 /// Una unidad conectada: abierta (`vol`) o cifrada esperando contraseña (`locked`).
@@ -430,7 +432,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -459,7 +461,7 @@ impl Files {
             // Con NFFS dañado no se formatea nunca: se deja el disco como está.
             return match Nffs::mount(dev) {
                 Ok(fs) => {
-                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() };
+                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None };
                     f.startup(now);
                     f
                 }
@@ -476,7 +478,7 @@ impl Files {
     /// Para herramientas (nfdisk): trabaja sobre un volumen NFFS ya montado, tal cual: sin arranque
     /// (no crea ni migra nada), sin sesión (hay que usar `login`) y con las reglas de siempre.
     pub fn on_volume(fs: Nffs) -> Files {
-        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default() }
+        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None }
     }
 
     /// ¿Se guarda en un disco de verdad?
@@ -1521,6 +1523,38 @@ impl Files {
             self.generation += 1;
         }
         r
+    }
+
+    /// v0.12.2: raíces de confianza propias (DER). Las lee el sistema; cualquiera puede verlas.
+    pub fn custom_roots(&mut self) -> Vec<Vec<u8>> {
+        crate::raices::custom(&mut self.fs)
+    }
+
+    /// Almacén completo (Mozilla + propias) para validar HTTPS, sin releer el disco en cada conexión.
+    pub fn root_store(&mut self) -> alloc::sync::Arc<crate::x509::RootStore> {
+        crate::raices::store(&mut self.fs, &mut self.roots)
+    }
+
+    /// Configuración → Certificados: añade una raíz propia. Solo un administrador.
+    pub fn add_root(&mut self, der: Vec<u8>, now: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Denied);
+        }
+        crate::raices::add(&mut self.fs, &mut self.roots, &der, now)?;
+        self.generation += 1;
+        self.log("Certificados: raíz añadida en Configuración", now);
+        Ok(())
+    }
+
+    /// Configuración → Certificados: quita una raíz propia por su huella. Solo un administrador.
+    pub fn remove_root(&mut self, sha: [u8; 32], now: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Denied);
+        }
+        crate::raices::remove(&mut self.fs, &mut self.roots, &sha)?;
+        self.generation += 1;
+        self.log("Certificados: raíz quitada en Configuración", now);
+        Ok(())
     }
 
     /// Configuración → Red: cambia (o, con los dos a `None`, olvida) los permisos de un programa ya

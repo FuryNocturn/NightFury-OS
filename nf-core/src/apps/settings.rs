@@ -18,7 +18,7 @@ use crate::crypto::{ct_eq, wipe};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
 use crate::fsapi::FilesApi;
-use crate::fs::same;
+use crate::fs::{same, FsError};
 use crate::gamepad::*;
 use crate::geom::Rect;
 use crate::icons::{self, Icon};
@@ -82,6 +82,10 @@ const T_ASK_HOME: u32 = 57;
 const T_APP_DIR: u32 = 60;
 const T_APP_REPLACE: u32 = 61;
 const T_APP_DEL: u32 = 62;
+/// Certificados (v0.12.2): archivo a añadir, confirmar añadir, confirmar quitar.
+const T_CERT_FILE: u32 = 63;
+const T_CERT_ADD: u32 = 64;
+const T_CERT_DEL: u32 = 65;
 const NO_MATCH: &str = "Las claves no coinciden.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +117,9 @@ enum Act {
     NetOut(usize),
     NetIn(usize),
     NetForget(usize),
+    /// Certificados: elegir un archivo para añadir una raíz; quitar la raíz propia `i` de `Settings::certs`.
+    CertAdd,
+    CertDel(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -200,6 +207,11 @@ struct Settings {
     net_seen: Option<NetStatus>,
     /// Permisos de red de los programas tal como se vieron al dibujar la página Red.
     net_perms: Vec<crate::netperm::Perm>,
+    /// Raíces propias tal como se vieron al dibujar la página Red.
+    certs: Vec<crate::x509::CertInfo>,
+    /// Raíz elegida (DER) esperando la confirmación, y huella de la que se va a quitar.
+    cert_der: Option<Vec<u8>>,
+    cert_del: Option<[u8; 32]>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -228,6 +240,9 @@ fn init() -> Settings {
         pad_state: PadState::default(),
         net_seen: None,
         net_perms: Vec::new(),
+        certs: Vec::new(),
+        cert_der: None,
+        cert_del: None,
     }
 }
 
@@ -337,6 +352,7 @@ impl Settings {
         self.button_if(s, &mut (x0, y), x0, right, "Renovar dirección", Act::NetRenew, on, theme);
         y += BTN_H + if compact { 14 } else { 22 };
         y = self.net_perms_list(s, theme, sys, x0, y, right);
+        y = self.certs_list(s, theme, sys, x0, y, right);
         self.content_h = y + self.scroll + 16;
     }
 
@@ -380,6 +396,47 @@ impl Settings {
                 y = at.1 + BTN_H;
             }
             y += 12;
+        }
+        y
+    }
+
+    /// v0.12.2: raíces de confianza para HTTPS: las de Mozilla (fijas) y las que añade un administrador.
+    #[allow(clippy::too_many_arguments)]
+    fn certs_list(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, x0: i32, mut y: i32, right: i32) -> i32 {
+        font::draw(s, x0, y, "Certificados", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        let admin = sys.fs().is_admin();
+        y = note(s, x0, y, right - x0, if admin {
+            "Son las autoridades en las que confía el sistema para abrir sitios seguros (https). Las de Mozilla vienen con el sistema y no se pueden cambiar."
+        } else {
+            "Son las autoridades en las que confía el sistema para abrir sitios seguros (https). Solo un administrador puede añadir o quitar certificados."
+        });
+        y += 6;
+        font::draw(s, x0, y, &format!("{} certificados de Mozilla", crate::raices::mozilla_count()), 9, false, TEXT);
+        y += font::line_h(9) + 8;
+        self.certs = sys.fs().custom_roots().iter().filter_map(|d| crate::x509::Cert::parse(d).ok()).map(|c| c.info()).collect();
+        if self.certs.is_empty() {
+            font::draw(s, x0, y, "No has añadido ningún certificado.", 9, false, GRAY);
+            y += 24;
+        }
+        for i in 0..self.certs.len() {
+            let c = self.certs[i].clone();
+            font::draw(s, x0, y, &cert_who(&c.cn, &c.org), 9, true, TEXT);
+            y += font::line_h(9) + 2;
+            let line = format!("Emitido por {} · Caduca el {} · Huella {}", cert_who(&c.issuer.cn, &c.issuer.org), cert_date(&c.not_after), cert_fp(&c.sha256, 0, 4));
+            font::draw_in(s, Rect::new(x0, y, (right - x0).max(0), font::line_h(9)), &line, 9, false, GRAY, Align::Left);
+            y += font::line_h(9);
+            if admin {
+                let mut at = (x0, y + 4);
+                self.button(s, &mut at, x0, right, "Quitar", Act::CertDel(i), theme);
+                y = at.1 + BTN_H;
+            }
+            y += 10;
+        }
+        if admin {
+            let mut at = (x0, y);
+            self.button(s, &mut at, x0, right, "Añadir certificado…", Act::CertAdd, theme);
+            y = at.1 + BTN_H;
         }
         y
     }
@@ -428,6 +485,27 @@ impl Settings {
             y += font::line_h(9) + 2;
         }
     }
+}
+
+/// «Nombre — Organización» (o lo que haya) de un certificado.
+fn cert_who(cn: &str, org: &str) -> String {
+    match (cn.is_empty(), org.is_empty()) {
+        (false, false) if cn != org => format!("{cn} — {org}"),
+        (false, _) => String::from(cn),
+        (true, false) => String::from(org),
+        _ => String::from("(sin nombre)"),
+    }
+}
+
+fn cert_date(t: &crate::x509::Time) -> String {
+    format!("{:02}/{:02}/{}", t.day, t.month, t.year)
+}
+
+/// `n` grupos de 4 cifras (mayúsculas) de la huella SHA-256, desde el grupo `from` (hay 16 en total).
+fn cert_fp(sha: &[u8; 32], from: usize, n: usize) -> String {
+    let hex = crate::crypto::to_hex(sha).to_uppercase();
+    let parts: Vec<&str> = (from..(from + n).min(16)).map(|i| &hex[i * 4..i * 4 + 4]).collect();
+    parts.join(" ")
 }
 
 fn message(cx: &mut Ctx, text: &str) {
@@ -957,6 +1035,18 @@ impl Settings {
                 cx.dialog = Some(DialogRequest::Folder { tag: T_APP_DIR, title: String::from("Instalar programa"), dir });
                 return;
             }
+            Act::CertAdd => {
+                let dir = cx.sys.fs().std_dir(crate::files::Std::Downloads);
+                cx.dialog = Some(DialogRequest::Open { tag: T_CERT_FILE, title: String::from("Añadir certificado"), dir });
+                return;
+            }
+            Act::CertDel(i) => {
+                let Some(c) = self.certs.get(i) else { return };
+                let text = format!("¿Quitar el certificado de {}?\nLos sitios que dependan de él dejarán de ser de confianza.", cert_who(&c.cn, &c.org));
+                cx.dialog = Some(DialogRequest::Message { tag: T_CERT_DEL, title: String::from("Certificados"), text, buttons: Buttons::YesNo });
+                self.cert_del = Some(c.sha256);
+                return;
+            }
             Act::AppUninstall(i) => {
                 let Some(p) = self.apps.get(i).cloned() else { return };
                 let text = format!("¿Desinstalar «{}»?\nSu carpeta irá a la Papelera.", p.name);
@@ -1032,7 +1122,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) | Act::CertAdd | Act::CertDel(_) => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -1478,6 +1568,29 @@ impl App for Settings {
                 };
                 app_message(cx, &r.unwrap_or_else(|e| e));
             }
+            DialogResult::Path { tag: T_CERT_FILE, path: Some(src) } => self.cert_file(&src, cx),
+            DialogResult::Answer { tag: T_CERT_ADD, answer } => {
+                let Some(der) = self.cert_der.take() else { return };
+                if answer == Answer::Yes {
+                    let now = cx.sys.now();
+                    let text = match cx.sys.fs().add_root(der, now) {
+                        Ok(()) => "El certificado se ha añadido.",
+                        Err(FsError::Exists) => "Ese certificado ya está instalado.",
+                        Err(FsError::Denied) => "Solo un administrador puede añadir certificados.",
+                        Err(_) => "No se pudo guardar el certificado.",
+                    };
+                    cert_message(cx, text);
+                }
+            }
+            DialogResult::Answer { tag: T_CERT_DEL, answer } => {
+                let Some(sha) = self.cert_del.take() else { return };
+                if answer == Answer::Yes {
+                    let now = cx.sys.now();
+                    if cx.sys.fs().remove_root(sha, now).is_err() {
+                        cert_message(cx, "No se pudo quitar el certificado.");
+                    }
+                }
+            }
             DialogResult::Text { tag, value } => self.step_text(tag, value.map(Secret), cx),
             DialogResult::Answer { tag, answer } => self.step_answer(tag, answer, cx),
             DialogResult::Path { .. } => {}
@@ -1531,6 +1644,34 @@ impl Settings {
                 app_message(cx, &r.unwrap_or_else(|e| e));
             }
         }
+    }
+}
+
+fn cert_message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_MSG, title: String::from("Certificados"), text: String::from(text), buttons: Buttons::Ok });
+}
+
+impl Settings {
+    /// Archivo elegido para añadir: se comprueba y se enseña a quién pertenece antes de confiar en él.
+    fn cert_file(&mut self, src: &str, cx: &mut Ctx) {
+        let Ok(bytes) = cx.sys.fs().read(src) else { return cert_message(cx, "No se pudo leer el archivo.") };
+        let (der, c) = match crate::raices::check(&bytes) {
+            Ok(r) => r,
+            Err(e) => return cert_message(cx, e.mensaje()),
+        };
+        if cx.sys.fs().custom_roots().iter().any(|d| crate::crypto::sha256(d) == c.sha256) {
+            return cert_message(cx, "Ese certificado ya está instalado.");
+        }
+        let text = format!(
+            "¿Confiar en este certificado?\n\nPertenece a: {}\nEmitido por: {}\nCaduca el: {}\nHuella SHA-256:\n{}\n{}\n\nConfiar en una autoridad permite a quien la controla hacerse pasar por cualquier sitio.",
+            cert_who(&c.cn, &c.org),
+            cert_who(&c.issuer.cn, &c.issuer.org),
+            cert_date(&c.not_after),
+            cert_fp(&c.sha256, 0, 8),
+            cert_fp(&c.sha256, 8, 8),
+        );
+        cx.dialog = Some(DialogRequest::Message { tag: T_CERT_ADD, title: String::from("Certificados"), text, buttons: Buttons::YesNo });
+        self.cert_der = Some(der);
     }
 }
 
@@ -2738,6 +2879,51 @@ mod tests {
             b.dibuja(780, 520);
             assert!(b.app.content_h > 520 && b.app.scrolls());
         }
+    }
+
+    #[test]
+    fn red_certificados_anadir_y_quitar() {
+        let raiz = include_bytes!("../x509/testdata/raiz.der");
+        let hoja = include_bytes!("../x509/testdata/hoja.der");
+        let n = crate::platform::DateTime::default();
+        let ruta = |b: &mut Banco, nombre: &str, d: &[u8]| {
+            let p = format!("C:\\Usuarios\\{}\\{nombre}",b.files().user().unwrap());
+            b.files().write(&p, d, n).unwrap();
+            p
+        };
+        let mut b = Banco::con_disco("Luis");
+        b.pagina(PAGE_NET);
+        assert!(!b.hay(Act::CertAdd), "un usuario normal no añade");
+        assert_eq!(b.files().add_root(raiz.to_vec(), n), Err(FsError::Denied));
+        let mut b = Banco::con_disco("Ana");
+        b.pagina(PAGE_NET);
+        // No es una autoridad: el error sale antes de confirmar.
+        let p = ruta(&mut b, "hoja.der", hoja);
+        b.pulsa(Act::CertAdd);
+        assert!(matches!(b.dialog.take(), Some(DialogRequest::Open { tag: T_CERT_FILE, .. })));
+        b.responde(DialogResult::Path { tag: T_CERT_FILE, path: Some(p) });
+        assert!(b.mensaje().contains("no es de una autoridad"));
+        // Una raíz: se enseña y se confirma.
+        let p = ruta(&mut b, "raiz.der", raiz);
+        b.responde(DialogResult::Path { tag: T_CERT_FILE, path: Some(p) });
+        assert!(matches!(&b.dialog, Some(DialogRequest::Message { tag: T_CERT_ADD, text, .. }) if text.contains("Huella SHA-256") && text.contains("hacerse pasar")));
+        b.respuesta(T_CERT_ADD, Answer::Cancel);
+        assert!(b.files().custom_roots().is_empty());
+        let p = ruta(&mut b, "raiz.der", raiz);
+        b.responde(DialogResult::Path { tag: T_CERT_FILE, path: Some(p.clone()) });
+        b.respuesta(T_CERT_ADD, Answer::Yes);
+        assert!(b.mensaje().contains("se ha añadido"));
+        assert_eq!(b.files().custom_roots().len(), 1);
+        // Otra vez el mismo: ya está.
+        b.responde(DialogResult::Path { tag: T_CERT_FILE, path: Some(p) });
+        assert!(b.mensaje().contains("ya está instalado"));
+        // Quitar, con confirmación.
+        b.pulsa(Act::CertDel(0));
+        b.respuesta(T_CERT_DEL, Answer::No);
+        assert_eq!(b.files().custom_roots().len(), 1);
+        b.pulsa(Act::CertDel(0));
+        b.respuesta(T_CERT_DEL, Answer::Yes);
+        assert!(b.files().custom_roots().is_empty() && b.dialog.is_none());
     }
 
     #[test]
