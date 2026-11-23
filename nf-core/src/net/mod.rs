@@ -23,6 +23,7 @@ mod ip;
 mod pkt;
 mod tcb;
 mod tcp;
+mod udp;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -112,6 +113,52 @@ pub enum NetError {
     HttpsNotYet,
     /// Respuesta mal formada, con un motivo corto en español.
     Protocol(&'static str),
+    /// v0.12.1: el usuario no ha dado permiso a este programa (o lo ha quitado en Configuración).
+    Denied,
+    /// v0.12.1: el aviso de permiso está en pantalla. El programa vuelve a intentarlo más tarde.
+    Pending,
+    /// v0.12.1: el puerto ya lo usa otro (o, para un programa de terceros, es menor que 1024).
+    InUse,
+}
+
+/// v0.12.1: un socket UDP y un puerto TCP a la escucha.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct UdpId(pub u32);
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub struct ListenId(pub u32);
+
+/// Un datagrama UDP recibido.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Datagram {
+    pub from: Ipv4,
+    pub port: u16,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Proto {
+    Tcp,
+    /// Puerto TCP a la escucha (sin otro extremo).
+    TcpListen,
+    Udp,
+}
+
+/// Una conexión o socket abierto, para el Administrador de tareas.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ConnInfo {
+    pub proto: Proto,
+    /// El número de `SockId`, `UdpId` o `ListenId` según `proto`.
+    pub id: u32,
+    pub local_port: u16,
+    /// Otro extremo (TCP); `None` en UDP y a la escucha.
+    pub remote: Option<(Ipv4, u16)>,
+    /// Texto corto en español: «Conectando», «Abierta», «Cerrando», «Cerrada», «Escuchando», «—».
+    pub state: &'static str,
+    /// Bytes de datos recibidos y enviados (sin cabeceras) desde que se abrió.
+    pub rx: u64,
+    pub tx: u64,
+    /// Proceso que lo abrió (`ProcInfo::id`); 0 = el sistema (Terminal, bandeja…).
+    pub owner: u64,
 }
 
 /// Respuesta a un `ping`.
@@ -154,6 +201,14 @@ pub const MAX_SOCKS: usize = 16;
 pub const MAX_PINGS: usize = 16;
 pub const MAX_QUERIES: usize = 16;
 pub const TCP_BUF: usize = 64 * 1024;
+/// v0.12.1: sockets UDP y puertos a la escucha a la vez (en toda la pila), datagramas en cola por
+/// socket UDP, conexiones esperando `tcp_accept` por puerto, y datos máximos de un datagrama (sin
+/// fragmentar: 1500 − 20 − 8).
+pub const MAX_UDP: usize = 32;
+pub const MAX_LISTEN: usize = 16;
+pub const UDP_QUEUE: usize = 32;
+pub const LISTEN_BACKLOG: usize = 8;
+pub const UDP_MAX: usize = 1472;
 
 /// Configuración obtenida por DHCP.
 pub(crate) struct Cfg {
@@ -187,6 +242,10 @@ pub struct Net {
     dns_cache: Vec<dns::CacheEntry>,
     socks: Vec<tcb::Sock>,
     next_sock: u32,
+    udps: Vec<udp::Udp>,
+    next_udp: u32,
+    listens: Vec<udp::Listener>,
+    next_listen: u32,
 }
 
 impl Net {
@@ -213,6 +272,10 @@ impl Net {
             dns_cache: Vec::new(),
             socks: Vec::new(),
             next_sock: 0,
+            udps: Vec::new(),
+            next_udp: 0,
+            listens: Vec::new(),
+            next_listen: 0,
         }
     }
 
@@ -353,6 +416,70 @@ impl Net {
         self.tcp_shut(s, true)
     }
 
+    // ---------- v0.12.1: UDP, TCP a la escucha y lista de conexiones (`udp.rs`, `tcb.rs`) ----------
+    //
+    // Regla de «solo red local» (la aplica la pila, no el servicio): «red local» = misma subred que
+    // nuestra IP según la máscara de DHCP (sin dirección no hay nada que recibir).
+    // - Un socket UDP recibe de quien le haya enviado él antes (misma IP y puerto: la respuesta de un
+    //   servidor de Internet entra) y, si se abrió con un puerto fijo, además de cualquier equipo de la
+    //   red local, también por difusión (255.255.255.255 o la de la subred). Lo demás se descarta.
+    // - Un puerto a la escucha solo acepta SYN de la red local; a los de fuera, RST.
+    // - Los puertos que usa la pila (68 de DHCP, los de las consultas DNS en curso) no se dan; un
+    //   datagrama a uno de esos va a la pila, no al socket.
+
+    /// Abre un socket UDP. `port` 0 = uno efímero libre (49152-65535). `InUse` si el puerto está
+    /// cogido; `Busy` con `MAX_UDP` abiertos. Sin dirección también se puede abrir.
+    pub fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
+        self.udp_open(port)
+    }
+
+    /// Envía un datagrama de hasta `UDP_MAX` bytes (más: `Protocol("datagrama demasiado grande")`).
+    /// `dst` puede ser 255.255.255.255 o la difusión de la subred; multidifusión no
+    /// (`Unreachable(dst)`). Si hay que preguntar la MAC por ARP, sale cuando llegue la respuesta (como
+    /// el resto de la pila). Sin dirección, `NoAddress`.
+    pub fn udp_send(&mut self, s: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError> {
+        self.udp_write(s, dst, port, data)
+    }
+
+    /// El siguiente datagrama de la cola (`UDP_QUEUE` como mucho: los que llegan con la cola llena se
+    /// tiran). `Ok(None)` si no hay; `Gone` si el identificador no existe.
+    pub fn udp_recv(&mut self, s: UdpId) -> Result<Option<Datagram>, NetError> {
+        self.udp_read(s)
+    }
+
+    pub fn udp_close(&mut self, s: UdpId) {
+        self.udp_shut(s)
+    }
+
+    /// Pone un puerto TCP a la escucha (`port` ≠ 0). `InUse` si ya escucha otro; `Busy` con
+    /// `MAX_LISTEN`. Hasta `LISTEN_BACKLOG` conexiones esperan `tcp_accept`; con la cola llena, el SYN
+    /// se ignora (el otro reintenta).
+    pub fn tcp_listen(&mut self, port: u16) -> Result<ListenId, NetError> {
+        self.listen_open(port)
+    }
+
+    /// Una conexión ya establecida (tras el saludo de tres pasos) con su IP y puerto de origen, o
+    /// `Ok(None)` si no hay ninguna. Desde aquí es una `SockId` normal (cuenta en `MAX_SOCKS`; si no
+    /// cabe, se queda en la cola). `Gone` si el identificador no existe.
+    pub fn tcp_accept(&mut self, l: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError> {
+        self.listen_accept(l)
+    }
+
+    /// Deja de escuchar; las conexiones en cola sin aceptar se cortan con RST.
+    pub fn tcp_unlisten(&mut self, l: ListenId) {
+        self.listen_shut(l)
+    }
+
+    /// Todo lo abierto (TCP sin liberar, UDP y a la escucha), con sus contadores.
+    pub fn connections(&self) -> Vec<ConnInfo> {
+        self.conn_list()
+    }
+
+    /// Apunta el proceso dueño de algo ya abierto (lo hace el servicio); un id que no existe se ignora.
+    pub fn set_owner(&mut self, proto: Proto, id: u32, owner: u64) {
+        self.owner_set(proto, id, owner)
+    }
+
     /// 32 bits impredecibles: SHA-256(secreto ‖ contador).
     pub(crate) fn rand(&mut self) -> u32 {
         let mut m = [0u8; 40];
@@ -374,7 +501,8 @@ impl Net {
         self.cfg.as_ref().map(|c| c.ip).ok_or(NetError::NoAddress)
     }
 
-    /// Se pierde la dirección (cable, caducidad o `renew`): caen ARP y conexiones.
+    /// Se pierde la dirección (cable, caducidad o `renew`): caen ARP y conexiones (los sockets UDP y
+    /// los puertos a la escucha siguen abiertos).
     pub(crate) fn lose_config(&mut self) {
         self.cfg = None;
         self.arp = ip::ArpState::default();
@@ -382,7 +510,7 @@ impl Net {
         for s in self.socks.iter_mut() {
             s.kill(NetError::Reset);
         }
-        self.socks.retain(|s| !s.released);
+        self.socks.retain(|s| !s.released && s.listener.is_none());
     }
 
     fn rx_all(&mut self) {
@@ -412,6 +540,16 @@ pub trait NetApi {
     fn tcp_recv(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError>;
     fn tcp_close(&mut self, s: SockId);
     fn tcp_abort(&mut self, s: SockId);
+    fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError>;
+    fn udp_send(&mut self, s: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError>;
+    fn udp_recv(&mut self, s: UdpId) -> Result<Option<Datagram>, NetError>;
+    fn udp_close(&mut self, s: UdpId);
+    fn tcp_listen(&mut self, port: u16) -> Result<ListenId, NetError>;
+    fn tcp_accept(&mut self, l: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError>;
+    fn tcp_unlisten(&mut self, l: ListenId);
+    fn connections(&mut self) -> Vec<ConnInfo>;
+    /// Solo el servicio del sistema; en un programa no hace nada.
+    fn set_owner(&mut self, proto: Proto, id: u32, owner: u64);
 }
 
 impl NetApi for Net {
@@ -450,6 +588,33 @@ impl NetApi for Net {
     }
     fn tcp_abort(&mut self, s: SockId) {
         Net::tcp_abort(self, s)
+    }
+    fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
+        Net::udp_bind(self, port)
+    }
+    fn udp_send(&mut self, s: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError> {
+        Net::udp_send(self, s, dst, port, data)
+    }
+    fn udp_recv(&mut self, s: UdpId) -> Result<Option<Datagram>, NetError> {
+        Net::udp_recv(self, s)
+    }
+    fn udp_close(&mut self, s: UdpId) {
+        Net::udp_close(self, s)
+    }
+    fn tcp_listen(&mut self, port: u16) -> Result<ListenId, NetError> {
+        Net::tcp_listen(self, port)
+    }
+    fn tcp_accept(&mut self, l: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError> {
+        Net::tcp_accept(self, l)
+    }
+    fn tcp_unlisten(&mut self, l: ListenId) {
+        Net::tcp_unlisten(self, l)
+    }
+    fn connections(&mut self) -> Vec<ConnInfo> {
+        Net::connections(self)
+    }
+    fn set_owner(&mut self, proto: Proto, id: u32, owner: u64) {
+        Net::set_owner(self, proto, id, owner)
     }
 }
 

@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.12.0)
+# Kit de programas de NightFury (v0.12.1)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -136,13 +136,85 @@ Configuración y Explorador), que el sistema reconoce por su binario exacto.
   - Ejes `state.axes[AXIS_LX..=AXIS_RT]`: sticks de −32768 a 32767 (Y negativa = arriba) y gatillos de 0 a
     32767. En el ABI son los eventos `EV_GAMEPAD` (20) y `EV_GAMEPADS` (21); ver `nf-core\src\abi.rs`.
 
-### Red (v0.12)
+### Red (v0.12.1)
 
-- En la v0.12.0 la red (`cx.sys.net()`, trait `nf_core::net::NetApi`) solo la usan los programas del sistema:
-  la Terminal (`ping`, `ipconfig`, `nslookup`, `curl`), Configuración → Red y el icono de la bandeja.
-- Un programa de terceros recibe `Some(...)`, pero cada llamada le contesta como si no hubiera tarjeta
-  (`NetError::NoAdapter`, estado sin adaptador). No falla ni se cuelga.
-- Los sockets para todos los programas, con el aviso «¿Permitir que X use la red?», llegan en la v0.12.1.
+Desde la v0.12.1 cualquier programa puede usar la red con `cx.sys.net()` (trait `nf_core::net::NetApi`):
+DNS, ping, TCP saliente, UDP y hacer de servidor TCP. Todo es **sin bloqueo**: pides algo y lo consultas en
+los siguientes `tick` (pon un tick, por ejemplo `Some(50)`, en `programa!`).
+
+**Permisos.** La primera vez que el programa usa la red, el sistema pregunta al usuario, como el cortafuegos
+de Windows. Hay dos avisos, y cada uno se recuerda por separado:
+
+| Aviso | Lo piden |
+|---|---|
+| «¿Permitir que X use la red?» | `resolve`, `ping`, `tcp_connect`, `udp_send`, `udp_bind(0)` |
+| «¿Permitir que X acepte conexiones de otros equipos?» | `udp_bind(puerto)` con puerto fijo, `tcp_listen`, `tcp_accept` |
+
+- Mientras el aviso está en pantalla la llamada devuelve `Err(NetError::Pending)`: vuelve a intentarlo en otro
+  tick. Si el usuario dice que no, `Err(NetError::Denied)`; dilo en la ventana (el usuario puede cambiarlo en
+  Configuración → Red) y no te cuelgues.
+- El permiso va ligado al contenido exacto del `.nfx`: si publicas una versión nueva, vuelve a preguntar.
+- Los puertos 1–1023 son del sistema (`Err(NetError::InUse)`). `renew` no hace nada y `status()` da la MAC
+  a ceros.
+- **Entrantes solo de la red local**: un puerto TCP a la escucha solo acepta equipos de la misma subred; un
+  socket UDP recibe respuestas de quien le enviaste y, si tiene puerto fijo, también de la red local y por
+  difusión.
+
+**Llamadas.**
+
+| Llamada | Qué hace |
+|---|---|
+| `status()` | estado, IP, máscara, puerta de enlace, DNS |
+| `resolve(nombre)` / `resolve_poll(id)` | DNS: `None` mientras espera, luego `Some(Ok(ips))` |
+| `ping(ip, bytes, ttl)` / `ping_poll(id)` | eco ICMP |
+| `tcp_connect(ip, puerto)` → `SockId` | conecta; mira `tcp_state(s)` hasta `Open` o `Failed(e)` |
+| `tcp_send(s, datos)` | envía lo que quepa y devuelve cuántos bytes ha aceptado: reenvía el resto después |
+| `tcp_recv(s, buf)` | copia lo recibido; `Ok(0)` si de momento no hay nada |
+| `tcp_close(s)` / `tcp_abort(s)` | cierre limpio / corte inmediato |
+| `tcp_listen(puerto)` → `ListenId` | escucha (cola de 8) |
+| `tcp_accept(l)` | `Some((s, ip, puerto))` si hay una conexión nueva |
+| `tcp_unlisten(l)` | deja de escuchar |
+| `udp_bind(puerto)` → `UdpId` | `0` = puerto libre al azar (49152–65535) |
+| `udp_send(u, ip, puerto, datos)` | un datagrama de 1472 bytes como mucho; `255.255.255.255` = difusión |
+| `udp_recv(u)` | `Some(Datagram { from, port, data })` o `None` |
+| `udp_close(u)` | libera el socket |
+| `connections()` | las conexiones de tu programa (lo que ve el Administrador de tareas) |
+
+Lo que el programa abre se cierra solo al terminar. Como mucho 32 sockets UDP y 16 puertos a la escucha en
+todo el equipo.
+
+```rust
+fn tick(&mut self, cx: &mut Ctx) {
+    let Some(net) = cx.sys.net() else { return };
+    if self.sock.is_none() {
+        match net.tcp_connect([192, 168, 1, 20], 8080) {
+            Ok(s) => self.sock = Some(s),
+            Err(NetError::Pending) => {}                       // el aviso está abierto: luego
+            Err(NetError::Denied) => self.texto = "Sin permiso para usar la red".into(),
+            Err(e) => self.texto = format!("{e:?}"),
+        }
+        return;
+    }
+    let s = self.sock.unwrap();
+    if net.tcp_state(s) == TcpState::Open && !self.enviado {
+        self.enviado = net.tcp_send(s, b"hola") == Ok(4);
+    }
+    let mut buf = [0u8; 512];
+    if let Ok(n) = net.tcp_recv(s, &mut buf) {
+        self.recibido.extend_from_slice(&buf[..n]);
+        cx.redraw |= n > 0;
+    }
+}
+```
+
+El ejemplo completo es **Mensajes** (`programs\mensajes`): descubre equipos por difusión UDP, conecta por
+TCP y cifra de extremo a extremo con `nf_core::crypto` (X25519, ChaCha20-Poly1305, HKDF). Su protocolo está
+en `docs\Mensajes-protocolo.md`. Para probarlo instálalo desde Configuración → Aplicaciones en dos equipos de
+la misma red.
+
+**Cifrado.** `nf_core::crypto` trae `sha256`, `hmac`, `hkdf_extract`/`hkdf_expand`, `x25519` (y
+`X25519_BASE`), `chacha20_xor`, `poly1305` y `aead_seal`/`aead_open` (ChaCha20-Poly1305). Están probados con
+los vectores de los RFC 7748, 8439 y 5869, pero son implementaciones propias **no auditadas**.
 
 ## Guardar un archivo (`SAVE_AS`)
 

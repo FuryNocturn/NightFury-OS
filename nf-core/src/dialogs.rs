@@ -35,6 +35,9 @@ pub enum Buttons {
     FormatCancel,
     /// "Cifrar" (`Answer::Yes`) y "Cancelar"; empieza en «Cancelar».
     EncryptCancel,
+    /// "Permitir" (`Answer::Yes`) y "No permitir" (`Answer::No`); empieza en «No permitir». Solo el
+    /// sistema (aviso de red): un programa no puede pedirlo (`request.rs` no lo lee).
+    AllowDeny,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -355,8 +358,9 @@ impl Dialog {
                     Buttons::YesNoCancel => vec![("Sí", Answer::Yes), ("No", Answer::No), ("Cancelar", Answer::Cancel)],
                     Buttons::FormatCancel => vec![("Formatear", Answer::Yes), ("Cancelar", Answer::Cancel)],
                     Buttons::EncryptCancel => vec![("Cifrar", Answer::Yes), ("Cancelar", Answer::Cancel)],
+                    Buttons::AllowDeny => vec![("Permitir", Answer::Yes), ("No permitir", Answer::No)],
                 };
-                if matches!(buttons, Buttons::FormatCancel | Buttons::EncryptCancel) {
+                if matches!(buttons, Buttons::FormatCancel | Buttons::EncryptCancel | Buttons::AllowDeny) {
                     d.focus = 1;
                 }
                 d.lines = wrap(&text, FS, d.w - 2 * PAD);
@@ -1078,6 +1082,7 @@ mod tests {
             (Buttons::YesNoCancel, Answer::Yes, Answer::Cancel),
             (Buttons::FormatCancel, Answer::Cancel, Answer::Cancel),
             (Buttons::EncryptCancel, Answer::Cancel, Answer::Cancel),
+            (Buttons::AllowDeny, Answer::No, Answer::No),
         ] {
             let (mut d, mut sys) = msg(b);
             assert_eq!(press(&mut d, &mut sys, Key::Enter), ans(enter));

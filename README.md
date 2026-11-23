@@ -11,10 +11,10 @@
 | ![Explorador](docs/img/explorador.png) | ![Terminal](docs/img/terminal.png) |
 
 ## Estado / Status
-Versión 0.12.0, en desarrollo: red por cable (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 e I225/I226; Realtek RTL8111/8168; virtio-net), con DHCP, DNS y, en la Terminal, `ping`, `ipconfig`, `nslookup` y `curl` (HTTP; HTTPS en una versión próxima). Ya estaban el USB propio y la lectura de discos NTFS y ext2/3/4. Probado en QEMU; en hardware real todavía no.
-Version 0.12.0, work in progress: wired networking (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 and I225/I226; Realtek RTL8111/8168; virtio-net) with DHCP, DNS and, in the Terminal, `ping`, `ipconfig`, `nslookup` and `curl` (HTTP; HTTPS coming soon). Native USB and read-only NTFS and ext2/3/4 disks were already there. Tested in QEMU; not yet on real hardware.
+Versión 0.12.1, en desarrollo: los programas de terceros ya pueden usar la red (TCP y UDP, salientes y a la escucha) con un aviso de permiso por programa, como un cortafuegos, y la Configuración y el Administrador de tareas muestran los permisos y las conexiones. Con el KIT viene **Mensajes**, un chat cifrado de extremo a extremo entre equipos de la misma red local, sin servidor. La 0.12.0 trajo la red por cable (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 e I225/I226; Realtek RTL8111/8168; virtio-net), con DHCP, DNS y, en la Terminal, `ping`, `ipconfig`, `nslookup` y `curl` (HTTP; HTTPS en una versión próxima). Probado en QEMU; en hardware real todavía no.
+Version 0.12.1, work in progress: third-party programs can now use the network (TCP and UDP, outgoing and listening) behind a per-program permission prompt, like a firewall; Settings and the Task Manager show the permissions and connections. The KIT ships **Mensajes**, an end-to-end encrypted, serverless chat between machines on the same local network. 0.12.0 brought wired networking (Intel 82540EM, 82574L, 82576, I210/I211, I217-I219 and I225/I226; Realtek RTL8111/8168; virtio-net) with DHCP, DNS and, in the Terminal, `ping`, `ipconfig`, `nslookup` and `curl` (HTTP; HTTPS coming soon). Tested in QEMU; not yet on real hardware.
 
-> **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS) es una implementación propia **no auditada**. No protejas con ella nada importante.
+> **Aviso / Warning:** la criptografía (SHA-256, PBKDF2, AES-256-XTS y, en Mensajes, X25519, HKDF y ChaCha20-Poly1305) es una implementación propia **no auditada**. No protejas con ella nada importante.
 > The cryptography is a custom, **unaudited** implementation. Do not rely on it for anything important.
 
 ## Compilar y arrancar / Build and run

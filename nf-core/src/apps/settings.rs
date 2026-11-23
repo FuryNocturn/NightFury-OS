@@ -109,6 +109,10 @@ enum Act {
     PadBack,
     /// Red: pedir la dirección otra vez.
     NetRenew,
+    /// Índice en `Settings::net_perms`: cambiar «usar la red», «aceptar conexiones» u olvidarlo.
+    NetOut(usize),
+    NetIn(usize),
+    NetForget(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -194,6 +198,8 @@ struct Settings {
     pad_state: PadState,
     /// Estado de la red tal como se vio al dibujar la página Red (para redibujar cuando cambia).
     net_seen: Option<NetStatus>,
+    /// Permisos de red de los programas tal como se vieron al dibujar la página Red.
+    net_perms: Vec<crate::netperm::Perm>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -221,6 +227,7 @@ fn init() -> Settings {
         testing: None,
         pad_state: PadState::default(),
         net_seen: None,
+        net_perms: Vec::new(),
     }
 }
 
@@ -293,7 +300,7 @@ impl Settings {
     fn net_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
         let compact = s.h < 440;
         let x0 = PANEL_W + 24;
-        let mut y = if compact { 14 } else { 24 };
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
         font::draw(s, x0, y, "Red", 18, false, TEXT);
         y += font::line_h(18) + if compact { 8 } else { 16 };
         let st = sys.net().map(|n| n.status());
@@ -326,8 +333,55 @@ impl Settings {
         }
         y += if compact { 6 } else { 14 };
         let on = matches!(st.map(|s| s.state), Some(State::Configuring | State::NoInternet | State::Connected));
-        let right = (s.w - 8).max(x0 + 1);
+        let right = (s.w - SB_W - 8).max(x0 + 1);
         self.button_if(s, &mut (x0, y), x0, right, "Renovar dirección", Act::NetRenew, on, theme);
+        y += BTN_H + if compact { 14 } else { 22 };
+        y = self.net_perms_list(s, theme, sys, x0, y, right);
+        self.content_h = y + self.scroll + 16;
+    }
+
+    /// v0.12.1: los programas de terceros que han pedido usar la red y lo que se les contestó.
+    #[allow(clippy::too_many_arguments)]
+    fn net_perms_list(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, x0: i32, mut y: i32, right: i32) -> i32 {
+        font::draw(s, x0, y, "Programas que pueden usar la red", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        let admin = sys.fs().is_admin();
+        y = note(s, x0, y, right - x0, if admin {
+            "Cada programa pregunta la primera vez. Si el programa cambia, vuelve a preguntar."
+        } else {
+            "Solo un administrador puede cambiar estos permisos."
+        });
+        y += 10;
+        self.net_perms = sys.fs().net_perms();
+        if self.net_perms.is_empty() {
+            font::draw(s, x0, y, "Ningún programa ha pedido usar la red.", 9, false, GRAY);
+            return y + 24;
+        }
+        let text = |v: Option<bool>| match v {
+            Some(true) => "Permitido",
+            Some(false) => "No permitido",
+            None => "Sin preguntar",
+        };
+        for i in 0..self.net_perms.len() {
+            let p = self.net_perms[i].clone();
+            font::draw(s, x0, y, &p.name, 9, true, TEXT);
+            y += font::line_h(9) + 2;
+            for (label, v) in [("Usar la red", p.out), ("Aceptar conexiones de la red local", p.inn)] {
+                let end = font::draw(s, x0, y, label, 9, false, GRAY);
+                font::draw(s, end + 8, y, text(v), 9, false, TEXT);
+                y += font::line_h(9);
+            }
+            if admin {
+                let mut at = (x0, y + 4);
+                let flip = |v: Option<bool>, yes: &'static str, no: &'static str| if v == Some(true) { no } else { yes };
+                self.button(s, &mut at, x0, right, flip(p.out, "Permitir la red", "Bloquear la red"), Act::NetOut(i), theme);
+                self.button(s, &mut at, x0, right, flip(p.inn, "Permitir conexiones", "Bloquear conexiones"), Act::NetIn(i), theme);
+                self.button(s, &mut at, x0, right, "Olvidar", Act::NetForget(i), theme);
+                y = at.1 + BTN_H;
+            }
+            y += 12;
+        }
+        y
     }
 
     fn about(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
@@ -645,7 +699,7 @@ impl Settings {
     }
 
     fn scrolls(&self) -> bool {
-        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || (self.page == PAGE_DEVICES && self.testing.is_none())
+        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || (self.page == PAGE_DEVICES && self.testing.is_none())
     }
 
     fn metrics(&self) -> Metrics {
@@ -930,6 +984,22 @@ impl Settings {
                 cx.redraw = true;
                 return;
             }
+            Act::NetOut(i) | Act::NetIn(i) | Act::NetForget(i) => {
+                let Some(p) = self.net_perms.get(i) else { return };
+                // «Permitir» si no lo estaba; «Bloquear» si lo estaba. Olvidar: vuelve a preguntar.
+                let flip = |v: Option<bool>| Some(v != Some(true));
+                let (out, inn) = match act {
+                    Act::NetOut(_) => (flip(p.out), p.inn),
+                    Act::NetIn(_) => (p.out, flip(p.inn)),
+                    _ => (None, None),
+                };
+                let (hash, now) = (p.hash, cx.sys.now());
+                if let Err(e) = cx.sys.fs().set_net_perm(hash, out, inn, now) {
+                    message(cx, e.message());
+                }
+                cx.redraw = true;
+                return;
+            }
             _ => {}
         }
         let crypto = match act {
@@ -962,7 +1032,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -2629,6 +2699,45 @@ mod tests {
         core::mem::swap(&mut lan.net, b.sys.net.as_mut().unwrap());
         lan.run(ms);
         core::mem::swap(&mut lan.net, b.sys.net.as_mut().unwrap());
+    }
+
+    #[test]
+    fn red_lista_los_permisos_de_los_programas() {
+        use crate::netperm::Perm;
+        let n = crate::platform::DateTime::default();
+        let perms = |b: &mut Banco| b.files().net_perms();
+        for quien in ["Ana", "Luis"] {
+            let mut b = Banco::con_disco(quien);
+            b.pagina(PAGE_NET);
+            assert!(!b.hay(Act::NetOut(0)), "sin programas no hay botones");
+            let p = |h: u8, name: &str, out, inn| Perm { hash: [h; 32], name: String::from(name), out, inn };
+            b.files().set_net_perms(&[p(1, "Mensajes", Some(true), None), p(2, "Juego", Some(false), Some(false))], n).unwrap();
+            if quien == "Luis" {
+                // Un usuario normal ve la lista pero no puede cambiarla.
+                assert!(!b.hay(Act::NetOut(0)) && !b.hay(Act::NetForget(1)));
+                assert_eq!(b.app.net_perms.len(), 2);
+                continue;
+            }
+            // Bloquear la red a Mensajes; permitir que Juego acepte conexiones.
+            b.pulsa(Act::NetOut(0));
+            assert_eq!(perms(&mut b)[0].out, Some(false));
+            b.pulsa(Act::NetIn(1));
+            assert_eq!((perms(&mut b)[1].out, perms(&mut b)[1].inn), (Some(false), Some(true)));
+            // «Sin preguntar» pasa a permitido.
+            b.pulsa(Act::NetIn(0));
+            assert_eq!(perms(&mut b)[0].inn, Some(true));
+            // Olvidar quita el programa: la próxima vez vuelve a preguntar.
+            b.pulsa(Act::NetForget(0));
+            let quedan = perms(&mut b);
+            assert_eq!((quedan.len(), quedan[0].name.as_str()), (1, "Juego"));
+            assert!(b.hay(Act::NetForget(0)) && !b.hay(Act::NetForget(1)));
+            assert!(b.dialog.is_none());
+            // Una lista larga se desplaza.
+            let muchos: Vec<Perm> = (0..30).map(|i| p(i, "Programa", Some(true), Some(true))).collect();
+            b.files().set_net_perms(&muchos, n).unwrap();
+            b.dibuja(780, 520);
+            assert!(b.app.content_h > 520 && b.app.scrolls());
+        }
     }
 
     #[test]

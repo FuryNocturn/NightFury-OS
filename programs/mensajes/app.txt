@@ -1,0 +1,6 @@
+nombre=Mensajes
+version=1.0
+autor=NightFury
+icono=app
+ancho=640
+alto=420

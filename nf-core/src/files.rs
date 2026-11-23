@@ -1509,6 +1509,40 @@ impl Files {
         let _ = self.fs.write(rel(LOG_FILE), &data, now);
     }
 
+    /// v0.12.1: permisos de red de los programas (`netperm`). Los lee y escribe el sistema (aviso y
+    /// Configuración) sin pasar por los permisos de la cuenta; los programas no llegan aquí.
+    pub fn net_perms(&mut self) -> Vec<crate::netperm::Perm> {
+        crate::netperm::parse(&self.fs.read(rel(crate::netperm::PERMS_FILE)).unwrap_or_default())
+    }
+    pub fn set_net_perms(&mut self, perms: &[crate::netperm::Perm], now: DateTime) -> Result<(), FsError> {
+        mk(&mut self.fs, rel(SYS_CONFIG_DIR), now);
+        let r = self.fs.write(rel(crate::netperm::PERMS_FILE), &crate::netperm::render(perms), now);
+        if r.is_ok() {
+            self.generation += 1;
+        }
+        r
+    }
+
+    /// Configuración → Red: cambia (o, con los dos a `None`, olvida) los permisos de un programa ya
+    /// apuntado. Solo un administrador; un programa que no está es `NotFound`.
+    pub fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, now: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Invalid);
+        }
+        let mut perms = self.net_perms();
+        let i = perms.iter().position(|p| p.hash == hash).ok_or(FsError::NotFound)?;
+        let name = alloc::format!("«{}»", perms[i].name);
+        if out.is_none() && inn.is_none() {
+            perms.remove(i);
+        } else {
+            perms[i].out = out;
+            perms[i].inn = inn;
+        }
+        self.set_net_perms(&perms, now)?;
+        self.log(&alloc::format!("Red: permisos de {name} cambiados en Configuración"), now);
+        Ok(())
+    }
+
     /// Al montar un disco: estructura, migración pendiente y limpieza. Nunca falla hacia fuera;
     /// lo que no pueda hacer ahora lo reintenta el siguiente arranque.
     fn startup(&mut self, now: DateTime) {

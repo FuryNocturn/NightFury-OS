@@ -496,6 +496,8 @@ pub const HUNG_MS: u64 = 5000;
 const T_SAVE: u32 = 1;
 const T_CRASH: u32 = 2;
 const T_HUNG: u32 = 3;
+/// v0.12.1: aviso de permiso de red.
+const T_NET: u32 = 4;
 
 /// Ventana de un programa dentro del escritorio.
 pub struct ProcApp {
@@ -538,6 +540,7 @@ const DRAG_SPINS: u32 = 100_000;
 
 impl ProcApp {
     pub fn new(proc: Box<dyn Process>, name: &str, icon: Option<Icon>, system: bool) -> Self {
+        let pid = proc.id();
         ProcApp {
             proc,
             name: String::from(name),
@@ -558,7 +561,18 @@ impl ProcApp {
             src_ans: None,
             last_over: false,
             system,
-            net_own: NetOwn::default(),
+            net_own: {
+                let mut own = NetOwn::default();
+                own.set_pid(pid);
+                own
+            },
+        }
+    }
+
+    /// Programa de terceros: su identidad para los permisos de red (SHA-256 del `.nfx`).
+    pub fn set_net_identity(&mut self, hash: [u8; 32]) {
+        if !self.system {
+            self.net_own.set_program(hash, &self.name);
         }
     }
 
@@ -711,6 +725,14 @@ impl ProcApp {
         }
         if !matches!(status, Status::Killed(_)) {
             self.atender(cx);
+            // El aviso de red espera a que no haya otro diálogo del programa ni del escritorio.
+            if cx.dialog.is_none() && !self.dlg_open && self.saving.is_none() {
+                if let Some((k, name)) = self.net_own.prompt() {
+                    let title = String::from(if k == crate::netperm::Kind::Out { "Red" } else { "Conexiones entrantes" });
+                    let text = crate::netperm::prompt_text(&name, k);
+                    cx.dialog = Some(DialogRequest::Message { tag: T_NET, title, text, buttons: Buttons::AllowDeny });
+                }
+            }
         }
         match status {
             Status::Alive => {}
@@ -810,6 +832,7 @@ impl App for ProcApp {
                 self.post(WireEvent { kind: EV_SAVED, a, ..Default::default() }, cx.now_ms);
             }
             DialogResult::Answer { tag: T_CRASH, .. } => cx.close = true,
+            DialogResult::Answer { tag: T_NET, answer } => self.net_own.answered(cx.sys, answer == Answer::Yes),
             DialogResult::Answer { tag: T_HUNG, answer: Answer::Yes } => {
                 self.proc.kill();
                 cx.close = true;
@@ -1319,6 +1342,30 @@ pub(crate) mod tests {
 
     fn dialogo(tag: u32) -> Request {
         Request::Dialog(DialogRequest::Input { tag, title: String::from("t"), label: String::new(), value: String::new() })
+    }
+
+    #[test]
+    fn aviso_de_red_de_un_programa_de_terceros() {
+        let (mut app, sh, _) = fake();
+        app.set_net_identity([5; 32]);
+        let mut sys = TestPlatform::default();
+        sys.net = Some(crate::net::Net::new([0; 32]));
+        let mut theme = Theme::default();
+        let pide = crate::service::Call::NetConnect { dst: [192, 168, 1, 9], port: 80 };
+        sh.borrow_mut().service = Some(encode(&pide));
+        let mut cx = Ctx::new(&mut sys, &mut theme, 1);
+        app.tick(&mut cx);
+        let r = sh.borrow_mut().reply.take().unwrap();
+        assert_eq!(crate::wire::decode::<Result<crate::net::SockId, crate::net::NetError>>(&r[1..]), Ok(Err(crate::net::NetError::Pending)));
+        let Some(DialogRequest::Message { tag, text, buttons, .. }) = cx.dialog.take() else { panic!("sin aviso") };
+        assert_eq!((tag, buttons), (T_NET, Buttons::AllowDeny));
+        assert!(text.contains("«Prueba» use la red"));
+        app.dialog_result(DialogResult::Answer { tag: T_NET, answer: Answer::Yes }, &mut cx);
+        assert_eq!(cx.sys.files().net_perms()[0].out, Some(true));
+        // Uno del sistema no tiene identidad de terceros ni pregunta nunca.
+        let (mut s, _, _) = fake_con(true);
+        s.set_net_identity([6; 32]);
+        assert!(s.net_own.prompt().is_none());
     }
 
     #[test]

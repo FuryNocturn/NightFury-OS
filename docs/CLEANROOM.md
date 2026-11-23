@@ -28,7 +28,7 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/input.rs` | Códigos de tecla y distribución ES | Tabla pública "scan code set 1"; distribución de teclado española |
 | `nf-core/src/glyphs.rs` | Tipografía | Diseño propio, trazo a trazo |
 | `nf-core/src/icons.rs`, `theme.rs` | Iconos, logo, fondos | Diseño propio, generado por código |
-| `nf-core/src/crypto.rs` | SHA-256, HMAC-SHA-256, PBKDF2 | FIPS 180-4; RFC 2104 y RFC 4231 (vectores); RFC 8018. Código propio, comprobado con los vectores oficiales |
+| `nf-core/src/crypto.rs` | SHA-256, HMAC-SHA-256, PBKDF2, HKDF, X25519, ChaCha20-Poly1305 | FIPS 180-4; RFC 2104 y RFC 4231 (vectores); RFC 8018; RFC 5869 (HKDF), RFC 7748 (X25519) y RFC 8439 (ChaCha20, Poly1305 y su AEAD), con sus vectores. Código propio, comprobado con los vectores oficiales |
 | `nf-core/src/cipher.rs` | AES-256, modos CTR y XTS | FIPS 197 (la caja S se calcula, no se copia); NIST SP 800-38A; IEEE 1619 / NIST SP 800-38E. Código propio, comprobado con los vectores oficiales |
 | `nf-core/src/keys.rs`, `accounts.rs` | Llaves envueltas, acumulador de aleatoriedad, cuentas | Diseño propio sobre las primitivas anteriores |
 | `kernel/src/main.rs` (`entropy`) | RDRAND, contador de ciclos | Intel SDM vol. 2 (RDRAND, RDTSC, CPUID.01H:ECX bit 30) |
@@ -49,7 +49,9 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `kernel/src/red/intel/pch.rs` | Intel I217, I218 e I219 (salida de ULP, PHY paginado, ajustes de enlace) | Especificación de sala limpia «intel-ethernet» (ver abajo) |
 | `kernel/src/red/realtek.rs` | Realtek RTL8111/8168 (revisiones 8168g/gu/h/m y 8411b), sin firmware | Especificación de sala limpia «realtek» (ver abajo) |
 | `kernel/src/red/virtio.rs` | Tarjeta de red de las máquinas virtuales | OASIS Virtual I/O Device (VIRTIO) 1.2 (PCI moderno, colas divididas, dispositivo de red) |
-| `nf-core/src/net/` | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS y cliente HTTP/1.1 | RFC 826 (ARP), 791 (IPv4), 792 (ICMP), 768 (UDP), 9293 (TCP), 6298 (temporizador de retransmisión), 2131 y 2132 (DHCP), 1035 (DNS), 9110 y 9112 (HTTP); IEEE 802.3 (trama Ethernet). Diseño propio |
+| `nf-core/src/net/` | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS y cliente HTTP/1.1 | RFC 826 (ARP), 791 (IPv4), 792 (ICMP), 768 (UDP), 9293 (TCP), 6298 (temporizador de retransmisión), 2131 y 2132 (DHCP), 1035 (DNS), 9110 y 9112 (HTTP); IEEE 802.3 (trama Ethernet). Diseño propio. v0.12.1: sockets UDP y TCP a la escucha para programas con filtro de red local, también diseño propio |
+| `nf-core/src/netperm.rs` | Permisos de red de los programas (avisos «usar la red» y «aceptar conexiones») | Diseño propio; la idea de preguntar por programa es la de cualquier cortafuegos, sin código ni textos de otros |
+| `programs/mensajes` | Chat cifrado de extremo a extremo en la red local | Protocolo propio (`docs/Mensajes-protocolo.md`) sobre RFC 7748, 8439 y 5869. No se ha mirado el código ni la especificación de otros programas de mensajería; la lista de palabras de verificación es propia |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
 
 ## Sala limpia en dos equipos (desde v0.11.1)
@@ -77,7 +79,7 @@ Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas
 `mkfs.ext4` y `mkntfs` solo como herramientas: se ejecutan, no se lee su código.
 
 ## Firmware de terceros
-La versión 0.12.0 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
+La versión 0.12.1 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa

@@ -21,7 +21,8 @@ use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
-use crate::net::{Ipv4, NetApi, NetError, NetStatus, PingId, PingReply, QueryId, SockId, State, TcpState, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, TCP_BUF};
+use crate::net::{ConnInfo, Datagram, Ipv4, ListenId, NetApi, NetError, NetStatus, PingId, PingReply, Proto, QueryId, SockId, State, TcpState, UdpId, MAX_LISTEN, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, MAX_UDP, TCP_BUF, UDP_MAX};
+use crate::netperm::{self, Kind};
 use crate::platform::{DateTime, MemInfo, Platform};
 use crate::wire::{decode, encode, Bad, Reader, Wire, WireResult, Writer};
 use alloc::string::String;
@@ -141,6 +142,16 @@ calls! {
     NetRecv { id: SockId, max: u32 } = 72,
     NetClose { id: SockId } = 73,
     NetAbort { id: SockId } = 74,
+    UdpBind { port: u16 } = 75,
+    UdpSend { id: UdpId, dst: Ipv4, port: u16, data: Blob } = 76,
+    UdpRecv { id: UdpId } = 77,
+    UdpClose { id: UdpId } = 78,
+    TcpListen { port: u16 } = 79,
+    TcpAccept { id: ListenId } = 80,
+    TcpUnlisten { id: ListenId } = 81,
+    NetConnections = 82,
+    NetPerms = 83,
+    SetNetPerm { hash: [u8; 32], out: Option<bool>, inn: Option<bool> } = 84,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -390,6 +401,26 @@ impl Wire for [u8; 6] {
     }
 }
 
+impl Wire for [u8; 32] {
+    fn put(&self, w: &mut Writer) {
+        w.buf.extend_from_slice(self);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(r.take(32)?);
+        Ok(a)
+    }
+}
+
+impl Wire for netperm::Perm {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.hash).put(&self.name).put(&self.out).put(&self.inn);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(netperm::Perm { hash: r.get()?, name: r.get()?, out: r.get()?, inn: r.get()? })
+    }
+}
+
 macro_rules! net_id {
     ($($t:ident),*) => {$(
         impl Wire for $t {
@@ -402,7 +433,50 @@ macro_rules! net_id {
         }
     )*};
 }
-net_id!(PingId, QueryId, SockId);
+net_id!(PingId, QueryId, SockId, UdpId, ListenId);
+
+impl Wire for Datagram {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.from).put(&self.port).bytes(&self.data);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(Datagram { from: r.get()?, port: r.get()?, data: r.bytes()?.to_vec() })
+    }
+}
+
+/// Textos de `ConnInfo::state`, por posición (como `PROTOCOL`).
+const CONN_STATES: [&str; 6] = ["Conectando", "Abierta", "Cerrando", "Cerrada", "Escuchando", "—"];
+
+impl Wire for ConnInfo {
+    fn put(&self, w: &mut Writer) {
+        let p: u8 = match self.proto {
+            Proto::Tcp => 0,
+            Proto::TcpListen => 1,
+            Proto::Udp => 2,
+        };
+        w.put(&p).put(&self.id).put(&self.local_port).put(&self.remote);
+        w.put(&(CONN_STATES.iter().position(|s| *s == self.state).unwrap_or(5) as u8));
+        w.put(&self.rx).put(&self.tx).put(&self.owner);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        let proto = match u8::get(r)? {
+            0 => Proto::Tcp,
+            1 => Proto::TcpListen,
+            2 => Proto::Udp,
+            _ => return Err(Bad),
+        };
+        Ok(ConnInfo {
+            proto,
+            id: r.get()?,
+            local_port: r.get()?,
+            remote: r.get()?,
+            state: CONN_STATES.get(u8::get(r)? as usize).copied().unwrap_or("—"),
+            rx: r.get()?,
+            tx: r.get()?,
+            owner: r.get()?,
+        })
+    }
+}
 
 const STATES: [State; 5] = [State::NoAdapter, State::NoCable, State::Configuring, State::NoInternet, State::Connected];
 
@@ -441,7 +515,7 @@ impl Wire for NetStatus {
 
 /// Motivos de `NetError::Protocol` que viajan por su posición (el texto es `&'static str`, así que
 /// al recibir se vuelve a uno de estos y nunca se crea un texto nuevo). Solo se añade al final.
-const PROTOCOL: [&str; 10] = [
+const PROTOCOL: [&str; 11] = [
     "Content-Length no válido",
     "cabeceras demasiado grandes",
     "conexión cerrada antes de las cabeceras",
@@ -452,6 +526,7 @@ const PROTOCOL: [&str; 10] = [
     "sin servidor DNS",
     "tamaño de bloque no válido",
     "tamaño de eco excesivo",
+    "datagrama demasiado grande",
 ];
 const PROTOCOL_UNKNOWN: &str = "respuesta no válida";
 
@@ -473,6 +548,9 @@ impl Wire for NetError {
             BadUrl => w.put(&11u8),
             HttpsNotYet => w.put(&12u8),
             Protocol(t) => w.put(&13u8).put(&(PROTOCOL.iter().position(|p| p == t).map_or(255, |i| i as u8))),
+            Denied => w.put(&14u8),
+            Pending => w.put(&15u8),
+            InUse => w.put(&16u8),
         };
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
@@ -492,6 +570,9 @@ impl Wire for NetError {
             11 => BadUrl,
             12 => HttpsNotYet,
             13 => Protocol(PROTOCOL.get(u8::get(r)? as usize).copied().unwrap_or(PROTOCOL_UNKNOWN)),
+            14 => Denied,
+            15 => Pending,
+            16 => InUse,
             _ => return Err(Bad),
         })
     }
@@ -534,9 +615,81 @@ pub struct NetOwn {
     pings: Vec<PingId>,
     queries: Vec<QueryId>,
     socks: Vec<SockId>,
+    udps: Vec<UdpId>,
+    listens: Vec<ListenId>,
+    /// v0.12.1, programa de terceros: SHA-256 de su `.nfx` y nombre. Sin esto no tiene red.
+    id: Option<([u8; 32], String)>,
+    /// Sus permisos tal como estaban en la generación de archivos dada (se releen si cambia).
+    cache: Option<(u64, Option<bool>, Option<bool>)>,
+    /// Aviso pendiente de respuesta, y si ya está en pantalla.
+    ask: Option<Kind>,
+    shown: bool,
+    /// Proceso dueño (`ProcInfo::id`) para el Administrador de tareas; 0 sin proceso.
+    pid: u64,
 }
 
 impl NetOwn {
+    /// Proceso al que se apunta lo que abra (`ProcApp`).
+    pub fn set_pid(&mut self, pid: u64) {
+        self.pid = pid;
+    }
+
+    /// Programa de terceros con esta identidad (`ProcApp`, al cargarlo).
+    pub fn set_program(&mut self, hash: [u8; 32], name: &str) {
+        self.id = Some((hash, String::from(name)));
+    }
+
+    /// Aviso que falta enseñar (y lo da por enseñado). `ProcApp` lo llama cuando el escritorio
+    /// tiene el hueco de diálogo libre.
+    pub fn prompt(&mut self) -> Option<(Kind, String)> {
+        let (k, (_, name)) = (self.ask?, self.id.as_ref()?);
+        if self.shown {
+            return None;
+        }
+        self.shown = true;
+        Some((k, name.clone()))
+    }
+
+    /// El usuario respondió al aviso: se guarda para todas las cuentas y se apunta en el registro.
+    pub fn answered(&mut self, sys: &mut dyn Platform, allow: bool) {
+        let (Some(k), Some((hash, name))) = (self.ask.take(), self.id.clone()) else { return };
+        self.shown = false;
+        let now = sys.now();
+        let files = sys.files();
+        let mut perms = files.net_perms();
+        netperm::record(&mut perms, hash, &name, k, allow);
+        // Aunque no se pueda guardar (disco en memoria o lleno), vale para esta vez.
+        let _ = files.set_net_perms(&perms, now);
+        let what = match k {
+            Kind::Out => "usar la red",
+            Kind::In => "aceptar conexiones",
+        };
+        files.log(&alloc::format!("Red: «{}» {} {what}", netperm::clean_name(&name), if allow { "puede" } else { "no puede" }), now);
+        let p = perms.iter().find(|p| p.hash == hash);
+        self.cache = Some((files.generation(), p.and_then(|p| p.out), p.and_then(|p| p.inn)));
+    }
+
+    /// ¿Puede el programa hacer algo de tipo `k`? Sin respuesta todavía, pide el aviso (`Pending`).
+    fn check(&mut self, sys: &mut dyn Platform, k: Kind) -> Result<(), NetError> {
+        let Some((hash, _)) = self.id.as_ref() else { return Err(NetError::NoAdapter) };
+        let generation = sys.files().generation();
+        if self.cache.is_none_or(|c| c.0 != generation) {
+            let p = sys.files().net_perms().into_iter().find(|p| p.hash == *hash);
+            self.cache = Some((generation, p.as_ref().and_then(|p| p.out), p.as_ref().and_then(|p| p.inn)));
+        }
+        let (_, out, inn) = self.cache.unwrap_or_default();
+        match if k == Kind::Out { out } else { inn } {
+            Some(true) => Ok(()),
+            Some(false) => Err(NetError::Denied),
+            None => {
+                if self.ask.is_none() {
+                    self.ask = Some(k);
+                }
+                Err(NetError::Pending)
+            }
+        }
+    }
+
     /// El programa se va: corta sus conexiones y recoge sus pings y consultas (los que siguen en
     /// marcha vencen solos por plazo y la pila los borra poco después).
     pub fn release(&mut self, sys: &mut dyn Platform) {
@@ -550,17 +703,43 @@ impl NetOwn {
             for q in self.queries.drain(..) {
                 net.resolve_poll(q);
             }
+            for u in self.udps.drain(..) {
+                net.udp_close(u);
+            }
+            for l in self.listens.drain(..) {
+                net.tcp_unlisten(l);
+            }
         }
-        *self = NetOwn::default();
+        self.pings.clear();
+        self.queries.clear();
+        self.socks.clear();
+        self.udps.clear();
+        self.listens.clear();
     }
 }
 
-/// Lo que ve quien no tiene red (programa de terceros o equipo sin pila): no hay tarjeta.
+/// Qué permiso necesita una llamada de red de un programa de terceros (`None`: ninguno, porque solo
+/// lee el estado o trabaja con identificadores que ya abrió con permiso).
+fn needs(call: &Call) -> Option<Kind> {
+    match call {
+        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::UdpSend { .. } | Call::UdpBind { port: 0 } => Some(Kind::Out),
+        Call::UdpBind { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => Some(Kind::In),
+        _ => None,
+    }
+}
+
+/// Lo que ve quien no tiene red (equipo sin pila o programa sin identidad): no hay tarjeta.
 fn no_net(call: &Call) -> Vec<u8> {
-    let e = NetError::NoAdapter;
+    net_err(call, NetError::NoAdapter)
+}
+
+/// La respuesta de `call` cuando falla con `e`.
+fn net_err(call: &Call, e: NetError) -> Vec<u8> {
     match call {
         Call::NetStatus => encode(&no_status()),
         Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
+        Call::UdpBind { .. } | Call::UdpSend { .. } | Call::UdpRecv { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => encode(&Err::<u8, _>(e)),
+        Call::NetConnections => encode(&Vec::<ConnInfo>::new()),
         Call::NetPingPoll { .. } | Call::NetResolvePoll { .. } => encode(&Some(Err::<u8, _>(e))),
         Call::NetState { .. } => encode(&TcpState::Failed(e)),
         _ => encode(&()),
@@ -770,10 +949,35 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         UnlockDrive { letter, secret, recovery } => gate(system, Err(no_key), || sys.files().unlock_drive(letter, &secret, recovery)),
         DriveAction { letter, req } => gate(system, Err(denied), || sys.files().request_drive_action(letter, req)),
         DriveResult => gate(system, None, || sys.files().drive_result()),
-        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. } => {
-            // En esta versión solo los programas del sistema usan la red (los de terceros, con permiso, en v0.12.1).
-            match if system { sys.net() } else { None } {
-                Some(net) => net_run(net, call, own),
+        NetPerms => gate(system, Vec::new(), || sys.files().net_perms()),
+        SetNetPerm { hash, out, inn } => {
+            let now = sys.now();
+            gate(system, Err(denied), || sys.files().set_net_perm(hash, out, inn, now))
+        }
+        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
+        | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
+            if !system {
+                if own.id.is_none() {
+                    return no_net(&call);
+                }
+                // Los puertos de menos de 1024 son del sistema, como en otros sistemas.
+                if let UdpBind { port } | TcpListen { port } = call {
+                    if (1..1024).contains(&port) {
+                        return net_err(&call, NetError::InUse);
+                    }
+                }
+                if let Some(k) = needs(&call) {
+                    if let Err(e) = own.check(sys, k) {
+                        return net_err(&call, e);
+                    }
+                }
+            }
+            match sys.net() {
+                // `renew` cambia la red de todo el equipo: solo el sistema. La MAC identifica el equipo:
+                // un programa de terceros no la ve.
+                Some(_) if !system && matches!(call, NetRenew) => encode(&()),
+                Some(net) if !system && matches!(call, NetStatus) => encode(&crate::net::NetStatus { mac: [0; 6], ..net.status() }),
+                Some(net) => net_run(net, call, own, system),
                 None => no_net(&call),
             }
         }
@@ -782,7 +986,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
 
 /// Las llamadas de red, con la pila ya a mano. Cada programa solo toca los identificadores que
 /// abrió él; uno ajeno es uno que «ya no existe».
-fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
+fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool) -> Vec<u8> {
     use Call::*;
     match call {
         NetStatus => encode(&net.status()),
@@ -841,6 +1045,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
             let r = if own.socks.len() >= MAX_SOCKS { Err(NetError::Busy) } else { net.tcp_connect(dst, port) };
             if let Ok(id) = r {
                 own.socks.push(id);
+                net.set_owner(Proto::Tcp, id.0, own.pid);
             }
             encode(&r)
         }
@@ -873,6 +1078,74 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn) -> Vec<u8> {
                 net.tcp_abort(id);
             }
             encode(&())
+        }
+        UdpBind { port } => {
+            let r = if own.udps.len() >= MAX_UDP { Err(NetError::Busy) } else { net.udp_bind(port) };
+            if let Ok(id) = r {
+                own.udps.push(id);
+                net.set_owner(Proto::Udp, id.0, own.pid);
+            }
+            encode(&r)
+        }
+        UdpSend { id, dst, port, data } => {
+            encode(&if !own.udps.contains(&id) {
+                Err(NetError::Gone)
+            } else if data.0.len() > UDP_MAX {
+                Err(NetError::Protocol("datagrama demasiado grande"))
+            } else {
+                net.udp_send(id, dst, port, &data.0)
+            })
+        }
+        UdpRecv { id } => encode(&if own.udps.contains(&id) { net.udp_recv(id) } else { Err(NetError::Gone) }),
+        UdpClose { id } => {
+            if let Some(i) = own.udps.iter().position(|&u| u == id) {
+                own.udps.swap_remove(i);
+                net.udp_close(id);
+            }
+            encode(&())
+        }
+        TcpListen { port } => {
+            let r = if own.listens.len() >= MAX_LISTEN { Err(NetError::Busy) } else { net.tcp_listen(port) };
+            if let Ok(id) = r {
+                own.listens.push(id);
+                net.set_owner(Proto::TcpListen, id.0, own.pid);
+            }
+            encode(&r)
+        }
+        TcpAccept { id } => {
+            if !own.listens.contains(&id) {
+                return encode(&Err::<Option<(SockId, Ipv4, u16)>, _>(NetError::Gone));
+            }
+            // Sin hueco en la lista del programa, la conexión espera en la cola de la pila.
+            if own.socks.len() >= MAX_SOCKS {
+                own.socks.retain(|&s| net.tcp_state(s) != TcpState::Failed(NetError::Gone));
+                if own.socks.len() >= MAX_SOCKS {
+                    return encode(&Ok::<Option<(SockId, Ipv4, u16)>, NetError>(None));
+                }
+            }
+            let r = net.tcp_accept(id);
+            if let Ok(Some((s, _, _))) = r {
+                own.socks.push(s);
+                net.set_owner(Proto::Tcp, s.0, own.pid);
+            }
+            encode(&r)
+        }
+        TcpUnlisten { id } => {
+            if let Some(i) = own.listens.iter().position(|&l| l == id) {
+                own.listens.swap_remove(i);
+                net.tcp_unlisten(id);
+            }
+            encode(&())
+        }
+        // Un programa del sistema (el Administrador de tareas) ve todo; uno de terceros, solo lo suyo.
+        NetConnections if system => encode(&net.connections()),
+        NetConnections => {
+            let mine = |c: &ConnInfo| match c.proto {
+                Proto::Tcp => own.socks.contains(&SockId(c.id)),
+                Proto::Udp => own.udps.contains(&UdpId(c.id)),
+                Proto::TcpListen => own.listens.contains(&ListenId(c.id)),
+            };
+            encode(&net.connections().into_iter().filter(mine).collect::<Vec<_>>())
         }
         _ => encode(&()),
     }
@@ -1088,6 +1361,12 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     fn request_drive_action(&mut self, letter: char, req: FormatRequest) -> Result<(), FsError> {
         self.fs(Call::DriveAction { letter, req })
     }
+    fn net_perms(&mut self) -> Vec<netperm::Perm> {
+        self.ask(Call::NetPerms, Vec::new())
+    }
+    fn set_net_perm(&mut self, hash: [u8; 32], out: Option<bool>, inn: Option<bool>, _now: DateTime) -> Result<(), FsError> {
+        self.fs(Call::SetNetPerm { hash, out, inn })
+    }
     fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
         self.ask(Call::DriveResult, None)
     }
@@ -1149,6 +1428,39 @@ impl<T: Transport> NetApi for RemoteNet<T> {
     fn tcp_abort(&mut self, id: SockId) {
         ask(&mut self.0, Call::NetAbort { id }, ())
     }
+    fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
+        self.net(Call::UdpBind { port })
+    }
+    fn udp_send(&mut self, id: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError> {
+        if data.len() > UDP_MAX {
+            return Err(NetError::Protocol("datagrama demasiado grande"));
+        }
+        self.net(Call::UdpSend { id, dst, port, data: Blob(data.to_vec()) })
+    }
+    fn udp_recv(&mut self, id: UdpId) -> Result<Option<Datagram>, NetError> {
+        let mut d: Option<Datagram> = self.net(Call::UdpRecv { id })?;
+        // Un sistema que mintiera con un datagrama enorme no hace crecer la memoria del programa sin tope.
+        if let Some(g) = d.as_mut() {
+            g.data.truncate(UDP_MAX);
+        }
+        Ok(d)
+    }
+    fn udp_close(&mut self, id: UdpId) {
+        ask(&mut self.0, Call::UdpClose { id }, ())
+    }
+    fn tcp_listen(&mut self, port: u16) -> Result<ListenId, NetError> {
+        self.net(Call::TcpListen { port })
+    }
+    fn tcp_accept(&mut self, id: ListenId) -> Result<Option<(SockId, Ipv4, u16)>, NetError> {
+        self.net(Call::TcpAccept { id })
+    }
+    fn tcp_unlisten(&mut self, id: ListenId) {
+        ask(&mut self.0, Call::TcpUnlisten { id }, ())
+    }
+    fn connections(&mut self) -> Vec<ConnInfo> {
+        ask(&mut self.0, Call::NetConnections, Vec::new())
+    }
+    fn set_owner(&mut self, _proto: Proto, _id: u32, _owner: u64) {}
 }
 
 #[cfg(test)]
@@ -1604,6 +1916,47 @@ pub(crate) mod tests {
         let (_real, mut p) = prog(true);
         assert_eq!(p.net.status().state, State::NoAdapter);
         assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::NoAdapter));
+    }
+
+    #[test]
+    fn red_de_terceros_con_aviso_que_se_recuerda() {
+        let (real, mut p, mut lan) = con_lan(false);
+        p.own.borrow_mut().set_program([7; 32], "Mensajes");
+        // El estado se ve sin preguntar, pero sin la MAC; renovar no hace nada.
+        let st = p.net.status();
+        assert_eq!((st.state, st.mac), (State::Connected, [0; 6]));
+        // Primera vez: aviso de «usar la red», una sola vez aunque insista.
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Pending));
+        assert_eq!(p.net.resolve("ejemplo.com"), Err(NetError::Pending));
+        assert_eq!(p.own.borrow_mut().prompt(), Some((Kind::Out, s("Mensajes"))));
+        assert_eq!(p.own.borrow_mut().prompt(), None, "ya en pantalla");
+        p.own.borrow_mut().answered(&mut *real.borrow_mut(), true);
+        let sk = p.net.tcp_connect(SRV, 80).unwrap();
+        corre(&real, &mut lan, 200);
+        assert_eq!(p.net.tcp_state(sk), TcpState::Open);
+        // Escuchar es otro permiso; los puertos bajos no se dan; se dice que no y se recuerda.
+        assert_eq!(p.net.tcp_listen(80), Err(NetError::InUse));
+        assert_eq!(p.net.udp_bind(5000), Err(NetError::Pending));
+        assert_eq!(p.own.borrow_mut().prompt(), Some((Kind::In, s("Mensajes"))));
+        p.own.borrow_mut().answered(&mut *real.borrow_mut(), false);
+        assert_eq!(p.net.tcp_listen(5000), Err(NetError::Denied));
+        // Guardado para todas las cuentas y en el registro.
+        let perms = real.borrow_mut().files().net_perms();
+        assert_eq!(perms, vec![netperm::Perm { hash: [7; 32], name: s("Mensajes"), out: Some(true), inn: Some(false) }]);
+        let log = real.borrow_mut().files().read(crate::files::LOG_FILE).unwrap();
+        assert!(String::from_utf8_lossy(&log).contains("Red: «Mensajes» puede usar la red"));
+        // Otra ventana del mismo programa ya no pregunta; uno con otro contenido, sí.
+        let mut b = otro(&real, false);
+        b.0.own.borrow_mut().set_program([7; 32], "Mensajes");
+        assert!(b.tcp_connect(SRV, 80).is_ok());
+        let mut c = otro(&real, false);
+        c.0.own.borrow_mut().set_program([8; 32], "Mensajes");
+        assert_eq!(c.tcp_connect(SRV, 80), Err(NetError::Pending));
+        // Quitado en Configuración: lo nuevo se niega.
+        let mut perms = real.borrow_mut().files().net_perms();
+        perms[0].out = Some(false);
+        real.borrow_mut().files().set_net_perms(&perms, NOW).unwrap();
+        assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Denied));
     }
 
     #[test]

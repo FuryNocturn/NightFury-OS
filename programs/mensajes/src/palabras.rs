@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
+//! Lista propia de 256 palabras para verificar una conversación (una por valor de byte).
+
+pub const LISTA: [&str; 256] = [
+    "abeja", "aceite", "acero", "agua", "aire", "ajo", "alamo", "alba",
+    "ala", "alma", "amigo", "ancla", "arbol", "arena", "arroz", "astro",
+    "azul", "bahia", "balsa", "barco", "barro", "bello", "besar", "bosque",
+    "brisa", "bruma", "cabra", "cacao", "cafe", "caja", "calma", "campo",
+    "canoa", "cara", "carro", "casa", "cedro", "cielo", "cinta", "circo",
+    "clavo", "cobre", "coco", "cola", "copa", "coral", "cuna", "cumbre",
+    "dado", "dardo", "delta", "diente", "disco", "dragon", "duna", "dulce",
+    "ebano", "eco", "ejido", "elfo", "encina", "eneldo", "escudo", "espiga",
+    "faro", "fiesta", "flecha", "flor", "fogata", "fresa", "fuego", "fuente",
+    "gallo", "gato", "gema", "giro", "globo", "gota", "grano", "grillo",
+    "guante", "guitarra", "hada", "hamaca", "harina", "hielo", "hierro", "hoja",
+    "hongo", "hormiga", "huerto", "huevo", "humo", "idea", "iman", "isla",
+    "jabali", "jardin", "jarra", "jaula", "jazmin", "joya", "juego", "junco",
+    "kiwi", "koala", "laguna", "lampara", "lana", "lapiz", "lazo", "leche",
+    "lento", "leon", "libro", "limon", "lince", "lirio", "llama", "lluvia",
+    "lobo", "luna", "luz", "madera", "mago", "mango", "mapa", "marmol",
+    "mazo", "miel", "mono", "monte", "mundo", "musgo", "nacar", "nave",
+    "nido", "nieve", "nogal", "norte", "nube", "nuez", "oasis", "ocaso",
+    "oliva", "onda", "orilla", "oro", "oruga", "oso", "otono", "paloma",
+    "pan", "pato", "pera", "perla", "pez", "piedra", "pino", "plata",
+    "plomo", "pluma", "polen", "puente", "queso", "quinoa", "rama", "rana",
+    "rayo", "red", "reloj", "remo", "rio", "roble", "roca", "rosa",
+    "ruta", "sabio", "sal", "salto", "selva", "sendero", "seta", "sol",
+    "sombra", "suelo", "tabla", "taza", "tejado", "tierra", "tigre", "tinta",
+    "tomate", "torre", "trigo", "tren", "trucha", "tulipan", "uva", "vaca",
+    "valle", "vela", "velero", "viento", "vino", "violin", "volcan", "yate",
+    "yema", "zafiro", "zorro", "zumo", "arco", "bala", "banco", "bola",
+    "botella", "bruja", "buho", "cabo", "cadena", "cama", "canto", "capa",
+    "carta", "cesta", "cima", "cohete", "colina", "concha", "cuerda", "diamante",
+    "dedo", "duende", "eje", "enano", "escala", "espada", "estrella", "farol",
+    "fruta", "gaviota", "geranio", "halcon", "jirafa", "lago", "lupa", "manta",
+    "marea", "miga", "nariz", "niebla", "ola", "oveja", "pajaro", "pulpo",
+];
