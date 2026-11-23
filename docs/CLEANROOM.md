@@ -79,7 +79,7 @@ Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas
 `mkfs.ext4` y `mkntfs` solo como herramientas: se ejecutan, no se lee su código.
 
 ## Firmware de terceros
-La versión 0.12.0 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
+La versión 0.12.1 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa
