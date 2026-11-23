@@ -155,7 +155,7 @@ impl Net {
 
     pub(super) fn owner_set(&mut self, proto: Proto, id: u32, owner: u64) {
         match proto {
-            Proto::Tcp => self.socks.iter_mut().filter(|k| k.id == id).for_each(|k| k.owner = owner),
+            Proto::Tcp | Proto::Tls => self.socks.iter_mut().filter(|k| k.id == id).for_each(|k| k.owner = owner),
             Proto::Udp => self.udps.iter_mut().filter(|u| u.id == id).for_each(|u| u.owner = owner),
             Proto::TcpListen => self.listens.iter_mut().filter(|l| l.id == id).for_each(|l| l.owner = owner),
         }
@@ -170,7 +170,7 @@ impl Net {
                 St::Closed => "Cerrada",
                 _ => "Cerrando",
             };
-            v.push(ConnInfo { proto: Proto::Tcp, id: k.id, local_port: k.lport, remote: Some((k.remote, k.rport)), state, rx: k.rx, tx: k.tx, owner: k.owner });
+            v.push(ConnInfo { proto: if k.tls.is_some() { Proto::Tls } else { Proto::Tcp }, id: k.id, local_port: k.lport, remote: Some((k.remote, k.rport)), state, rx: k.rx, tx: k.tx, owner: k.owner });
         }
         for l in &self.listens {
             v.push(ConnInfo { proto: Proto::TcpListen, id: l.id, local_port: l.port, remote: None, state: "Escuchando", rx: 0, tx: 0, owner: l.owner });

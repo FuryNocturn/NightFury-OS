@@ -38,7 +38,7 @@ fn heads(ev: &[HttpEvent]) -> usize {
 }
 
 fn url(h: &str, p: u16, path: &str) -> Result<Url, NetError> {
-    Ok(Url { host: h.to_string(), port: p, path: path.to_string() })
+    Ok(Url { https: false, host: h.to_string(), port: p, path: path.to_string() })
 }
 
 #[test]
@@ -52,8 +52,7 @@ fn analisis_de_urls() {
     assert_eq!(parse_url("localhost:3000/x"), url("localhost", 3000, "/x"));
     assert_eq!(parse_url("10.0.0.1/x#y"), url("10.0.0.1", 80, "/x"));
     assert_eq!(parse_url("host/redir?u=http://otra/"), url("host", 80, "/redir?u=http://otra/"));
-    assert_eq!(parse_url("https://x"), Err(NetError::HttpsNotYet));
-    assert_eq!(parse_url("HTTPS://x/y"), Err(NetError::HttpsNotYet));
+    assert_eq!(parse_url("https://x"), Ok(Url { https: true, host: "x".to_string(), port: 443, path: "/".to_string() }));
     for m in ["", "ftp://x", "http://", "http://:80/", "http://a:0/", "http://a:65536/", "http://a:x/", "http://a:/", "http://u@a/", "http://[::1]/", "http://a b/", "http://a/\r\nX: y", " http://a", "http://.a/", "http://a|b/", "file:///etc/passwd"] {
         assert_eq!(parse_url(m), Err(NetError::BadUrl), "{m:?}");
     }
@@ -257,7 +256,7 @@ fn redireccion_relativa_y_tope() {
 fn redirecciones_a_destinos_imposibles() {
     let mut l = lan();
     for (loc, esperado) in [
-        ("https://example.org/", NetError::HttpsNotYet),
+        ("https://example.org/", NetError::Tls("Este equipo no puede comprobar certificados.".to_string())),
         ("ftp://example.org/", NetError::BadUrl),
         ("http://no-existe.test/", NetError::NotFound),
         ("/con espacio", NetError::BadUrl),
@@ -329,7 +328,6 @@ fn errores_de_red_y_de_arranque() {
     assert_eq!(fetch(&mut l, "http://example.org:81/", false, true).unwrap(), [HttpEvent::Error(NetError::Refused)]);
     assert_eq!(fetch(&mut l, "http://no-existe.test/", false, true).unwrap(), [HttpEvent::Error(NetError::NotFound)]);
     assert!(matches!(HttpGet::start(&mut l.net, "ftp://x/", false, true), Err(NetError::BadUrl)));
-    assert!(matches!(HttpGet::start(&mut l.net, "https://x/", false, true), Err(NetError::HttpsNotYet)));
     l.wire.borrow_mut().link = None;
     l.run(100);
     let r = HttpGet::start(&mut l.net, "http://otro.test/", false, true);

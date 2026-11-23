@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.12.1)
+# Kit de programas de NightFury (v0.12.2)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -147,7 +147,7 @@ de Windows. Hay dos avisos, y cada uno se recuerda por separado:
 
 | Aviso | Lo piden |
 |---|---|
-| «¿Permitir que X use la red?» | `resolve`, `ping`, `tcp_connect`, `udp_send`, `udp_bind(0)` |
+| «¿Permitir que X use la red?» | `resolve`, `ping`, `tcp_connect`, `tcp_connect_tls`, `udp_send`, `udp_bind(0)` |
 | «¿Permitir que X acepte conexiones de otros equipos?» | `udp_bind(puerto)` con puerto fijo, `tcp_listen`, `tcp_accept` |
 
 - Mientras el aviso está en pantalla la llamada devuelve `Err(NetError::Pending)`: vuelve a intentarlo en otro
@@ -170,6 +170,8 @@ de Windows. Hay dos avisos, y cada uno se recuerda por separado:
 | `tcp_connect(ip, puerto)` → `SockId` | conecta; mira `tcp_state(s)` hasta `Open` o `Failed(e)` |
 | `tcp_send(s, datos)` | envía lo que quepa y devuelve cuántos bytes ha aceptado: reenvía el resto después |
 | `tcp_recv(s, buf)` | copia lo recibido; `Ok(0)` si de momento no hay nada |
+| `tcp_connect_tls(ip, puerto, nombre)` → `SockId` | como `tcp_connect`, con TLS (HTTPS): ver «Conexión segura» |
+| `tcp_tls_info(s)` | `Some(TlsInfo)` con versión, cifrado, titular del certificado y caducidad |
 | `tcp_close(s)` / `tcp_abort(s)` | cierre limpio / corte inmediato |
 | `tcp_listen(puerto)` → `ListenId` | escucha (cola de 8) |
 | `tcp_accept(l)` | `Some((s, ip, puerto))` si hay una conexión nueva |
@@ -203,6 +205,51 @@ fn tick(&mut self, cx: &mut Ctx) {
     if let Ok(n) = net.tcp_recv(s, &mut buf) {
         self.recibido.extend_from_slice(&buf[..n]);
         cx.redraw |= n > 0;
+    }
+}
+```
+
+**Conexión segura (v0.12.2).** `tcp_connect_tls(ip, puerto, nombre)` abre una conexión TLS (HTTPS)
+al servidor de esa `ip`; `nombre` es el que debe llevar su certificado (resuélvelo antes con `resolve`).
+Mismo `SockId`, y `tcp_state`, `tcp_send`, `tcp_recv`, `tcp_close` y `tcp_abort` funcionan igual, pero con
+**texto claro**: el sistema guarda las claves y cifra y descifra por ti. Pide el **mismo permiso** que
+`tcp_connect` (`Pending`/`Denied` igual). `tcp_state` sigue en `Connecting` mientras dura el saludo seguro.
+
+- El certificado **siempre** se comprueba (raíces de Configuración → Certificados, nombre y fechas) y un
+  programa de terceros **no puede saltárselo**. Si falla, `tcp_state` da `Failed(NetError::Tls(motivo))` con
+  un texto en español listo para mostrar («El certificado ha caducado…», «…no corresponde a este nombre…»);
+  lo mismo si el servidor corta durante el saludo o solo habla un TLS antiguo.
+- El nombre solo puede tener letras, cifras, `-`, `.` y `_` (253 como mucho); si no, `Err(NetError::BadUrl)`.
+- `tcp_send` y `tcp_recv` mueven como mucho 64 KiB por llamada, igual que en TCP.
+- La fecha de los certificados sale del reloj del equipo: con el reloj mal, un certificado bueno parecerá
+  caducado.
+
+```rust
+// Pide «GET /» por HTTPS a una IP ya resuelta (tick a tick, como el resto de la red).
+fn tick(&mut self, cx: &mut Ctx) {
+    let Some(net) = cx.sys.net() else { return };
+    let s = match self.sock {
+        Some(s) => s,
+        None => match net.tcp_connect_tls(self.ip, 443, "ejemplo.com") {
+            Ok(s) => { self.sock = Some(s); return }
+            Err(NetError::Pending) => return,
+            Err(e) => { self.texto = format!("{e:?}"); return }
+        },
+    };
+    match net.tcp_state(s) {
+        TcpState::Failed(NetError::Tls(motivo)) => self.texto = motivo, // «El certificado ha caducado…»
+        TcpState::Open if !self.enviado => {
+            self.enviado = net.tcp_send(s, b"GET / HTTP/1.1
+Host: ejemplo.com
+Connection: close
+
+").is_ok();
+        }
+        _ => {}
+    }
+    let mut buf = [0u8; 512];
+    if let Ok(n) = net.tcp_recv(s, &mut buf) {
+        self.recibido.extend_from_slice(&buf[..n]); // texto claro
     }
 }
 ```

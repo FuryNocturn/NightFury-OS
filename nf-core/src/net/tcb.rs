@@ -146,6 +146,8 @@ pub struct Sock {
     /// Bytes de datos recibidos y puestos en el búfer de envío, para `connections`.
     pub rx: u64,
     pub tx: u64,
+    /// v0.12.2: TLS por encima de esta conexión.
+    pub tls: Option<alloc::boxed::Box<super::tlsconn::TlsConn>>,
     pub iss: u32,
     snd_una: u32,
     snd_nxt: u32,
@@ -187,6 +189,7 @@ impl Sock {
             owner: 0,
             rx: 0,
             tx: 0,
+            tls: None,
             iss,
             snd_una: iss,
             snd_nxt: iss.wrapping_add(1),
@@ -227,6 +230,14 @@ impl Sock {
     /// Cola de entrantes sin aceptar que ya murió (reset, plazo…): se puede quitar.
     pub fn dead(&self) -> bool {
         self.st == St::Closed && (self.released || self.listener.is_some())
+    }
+
+    /// Como `state`, pero con TLS el saludo cuenta: sigue «Conectando» hasta que acaba.
+    pub fn tls_state(&self) -> TcpState {
+        match &self.tls {
+            Some(t) => t.state(self),
+            None => self.state(),
+        }
     }
 
     pub fn state(&self) -> TcpState {

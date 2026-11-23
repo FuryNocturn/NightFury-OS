@@ -33,7 +33,9 @@ pub mod menu;
 pub mod net;
 pub mod netperm;
 pub mod nfx;
+pub mod pk;
 pub mod platform;
+pub mod raices;
 pub mod proc;
 pub mod request;
 pub mod programs;
@@ -43,9 +45,11 @@ pub mod service;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod tls;
 pub mod usbhid;
 pub mod vol;
 pub mod wire;
+pub mod x509;
 
 /// Nombre del sistema. Único sitio donde se define (ver docs/CLEANROOM.md).
 pub const NAME: &str = "NightFury";

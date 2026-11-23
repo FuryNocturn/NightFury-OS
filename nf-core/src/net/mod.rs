@@ -23,6 +23,7 @@ mod ip;
 mod pkt;
 mod tcb;
 mod tcp;
+mod tlsconn;
 mod udp;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -109,8 +110,8 @@ pub enum NetError {
     /// Identificador que ya no existe (operación terminada o liberada).
     Gone,
     BadUrl,
-    /// `https://`: llega en v0.12.2.
-    HttpsNotYet,
+    /// v0.12.2: fallo de la conexión segura (certificado, alerta, protocolo…), ya en español.
+    Tls(String),
     /// Respuesta mal formada, con un motivo corto en español.
     Protocol(&'static str),
     /// v0.12.1: el usuario no ha dado permiso a este programa (o lo ha quitado en Configuración).
@@ -138,6 +139,8 @@ pub struct Datagram {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Proto {
     Tcp,
+    /// v0.12.2: TCP con TLS por encima.
+    Tls,
     /// Puerto TCP a la escucha (sin otro extremo).
     TcpListen,
     Udp,
@@ -188,6 +191,21 @@ pub enum TcpState {
     /// Cerrada limpiamente por los dos lados.
     Closed,
     Failed(NetError),
+}
+
+/// v0.12.2: lo que se sabe de una conexión segura ya establecida, para mostrar (`curl -v`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TlsInfo {
+    pub version: String,
+    pub suite: String,
+    pub group: String,
+    /// «CN (O)» del certificado del sitio y de quien lo emitió (vacío si la cadena no se validó).
+    pub subject: String,
+    pub issuer: String,
+    /// Caducidad (año, mes, día), UTC.
+    pub expires: (u16, u8, u8),
+    /// Solo con `-k`: por qué el certificado no vale.
+    pub cert_error: Option<String>,
 }
 
 /// Plazos (ms).
@@ -246,6 +264,11 @@ pub struct Net {
     next_udp: u32,
     listens: Vec<udp::Listener>,
     next_listen: u32,
+    /// v0.12.2: raíces de confianza y hora (UTC) para las conexiones seguras; las pone el sistema.
+    tls_env: Option<(alloc::sync::Arc<crate::x509::RootStore>, crate::x509::Time)>,
+    /// Solo pruebas: random, session_id y privada x25519 fijos para el cliente TLS (reproducir un saludo grabado).
+    #[cfg(test)]
+    tls_fijo: Option<([u8; 32], [u8; 32], [u8; 32])>,
 }
 
 impl Net {
@@ -276,6 +299,9 @@ impl Net {
             next_udp: 0,
             listens: Vec::new(),
             next_listen: 0,
+            tls_env: None,
+            #[cfg(test)]
+            tls_fijo: None,
         }
     }
 
@@ -386,9 +412,31 @@ impl Net {
         self.tcp_open(dst, port)
     }
 
+    /// v0.12.2: raíces y hora (UTC) con que se comprueban los certificados de las próximas conexiones seguras.
+    pub fn set_tls_env(&mut self, roots: alloc::sync::Arc<crate::x509::RootStore>, now: crate::x509::Time) {
+        self.tls_env = Some((roots, now));
+    }
+
+    /// v0.12.2: como `tcp_connect`, con TLS por encima: el saludo avanza solo en `poll` y `tcp_state` sigue
+    /// en `Connecting` hasta que acaba. `host` es el nombre del certificado; `insecure` (solo `curl -k`) deja
+    /// seguir con un certificado malo. Hace falta `set_tls_env` antes.
+    pub fn tcp_connect_tls(&mut self, dst: Ipv4, port: u16, host: &str, insecure: bool) -> Result<SockId, NetError> {
+        self.tls_open(dst, port, host, insecure)
+    }
+
+    /// Solo pruebas: valores fijos (random, session_id, privada x25519) para las conexiones seguras.
+    #[cfg(test)]
+    pub fn set_tls_fijo(&mut self, random: [u8; 32], sid: [u8; 32], x_priv: [u8; 32]) {
+        self.tls_fijo = Some((random, sid, x_priv));
+    }
+
+    pub fn tcp_tls_info(&self, s: SockId) -> Option<TlsInfo> {
+        self.tls_info(s)
+    }
+
     pub fn tcp_state(&self, s: SockId) -> TcpState {
         match self.socks.iter().find(|k| k.id == s.0 && !k.released) {
-            Some(k) => k.state(),
+            Some(k) => k.tls_state(),
             None => TcpState::Failed(NetError::Gone),
         }
     }
@@ -540,6 +588,18 @@ pub trait NetApi {
     fn tcp_recv(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError>;
     fn tcp_close(&mut self, s: SockId);
     fn tcp_abort(&mut self, s: SockId);
+    /// v0.12.2: conexión segura (TLS) a `dst`; `host` es el nombre que debe tener el certificado. Mismo
+    /// `SockId` y mismas llamadas que TCP, pero con texto claro. Un programa de terceros nunca puede
+    /// saltarse la comprobación (`insecure` solo vale en el sistema).
+    fn tcp_connect_tls(&mut self, _dst: Ipv4, _port: u16, _host: &str, _insecure: bool) -> Result<SockId, NetError> {
+        Err(NetError::NoAdapter)
+    }
+    /// v0.12.2: datos de la conexión segura (`None` si no es segura o aún no hay saludo).
+    fn tcp_tls_info(&mut self, _s: SockId) -> Option<TlsInfo> {
+        None
+    }
+    /// v0.12.2: solo el sistema pone las raíces y la hora para validar; en un programa no hace nada.
+    fn set_tls_env(&mut self, _roots: alloc::sync::Arc<crate::x509::RootStore>, _now: crate::x509::Time) {}
     fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError>;
     fn udp_send(&mut self, s: UdpId, dst: Ipv4, port: u16, data: &[u8]) -> Result<(), NetError>;
     fn udp_recv(&mut self, s: UdpId) -> Result<Option<Datagram>, NetError>;
@@ -588,6 +648,15 @@ impl NetApi for Net {
     }
     fn tcp_abort(&mut self, s: SockId) {
         Net::tcp_abort(self, s)
+    }
+    fn tcp_connect_tls(&mut self, dst: Ipv4, port: u16, host: &str, insecure: bool) -> Result<SockId, NetError> {
+        Net::tcp_connect_tls(self, dst, port, host, insecure)
+    }
+    fn tcp_tls_info(&mut self, s: SockId) -> Option<TlsInfo> {
+        Net::tcp_tls_info(self, s)
+    }
+    fn set_tls_env(&mut self, roots: alloc::sync::Arc<crate::x509::RootStore>, now: crate::x509::Time) {
+        Net::set_tls_env(self, roots, now)
     }
     fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
         Net::udp_bind(self, port)

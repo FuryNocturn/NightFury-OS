@@ -17,7 +17,7 @@ const NO_CARD: &str = "No hay ninguna tarjeta de red.";
 const NO_CABLE: &str = "El cable de red está desconectado.";
 const NO_IP: &str = "Todavía no hay dirección IP.";
 const PING_USO: &str = "Uso: ping [-n N] [-t] destino";
-const CURL_USO: &str = "Uso: curl [-o nombre] [-I] [-L] URL";
+const CURL_USO: &str = "Uso: curl [-o nombre] [-I] [-L] [-k] [-v] URL";
 const PING_BYTES: u16 = 32;
 const PING_TTL: u8 = 128;
 const PING_EVERY_MS: u64 = 1000;
@@ -36,7 +36,8 @@ pub(super) enum NetCmd {
     Renew,
     Nslookup(String),
     /// `out` = (ruta completa, nombre tal como lo escribió el usuario).
-    Curl { url: String, head: bool, follow: bool, out: Option<(String, String)> },
+    /// `insecure` = `-k` (seguir con un certificado malo, avisando); `verbose` = `-v`.
+    Curl { url: String, head: bool, follow: bool, insecure: bool, verbose: bool, out: Option<(String, String)> },
 }
 
 fn uso(s: &str) -> Result<NetCmd, Vec<String>> {
@@ -80,11 +81,13 @@ pub(super) fn parse(cmd: &str, args: &str, cwd: &str, sys: &mut dyn Platform) ->
             _ => uso("Uso: nslookup host"),
         },
         _ => {
-            let (mut url, mut head, mut follow, mut out, mut i) = (None, false, false, None, 0);
+            let (mut url, mut head, mut follow, mut insecure, mut verbose, mut out, mut i) = (None, false, false, false, false, None, 0);
             while i < a.len() {
                 match a[i].as_str() {
                     "-I" => head = true,
                     "-L" => follow = true,
+                    "-k" => insecure = true,
+                    "-v" => verbose = true,
                     "-o" => {
                         i += 1;
                         match a.get(i) {
@@ -101,10 +104,8 @@ pub(super) fn parse(cmd: &str, args: &str, cwd: &str, sys: &mut dyn Platform) ->
             if head && out.is_some() {
                 return uso("curl: -I y -o no se pueden usar juntos.");
             }
-            match parse_url(&url) {
-                Err(NetError::HttpsNotYet) => return uso("HTTPS llega en una versión próxima"),
-                Err(_) => return uso("curl: (3) URL no válida"),
-                Ok(_) => {}
+            if parse_url(&url).is_err() {
+                return uso("curl: (3) URL no válida");
             }
             let out = match out {
                 None => None,
@@ -116,7 +117,7 @@ pub(super) fn parse(cmd: &str, args: &str, cwd: &str, sys: &mut dyn Platform) ->
                     Some((p, name))
                 }
             };
-            Ok(NetCmd::Curl { url, head, follow, out })
+            Ok(NetCmd::Curl { url, head, follow, insecure, verbose, out })
         }
     }
 }
@@ -216,6 +217,7 @@ pub(super) struct Ping {
 pub(super) struct Curl {
     get: HttpGet,
     head: bool,
+    verbose: bool,
     /// (ruta, nombre escrito, cuerpo acumulado).
     save: Option<(String, String, Vec<u8>)>,
     host: String,
@@ -235,10 +237,15 @@ pub(super) enum Job {
 impl Job {
     /// Empieza `cmd`. `None` si ya está hecha (sale por `out`) o no se pudo empezar.
     pub(super) fn start(cmd: NetCmd, sys: &mut dyn Platform, now: u64, out: &mut Vec<String>) -> Option<Job> {
+        // Raíces y hora para comprobar certificados (una redirección puede llevar a https aunque la URL no lo sea).
+        let tls = matches!(cmd, NetCmd::Curl { .. }).then(|| (sys.files().root_store(), crate::service::hora_x509(sys.now())));
         let Some(net) = sys.net() else {
             out.push(String::from(NO_CARD));
             return None;
         };
+        if let Some((roots, t)) = tls {
+            net.set_tls_env(roots, t);
+        }
         let st = net.status();
         let plain = matches!(cmd, NetCmd::Ipconfig { .. });
         if st.state == State::NoAdapter || (st.state == State::NoCable && !plain) {
@@ -282,11 +289,11 @@ impl Job {
                 }
                 Some(Job::Ping(p))
             }
-            NetCmd::Curl { url, head, follow, out: save } => {
+            NetCmd::Curl { url, head, follow, insecure, verbose, out: save } => {
                 // parse ya validó la URL; el host y el puerto son los de la URL original (sirven para los errores).
                 let u = parse_url(&url).ok()?;
-                match HttpGet::start(net, &url, head, follow) {
-                    Ok(get) => Some(Job::Curl(Curl { get, head, save: save.map(|(p, n)| (p, n, Vec::new())), host: u.host, port: u.port, line: Vec::new() })),
+                match HttpGet::start_tls(net, &url, head, follow, insecure) {
+                    Ok(get) => Some(Job::Curl(Curl { get, head, verbose, save: save.map(|(p, n)| (p, n, Vec::new())), host: u.host, port: u.port, line: Vec::new() })),
                     Err(e) => {
                         out.push(curl_err(&e, &u.host, u.port));
                         None
@@ -459,7 +466,7 @@ fn curl_err(e: &NetError, host: &str, port: u16) -> String {
         NetError::Reset => String::from("curl: (56) Conexión cortada"),
         NetError::Protocol(m) => format!("curl: (8) Respuesta no válida: {m}"),
         NetError::BadUrl => String::from("curl: (3) URL no válida"),
-        NetError::HttpsNotYet => String::from("HTTPS llega en una versión próxima"),
+        NetError::Tls(m) => format!("curl: (35) {m}"),
         e => format!("curl: {}", net_err(e)),
     }
 }
@@ -494,11 +501,29 @@ fn step_curl(c: &mut Curl, sys: &mut dyn Platform, now: u64, out: &mut Vec<Strin
     };
     for ev in c.get.poll(net, now) {
         match ev {
-            HttpEvent::Head { status, reason, headers } if c.head => {
-                out.push(format!("HTTP/1.1 {status} {reason}").trim_end().into());
-                out.extend(headers.iter().map(|(k, v)| format!("{k}: {v}")));
+            HttpEvent::Head { status, reason, headers } if c.head || c.verbose => {
+                let p = if c.verbose { "< " } else { "" };
+                out.push(format!("{p}HTTP/1.1 {status} {reason}").trim_end().into());
+                out.extend(headers.iter().map(|(k, v)| format!("{p}{k}: {v}")));
             }
             HttpEvent::Head { .. } => {}
+            HttpEvent::Secure(i) => {
+                // `-k` con un certificado que no vale: sigue, pero se dice claro
+                if let Some(e) = &i.cert_error {
+                    out.push(format!("Aviso: la conexión no es segura (-k): {e}"));
+                }
+                if c.verbose {
+                    out.push(format!("* Conexión segura: {}, {}, grupo {}", i.version, i.suite, i.group));
+                    if i.subject.is_empty() {
+                        out.push(String::from("* Certificado: sin comprobar"));
+                    } else {
+                        let (y, m, d) = i.expires;
+                        out.push(format!("* Certificado de: {}", i.subject));
+                        out.push(format!("* Emitido por: {}", i.issuer));
+                        out.push(format!("* Caduca el: {d:02}/{m:02}/{y:04}"));
+                    }
+                }
+            }
             HttpEvent::Body(b) => match &mut c.save {
                 Some((_, _, data)) if data.len() + b.len() > MAX_SAVE => {
                     c.get.cancel(net);
