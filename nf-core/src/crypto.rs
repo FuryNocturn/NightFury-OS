@@ -7,6 +7,8 @@
 //! - HMAC-SHA-256: RFC 2104 (vectores de RFC 4231).
 //! - PBKDF2-HMAC-SHA-256: RFC 8018.
 //! - HKDF-SHA-256: RFC 5869.
+//! - SHA-384 y SHA-512: FIPS 180-4; HMAC-SHA-384 y HKDF-SHA-384.
+//! - Rng: generador sobre ChaCha20 (la semilla la pone la plataforma).
 //! - ChaCha20, Poly1305 y su AEAD: RFC 8439.
 //! - X25519: RFC 7748.
 //!
@@ -214,6 +216,228 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8], out: &mut [u8]) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// SHA-512 / SHA-384 (FIPS 180-4), HMAC-SHA-384 y HKDF-SHA-384 (TLS_AES_256_GCM_SHA384)
+// ---------------------------------------------------------------------------------------------
+
+const K512: [u64; 80] = [
+    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
+    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
+    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
+    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
+    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
+    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
+    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
+    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
+    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
+    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
+    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
+    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
+    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
+    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
+    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
+    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
+    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
+    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
+    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
+    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
+];
+
+/// SHA-512 incremental.
+#[derive(Clone)]
+pub struct Sha512 {
+    h: [u64; 8],
+    buf: [u8; 128],
+    n: usize,
+    len: u128,
+}
+
+impl Default for Sha512 {
+    fn default() -> Sha512 {
+        Sha512::new()
+    }
+}
+
+impl Sha512 {
+    pub fn new() -> Sha512 {
+        Sha512::with_iv([
+        0x6a09e667f3bcc908, 0xbb67ae8584caa73b, 0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
+        0x510e527fade682d1, 0x9b05688c2b3e6c1f, 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
+        ])
+    }
+
+    fn with_iv(h: [u64; 8]) -> Sha512 {
+        Sha512 { h, buf: [0; 128], n: 0, len: 0 }
+    }
+
+    fn block(h: &mut [u64; 8], b: &[u8]) {
+        let mut w = [0u64; 80];
+        for (i, c) in b.chunks_exact(8).enumerate() {
+            w[i] = u64::from_be_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+        }
+        for i in 16..80 {
+            let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
+            let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+        let [mut a, mut b2, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
+        for i in 0..80 {
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let maj = (a & b2) ^ (a & c) ^ (b2 & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b2;
+            b2 = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (x, y) in h.iter_mut().zip([a, b2, c, d, e, f, g, hh]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.len += data.len() as u128;
+        if self.n > 0 {
+            let k = (128 - self.n).min(data.len());
+            self.buf[self.n..self.n + k].copy_from_slice(&data[..k]);
+            self.n += k;
+            data = &data[k..];
+            if self.n < 128 {
+                return;
+            }
+            let b = self.buf;
+            Self::block(&mut self.h, &b);
+            self.n = 0;
+        }
+        let mut it = data.chunks_exact(128);
+        for b in &mut it {
+            Self::block(&mut self.h, b);
+        }
+        let r = it.remainder();
+        self.buf[..r.len()].copy_from_slice(r);
+        self.n = r.len();
+    }
+
+    pub fn finish(mut self) -> [u8; 64] {
+        let bits = self.len.wrapping_mul(8);
+        self.update(&[0x80]);
+        while self.n != 112 {
+            self.update(&[0]);
+        }
+        self.update(&bits.to_be_bytes());
+        let mut out = [0u8; 64];
+        for (o, x) in out.chunks_exact_mut(8).zip(self.h) {
+            o.copy_from_slice(&x.to_be_bytes());
+        }
+        out
+    }
+}
+
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut s = Sha512::new();
+    s.update(data);
+    s.finish()
+}
+
+/// SHA-384: SHA-512 con otros valores iniciales y salida recortada a 48 bytes.
+#[derive(Clone)]
+pub struct Sha384(Sha512);
+
+impl Default for Sha384 {
+    fn default() -> Sha384 {
+        Sha384::new()
+    }
+}
+
+impl Sha384 {
+    pub fn new() -> Sha384 {
+        Sha384(Sha512::with_iv([
+        0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939,
+        0x67332667ffc00b31, 0x8eb44a8768581511, 0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4,
+        ]))
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    pub fn finish(self) -> [u8; 48] {
+        let mut out = [0u8; 48];
+        out.copy_from_slice(&self.0.finish()[..48]);
+        out
+    }
+}
+
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut s = Sha384::new();
+    s.update(data);
+    s.finish()
+}
+
+/// HMAC-SHA-384 (bloque de 128 bytes) con la clave ya absorbida: se clona para cada mensaje.
+#[derive(Clone)]
+pub struct Hmac384 {
+    inner: Sha384,
+    outer: Sha384,
+}
+
+impl Hmac384 {
+    pub fn new(key: &[u8]) -> Hmac384 {
+        let mut k = [0u8; 128];
+        if key.len() > 128 {
+            k[..48].copy_from_slice(&sha384(key));
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let (mut inner, mut outer) = (Sha384::new(), Sha384::new());
+        inner.update(&k.map(|b| b ^ 0x36));
+        outer.update(&k.map(|b| b ^ 0x5c));
+        wipe(&mut k);
+        Hmac384 { inner, outer }
+    }
+
+    /// HMAC de la concatenación de `parts`.
+    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 48] {
+        let mut i = self.inner.clone();
+        for p in parts {
+            i.update(p);
+        }
+        let mut o = self.outer.clone();
+        o.update(&i.finish());
+        o.finish()
+    }
+}
+
+pub fn hmac384(key: &[u8], data: &[u8]) -> [u8; 48] {
+    Hmac384::new(key).mac(&[data])
+}
+
+/// HKDF-Extract (RFC 5869, SHA-384).
+pub fn hkdf384_extract(salt: &[u8], ikm: &[u8]) -> [u8; 48] {
+    hmac384(salt, ikm)
+}
+
+/// HKDF-Expand (RFC 5869, SHA-384): rellena `out`.
+/// Panic si `out.len() > 255 * 48` (error de programación, no de datos).
+pub fn hkdf384_expand(prk: &[u8; 48], info: &[u8], out: &mut [u8]) {
+    assert!(out.len() <= 255 * 48, "hkdf384_expand: salida demasiado larga");
+    let h = Hmac384::new(prk);
+    let mut t = [0u8; 48];
+    for (i, chunk) in out.chunks_mut(48).enumerate() {
+        let prev: &[u8] = if i == 0 { &[] } else { &t };
+        t = h.mac(&[prev, info, &[i as u8 + 1]]);
+        chunk.copy_from_slice(&t[..chunk.len()]);
+    }
+    wipe(&mut t);
+}
+
+// ---------------------------------------------------------------------------------------------
 // ChaCha20 (RFC 8439 §2.1-2.4)
 // ---------------------------------------------------------------------------------------------
 
@@ -393,6 +617,49 @@ pub fn aead_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], sealed: &[u8]) ->
     let mut out = ct.to_vec();
     chacha20_xor(key, 1, nonce, &mut out);
     Some(out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Generador aleatorio sobre ChaCha20 con borrado de clave tras cada uso
+// ---------------------------------------------------------------------------------------------
+
+/// Generador pseudoaleatorio criptográfico. La semilla (32 bytes de entropía real) la pone quien lo crea.
+/// Tras cada `fill` la clave se sustituye por otra sacada del flujo, así un volcado posterior de la
+/// memoria no permite reconstruir lo ya entregado. Se borra al soltarlo.
+pub struct Rng {
+    key: [u8; 32],
+}
+
+impl Rng {
+    pub fn new(seed: [u8; 32]) -> Rng {
+        Rng { key: seed }
+    }
+
+    /// Rellena `out` con bytes aleatorios (panic si pide más de 1 GiB de una vez).
+    pub fn fill(&mut self, out: &mut [u8]) {
+        assert!(out.len() <= 1 << 30, "Rng::fill: petición demasiado grande");
+        let nonce = [0u8; 12];
+        out.fill(0);
+        chacha20_xor(&self.key, 1, &nonce, out);
+        let mut next = chacha20_block(&self.key, 0, &nonce);
+        self.key.copy_from_slice(&next[..32]);
+        wipe(&mut next);
+    }
+
+    /// Mezcla entropía nueva con la clave actual: clave = SHA-256(clave ‖ extra).
+    pub fn reseed(&mut self, extra: &[u8]) {
+        let mut s = Sha256::new();
+        s.update(&self.key);
+        s.update(extra);
+        wipe(&mut self.key);
+        self.key = s.finish();
+    }
+}
+
+impl Drop for Rng {
+    fn drop(&mut self) {
+        wipe(&mut self.key);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -829,5 +1096,109 @@ mod tests {
         let mut o = [0u8; 42];
         hkdf_expand(&prk, &[], &mut o);
         assert_eq!(hx(&o), "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8");
+    }
+
+    #[test]
+    fn sha384_sha512_vectores_fips_180_4() {
+        assert_eq!(
+            hx(&sha512(b"abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        );
+        assert_eq!(
+            hx(&sha512(b"")),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+        );
+        assert_eq!(
+            hx(&sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
+        );
+        assert_eq!(
+            hx(&sha384(b"")),
+            "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"
+        );
+        // Mensaje de dos bloques (896 bits).
+        let m = b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        assert_eq!(
+            hx(&sha512(m)),
+            "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+        );
+        assert_eq!(
+            hx(&sha384(m)),
+            "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039"
+        );
+        // Un millón de 'a' por trozos irregulares (relleno del búfer de 128 bytes).
+        let (mut a, mut b) = (Sha512::new(), Sha384::new());
+        let mut left = 1_000_000;
+        let mut step = 1;
+        while left > 0 {
+            let n = step.min(left);
+            a.update(&vec![b'a'; n]);
+            b.update(&vec![b'a'; n]);
+            left -= n;
+            step = step % 211 + 7;
+        }
+        assert_eq!(
+            hx(&a.finish()),
+            "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973ebde0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b"
+        );
+        assert_eq!(
+            hx(&b.finish()),
+            "9d0e1809716474cb086e834e310a4a1ced149e9c00f248527972cec5704c2a5b07b8b3dc38ecc4ebae97ddd87f3d8985"
+        );
+    }
+
+    #[test]
+    fn hmac_sha384_rfc_4231() {
+        assert_eq!(
+            hx(&hmac384(&[0x0b; 20], b"Hi There")),
+            "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6"
+        );
+        assert_eq!(
+            hx(&hmac384(b"Jefe", b"what do ya want for nothing?")),
+            "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649"
+        );
+        // Clave más larga que el bloque (se hashea primero).
+        assert_eq!(
+            hx(&hmac384(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952"
+        );
+    }
+
+    #[test]
+    fn hkdf_sha384() {
+        // Mismas entradas que el caso 1 de RFC 5869 (con SHA-384); salida calculada con HMAC de otra implementación.
+        let salt: Vec<u8> = (0..13).collect();
+        let info: Vec<u8> = (0xf0..0xfa).collect();
+        let prk = hkdf384_extract(&salt, &[0x0b; 22]);
+        assert_eq!(hx(&prk), "704b39990779ce1dc548052c7dc39f303570dd13fb39f7acc564680bef80e8dec70ee9a7e1f3e293ef68eceb072a5ade");
+        let mut o = [0u8; 100];
+        hkdf384_expand(&prk, &info, &mut o);
+        assert_eq!(
+            hx(&o),
+            "9b5097a86038b805309076a44b3a9f38063e25b516dcbf369f394cfab43685f748b6457763e4f0204fc5d95d1da3e62587b22eb8943d0fab6bb631a2fe9df1a68c6ce5d56116a52005b3f122b88b39b7251fcd6c44d3ef25f20ed96802bf1b2c1d98bf74"
+        );
+    }
+
+    #[test]
+    fn rng_determinista_y_distinto() {
+        let (mut a, mut b, mut c) = (Rng::new([1; 32]), Rng::new([1; 32]), Rng::new([2; 32]));
+        let (mut x, mut y, mut z) = ([0u8; 100], [0u8; 100], [0u8; 100]);
+        a.fill(&mut x);
+        b.fill(&mut y);
+        c.fill(&mut z);
+        assert_eq!(x, y);
+        assert_ne!(x, z);
+        // Cada llamada continúa distinta; reseed con distinto extra diverge.
+        a.fill(&mut y);
+        assert_ne!(x, y);
+        b.fill(&mut x);
+        assert_eq!(x, y);
+        a.reseed(b"uno");
+        b.reseed(b"dos");
+        a.fill(&mut x);
+        b.fill(&mut y);
+        assert_ne!(x, y);
+        // No es todo ceros ni repite bloques.
+        assert_ne!(x[..32], x[32..64]);
     }
 }
