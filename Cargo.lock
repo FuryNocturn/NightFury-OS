@@ -42,6 +42,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mensajes"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+]
+
+[[package]]
 name = "nf-app"
 version = "0.12.0"
 dependencies = [
@@ -70,6 +78,7 @@ dependencies = [
 name = "nfprog"
 version = "0.12.0"
 dependencies = [
+ "mensajes",
  "nf-core",
  "paint",
  "reloj",

@@ -4,7 +4,7 @@
 //!
 //! - `nfprog iconos [programs]`: dibuja con nf-core el `icono.bmp` (32×32, BMP de 24 bits, magenta
 //!   FF00FF = transparente) de Reloj y Paint y lo deja en `programs/<nombre>/`.
-//! - `nfprog capturas <carpeta>`: guarda en BMP el contenido de Reloj, Paint y el Administrador de
+//! - `nfprog capturas <carpeta>`: guarda en BMP el contenido de Reloj, Paint, Mensajes y el Administrador de
 //!   tareas en varias situaciones (para revisar el aspecto sin arrancar el sistema).
 use nf_core::apps::{self, App, AppKind, Ctx, MouseEv};
 use nf_core::bmp;
@@ -279,6 +279,15 @@ fn capturas_paint(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn capturas_mensajes(dir: &str) -> Result<(), String> {
+    // El ejemplo (dos contactos y una conversación) no usa la red: solo hace falta un sistema donde crear su carpeta.
+    let mut b = Banco::new(mensajes_app::crear_demo(&mut TestPlatform::default()), vec![]);
+    guarda(dir, "mensajes-conversacion", &b.foto(640, 420, 0))?;
+    let mut b = Banco::new(mensajes_app::crear(), vec![]);
+    guarda(dir, "mensajes-bienvenida", &b.foto(640, 420, 0))?;
+    Ok(())
+}
+
 fn capturas_tareas(dir: &str) -> Result<(), String> {
     let p = |id, nombre: &str, mb: u64, cpu, ok| ProcInfo { id, name: nombre.into(), mem: mb * 1_048_576 + 300_000, cpu_ms: cpu, responding: ok };
     let mut b = Banco::new(apps::create(AppKind::TaskManager), vec![p(1, "Calculadora", 3, 0, true), p(2, "Paint", 38, 0, true), p(3, "Reloj", 4, 0, true), p(4, "Plantilla", 3, 0, false)]);
@@ -307,7 +316,7 @@ fn main() -> ExitCode {
     let r = match args.get(1).map(String::as_str) {
         Some("iconos") => iconos(args.get(2).map_or("programs", String::as_str)),
         Some("capturas") => match args.get(2) {
-            Some(d) => std::fs::create_dir_all(d).map_err(|e| e.to_string()).and_then(|_| capturas_reloj(d)).and_then(|_| capturas_paint(d)).and_then(|_| capturas_tareas(d)),
+            Some(d) => std::fs::create_dir_all(d).map_err(|e| e.to_string()).and_then(|_| capturas_reloj(d)).and_then(|_| capturas_paint(d)).and_then(|_| capturas_mensajes(d)).and_then(|_| capturas_tareas(d)),
             None => Err(String::from("uso: nfprog capturas <carpeta>")),
         },
         _ => Err(String::from("uso: nfprog iconos [programs] | nfprog capturas <carpeta>")),
