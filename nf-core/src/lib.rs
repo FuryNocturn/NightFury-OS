@@ -45,6 +45,7 @@ pub mod service;
 pub mod surface;
 pub mod sync;
 pub mod theme;
+pub mod tls;
 pub mod usbhid;
 pub mod vol;
 pub mod wire;

@@ -555,6 +555,11 @@ impl Cert {
         self.issuer == self.subject
     }
 
+    /// Clave pública del certificado (`None` si usa un algoritmo o curva que no admitimos).
+    pub fn public_key(&self) -> Option<&PubKey> {
+        self.key.as_ref()
+    }
+
     pub fn info(&self) -> CertInfo {
         CertInfo {
             cn: self.subject_name.cn.clone(),
