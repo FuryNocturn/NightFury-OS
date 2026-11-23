@@ -1531,6 +1531,7 @@ impl Files {
         }
         let mut perms = self.net_perms();
         let i = perms.iter().position(|p| p.hash == hash).ok_or(FsError::NotFound)?;
+        let name = alloc::format!("«{}»", perms[i].name);
         if out.is_none() && inn.is_none() {
             perms.remove(i);
         } else {
@@ -1538,7 +1539,6 @@ impl Files {
             perms[i].inn = inn;
         }
         self.set_net_perms(&perms, now)?;
-        let name = perms.get(i).filter(|p| p.hash == hash).map_or_else(|| String::from("un programa"), |p| alloc::format!("«{}»", p.name));
         self.log(&alloc::format!("Red: permisos de {name} cambiados en Configuración"), now);
         Ok(())
     }
