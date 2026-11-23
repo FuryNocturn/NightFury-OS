@@ -33,6 +33,7 @@ pub mod menu;
 pub mod net;
 pub mod netperm;
 pub mod nfx;
+pub mod pk;
 pub mod platform;
 pub mod proc;
 pub mod request;
