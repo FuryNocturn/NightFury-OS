@@ -50,6 +50,11 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `kernel/src/red/realtek.rs` | Realtek RTL8111/8168 (revisiones 8168g/gu/h/m y 8411b), sin firmware | Especificación de sala limpia «realtek» (ver abajo) |
 | `kernel/src/red/virtio.rs` | Tarjeta de red de las máquinas virtuales | OASIS Virtual I/O Device (VIRTIO) 1.2 (PCI moderno, colas divididas, dispositivo de red) |
 | `nf-core/src/net/` | Ethernet, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS y cliente HTTP/1.1 | RFC 826 (ARP), 791 (IPv4), 792 (ICMP), 768 (UDP), 9293 (TCP), 6298 (temporizador de retransmisión), 2131 y 2132 (DHCP), 1035 (DNS), 9110 y 9112 (HTTP); IEEE 802.3 (trama Ethernet). Diseño propio. v0.12.1: sockets UDP y TCP a la escucha para programas con filtro de red local, también diseño propio |
+| `nf-core/src/crypto.rs`, `cipher.rs` (v0.12.2) | SHA-384/512, HMAC-SHA-384, HKDF-SHA-384, generador ChaCha20, AES-128 y AES-GCM | FIPS 180-4; RFC 2104, 4231 y 5869; FIPS 197; NIST SP 800-38D (GCM), con sus vectores. Código propio |
+| `nf-core/src/pk.rs`, `pk/` | Enteros grandes, RSA (PKCS#1 v1.5 y PSS, solo verificar), ECDSA P-256/P-384 y ECDH P-256 | RFC 8017; FIPS 186-4; SEC 1 y SEC 2 (curvas); vectores de NIST CAVP y RFC 6979. Código propio; P-256 con privada en tiempo constante |
+| `nf-core/src/x509/` | DER, PEM, certificados X.509 y validación de cadena | ITU-T X.690 (DER); RFC 7468 (PEM); RFC 5280 (certificados, cadena, restricciones de nombre); RFC 6125 (nombre del sitio y comodines). Certificados de prueba hechos con OpenSSL, usado solo como herramienta |
+| `nf-core/src/tls/`, `net/tlsconn.rs` | Cliente TLS 1.3 y TLS 1.2 con ECDHE | RFC 8446 (TLS 1.3) con las trazas de RFC 8448; RFC 5246 (TLS 1.2); RFC 8422, 5289 y 7905 (ECDHE y cifrados); RFC 7627 (extended master secret); RFC 6066 (SNI); RFC 7301 (ALPN). Probado contra OpenSSL ejecutándolo, sin leer su código |
+| `nf-core/src/raices.rs`, `tools/raices.ps1` | Raíces de confianza (Mozilla + propias) | Formato público de `certdata.txt` de NSS; los datos de las raíces son de Mozilla (ver «Datos de terceros») |
 | `nf-core/src/netperm.rs` | Permisos de red de los programas (avisos «usar la red» y «aceptar conexiones») | Diseño propio; la idea de preguntar por programa es la de cualquier cortafuegos, sin código ni textos de otros |
 | `programs/mensajes` | Chat cifrado de extremo a extremo en la red local | Protocolo propio (`docs/Mensajes-protocolo.md`) sobre RFC 7748, 8439 y 5869. No se ha mirado el código ni la especificación de otros programas de mensajería; la lista de palabras de verificación es propia |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
@@ -78,12 +83,18 @@ Especificaciones escritas así:
 Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas con discos reales usan
 `mkfs.ext4` y `mkntfs` solo como herramientas: se ejecutan, no se lee su código.
 
+## Datos de terceros
+`nf-core/data/raices/raices.bin` contiene los certificados raíz de la lista de Mozilla (NSS `certdata.txt`), que se
+distribuyen bajo la **Mozilla Public License 2.0**. Solo son datos (certificados públicos), no código; van en un
+fichero aparte con su licencia y su origen en `nf-core/data/raices/LEEME.md`, y se renuevan con cada versión.
+
 ## Firmware de terceros
-La versión 0.12.1 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
+La versión 0.12.2 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa
-tablas (tiempos dependientes de los datos); se acepta mientras el sistema sea un solo programa. Sirve para uso personal.
+tablas (tiempos dependientes de los datos); se acepta mientras el sistema sea un solo programa, y en TLS se prefiere
+ChaCha20-Poly1305. HTTPS no comprueba la revocación de certificados (OCSP/CRL). Sirve para uso personal.
 
 ## Licencia
 GPL-3.0 con un término adicional de crédito (§7(b)); ver `LICENSE` y `NOTICE`.

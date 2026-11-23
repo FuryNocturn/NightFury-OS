@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.12.1)
+# Kit de programas de NightFury (v0.12.2)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
