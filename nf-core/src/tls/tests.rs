@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Pruebas de TLS 1.3.
+//! Pruebas de TLS 1.3 y 1.2.
 //!
 //! - RFC 8448 §3: programa de claves con el ClientHello y el ServerHello del documento.
 //! - `vuelo_*.bin` (testdata): lo que respondió un `openssl s_server` a nuestro ClientHello fijo (que es
@@ -9,6 +9,7 @@
 //!   son SOLO de prueba; los genera `testdata/gen.sh`).
 //! - Interoperabilidad con OpenSSL (`#[ignore]`): `cargo test -p nf-core -- --ignored tls`.
 
+use super::hs12::prf;
 use super::hs13::claves;
 use super::*;
 use crate::crypto::{from_hex, Rng};
@@ -21,6 +22,16 @@ const VUELOS: [(&str, &[u8], &str, &str); 4] = [
     ("aes128_rsa", include_bytes!("testdata/vuelo_aes128_rsa.bin"), "TLS_AES_128_GCM_SHA256", "x25519"),
     ("aes256_p384", include_bytes!("testdata/vuelo_aes256_p384.bin"), "TLS_AES_256_GCM_SHA384", "x25519"),
     ("hrr_ec", include_bytes!("testdata/vuelo_hrr_ec.bin"), "TLS_CHACHA20_POLY1305_SHA256", "secp256r1"),
+];
+/// Vuelos de TLS 1.2: (nombre, bytes, suite, grupo, ¿extended_master_secret?).
+const VUELOS12: [(&str, &[u8], &str, &str, bool); 7] = [
+    ("c12_chacha_ec", include_bytes!("testdata/vuelo_c12_chacha_ec.bin"), "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true),
+    ("c12_chacha_rsa_pss", include_bytes!("testdata/vuelo_c12_chacha_rsa_pss.bin"), "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true),
+    ("c12_aes128_ec_sha384", include_bytes!("testdata/vuelo_c12_aes128_ec_sha384.bin"), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", true),
+    ("c12_aes128_rsa_pkcs1", include_bytes!("testdata/vuelo_c12_aes128_rsa_pkcs1.bin"), "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "secp256r1", true),
+    ("c12_aes256_ec", include_bytes!("testdata/vuelo_c12_aes256_ec.bin"), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "secp256r1", true),
+    ("c12_aes256_rsa", include_bytes!("testdata/vuelo_c12_aes256_rsa.bin"), "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", "x25519", true),
+    ("c12_sin_ems", include_bytes!("testdata/vuelo_c12_sin_ems.bin"), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", false),
 ];
 
 fn hex(s: &str) -> Vec<u8> {
@@ -166,8 +177,12 @@ fn clienthello_bien_formado() {
     assert_eq!(&o[11..43], &RANDOM);
     assert_eq!(o[43], 32);
     assert_eq!(&o[44..76], &SID);
-    // Suites: ChaCha20, AES-128, AES-256 (en ese orden).
-    assert_eq!(&o[76..84], &[0, 6, 0x13, 3, 0x13, 1, 0x13, 2]);
+    // Suites: las de 1.3 (ChaCha20, AES-128, AES-256) y luego las de 1.2.
+    assert_eq!(&o[76..96], &[0, 18, 0x13, 3, 0x13, 1, 0x13, 2, 0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30]);
+    // supported_versions: 1.3 y 1.2; renegotiation_info vacía y extended_master_secret.
+    assert!(o.windows(7).any(|w| w == [0x00, 0x2b, 0x00, 0x05, 4, 3, 4]));
+    assert!(o.windows(5).any(|w| w == [0xff, 0x01, 0x00, 0x01, 0x00]));
+    assert!(o.windows(4).any(|w| w == [0x00, 0x17, 0x00, 0x00]));
     assert!(o.windows(9).any(|w| w == b"prueba.nf"));
     assert!(o.windows(8).any(|w| w == b"http/1.1"));
     // Con una IP literal no hay SNI.
@@ -504,6 +519,302 @@ fn fuzz_sin_panico() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// TLS 1.2
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn prf_de_tls12() {
+    // Vectores de PRF (secreto, etiqueta, semilla); la salida de referencia viene de `openssl kdf TLS1-PRF`.
+    let sal = prf(super::keys::Hash::S256, &hex("9bbe436ba940f017b17652849a71db35"), "test label", &hex("a0ba9f936cda311827a6f796ffd5198c"), 100);
+    assert_eq!(&*sal, &hex("e3f229ba727be17b8d122620557cd453c2aab21d07c3d495329b52d4e61edb5a6b301791e90d35c9c9a46b4e14baf9af0fa022f7077def17abfd3797c0564bab4fbc91666e9def9b97fce34f796789baa48082d122ee42c5a72e5a5110fff70187347b66")[..]);
+    let sal = prf(super::keys::Hash::S384, &hex("b80b733d6ceefcdc71566ea48e5567df"), "test label", &hex("d4640e12e4bcdbfb437f03e6ae418ee5"), 48);
+    assert_eq!(&*sal, &hex("4080bbcbdd175e5f6bfda2777b8ef4279074f9e398429a73e1dfd004a41ba996bf4a19c7922ed22cc4157fa6f3d41b18")[..]);
+    // La salida corta es prefijo de la larga.
+    let a = prf(super::keys::Hash::S256, b"k", "l", b"s", 10);
+    let b = prf(super::keys::Hash::S256, b"k", "l", b"s", 70);
+    assert_eq!(&a[..], &b[..10]);
+}
+
+/// Copia de las claves de un sentido (para hacer de servidor o comprobar lo que escribió el cliente).
+fn espejo(k: &Keys, a: record::Aead) -> Keys {
+    let il = if a == record::Aead::Chacha { 12 } else { 4 };
+    let mut n = Keys::new12(a, Secret(k.key.to_vec()), &k.iv[..il]);
+    n.seq = k.seq;
+    n
+}
+
+#[test]
+fn reproduce_vuelos_tls12() {
+    for (nombre, v, suite, grupo, ems) in VUELOS12 {
+        for t in [v.len(), 1, 7] {
+            let (mut c, r) = reproducir("prueba.nf", false, v, t);
+            r.unwrap_or_else(|e| panic!("{nombre}/{t}: {}", e.mensaje()));
+            assert!(c.is_ready(), "{nombre}");
+            let i = c.info().unwrap();
+            assert_eq!((i.version, i.suite, i.group), ("TLS 1.2", suite, grupo), "{nombre}");
+            assert_eq!(c.s12.ems, ems, "{nombre}");
+            assert_eq!(i.chain.as_ref().unwrap().leaf.cn, "prueba.nf");
+            assert!(c.read().starts_with(b"HTTP/1.0 200 ok"), "{nombre}");
+            assert!(c.peer_closed(), "{nombre}");
+        }
+    }
+}
+
+/// Cliente que acaba de terminar el saludo de un vuelo, y el desplazamiento justo después.
+fn conectado12(v: &[u8]) -> (Client, usize) {
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    for (p, _, n) in registros(v) {
+        c.feed(&v[p..p + 5 + n]).unwrap();
+        if c.is_ready() {
+            c.take_output();
+            return (c, p + 5 + n);
+        }
+    }
+    panic!("el vuelo no termina el saludo");
+}
+
+/// (inicio del registro, inicio del mensaje) del primer mensaje de saludo de tipo `t` en claro.
+fn mensaje12(v: &[u8], t: u8) -> (usize, usize) {
+    for (p, ct, n) in registros(v) {
+        if ct != 22 {
+            break;
+        }
+        let mut q = p + 5;
+        while q + 4 <= p + 5 + n {
+            if v[q] == t {
+                return (p, q);
+            }
+            q += 4 + (((v[q + 1] as usize) << 16) | ((v[q + 2] as usize) << 8) | v[q + 3] as usize);
+        }
+    }
+    panic!("sin mensaje {t}");
+}
+
+fn con_parche12(i: usize, f: impl Fn(&mut Vec<u8>)) -> (Client, Result<(), TlsError>) {
+    let mut v = VUELOS12[i].1.to_vec();
+    f(&mut v);
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    let r = c.feed(&v);
+    (c, r)
+}
+
+#[test]
+fn serverhello12_incorrecto() {
+    let suite = 44 + VUELOS12[0].1[43] as usize;
+    // Suite que no se ofreció (CBC).
+    let (mut c, r) = con_parche12(0, |v| v[suite..suite + 2].copy_from_slice(&[0xc0, 0x13]));
+    assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("suite")));
+    assert_eq!(c.take_output(), [21, 3, 3, 0, 2, 2, 47]);
+    // Una suite de 1.3 sin supported_versions tampoco vale.
+    assert!(con_parche12(0, |v| v[suite..suite + 2].copy_from_slice(&[0x13, 0x01])).1.is_err());
+    // El servidor solo admite 1.1: error claro y alerta protocol_version.
+    let (mut c, r) = con_parche12(0, |v| v[9..11].copy_from_slice(&[3, 2]));
+    assert!(matches!(r, Err(TlsError::NoSoportado(m)) if m.contains("TLS 1.1")));
+    assert_eq!(c.take_output(), [21, 3, 3, 0, 2, 2, 70]);
+    assert!(matches!(con_parche12(0, |v| v[9..11].copy_from_slice(&[3, 5])).1, Err(TlsError::Protocolo(_))));
+    // Centinelas de degradación con TLS 1.2 negociado (ofrecimos 1.3).
+    for ultimo in [0u8, 1] {
+        let (_, r) = con_parche12(0, |v| {
+            v[11 + 24..11 + 31].copy_from_slice(b"DOWNGRD");
+            v[11 + 31] = ultimo;
+        });
+        assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("degradación")));
+    }
+    // Compresión, renegotiation_info no vacía y una extensión que no se pidió.
+    assert!(con_parche12(0, |v| v[suite + 2] = 1).1.is_err());
+    let reneg = |v: &Vec<u8>| v.windows(5).position(|w| w == [0xff, 0x01, 0x00, 0x01, 0x00]).unwrap();
+    let (mut c, r) = con_parche12(0, |v| {
+        let n = reneg(v);
+        v[n + 4] = 1;
+    });
+    assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("renegociación")));
+    assert_eq!(c.take_output(), [21, 3, 3, 0, 2, 2, 40]);
+    assert!(con_parche12(0, |v| {
+        let n = reneg(v);
+        v[n] = 0xfe;
+    }).1.is_err());
+}
+
+#[test]
+fn serverkeyexchange_incorrecto() {
+    for i in [0, 1, 3] {
+        let v = VUELOS12[i].1;
+        let (_, ske) = mensaje12(v, 12);
+        let long = ((v[ske + 1] as usize) << 16) | ((v[ske + 2] as usize) << 8) | v[ske + 3] as usize;
+        let alg = ske + 4 + 4 + v[ske + 4 + 3] as usize;
+        // Firma mala (último byte) y punto cambiado (la firma ya no cuadra).
+        let (mut c, r) = con_parche12(i, |v| v[ske + 4 + long - 1] ^= 1);
+        assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("ServerKeyExchange")), "{i}");
+        assert_eq!(c.take_output(), [21, 3, 3, 0, 2, 2, 51]);
+        assert!(con_parche12(i, |v| v[ske + 4 + 4] ^= 1).1.is_err());
+        // Curva que no se ofreció (secp384r1), tipo de curva que no es «con nombre», punto con longitud rara.
+        let (_, r) = con_parche12(i, |v| v[ske + 5..ske + 7].copy_from_slice(&[0, 0x18]));
+        assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("curva")), "{i}");
+        assert!(con_parche12(i, |v| v[ske + 4] = 1).1.is_err());
+        assert!(con_parche12(i, |v| v[ske + 7] = 31).1.is_err());
+        // Algoritmo de firma no ofrecido (RSA PKCS#1 con SHA-1), o que no casa con la clave del certificado.
+        let (_, r) = con_parche12(i, |v| v[alg..alg + 2].copy_from_slice(&[0x02, 0x01]));
+        assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("firma")), "{i}");
+        let otro: [u8; 2] = if i == 0 { [0x08, 0x04] } else { [0x04, 0x03] };
+        assert!(con_parche12(i, |v| v[alg..alg + 2].copy_from_slice(&otro)).1.is_err(), "{i}");
+    }
+}
+
+#[test]
+fn certificate_request_y_finished_malo() {
+    let v = VUELOS12[2].1;
+    // CertificateRequest antes del ServerHelloDone: el cliente contesta con un Certificate vacío
+    // (el Finished del servidor ya no cuadra porque el transcript cambió: acaba en error).
+    let (rec, msg) = mensaje12(v, 14);
+    assert_eq!(rec + 5, msg);
+    let cr = [13, 0, 0, 8, 1, 0x40, 0, 2, 4, 3, 0, 0];
+    let mut m = v[..rec].to_vec();
+    m.extend_from_slice(&[22, 3, 3, 0, cr.len() as u8]);
+    m.extend_from_slice(&cr);
+    m.extend_from_slice(&v[rec..]);
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    assert!(c.feed(&m).is_err());
+    assert!(c.take_output().windows(12).any(|w| w == [22, 3, 3, 0, 7, 11, 0, 0, 3, 0, 0, 0]));
+    // Finished con verify_data incorrecto, bien cifrado, y datos antes del Finished: se rechazan.
+    for (i, f) in VUELOS12.iter().enumerate() {
+        let ccs = registros(f.1).into_iter().find(|r| r.1 == 20).unwrap();
+        for ct in [22u8, 23] {
+            let mut c = fijo("prueba.nf", false);
+            c.take_output();
+            c.feed(&f.1[..ccs.0 + 5 + ccs.2]).unwrap();
+            let mut k = espejo(c.rx.as_ref().unwrap(), c.suite.unwrap().aead);
+            let datos: &[u8] = if ct == 22 { &[20, 0, 0, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] } else { b"hola" };
+            let e = c.feed(&k.seal(ct, datos).unwrap()).unwrap_err();
+            assert!(matches!(e, TlsError::Protocolo(_)), "{i}/{ct}");
+            assert!(!c.is_ready());
+        }
+    }
+    // Un ChangeCipherSpec repetido, o con el servidor aún en medio del saludo en claro tras el ServerHello.
+    let ccs = registros(v).into_iter().find(|r| r.1 == 20).unwrap();
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    c.feed(&v[..ccs.0 + 5 + ccs.2]).unwrap();
+    assert!(c.feed(&[20, 3, 3, 0, 1, 1]).is_err());
+    let sh = registros(v)[0];
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    c.feed(&v[..sh.0 + 5 + sh.2]).unwrap();
+    assert!(c.feed(&[20, 3, 3, 0, 1, 1]).is_err());
+}
+
+#[test]
+fn tls12_ya_conectado() {
+    for (nombre, v, _, _, _) in VUELOS12 {
+        let (mut c, _) = conectado12(v);
+        let a = c.suite.unwrap().aead;
+        let mut s = espejo(c.rx.as_ref().unwrap(), a);
+        // HelloRequest: se ignora y todo sigue.
+        c.feed(&s.seal(CT_SALUDO, &[0, 0, 0, 0]).unwrap()).unwrap();
+        assert!(c.is_ready() && c.take_output().is_empty(), "{nombre}");
+        // Escritura en registros de hasta 16 KiB que descifra una copia de las claves.
+        let mut k = espejo(c.tx.as_ref().unwrap(), a);
+        let datos: Vec<u8> = (0..40_000u32).map(|i| (i * 7) as u8).collect();
+        c.write(&datos).unwrap();
+        let o = c.take_output();
+        let r = registros(&o);
+        assert_eq!(r.len(), 3, "{nombre}");
+        let mut claro = Vec::new();
+        for (p, ct, n) in r {
+            assert!(n <= MAX_CIFRADO);
+            assert_eq!(ct, CT_DATOS);
+            let (t, d) = k.open(&o[p..p + 5], &o[p + 5..p + 5 + n]).unwrap();
+            assert_eq!(t, CT_DATOS);
+            claro.extend(d);
+        }
+        assert_eq!(claro, datos, "{nombre}");
+        // Lectura, también de un registro vacío.
+        c.feed(&s.seal(CT_DATOS, b"respuesta").unwrap()).unwrap();
+        c.feed(&s.seal(CT_DATOS, b"").unwrap()).unwrap();
+        assert_eq!(c.read(), b"respuesta");
+        // Mensajes que en 1.2 no existen o no vienen a cuento: HelloRequest con cuerpo, NewSessionTicket, KeyUpdate, ServerHelloDone.
+        for m in [&[0u8, 0, 0, 1, 0][..], &[4, 0, 0, 0], &[24, 0, 0, 1, 0], &[14, 0, 0, 0]] {
+            let (mut c, _) = conectado12(v);
+            let mut s = espejo(c.rx.as_ref().unwrap(), a);
+            assert!(c.feed(&s.seal(CT_SALUDO, m).unwrap()).is_err(), "{nombre}");
+        }
+        // Registro corrupto: error y todo cerrado.
+        let (mut c, _) = conectado12(v);
+        let mut s = espejo(c.rx.as_ref().unwrap(), a);
+        let mut r = s.seal(CT_DATOS, b"datos").unwrap();
+        let n = r.len() - 1;
+        r[n] ^= 1;
+        assert!(matches!(c.feed(&r), Err(TlsError::Protocolo(_))));
+        assert_eq!(c.feed(&[0]), Err(TlsError::Cerrado));
+        // close_notify del servidor: se anota y se contesta con el nuestro.
+        let (mut c, _) = conectado12(v);
+        let mut s = espejo(c.rx.as_ref().unwrap(), a);
+        let mut k = espejo(c.tx.as_ref().unwrap(), a);
+        c.feed(&s.seal(CT_ALERTA, &[1, 0]).unwrap()).unwrap();
+        assert!(c.peer_closed());
+        let o = c.take_output();
+        assert_eq!(k.open(&o[..5], &o[5..]).unwrap(), (CT_ALERTA, vec![1, 0]), "{nombre}");
+        assert_eq!(c.write(b"x"), Err(TlsError::Cerrado));
+        // close propio.
+        let (mut c, _) = conectado12(v);
+        c.close();
+        assert!(!c.take_output().is_empty());
+        assert_eq!(c.write(b"x"), Err(TlsError::Cerrado));
+    }
+}
+
+#[test]
+fn ningun_cambio_del_saludo12_se_acepta() {
+    // Como en 1.3: cambiar un byte del saludo (hasta el Finished del servidor) da error o lo deja sin terminar,
+    // salvo la versión de cada cabecera de registro, que se ignora a propósito.
+    for i in [0, 3] {
+        let v = VUELOS12[i].1;
+        let fin = conectado12(v).1;
+        let cab: Vec<usize> = registros(v).iter().map(|x| x.0 + 2).collect();
+        for p in (0..fin).filter(|p| !cab.contains(p)) {
+            let mut m = v[..fin].to_vec();
+            m[p] ^= 0x01;
+            let (c, e) = reproducir("prueba.nf", false, &m, 1 << 20);
+            assert!(e.is_err() || !c.is_ready(), "vuelo {i}, byte {p} aceptado");
+        }
+    }
+}
+
+#[test]
+fn fuzz12_sin_panico() {
+    let mut x = Xs(0x1234_5678_9abc_def1);
+    for (_, v, _, _, _) in VUELOS12 {
+        for _ in 0..150 {
+            let mut m = v.to_vec();
+            for _ in 0..1 + x.n() % 3 {
+                let p = (x.n() as usize) % m.len();
+                m[p] = x.n() as u8;
+            }
+            match x.n() % 4 {
+                0 => m.truncate((x.n() as usize) % m.len()),
+                1 => {
+                    let p = (x.n() as usize) % m.len();
+                    m.drain(p..(p + 1 + (x.n() as usize) % 50).min(m.len()));
+                }
+                _ => {}
+            }
+            let mut c = fijo("prueba.nf", x.n() % 2 == 0);
+            c.take_output();
+            let trozo = 1 + (x.n() as usize) % 700;
+            for t in m.chunks(trozo) {
+                if c.feed(t).is_err() {
+                    break;
+                }
+            }
+            c.read();
+            let _ = c.write(b"x");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Interoperabilidad con OpenSSL (`cargo test -p nf-core -- --ignored tls`)
 // ---------------------------------------------------------------------------------------------
 
@@ -527,12 +838,14 @@ mod openssl {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/tls/testdata")
     }
 
-    fn lanzar(cert: &str, extra: &[&str]) -> (Servidor, u16) {
+    /// `proto`: "-tls1_3", "-tls1_2" o "" (los dos).
+    fn lanzar(proto: &str, cert: &str, extra: &[&str]) -> (Servidor, u16) {
         let puerto = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let d = datos();
         let exe = std::env::var("OPENSSL").unwrap_or_else(|_| "openssl".into());
         let hijo = Command::new(exe)
-            .args(["s_server", "-tls1_3", "-www", "-accept", &format!("127.0.0.1:{puerto}")])
+            .args(["s_server", "-www", "-accept", &format!("127.0.0.1:{puerto}")])
+            .args(Some(proto).filter(|p| !p.is_empty()))
             .arg("-cert")
             .arg(d.join(format!("{cert}.pem")))
             .arg("-key")
@@ -590,7 +903,7 @@ mod openssl {
 
     /// Una combinación: certificado, opciones de s_server, suite y grupo esperados. Con `grabar` guarda el vuelo.
     fn caso(nombre: &str, cert: &str, extra: &[&str], suite: &str, grupo: &str) {
-        let (_s, puerto) = lanzar(cert, extra);
+        let (_s, puerto) = lanzar("-tls1_3", cert, extra);
         let mut c = fijo("prueba.nf", false);
         let (r, recibido) = get(&mut c, puerto);
         let resp = r.unwrap_or_else(|e| panic!("{nombre}: {}", e.mensaje()));
@@ -637,7 +950,7 @@ mod openssl {
     #[test]
     #[ignore]
     fn tls_openssl_certificado_de_otro_host() {
-        let (_s, puerto) = lanzar("srv_otro", &[]);
+        let (_s, puerto) = lanzar("-tls1_3", "srv_otro", &[]);
         let (r, recibido) = get(&mut fijo("prueba.nf", false), puerto);
         assert_eq!(r, Err(TlsError::Cert(CertError::NombreNoCoincide)));
         if std::env::var("NF_TLS_GRABAR").is_ok() {
@@ -652,7 +965,7 @@ mod openssl {
     #[test]
     #[ignore]
     fn tls_openssl_con_new_y_semilla_distinta() {
-        let (_s, puerto) = lanzar("srv_ec", &[]);
+        let (_s, puerto) = lanzar("-tls1_3", "srv_ec", &[]);
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let mut seed = [0u8; 32];
         seed[..16].copy_from_slice(&t.to_le_bytes());
@@ -665,9 +978,107 @@ mod openssl {
     #[ignore]
     fn tls_openssl_ip_literal_sin_sni() {
         // El certificado solo tiene DNS: con la IP debe fallar por nombre, no por el saludo.
-        let (_s, puerto) = lanzar("srv_ec", &[]);
+        let (_s, puerto) = lanzar("-tls1_3", "srv_ec", &[]);
         let mut c = Client::con_valores("127.0.0.1", ahora(), almacen(), false, Rng::new([3; 32]), RANDOM, SID.to_vec(), PRIV);
         let (r, _) = get(&mut c, puerto);
         assert_eq!(r, Err(TlsError::Cert(CertError::NombreNoCoincide)));
+    }
+
+    /// Una combinación de TLS 1.2: `cifrado` es el nombre OpenSSL de la suite.
+    fn caso12(nombre: &str, cert: &str, cifrado: &str, extra: &[&str], suite: &str, grupo: &str, ems: bool) {
+        let mut args = vec!["-cipher", cifrado];
+        args.extend_from_slice(extra);
+        let (_s, puerto) = lanzar("-tls1_2", cert, &args);
+        let mut c = fijo("prueba.nf", false);
+        let (r, recibido) = get(&mut c, puerto);
+        let resp = r.unwrap_or_else(|e| panic!("{nombre}: {}", e.mensaje()));
+        let i = c.info().expect("info");
+        assert_eq!((i.version, i.suite, i.group), ("TLS 1.2", suite, grupo), "{nombre}");
+        assert_eq!(c.s12.ems, ems, "{nombre}");
+        let texto = String::from_utf8_lossy(&resp);
+        assert!(texto.starts_with("HTTP/1.0 200 ok"), "{nombre}: {texto}");
+        assert!(texto.contains(&format!("Cipher is {cifrado}")) && texto.contains("TLSv1.2"), "{nombre}: {texto}");
+        if std::env::var("NF_TLS_GRABAR").is_ok() && VUELOS12.iter().any(|v| v.0 == nombre) {
+            std::fs::write(datos().join(format!("vuelo_{nombre}.bin")), recibido).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_chacha_ecdsa() {
+        caso12("c12_chacha_ec", "srv_ec", "ECDHE-ECDSA-CHACHA20-POLY1305", &[], "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_chacha_rsa_pss() {
+        caso12("c12_chacha_rsa_pss", "srv_rsa", "ECDHE-RSA-CHACHA20-POLY1305", &["-sigalgs", "RSA-PSS+SHA256"], "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_aes128_ecdsa_con_sha384() {
+        caso12("c12_aes128_ec_sha384", "srv_ec", "ECDHE-ECDSA-AES128-GCM-SHA256", &["-sigalgs", "ECDSA+SHA384"], "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_aes128_rsa_pkcs1_p256() {
+        caso12("c12_aes128_rsa_pkcs1", "srv_rsa", "ECDHE-RSA-AES128-GCM-SHA256", &["-sigalgs", "RSA+SHA256", "-groups", "P-256"], "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256", "secp256r1", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_aes256_ecdsa_p256() {
+        caso12("c12_aes256_ec", "srv_ec", "ECDHE-ECDSA-AES256-GCM-SHA384", &["-groups", "P-256"], "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "secp256r1", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_aes256_rsa() {
+        caso12("c12_aes256_rsa", "srv_rsa", "ECDHE-RSA-AES256-GCM-SHA384", &[], "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", "x25519", true);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_sin_extended_master_secret() {
+        caso12("c12_sin_ems", "srv_ec", "ECDHE-ECDSA-AES128-GCM-SHA256", &["-no_ems"], "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", false);
+        caso12("sin_grabar_rsa_sin_ems", "srv_rsa", "ECDHE-RSA-CHACHA20-POLY1305", &["-no_ems", "-groups", "P-256"], "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "secp256r1", false);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_certificado_de_otro_host() {
+        let (_s, puerto) = lanzar("-tls1_2", "srv_otro", &[]);
+        let (r, _) = get(&mut fijo("prueba.nf", false), puerto);
+        assert_eq!(r, Err(TlsError::Cert(CertError::NombreNoCoincide)));
+        let mut c = fijo("prueba.nf", true);
+        let (r, _) = get(&mut c, puerto);
+        assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
+        let i = c.info().unwrap();
+        assert_eq!((i.version, i.cert_error), ("TLS 1.2", Some(CertError::NombreNoCoincide)));
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_con_new_y_semilla_distinta() {
+        let (_s, puerto) = lanzar("-tls1_2", "srv_ec", &[]);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut seed = [0u8; 32];
+        seed[..16].copy_from_slice(&t.to_le_bytes());
+        let mut c = Client::new("prueba.nf", ahora(), almacen(), false, seed);
+        let (r, _) = get(&mut c, puerto);
+        assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
+        assert_eq!(c.info().unwrap().version, "TLS 1.2");
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_servidor_con_1_2_y_1_3_negocia_1_3() {
+        let (_s, puerto) = lanzar("", "srv_ec", &[]);
+        let mut c = fijo("prueba.nf", false);
+        let (r, _) = get(&mut c, puerto);
+        assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
+        assert_eq!(c.info().unwrap().version, "TLS 1.3");
     }
 }

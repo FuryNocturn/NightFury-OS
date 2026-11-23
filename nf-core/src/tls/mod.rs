@@ -2,12 +2,14 @@
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! v0.12.2: cliente TLS 1.3 (RFC 8446) como máquina de estados sin E/S.
 //!
-//! Escrito desde las normas: RFC 8446, 8448 (vectores), 6066 (SNI), 7301 (ALPN), 8422 y 5869.
+//! Escrito desde las normas: RFC 8446, 8448 (vectores), 6066 (SNI), 7301 (ALPN), 8422 y 5869; y para
+//! TLS 1.2: RFC 5246, 5289, 7905, 7627 y 5746.
 //! Quien lo usa mueve los bytes: lo que llega por TCP entra en `feed`, lo que hay que mandar sale de
 //! `take_output`. Capas: `record` (registros y AEAD), `keys` (HKDF y programa de claves),
-//! `hs13` (mensajes de saludo). Para añadir TLS 1.2 se reutilizan `record`, `Client` y los errores:
-//! basta ofrecer 0x0303 en `hs13::OFRECIDAS` y tratar el ServerHello sin `supported_versions`.
+//! `hs13` (mensajes de saludo 1.3) y `hs12` (saludo, PRF y registros de TLS 1.2: el cliente ofrece las dos
+//! versiones y sigue por la que elija el servidor).
 
+mod hs12;
 mod hs13;
 mod keys;
 mod record;
@@ -100,6 +102,11 @@ enum St {
     EsperaCert,
     EsperaCv,
     EsperaFin,
+    Esp12Cert,
+    Esp12Ske,
+    Esp12Hd,
+    Esp12Ccs,
+    Esp12Fin,
     Conectado,
     Fallido,
 }
@@ -187,6 +194,7 @@ pub struct Client {
     cert_error: Option<CertError>,
     /// El servidor pidió certificado: contexto a devolver en el Certificate vacío.
     cert_ctx: Option<Vec<u8>>,
+    s12: hs12::S12,
     info: Option<SessionInfo>,
     listo: bool,
     cierre_enviado: bool,
@@ -244,6 +252,7 @@ impl Client {
             chain: None,
             cert_error: None,
             cert_ctx: None,
+            s12: hs12::S12::nuevo(),
             info: None,
             listo: false,
             cierre_enviado: false,
@@ -360,6 +369,9 @@ impl Client {
     }
 
     fn en_registro(&mut self, ct: u8, header: &[u8], body: &[u8]) -> Result<(), Fallo> {
+        if self.s12.activo {
+            return self.en_registro12(ct, header, body);
+        }
         match ct {
             CT_CCS => {
                 // §5: solo el de compatibilidad (un 1), tras el ClientHello y antes del Finished del servidor.
@@ -403,7 +415,7 @@ impl Client {
         }
     }
 
-    fn en_alerta(&mut self, d: &[u8]) -> Result<(), Fallo> {
+    pub(super) fn en_alerta(&mut self, d: &[u8]) -> Result<(), Fallo> {
         let [_nivel, desc] = *d else { return Err(DEC) };
         match desc {
             0 => {

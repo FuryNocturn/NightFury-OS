@@ -63,6 +63,9 @@ impl Net {
 
     pub(super) fn tcp_write(&mut self, s: SockId, data: &[u8]) -> Result<usize, NetError> {
         let i = self.sock_idx(s).ok_or(NetError::Gone)?;
+        if self.socks[i].tls.is_some() {
+            return self.tls_write(i, data).unwrap_or(Err(NetError::Gone));
+        }
         let now = self.now;
         let k = &mut self.socks[i];
         if let Some(e) = &k.fail {
@@ -81,6 +84,14 @@ impl Net {
 
     pub(super) fn tcp_read(&mut self, s: SockId, buf: &mut [u8]) -> Result<usize, NetError> {
         let i = self.sock_idx(s).ok_or(NetError::Gone)?;
+        if self.socks[i].tls.is_some() {
+            let r = self.tls_read(i, buf).unwrap_or(Err(NetError::Gone));
+            // sin texto claro y con TCP caído, vale el error de TCP
+            return match (r, &self.socks[i].fail) {
+                (Ok(0), Some(e)) => Err(e.clone()),
+                (r, _) => r,
+            };
+        }
         let k = &mut self.socks[i];
         let n = k.read(buf);
         if n == 0 {
@@ -107,6 +118,7 @@ impl Net {
             k.kill(NetError::Reset);
             k.released = true;
         } else {
+            Net::tls_close(k);
             k.close();
             k.output(now, &mut out);
         }
@@ -116,6 +128,7 @@ impl Net {
     }
 
     pub(super) fn tcp_tick(&mut self) {
+        self.tls_tick();
         let now = self.now;
         let mut jobs = Vec::new();
         for k in self.socks.iter_mut() {

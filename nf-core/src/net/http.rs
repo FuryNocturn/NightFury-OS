@@ -4,34 +4,42 @@
 //! se llama a `poll` en cada tick hasta que devuelve `Done` o `Error`.
 //!
 //! CONTRATO: las firmas públicas no cambian.
-use super::{NetApi, NetError, QueryId, SockId, TcpState};
+use super::{NetApi, NetError, QueryId, SockId, TcpState, TlsInfo};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// URL `http://host[:puerto][/ruta][?consulta]`. El fragmento (`#…`) se descarta.
+/// URL `http://` o `https://host[:puerto][/ruta][?consulta]`. El fragmento (`#…`) se descarta.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Url {
+    /// v0.12.2: `https://` (puerto 443 si no se indica).
+    pub https: bool,
     pub host: String,
     pub port: u16,
     /// Empieza por `/` (vale `/` si la URL no trae ruta); incluye la consulta.
     pub path: String,
 }
 
-/// Sin esquema se supone `http://`. `https://` da `HttpsNotYet`; otro esquema, `BadUrl`.
+impl Url {
+    /// «host» o «host:puerto» si el puerto no es el del esquema (para `Host:` y para las redirecciones).
+    fn authority(&self) -> String {
+        if self.port == if self.https { 443 } else { 80 } { self.host.clone() } else { format!("{}:{}", self.host, self.port) }
+    }
+}
+
+/// Sin esquema se supone `http://`; otro esquema que no sea `http` ni `https`, `BadUrl`.
 // shortcut: sin usuario@, sin IPv6 entre corchetes ni IDN (el nombre va en ASCII); se añaden si hace falta.
 pub fn parse_url(s: &str) -> Result<Url, NetError> {
     if s.bytes().any(|c| c <= b' ' || c == 0x7F) {
         return Err(NetError::BadUrl);
     }
     let mut rest = s;
+    let mut https = false;
     if let Some(i) = s.find("://") {
         let sch = &s[..i];
         if !sch.is_empty() && sch.bytes().all(|c| c.is_ascii_alphanumeric() || b"+-.".contains(&c)) {
-            if sch.eq_ignore_ascii_case("https") {
-                return Err(NetError::HttpsNotYet);
-            }
-            if !sch.eq_ignore_ascii_case("http") {
+            https = sch.eq_ignore_ascii_case("https");
+            if !https && !sch.eq_ignore_ascii_case("http") {
                 return Err(NetError::BadUrl);
             }
             rest = &s[i + 3..];
@@ -50,7 +58,7 @@ pub fn parse_url(s: &str) -> Result<Url, NetError> {
             }
             (&auth[..i], p.parse::<u16>().ok().filter(|p| *p != 0).ok_or(NetError::BadUrl)?)
         }
-        None => (auth, 80),
+        None => (auth, if https { 443 } else { 80 }),
     };
     if host.is_empty() || host.len() > 253 || host.starts_with('.') || !host.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._".contains(&c)) {
         return Err(NetError::BadUrl);
@@ -66,7 +74,7 @@ pub fn parse_url(s: &str) -> Result<Url, NetError> {
             path.push(b as char);
         }
     }
-    Ok(Url { host: String::from(host), port, path })
+    Ok(Url { https, host: String::from(host), port, path })
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -75,6 +83,8 @@ pub enum HttpEvent {
     Head { status: u16, reason: String, headers: Vec<(String, String)> },
     /// Un trozo del cuerpo, ya sin la codificación «chunked».
     Body(Vec<u8>),
+    /// v0.12.2: conexión segura establecida (una por cada conexión `https://`, redirecciones incluidas).
+    Secure(TlsInfo),
     Done,
     Error(NetError),
 }
@@ -188,11 +198,13 @@ enum Mode {
 }
 
 /// Una petición `GET` (o `HEAD` con `head_only`). Con `follow`, sigue las redirecciones 301, 302,
-/// 303, 307 y 308 (una a `https://` termina en `HttpsNotYet`). Envía `Host`, `User-Agent:
+/// 303, 307 y 308 (también de `http` a `https` y entre `https`). Envía `Host`, `User-Agent:
 /// NightFury/<versión>`, `Accept: */*` y `Connection: close`.
 pub struct HttpGet {
     head_only: bool,
     follow: bool,
+    /// Solo `curl -k`: seguir con un certificado malo.
+    insecure: bool,
     redirects: u8,
     url: Url,
     stage: Stage,
@@ -239,15 +251,20 @@ pub(super) fn parse_head(h: &[u8]) -> Result<(u16, String, Vec<(String, String)>
 
 impl HttpGet {
     pub fn start(net: &mut dyn NetApi, url: &str, head_only: bool, follow: bool) -> Result<HttpGet, NetError> {
+        HttpGet::start_tls(net, url, head_only, follow, false)
+    }
+
+    /// Como `start`; con `insecure` una conexión `https://` sigue aunque el certificado no valga.
+    pub fn start_tls(net: &mut dyn NetApi, url: &str, head_only: bool, follow: bool, insecure: bool) -> Result<HttpGet, NetError> {
         let url = parse_url(url)?;
         let q = net.resolve(&url.host)?;
-        let mut g = HttpGet { head_only, follow, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, last: None };
+        let mut g = HttpGet { head_only, follow, insecure, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, last: None };
         g.build_request();
         Ok(g)
     }
 
     fn build_request(&mut self) {
-        let host = if self.url.port == 80 { self.url.host.clone() } else { format!("{}:{}", self.url.host, self.url.port) };
+        let host = self.url.authority();
         let m = if self.head_only { "HEAD" } else { "GET" };
         self.req = format!("{m} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n", self.url.path, crate::VERSION).into_bytes();
         self.sent = 0;
@@ -309,7 +326,7 @@ impl HttpGet {
                 None => false,
                 Some(Err(e)) => self.fail(net, e, ev),
                 // shortcut: solo se prueba la primera dirección A; si no responde, falla; probar las demás si hace falta.
-                Some(Ok(ips)) => match ips.first().map(|ip| net.tcp_connect(*ip, self.url.port)) {
+                Some(Ok(ips)) => match ips.first().map(|ip| if self.url.https { net.tcp_connect_tls(*ip, self.url.port, &self.url.host, self.insecure) } else { net.tcp_connect(*ip, self.url.port) }) {
                     Some(Ok(s)) => {
                         self.stage = Stage::Connecting(s);
                         true
@@ -321,6 +338,9 @@ impl HttpGet {
             Stage::Connecting(s) => match net.tcp_state(s) {
                 TcpState::Connecting => false,
                 TcpState::Open | TcpState::PeerClosed => {
+                    if self.url.https {
+                        ev.extend(net.tcp_tls_info(s).map(HttpEvent::Secure));
+                    }
                     self.stage = Stage::Sending(s);
                     true
                 }
@@ -404,21 +424,22 @@ impl HttpGet {
         if self.redirects > MAX_REDIRECTS {
             return self.fail(net, NetError::Protocol("demasiadas redirecciones"), ev);
         }
-        let auth = if self.url.port == 80 { self.url.host.clone() } else { format!("{}:{}", self.url.host, self.url.port) };
+        let auth = self.url.authority();
+        let scheme = if self.url.https { "https" } else { "http" };
         // absoluta solo si empieza por un esquema: «/login?next=http://x» es relativa
         let absoluta = loc.find("://").is_some_and(|i| i > 0 && loc[..i].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'-' || b == b'.'));
         let full = if absoluta {
             String::from(loc)
         } else if let Some(r) = loc.strip_prefix("//") {
-            format!("http://{r}")
+            format!("{scheme}://{r}")
         } else if loc.starts_with('/') {
-            format!("http://{auth}{loc}")
+            format!("{scheme}://{auth}{loc}")
         } else {
             // relativa: junto a la ruta actual (sin consulta)
             let p = self.url.path.split('?').next().unwrap_or("/");
             let dir = &p[..p.rfind('/').map_or(0, |i| i + 1)];
             // shortcut: no se normalizan «./» ni «../» de la ruta; el servidor suele hacerlo.
-            format!("http://{auth}{dir}{loc}")
+            format!("{scheme}://{auth}{dir}{loc}")
         };
         let url = match parse_url(&full) {
             Ok(u) => u,

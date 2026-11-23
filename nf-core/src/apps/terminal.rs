@@ -1520,7 +1520,7 @@ mod tests {
         assert_eq!(r.orden("curl -o pagina.txt http://ejemplo.com/"), [format!("Guardado pagina.txt ({} bytes)", cuerpo.len())]);
         assert_eq!(r.sys.fs().read(&h("pagina.txt")).unwrap(), cuerpo.as_bytes());
         // HTTPS, URL mala, errores de conexión y de uso.
-        assert_eq!(r.orden("curl https://ejemplo.com/"), ["HTTPS llega en una versión próxima"]);
+        assert_eq!(r.orden("curl https://ejemplo.com/"), ["curl: (7) No se pudo conectar con ejemplo.com puerto 443"]);
         assert_eq!(r.orden("curl http://"), ["curl: (3) URL no válida"]);
         assert_eq!(r.orden("curl http://noexiste.invalid/"), ["curl: (6) No se pudo resolver el host: noexiste.invalid"]);
         assert_eq!(r.orden("curl http://ejemplo.com:81/"), ["curl: (7) No se pudo conectar con ejemplo.com puerto 81"]);
@@ -1560,6 +1560,46 @@ mod tests {
         assert_eq!(r.sys.fs().read("C:\\Sistema\\temp\\x.bin").unwrap(), b"abc");
         // Una carpeta como destino se rechaza antes de descargar.
         assert_eq!(r.orden("curl -o Documentos ejemplo.com"), [FsError::IsDir.message()]);
+    }
+
+    /// `curl` con HTTPS contra un saludo TLS grabado (el servidor ya cierra antes de recibir la petición,
+    /// de ahí el «cerrada» final). La raíz de prueba solo está en el almacén si se añade.
+    #[test]
+    fn curl_https_certificados_k_y_v() {
+        const CA: &[u8] = include_bytes!("../tls/testdata/ca.der");
+        const VUELO: &[u8] = include_bytes!("../tls/testdata/vuelo_aes128_rsa.bin");
+        const VUELO_OTRO: &[u8] = include_bytes!("../tls/testdata/vuelo_otro_host.bin");
+        let nuevo = |vuelo: &[u8], con_raiz: bool| {
+            let mut lan = Lan::up();
+            lan.router.names.push((String::from("prueba.nf"), vec![SRV], 300));
+            lan.router.srv.listen_any(443, vuelo);
+            let mut r = Red::con(con_disco("Ana"), lan);
+            if con_raiz {
+                r.sys.files.add_root(CA.to_vec(), DateTime::default()).unwrap();
+            }
+            r.sys.net.as_mut().unwrap().set_tls_fijo([7; 32], [9; 32], [5; 32]);
+            r
+        };
+        let cerrada = "curl: (35) La conexión segura está cerrada.";
+        let mut r = nuevo(VUELO, true);
+        assert_eq!(
+            r.orden("curl -v https://prueba.nf/"),
+            [
+                "* Conexión segura: TLS 1.3, TLS_AES_128_GCM_SHA256, grupo x25519",
+                "* Certificado de: prueba.nf (NightFury Prueba)",
+                "* Emitido por: NF TLS Raiz de Prueba (NightFury Prueba)",
+                "* Caduca el: 01/01/2050",
+                cerrada
+            ]
+        );
+        // Sin la raíz, se niega y explica; con -k sigue y avisa en una línea.
+        let mut r = nuevo(VUELO, false);
+        let malo = "El certificado lo emitió una entidad que no es de confianza.";
+        assert_eq!(r.orden("curl https://prueba.nf/"), [format!("curl: (35) {malo}")]);
+        assert_eq!(r.orden("curl -k https://prueba.nf/"), [format!("Aviso: la conexión no es segura (-k): {malo}"), String::from(cerrada)]);
+        // Certificado de otro nombre.
+        let mut r = nuevo(VUELO_OTRO, true);
+        assert_eq!(r.orden("curl https://prueba.nf/"), ["curl: (35) El certificado no corresponde a este nombre de servidor."]);
     }
 
     /// La Terminal como programa en modo usuario: la red le llega por `RemoteNet` + `serve`.

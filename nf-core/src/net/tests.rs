@@ -15,6 +15,7 @@ mod dns_tests;
 mod fuzz;
 mod http_tests;
 mod tcp_tests;
+mod tls_tests;
 mod udp_tests;
 
 pub const HOST_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
@@ -122,6 +123,8 @@ pub struct Script {
     pub reply: Vec<u8>,
     pub close: bool,
     pub echo: bool,
+    /// Contesta al primer dato que llegue (un saludo TLS no acaba en línea en blanco).
+    pub any: bool,
 }
 
 pub struct Conn {
@@ -168,7 +171,13 @@ impl Srv {
 
     pub fn listen(&mut self, port: u16, reply: &[u8], close: bool, echo: bool) {
         self.scripts.retain(|s| s.0 != port);
-        self.scripts.push((port, Script { reply: reply.to_vec(), close, echo }));
+        self.scripts.push((port, Script { reply: reply.to_vec(), close, echo, any: false }));
+    }
+
+    /// Como `listen` con cierre, pero el primer dato que llegue ya dispara la respuesta.
+    pub fn listen_any(&mut self, port: u16, reply: &[u8]) {
+        self.listen(port, reply, true, false);
+        self.scripts.last_mut().unwrap().1.any = true;
     }
 
     fn push_new(c: &mut Conn, win: u16, swin: usize, now: u64, out: &mut Vec<Seg>) {
@@ -246,7 +255,7 @@ impl Srv {
             c.rcv_nxt = c.rcv_nxt.wrapping_add(t.data.len() as u32);
             if script.echo {
                 c.out.extend_from_slice(t.data);
-            } else if !c.replied && c.got.ends_with(b"\r\n\r\n") {
+            } else if !c.replied && (script.any || c.got.ends_with(b"\r\n\r\n")) {
                 c.out = script.reply.clone();
                 c.replied = true;
                 self.reqs.push(c.got.clone());

@@ -128,10 +128,10 @@ fn size_text(bytes: u64) -> String {
 }
 
 fn proto_text(p: Proto) -> &'static str {
-    if p == Proto::Udp {
-        "UDP"
-    } else {
-        "TCP"
+    match p {
+        Proto::Udp => "UDP",
+        Proto::Tls => "TLS",
+        _ => "TCP",
     }
 }
 
@@ -707,6 +707,11 @@ mod tests {
         assert_eq!(size_text(0), "0 B");
         assert_eq!(size_text(1229), "1,2 KB");
         assert_eq!(size_text(MB * 7 / 2), "3,5 MB");
+    }
+
+    #[test]
+    fn protocolo_tls_se_ve_como_tls() {
+        assert_eq!([proto_text(Proto::Tls), proto_text(Proto::Tcp), proto_text(Proto::Udp)], ["TLS", "TCP", "UDP"]);
     }
 
     #[test]

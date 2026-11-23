@@ -3,6 +3,7 @@
 //! Mensajes de saludo de TLS 1.3 del cliente (RFC 8446 §4 y §7): ClientHello, HelloRetryRequest,
 //! ServerHello, EncryptedExtensions, Certificate, CertificateVerify, Finished y KeyUpdate.
 
+use super::hs12::SUITES12;
 use super::keys::{secretos_aplicacion, secretos_saludo, Hash};
 use super::record::{Aead, Keys, CT_CCS, CT_SALUDO};
 use super::{ilegal, Client, Fallo, Rd, SessionInfo, St, TlsError, DEC, UNEXP};
@@ -12,13 +13,13 @@ use crate::x509::{verify_server, Cert, CertError};
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Versiones que ofrece el ClientHello. Único sitio donde añadir 0x0303 cuando llegue TLS 1.2.
-const OFRECIDAS: [u16; 1] = [0x0304];
+/// Versiones que ofrece el ClientHello (supported_versions).
+const OFRECIDAS: [u16; 2] = [0x0304, 0x0303];
 /// Mayor mensaje de saludo, certificados incluidos, y transcript total que se aceptan.
 const MAX_SALUDO: usize = 1 << 16;
 const MAX_TRANSCRIPT: usize = 1 << 18;
-const MAX_CERTS: usize = 20;
-const CCS: [u8; 6] = [CT_CCS, 3, 3, 0, 1, 1];
+pub(super) const MAX_CERTS: usize = 20;
+pub(super) const CCS: [u8; 6] = [CT_CCS, 3, 3, 0, 1, 1];
 
 #[derive(Clone, Copy)]
 pub struct Suite {
@@ -35,10 +36,10 @@ const SUITES: [Suite; 3] = [
     Suite { id: 0x1302, aead: Aead::Aes256, hash: Hash::S384, nombre: "TLS_AES_256_GCM_SHA384" },
 ];
 
-/// signature_algorithms ofrecidos: ECDSA, RSA-PSS y (solo para certificados) RSA PKCS#1.
+/// signature_algorithms ofrecidos: ECDSA, RSA-PSS y RSA PKCS#1 (este último solo vale en 1.2 y en certificados).
 const SIGALGS: [u16; 8] = [0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601];
 
-fn mensaje(t: u8, body: &[u8]) -> Vec<u8> {
+pub(super) fn mensaje(t: u8, body: &[u8]) -> Vec<u8> {
     let mut m = vec![t, (body.len() >> 16) as u8, (body.len() >> 8) as u8, body.len() as u8];
     m.extend_from_slice(body);
     m
@@ -69,6 +70,19 @@ fn extensiones(data: &[u8]) -> Result<Vec<(u16, &[u8])>, Fallo> {
     Ok(v)
 }
 
+/// ALPN del servidor (RFC 7301): un solo protocolo y tiene que ser el que ofrecimos.
+pub(super) fn alpn(b: &[u8]) -> Result<(), Fallo> {
+    let mut l = Rd(Rd(b).v16().ok_or(DEC)?);
+    let n = l.v8().ok_or(DEC)?;
+    if !l.0.is_empty() {
+        return Err(DEC);
+    }
+    if n != b"http/1.1" {
+        return Err(ilegal("el servidor eligió un protocolo que no se ofreció"));
+    }
+    Ok(())
+}
+
 fn alerta_cert(e: CertError) -> u8 {
     match e {
         CertError::Caducado | CertError::AunNoValido => 45,
@@ -84,8 +98,8 @@ impl Client {
         b.extend_from_slice(&self.random);
         b.push(self.sid.len() as u8);
         b.extend_from_slice(&self.sid);
-        b.extend_from_slice(&((SUITES.len() * 2) as u16).to_be_bytes());
-        for s in SUITES {
+        b.extend_from_slice(&(((SUITES.len() + SUITES12.len()) * 2) as u16).to_be_bytes());
+        for s in SUITES.iter().chain(&SUITES12) {
             b.extend_from_slice(&s.id.to_be_bytes());
         }
         b.extend_from_slice(&[1, 0]);
@@ -120,6 +134,10 @@ impl Client {
         }
         ext(&mut e, 0x000d, &sa);
         ext(&mut e, 0x0010, b"\x00\x09\x08http/1.1");
+        // TLS 1.2: formatos de punto (solo sin comprimir), extended_master_secret y renegotiation_info vacía.
+        ext(&mut e, 0x000b, &[1, 0]);
+        ext(&mut e, 0x0017, &[]);
+        ext(&mut e, 0xff01, &[0]);
         if !self.cookie.is_empty() {
             let mut c = (self.cookie.len() as u16).to_be_bytes().to_vec();
             c.extend_from_slice(&self.cookie);
@@ -130,7 +148,7 @@ impl Client {
         mensaje(1, &b)
     }
 
-    fn agregar(&mut self, m: &[u8]) -> Result<(), Fallo> {
+    pub(super) fn agregar(&mut self, m: &[u8]) -> Result<(), Fallo> {
         if self.transcript.len() + m.len() > MAX_TRANSCRIPT {
             return Err(Fallo(80, TlsError::Protocolo("saludo demasiado largo")));
         }
@@ -144,7 +162,7 @@ impl Client {
         self.enviar(CT_SALUDO, m)
     }
 
-    fn suite(&self) -> Result<Suite, Fallo> {
+    pub(super) fn suite(&self) -> Result<Suite, Fallo> {
         self.suite.ok_or(UNEXP)
     }
 
@@ -176,8 +194,27 @@ impl Client {
                 }
                 (St::EsperaCv, 15) => self.en_cv(&msg)?,
                 (St::EsperaFin, 20) => self.en_fin(&msg)?,
-                (St::Conectado, 4) => {} // NewSessionTicket: sin reanudación, se ignora
-                (St::Conectado, 24) => self.en_key_update(&msg)?,
+                (St::Conectado, 4) if !self.s12.activo => {} // NewSessionTicket: sin reanudación, se ignora
+                (St::Conectado, 24) if !self.s12.activo => self.en_key_update(&msg)?,
+                (St::Esp12Cert, 11) => {
+                    self.agregar(&msg)?;
+                    self.en_cert12(&msg)?
+                }
+                (St::Esp12Ske, 12) => {
+                    self.agregar(&msg)?;
+                    self.en_ske(&msg)?
+                }
+                (St::Esp12Hd, 13) if self.cert_ctx.is_none() => {
+                    self.agregar(&msg)?;
+                    self.en_cert_req12(&msg)?
+                }
+                (St::Esp12Hd, 14) => {
+                    self.agregar(&msg)?;
+                    self.en_shd(&msg)?
+                }
+                (St::Esp12Fin, 20) => self.en_fin12(&msg)?,
+                // HelloRequest (§7.4.1.1): no renegociamos, se ignora.
+                (St::Conectado, 0) if self.s12.activo && msg.len() == 4 => {}
                 _ => return Err(UNEXP),
             }
         }
@@ -185,8 +222,10 @@ impl Client {
 
     fn en_server_hello(&mut self, msg: &[u8]) -> Result<(), Fallo> {
         let mut r = Rd(&msg[4..]);
-        if r.u16().ok_or(DEC)? != 0x0303 {
-            return Err(ilegal("versión heredada incorrecta"));
+        match r.u16().ok_or(DEC)? {
+            0x0303 => {}
+            0x0300..=0x0302 => return Err(Fallo(70, TlsError::NoSoportado("el servidor solo admite TLS 1.1 o anterior"))),
+            _ => return Err(ilegal("versión heredada incorrecta")),
         }
         let random = r.take(32).ok_or(DEC)?;
         let sid = r.v8().ok_or(DEC)?;
@@ -196,24 +235,29 @@ impl Client {
         if !r.0.is_empty() {
             return Err(DEC);
         }
-        if comp != 0 || sid != &self.sid[..] {
+        if comp != 0 {
             return Err(ilegal("ServerHello no cuadra con el ClientHello"));
         }
-        // §4.1.3: centinelas de degradación a TLS 1.2 o inferior.
+        // §4.1.3: centinelas de degradación (ofrecimos 1.3, así que tampoco vale que se negocie 1.2).
         if &random[24..31] == b"DOWNGRD" && random[31] <= 1 {
             return Err(Fallo(47, TlsError::Protocolo("el servidor indica degradación de versión")));
         }
         let hrr = ct_eq(random, &sha256(b"HelloRetryRequest"));
         let exts = extensiones(exts)?;
         let busca = |t: u16| exts.iter().find(|e| e.0 == t).map(|e| e.1);
-        if exts.iter().any(|e| !matches!(e.0, 0x002b | 0x0033) && !(hrr && e.0 == 0x002c)) {
-            return Err(Fallo(110, TlsError::Protocolo("el servidor usa una extensión que no se pidió")));
-        }
         match busca(0x002b) {
-            Some(&[a, b]) if OFRECIDAS.contains(&u16::from_be_bytes([a, b])) && [a, b] == [3, 4] => {}
+            Some(&[3, 4]) => {}
             Some(&[_, _]) => return Err(ilegal("versión elegida no ofrecida")),
             Some(_) => return Err(DEC),
-            None => return Err(Fallo(70, TlsError::NoSoportado("TLS 1.2 llega en el paso 4"))),
+            // Sin supported_versions: el servidor eligió TLS 1.2 (un HelloRetryRequest no puede ser 1.2).
+            None if hrr || self.hrr_visto || self.s12.activo => return Err(ilegal("ServerHello sin supported_versions")),
+            None => return self.en_sh12(msg, random, sid, suite_id, &exts),
+        }
+        if sid != &self.sid[..] {
+            return Err(ilegal("ServerHello no cuadra con el ClientHello"));
+        }
+        if exts.iter().any(|e| !matches!(e.0, 0x002b | 0x0033) && !(hrr && e.0 == 0x002c)) {
+            return Err(Fallo(110, TlsError::Protocolo("el servidor usa una extensión que no se pidió")));
         }
         let suite = *SUITES.iter().find(|s| s.id == suite_id).ok_or(ilegal("suite no ofrecida"))?;
         if self.suite.is_some_and(|s| s.id != suite.id) {
@@ -291,20 +335,7 @@ impl Client {
         self.hrr_visto = true;
         self.agregar(msg)?;
         if p256 {
-            let mut k = [0u8; 32];
-            // Una privada fuera de [1, n-1] es casi imposible; unos pocos intentos bastan.
-            for _ in 0..8 {
-                self.rng.fill(&mut k);
-                if pk::p256_public(&k).is_some() {
-                    self.p_priv = Some(k);
-                    self.grupo = 0x0017;
-                    break;
-                }
-            }
-            wipe(&mut k);
-            if self.p_priv.is_none() {
-                return Err(Fallo(80, TlsError::Protocolo("no se pudo generar la clave P-256")));
-            }
+            self.nueva_p256()?;
         }
         if !self.ccs_enviado {
             self.out.extend_from_slice(&CCS);
@@ -313,6 +344,25 @@ impl Client {
         let ch = self.armar_hello();
         self.enviar_saludo(&ch)?;
         if self.hsbuf.is_empty() { Ok(()) } else { Err(UNEXP) }
+    }
+
+    /// Genera la privada P-256 (y pasa el grupo a secp256r1).
+    pub(super) fn nueva_p256(&mut self) -> Result<(), Fallo> {
+        let mut k = [0u8; 32];
+        // Una privada fuera de [1, n-1] es casi imposible; unos pocos intentos bastan.
+        for _ in 0..8 {
+            self.rng.fill(&mut k);
+            if pk::p256_public(&k).is_some() {
+                self.p_priv = Some(k);
+                self.grupo = 0x0017;
+                break;
+            }
+        }
+        wipe(&mut k);
+        if self.p_priv.is_none() {
+            return Err(Fallo(80, TlsError::Protocolo("no se pudo generar la clave P-256")));
+        }
+        Ok(())
     }
 
     fn en_ee(&mut self, msg: &[u8]) -> Result<(), Fallo> {
@@ -324,17 +374,7 @@ impl Client {
         for (t, b) in extensiones(e)? {
             match t {
                 0x0000 | 0x000a => {}
-                0x0010 => {
-                    // ALPN (RFC 7301): un solo protocolo y tiene que ser el que ofrecimos.
-                    let mut l = Rd(Rd(b).v16().ok_or(DEC)?);
-                    let n = l.v8().ok_or(DEC)?;
-                    if !l.0.is_empty() {
-                        return Err(DEC);
-                    }
-                    if n != b"http/1.1" {
-                        return Err(ilegal("el servidor eligió un protocolo que no se ofreció"));
-                    }
-                }
+                0x0010 => alpn(b)?,
                 _ => return Err(Fallo(110, TlsError::Protocolo("el servidor usa una extensión que no se pidió"))),
             }
         }
@@ -376,8 +416,18 @@ impl Client {
             }
             ders.push(der);
         }
-        let Some(&hoja) = ders.first() else { return Err(DEC) };
-        match verify_server(&ders, &self.host, self.now, &self.roots, &pk::verify) {
+        if ders.is_empty() {
+            return Err(DEC);
+        }
+        self.cadena(&ders)?;
+        self.st = St::EsperaCv;
+        Ok(())
+    }
+
+    /// Valida la cadena (hoja primero) y guarda la clave de la hoja; con `insecure` solo anota el fallo.
+    pub(super) fn cadena(&mut self, ders: &[&[u8]]) -> Result<(), Fallo> {
+        let hoja = ders[0];
+        match verify_server(ders, &self.host, self.now, &self.roots, &pk::verify) {
             Ok(ci) => self.chain = Some(ci),
             Err(e) if self.insecure => self.cert_error = Some(e),
             Err(e) => return Err(Fallo(alerta_cert(e), TlsError::Cert(e))),
@@ -385,7 +435,6 @@ impl Client {
         // Con -k también se comprueba el CertificateVerify, así que hace falta la clave de la hoja.
         let key = Cert::parse(hoja).ok().and_then(|c| c.public_key().cloned());
         self.leaf = Some(key.ok_or(Fallo(43, TlsError::Cert(CertError::NoSoportado)))?);
-        self.st = St::EsperaCv;
         Ok(())
     }
 

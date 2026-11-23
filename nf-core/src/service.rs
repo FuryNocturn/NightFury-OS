@@ -21,7 +21,7 @@ use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
 use crate::keys::{KeyError, Pool};
-use crate::net::{ConnInfo, Datagram, Ipv4, ListenId, NetApi, NetError, NetStatus, PingId, PingReply, Proto, QueryId, SockId, State, TcpState, UdpId, MAX_LISTEN, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, MAX_UDP, TCP_BUF, UDP_MAX};
+use crate::net::{ConnInfo, Datagram, TlsInfo, Ipv4, ListenId, NetApi, NetError, NetStatus, PingId, PingReply, Proto, QueryId, SockId, State, TcpState, UdpId, MAX_LISTEN, MAX_PINGS, MAX_QUERIES, MAX_SOCKS, MAX_UDP, TCP_BUF, UDP_MAX};
 use crate::netperm::{self, Kind};
 use crate::platform::{DateTime, MemInfo, Platform};
 use crate::wire::{decode, encode, Bad, Reader, Wire, WireResult, Writer};
@@ -155,6 +155,8 @@ calls! {
     CustomRoots = 85,
     AddRoot { der: Blob } = 86,
     RemoveRoot { sha: [u8; 32] } = 87,
+    NetConnectTls { dst: Ipv4, port: u16, host: String, insecure: bool } = 88,
+    NetTlsInfo { id: SockId } = 89,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -456,6 +458,7 @@ impl Wire for ConnInfo {
             Proto::Tcp => 0,
             Proto::TcpListen => 1,
             Proto::Udp => 2,
+            Proto::Tls => 3,
         };
         w.put(&p).put(&self.id).put(&self.local_port).put(&self.remote);
         w.put(&(CONN_STATES.iter().position(|s| *s == self.state).unwrap_or(5) as u8));
@@ -466,6 +469,7 @@ impl Wire for ConnInfo {
             0 => Proto::Tcp,
             1 => Proto::TcpListen,
             2 => Proto::Udp,
+            3 => Proto::Tls,
             _ => return Err(Bad),
         };
         Ok(ConnInfo {
@@ -549,7 +553,7 @@ impl Wire for NetError {
             Busy => w.put(&9u8),
             Gone => w.put(&10u8),
             BadUrl => w.put(&11u8),
-            HttpsNotYet => w.put(&12u8),
+            Tls(m) => w.put(&17u8).put(m),
             Protocol(t) => w.put(&13u8).put(&(PROTOCOL.iter().position(|p| p == t).map_or(255, |i| i as u8))),
             Denied => w.put(&14u8),
             Pending => w.put(&15u8),
@@ -571,13 +575,23 @@ impl Wire for NetError {
             9 => Busy,
             10 => Gone,
             11 => BadUrl,
-            12 => HttpsNotYet,
+            17 => Tls(r.get()?),
             13 => Protocol(PROTOCOL.get(u8::get(r)? as usize).copied().unwrap_or(PROTOCOL_UNKNOWN)),
             14 => Denied,
             15 => Pending,
             16 => InUse,
             _ => return Err(Bad),
         })
+    }
+}
+
+impl Wire for TlsInfo {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.version).put(&self.suite).put(&self.group).put(&self.subject).put(&self.issuer);
+        w.put(&self.expires.0).put(&self.expires.1).put(&self.expires.2).put(&self.cert_error);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(TlsInfo { version: r.get()?, suite: r.get()?, group: r.get()?, subject: r.get()?, issuer: r.get()?, expires: (r.get()?, r.get()?, r.get()?), cert_error: r.get()? })
     }
 }
 
@@ -725,7 +739,7 @@ impl NetOwn {
 /// lee el estado o trabaja con identificadores que ya abrió con permiso).
 fn needs(call: &Call) -> Option<Kind> {
     match call {
-        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::UdpSend { .. } | Call::UdpBind { port: 0 } => Some(Kind::Out),
+        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetConnectTls { .. } | Call::UdpSend { .. } | Call::UdpBind { port: 0 } => Some(Kind::Out),
         Call::UdpBind { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => Some(Kind::In),
         _ => None,
     }
@@ -740,7 +754,8 @@ fn no_net(call: &Call) -> Vec<u8> {
 fn net_err(call: &Call, e: NetError) -> Vec<u8> {
     match call {
         Call::NetStatus => encode(&no_status()),
-        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
+        Call::NetPing { .. } | Call::NetResolve { .. } | Call::NetConnect { .. } | Call::NetConnectTls { .. } | Call::NetSend { .. } | Call::NetRecv { .. } => encode(&Err::<u8, _>(e)),
+        Call::NetTlsInfo { .. } => encode(&None::<TlsInfo>),
         Call::UdpBind { .. } | Call::UdpSend { .. } | Call::UdpRecv { .. } | Call::TcpListen { .. } | Call::TcpAccept { .. } => encode(&Err::<u8, _>(e)),
         Call::NetConnections => encode(&Vec::<ConnInfo>::new()),
         Call::NetPingPoll { .. } | Call::NetResolvePoll { .. } => encode(&Some(Err::<u8, _>(e))),
@@ -751,6 +766,13 @@ fn net_err(call: &Call, e: NetError) -> Vec<u8> {
 
 fn no_status() -> NetStatus {
     NetStatus { state: State::NoAdapter, adapter: String::new(), mac: [0; 6], speed_mbps: 0, full_duplex: false, ip: None, mask: None, gateway: None, dns: Vec::new(), dhcp_server: None, lease_s: 0, lease_since_ms: 0 }
+}
+
+/// La hora del equipo como la quiere `x509`. shortcut: el reloj (RTC) va en hora local y aquí se toma como
+/// UTC; el desfase (como mucho unas horas) solo importa con un certificado que nace o caduca ese mismo día.
+/// Mejorar cuando el sistema conozca su zona horaria.
+pub(crate) fn hora_x509(d: DateTime) -> crate::x509::Time {
+    crate::x509::Time { year: d.year, month: d.month, day: d.day, hour: d.hour, min: d.minute, sec: d.second }
 }
 
 // ---------- Lado del sistema ----------
@@ -966,7 +988,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
             let now = sys.now();
             gate(system, Err(denied), || sys.files().remove_root(sha, now))
         }
-        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
+        NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetConnectTls { .. } | NetTlsInfo { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             if !system {
                 if own.id.is_none() {
@@ -984,12 +1006,14 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
                     }
                 }
             }
+            // Raíces de confianza y hora UTC para validar el certificado (solo si se va a abrir una conexión segura).
+            let tls_env = matches!(call, NetConnectTls { .. }).then(|| (sys.files().root_store(), hora_x509(sys.now())));
             match sys.net() {
                 // `renew` cambia la red de todo el equipo: solo el sistema. La MAC identifica el equipo:
                 // un programa de terceros no la ve.
                 Some(_) if !system && matches!(call, NetRenew) => encode(&()),
                 Some(net) if !system && matches!(call, NetStatus) => encode(&crate::net::NetStatus { mac: [0; 6], ..net.status() }),
-                Some(net) => net_run(net, call, own, system),
+                Some(net) => net_run(net, call, own, system, tls_env),
                 None => no_net(&call),
             }
         }
@@ -998,7 +1022,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
 
 /// Las llamadas de red, con la pila ya a mano. Cada programa solo toca los identificadores que
 /// abrió él; uno ajeno es uno que «ya no existe».
-fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool) -> Vec<u8> {
+fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool, tls_env: Option<(alloc::sync::Arc<crate::x509::RootStore>, crate::x509::Time)>) -> Vec<u8> {
     use Call::*;
     match call {
         NetStatus => encode(&net.status()),
@@ -1061,6 +1085,30 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool) -> 
             }
             encode(&r)
         }
+        NetConnectTls { dst, port, host, insecure } => {
+            if own.socks.len() >= MAX_SOCKS {
+                own.socks.retain(|&s| net.tcp_state(s) != TcpState::Failed(NetError::Gone));
+            }
+            // El nombre acaba en el SNI y en la comprobación del certificado: solo un nombre DNS razonable.
+            let host_ok = !host.is_empty() && host.len() <= NET_NAME_MAX && host.bytes().all(|c| c.is_ascii_alphanumeric() || b"-._".contains(&c));
+            let r = if !host_ok {
+                Err(NetError::BadUrl)
+            } else if own.socks.len() >= MAX_SOCKS {
+                Err(NetError::Busy)
+            } else {
+                if let Some((roots, now)) = tls_env {
+                    net.set_tls_env(roots, now);
+                }
+                // Un programa de terceros nunca puede saltarse la comprobación.
+                net.tcp_connect_tls(dst, port, &host, insecure && system)
+            };
+            if let Ok(id) = r {
+                own.socks.push(id);
+                net.set_owner(Proto::Tls, id.0, own.pid);
+            }
+            encode(&r)
+        }
+        NetTlsInfo { id } => encode(&if own.socks.contains(&id) { net.tcp_tls_info(id) } else { None }),
         NetState { id } => encode(&if own.socks.contains(&id) { net.tcp_state(id) } else { TcpState::Failed(NetError::Gone) }),
         NetSend { id, data } => {
             let n = data.0.len().min(NET_CHUNK);
@@ -1153,7 +1201,7 @@ fn net_run(net: &mut dyn NetApi, call: Call, own: &mut NetOwn, system: bool) -> 
         NetConnections if system => encode(&net.connections()),
         NetConnections => {
             let mine = |c: &ConnInfo| match c.proto {
-                Proto::Tcp => own.socks.contains(&SockId(c.id)),
+                Proto::Tcp | Proto::Tls => own.socks.contains(&SockId(c.id)),
                 Proto::Udp => own.udps.contains(&UdpId(c.id)),
                 Proto::TcpListen => own.listens.contains(&ListenId(c.id)),
             };
@@ -1448,6 +1496,12 @@ impl<T: Transport> NetApi for RemoteNet<T> {
     }
     fn tcp_abort(&mut self, id: SockId) {
         ask(&mut self.0, Call::NetAbort { id }, ())
+    }
+    fn tcp_connect_tls(&mut self, dst: Ipv4, port: u16, host: &str, insecure: bool) -> Result<SockId, NetError> {
+        self.net(Call::NetConnectTls { dst, port, host: s(host), insecure })
+    }
+    fn tcp_tls_info(&mut self, id: SockId) -> Option<TlsInfo> {
+        ask(&mut self.0, Call::NetTlsInfo { id }, None)
     }
     fn udp_bind(&mut self, port: u16) -> Result<UdpId, NetError> {
         self.net(Call::UdpBind { port })
@@ -1980,6 +2034,43 @@ pub(crate) mod tests {
         assert_eq!(p.net.tcp_connect(SRV, 80), Err(NetError::Denied));
     }
 
+    /// Conexión segura (TLS) de un programa de terceros: mismo permiso que `NetConnect`, nunca `insecure`.
+    #[test]
+    fn red_conexion_segura_permiso_y_sin_insecure() {
+        let (real, mut p, mut lan) = con_lan(false);
+        lan.router.names.push((s("prueba.nf"), vec![SRV], 300));
+        // Certificado que no vale para «prueba.nf» (raíz de prueba que no está en el almacén).
+        lan.router.srv.listen_any(443, include_bytes!("tls/testdata/vuelo_otro_host.bin"));
+        real.borrow_mut().net.as_mut().unwrap().set_tls_fijo([7; 32], [9; 32], [5; 32]);
+        // Sin identidad no hay red; con ella, el aviso de siempre antes de nada.
+        assert_eq!(p.net.tcp_connect_tls(SRV, 443, "prueba.nf", false), Err(NetError::NoAdapter));
+        p.own.borrow_mut().set_program([7; 32], "Navegador");
+        assert_eq!(p.net.tcp_connect_tls(SRV, 443, "prueba.nf", true), Err(NetError::Pending));
+        assert_eq!(p.own.borrow_mut().prompt(), Some((Kind::Out, s("Navegador"))));
+        // Otro programa al que se le dice que no.
+        let mut d = otro(&real, false);
+        d.0.own.borrow_mut().set_program([8; 32], "Otro");
+        assert_eq!(d.tcp_connect_tls(SRV, 443, "prueba.nf", false), Err(NetError::Pending));
+        d.0.own.borrow_mut().answered(&mut *real.borrow_mut(), false);
+        assert_eq!(d.tcp_connect_tls(SRV, 443, "prueba.nf", false), Err(NetError::Denied));
+        p.own.borrow_mut().answered(&mut *real.borrow_mut(), true);
+        assert_eq!(p.net.tcp_connect_tls(SRV, 443, "a b", false), Err(NetError::BadUrl));
+        // Pide `insecure`: se ignora y el certificado malo se niega, con el motivo legible.
+        let sk = p.net.tcp_connect_tls(SRV, 443, "prueba.nf", true).unwrap();
+        corre(&real, &mut lan, 400);
+        assert!(matches!(p.net.tcp_state(sk), TcpState::Failed(NetError::Tls(m)) if m.starts_with("El certificado")));
+        assert_eq!(p.net.tcp_tls_info(sk), None);
+        // Un programa del sistema sí puede (curl -k): conecta y deja ver por qué no era de fiar.
+        let mut c = otro(&real, true);
+        let sk = c.tcp_connect_tls(SRV, 443, "prueba.nf", true).unwrap();
+        corre(&real, &mut lan, 400);
+        assert_ne!(c.tcp_state(sk), TcpState::Connecting);
+        assert!(c.tcp_tls_info(sk).is_some_and(|i| i.cert_error.is_some()));
+        // Lo de otro programa no se ve.
+        assert_eq!(p.net.tcp_tls_info(sk), None);
+        assert!(p.net.tcp_send(sk, b"x").is_err());
+    }
+
     #[test]
     fn red_un_programa_no_toca_lo_de_otro() {
         let (real, mut a, mut lan) = con_lan(true);
@@ -2051,6 +2142,8 @@ pub(crate) mod tests {
             Call::NetRecv { id: SockId(1), max: u32::MAX },
             Call::NetClose { id: SockId(1) },
             Call::NetAbort { id: SockId(1) },
+            Call::NetConnectTls { dst: SRV, port: 443, host: s("prueba.nf"), insecure: false },
+            Call::NetTlsInfo { id: SockId(1) },
         ];
         for c in &calls {
             let bytes = encode(c);
@@ -2067,7 +2160,7 @@ pub(crate) mod tests {
         // Tipos.
         let st = NetStatus { dns: vec![[1, 1, 1, 1], [8, 8, 8, 8]], ip: Some([10, 0, 0, 2]), adapter: s("Ñ"), mac: [1, 2, 3, 4, 5, 6], ..no_status() };
         assert_eq!(decode::<NetStatus>(&encode(&st)), Ok(st));
-        for e in [NetError::NoAdapter, NetError::Unreachable([1, 2, 3, 4]), NetError::TtlExpired([5, 6, 7, 8]), NetError::Busy, NetError::HttpsNotYet, NetError::Protocol("sin servidor DNS")] {
+        for e in [NetError::NoAdapter, NetError::Unreachable([1, 2, 3, 4]), NetError::TtlExpired([5, 6, 7, 8]), NetError::Busy, NetError::Tls(String::from("El certificado ha caducado.")), NetError::Protocol("sin servidor DNS")] {
             assert_eq!(decode::<NetError>(&encode(&e)), Ok(e));
         }
         assert_eq!(decode::<NetError>(&encode(&NetError::Protocol("texto que no existe"))), Ok(NetError::Protocol(PROTOCOL_UNKNOWN)));
@@ -2075,6 +2168,8 @@ pub(crate) mod tests {
         assert!(decode::<NetError>(&[99]).is_err() && decode::<TcpState>(&[9]).is_err() && decode::<State>(&[9]).is_err());
         let t = TcpState::Failed(NetError::Reset);
         assert_eq!(decode::<TcpState>(&encode(&t)), Ok(t));
+        let i = TlsInfo { version: s("TLS 1.3"), suite: s("TLS_AES_128_GCM_SHA256"), group: s("x25519"), subject: s("ñ (O)"), issuer: s("R"), expires: (2050, 1, 1), cert_error: Some(s("mal")) };
+        assert_eq!(decode::<TlsInfo>(&encode(&i)), Ok(i));
         let r = PingReply { from: SRV, bytes: 32, rtt_ms: 7, ttl: 60 };
         assert_eq!(decode::<PingReply>(&encode(&r)), Ok(r));
         // Respuestas rotas al otro lado: no hay tarjeta.
