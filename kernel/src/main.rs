@@ -127,6 +127,24 @@ const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[
     ),
 ];
 
+/// Fuentes que trae el sistema (v0.12.4; Liberation, licencia OFL 1.1 en LICENSE), en `C:\Sistema\fuentes`.
+const FUENTES_SISTEMA: &[(&str, &[u8])] = &[
+    ("LiberationSans-Regular.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSans-Regular.ttf")),
+    ("LiberationSans-Bold.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSans-Bold.ttf")),
+    ("LiberationSans-Italic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSans-Italic.ttf")),
+    ("LiberationSans-BoldItalic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSans-BoldItalic.ttf")),
+    ("LiberationSerif-Regular.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSerif-Regular.ttf")),
+    ("LiberationSerif-Bold.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSerif-Bold.ttf")),
+    ("LiberationSerif-Italic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSerif-Italic.ttf")),
+    ("LiberationSerif-BoldItalic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationSerif-BoldItalic.ttf")),
+    ("LiberationMono-Regular.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationMono-Regular.ttf")),
+    ("LiberationMono-Bold.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationMono-Bold.ttf")),
+    ("LiberationMono-Italic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationMono-Italic.ttf")),
+    ("LiberationMono-BoldItalic.ttf", include_bytes!("../../nf-core/data/fuentes/LiberationMono-BoldItalic.ttf")),
+    ("LICENSE", include_bytes!("../../nf-core/data/fuentes/LICENSE")),
+    ("AUTHORS", include_bytes!("../../nf-core/data/fuentes/AUTHORS")),
+];
+
 #[global_allocator]
 static ASIGNADOR: Asignador = Asignador;
 
@@ -398,6 +416,9 @@ extern "C" fn kmain() -> ! {
                 if let Err(e) = plat.files.install_system_program(dir, items, now) {
                     traza!("NF programas: no se pudo instalar {}: {:?}", dir, e);
                 }
+            }
+            if let Err(e) = plat.files.install_system_files("fuentes", FUENTES_SISTEMA, now) {
+                traza!("NF fuentes: no se pudieron instalar: {:?}", e);
             }
         }
         while let Some(b) = ps2::TECLADO.pop() {

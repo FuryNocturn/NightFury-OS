@@ -1474,6 +1474,25 @@ impl Files {
         }
         Ok(changed)
     }
+
+    /// Instala (o actualiza) ficheros que trae el sistema en `C:\Sistema\<sub>` (v0.12.4: las fuentes).
+    /// Solo escribe los que cambian. Devuelve si cambió alguno.
+    pub fn install_system_files(&mut self, sub: &str, items: &[(&str, &[u8])], now: DateTime) -> Result<bool, FsError> {
+        if sub.is_empty() || sub.contains(['\\', '/', ':']) || sub.starts_with('.') {
+            return Err(FsError::Invalid);
+        }
+        let dir = join_rel(SYSTEM, sub);
+        mk(&mut self.fs, &dir, now);
+        let mut changed = false;
+        for (name, data) in items {
+            let p = join_rel(&dir, name);
+            if self.fs.read(&p).ok().as_deref() != Some(*data) {
+                self.fs.write(&p, data, now)?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
 }
 
 // ---- Permisos, registro, arranque y migración (internos salvo `log`) ----
@@ -4294,6 +4313,12 @@ mod tests {
         assert_eq!(f.mkdir("C:\\Programas\\Malo", d(3)), Err(FsError::Denied));
         assert_eq!(f.delete("C:\\Programas\\Calc\\app.txt"), Err(FsError::Denied));
         assert!(f.user_trash("C:\\Programas", d(3)).is_err());
+        // Ficheros del sistema (fuentes): se instalan con sesión normal, se leen, no se tocan, y solo se reescriben si cambian.
+        assert_eq!(f.install_system_files("fuentes", &[("a.ttf", b"A")], d(3)), Ok(true));
+        assert_eq!(f.install_system_files("fuentes", &[("a.ttf", b"A")], d(3)), Ok(false));
+        assert_eq!(f.read("C:\\Sistema\\fuentes\\a.ttf").as_deref(), Ok(&b"A"[..]));
+        assert_eq!(f.write("C:\\Sistema\\fuentes\\a.ttf", b"x", d(3)), Err(FsError::Denied));
+        assert_eq!(f.install_system_files("..\\config", &[], d(3)), Err(FsError::Invalid));
         // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
         f.login("Ana", "").unwrap();
         assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Denied));
