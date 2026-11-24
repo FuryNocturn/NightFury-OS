@@ -10,12 +10,14 @@ extern crate alloc;
 mod campo;
 mod cookies;
 mod datos;
+mod descargas;
 mod dibujo;
 mod entrada;
 mod fuentes;
 mod internas;
 mod paginas;
 mod pestana;
+mod red;
 #[cfg(test)]
 mod pruebas;
 
@@ -39,7 +41,9 @@ use nf_core::scrollbar::{Metrics, ScrollBar, SB_W};
 use nf_core::surface::Surface;
 use nf_core::theme::Theme;
 use nf_web::{Efecto, Envio, Familia, Fuentes, Letra, Metodo, Tecla};
+use descargas::Estado;
 use pestana::{ajustar_imagen, Pestana, Seguridad, Vista, MARGEN_IMG};
+use red::{Red, RedRc};
 
 const TAB_H: i32 = 36;
 const TOOL_H: i32 = 42;
@@ -73,8 +77,13 @@ const M_HIST: u32 = 3;
 const M_FAVS: u32 = 4;
 const M_BARRA: u32 = 5;
 const M_ESTRELLA: u32 = 6;
+const M_DESC: u32 = 7;
 const URL_HISTORIAL: &str = "nightfury://historial";
 const URL_FAVORITOS: &str = "nightfury://favoritos";
+const URL_DESCARGAS: &str = "nightfury://descargas";
+/// Barra de descargas de abajo: su alto y el ancho de cada tarjeta.
+const DESC_H: i32 = 84;
+const DESC_W: i32 = 320;
 /// Lo que se abre para pedir una ventana de incógnito: el escritorio lo entrega a este programa (`abre=nfinc` en
 /// su `app.txt`) y `open_path` lo reconoce. El fichero no existe ni hace falta que exista.
 const MARCA_INCOGNITO: &str = "AppData\\Navegador\\incognito.nfinc";
@@ -150,6 +159,14 @@ enum Hit {
     FavMas,
     /// Sugerencia de la barra de direcciones.
     Sug(usize),
+    /// El candado (o «No seguro») de la barra de direcciones.
+    Candado,
+    /// Barra de descargas: «Abrir», «Mostrar en carpeta», «Cancelar» de una tarjeta (id), la × y el resto.
+    DescAbrir(u32),
+    DescCarpeta(u32),
+    DescCancelar(u32),
+    DescCerrar,
+    Descargas,
     Pagina,
 }
 
@@ -183,6 +200,32 @@ fn rect_estrella(o: Rect) -> Rect {
 fn rect_sug(i: usize, w: i32) -> Rect {
     let o = rect_omnibox(w);
     Rect::new(o.x, o.bottom() + 6 + i as i32 * SUG_H, o.w, SUG_H)
+}
+/// Zona del candado dentro de la barra de direcciones (según lleve o no el rótulo «No seguro»).
+fn rect_candado(o: Rect, seg: Seguridad) -> Rect {
+    let w = if seg == Seguridad::NoSegura { 34 + font::width("No seguro", TS, false) + 4 } else { 30 };
+    Rect::new(o.x + 8, o.y + 2, w, o.h - 4)
+}
+/// Panel del candado, bajo la barra de direcciones, y sus controles.
+fn rect_panel(o: Rect) -> Rect {
+    Rect::new(o.x, o.bottom() + 6, 340, 188)
+}
+fn rect_recordar(p: Rect) -> Rect {
+    Rect::new(p.x + 16, p.y + 92, p.w - 32, 22)
+}
+fn rect_borrar_cookies(p: Rect) -> Rect {
+    Rect::new(p.x + 16, p.bottom() - 46, 250, 30)
+}
+/// Tarjeta `i` de la barra de descargas.
+fn rect_tarjeta(i: usize, h: i32) -> Rect {
+    Rect::new(8 + i as i32 * (DESC_W + 8), h - DESC_H + 6, DESC_W, DESC_H - 12)
+}
+/// Tarjetas que caben en la barra (la × ocupa el extremo derecho).
+fn tarjetas_caben(w: i32) -> usize {
+    (((w - 8 - 44) / (DESC_W + 8)).max(1)) as usize
+}
+fn rect_cerrar_descargas(w: i32, h: i32) -> Rect {
+    Rect::new(w - 36, h - DESC_H + (DESC_H - 28) / 2, 28, 28)
 }
 /// Caja de búsqueda de la página de inicio.
 fn rect_caja(p: Rect) -> Rect {
@@ -223,6 +266,10 @@ pub struct Navegador {
     barra_fav: Option<bool>,
     /// Acceso de la pestaña nueva bajo el ratón (id del favorito).
     hover_acceso: Option<u32>,
+    /// Cookies y descargas de la ventana (las comparten las pestañas).
+    red: RedRc,
+    /// Panel del candado abierto.
+    candado: bool,
 }
 
 /// App lista para `nf_app::programa!`.
@@ -239,8 +286,11 @@ fn con_clip(s: &mut Surface, r: Rect, f: impl FnOnce(&mut Surface)) {
 
 impl Navegador {
     fn nuevo() -> Navegador {
+        let red = Red::nueva();
         Navegador {
-            pest: alloc::vec![Pestana::nueva(0)],
+            pest: alloc::vec![Pestana::nueva(0, red.clone())],
+            red,
+            candado: false,
             act: 0,
             sig_id: 1,
             barra: Campo::default(),
@@ -283,18 +333,25 @@ impl Navegador {
         if !self.datos.cargado {
             let ahora = hora::segundos(sys.now());
             self.datos.cargar(sys.fs(), ahora, self.reloj);
+            // Las cookies guardadas (nada en incógnito): se leen y se quitan las caducadas.
+            let mut r = self.red.borrow_mut();
+            let utc = r.ahora_utc(sys);
+            r.cargar(sys.fs(), utc);
         }
     }
 
-    /// Escribe lo pendiente (todo, con `forzar`).
+    /// Escribe lo pendiente (todo, con `forzar`): historial, favoritos y las cookies de sitios en favoritos o recordados.
     fn guardar_datos(&mut self, sys: &mut dyn Platform, ms: u64, forzar: bool) {
         let now = sys.now();
         self.datos.guardar(sys.fs(), ms, now, forzar);
+        let favs = &self.datos.favs;
+        self.red.borrow_mut().guardar(sys.fs(), ms, now, forzar, |d| favs.es_sitio(d));
     }
 
-    /// Esta ventana pasa a ser de incógnito: nada del historial se queda ni se escribe.
+    /// Esta ventana pasa a ser de incógnito: nada del historial ni de las cookies se queda ni se escribe.
     fn poner_incognito(&mut self) {
         self.incognito = true;
+        self.red.borrow_mut().incognito = true;
         self.datos.incog = true;
         self.datos.hist = datos::Historial::default();
         self.sug.clear();
@@ -308,7 +365,8 @@ impl Navegador {
         let ahora = hora::segundos(sys.now());
         for t in self.pest.iter_mut() {
             if let Some(u) = t.interna.take() {
-                t.servir_interna(&u, &internas::pagina(&self.datos, &u, ahora));
+                let html = if internas::ruta(&u) == "descargas" { internas::descargas(&self.red.borrow().descargas) } else { internas::pagina(&self.datos, &u, ahora) };
+                t.servir_interna(&u, &html);
             }
         }
     }
@@ -324,7 +382,78 @@ impl Navegador {
 
     fn pagina(&self) -> Rect {
         let y = self.y_pagina();
-        Rect::new(0, y, self.size.0, (self.size.1 - y).max(1))
+        let barra = if self.barra_descargas() { DESC_H } else { 0 };
+        Rect::new(0, y, self.size.0, (self.size.1 - y - barra).max(1))
+    }
+
+    /// Hay tarjetas que enseñar en la barra de descargas (y no la han cerrado).
+    fn barra_descargas(&self) -> bool {
+        let r = self.red.borrow();
+        r.descargas.barra && r.descargas.items.iter().any(|i| i.estado != Estado::Pregunta)
+    }
+
+    /// Descargas de la barra, la más reciente primero (las que ya se han aceptado).
+    fn tarjetas(&self) -> Vec<u32> {
+        let r = self.red.borrow();
+        r.descargas.items.iter().rev().filter(|i| i.estado != Estado::Pregunta).take(tarjetas_caben(self.size.0)).map(|i| i.id).collect()
+    }
+
+    /// Lo que se puede pulsar en una tarjeta: rótulo, zona y qué hace.
+    fn acciones(&self, t: Rect, id: u32) -> Vec<(&'static str, Rect, Hit)> {
+        let r = self.red.borrow();
+        let Some(it) = r.descargas.items.iter().find(|i| i.id == id) else { return Vec::new() };
+        let lista: Vec<(&'static str, Hit)> = match it.estado {
+            Estado::Bajando => alloc::vec![("Cancelar", Hit::DescCancelar(id))],
+            Estado::Hecha => alloc::vec![("Abrir", Hit::DescAbrir(id)), ("Mostrar en carpeta", Hit::DescCarpeta(id))],
+            _ => Vec::new(),
+        };
+        let mut x = t.x + 10;
+        lista
+            .into_iter()
+            .map(|(txt, h)| {
+                let w = font::width(txt, TS_S, false) + 12;
+                let r = Rect::new(x, t.bottom() - 24, w, 20);
+                x += w + 6;
+                (txt, r, h)
+            })
+            .collect()
+    }
+
+    /// Dónde está la pregunta «¿Descargar…?» (arriba de la página, bajo el aviso rojo si lo hay).
+    fn rect_pregunta(&self) -> Option<Rect> {
+        self.red.borrow().descargas.pregunta()?;
+        let p = self.pagina();
+        Some(Rect::new(p.x, p.y + if self.aviso.is_some() { AVISO_H } else { 0 }, p.w - SB_W, AVISO_H))
+    }
+
+    /// Clic dentro del panel del candado: «Recordar sesión» o «Borrar cookies de este sitio».
+    fn clic_panel(&mut self, x: i32, y: i32, p: Rect, cx: &mut Ctx) {
+        let Some(h) = host(self.pest[self.act].url_visible()) else { return };
+        let mut r = self.red.borrow_mut();
+        if rect_recordar(p).contains(x, y) {
+            r.alternar_recordar(&h, cx.now_ms);
+        } else if rect_borrar_cookies(p).contains(x, y) {
+            r.borrar_sitio(&h, cx.now_ms);
+        }
+    }
+
+    /// Los botones de las tarjetas de la barra de descargas.
+    fn accion_descarga(&mut self, h: Hit, cx: &mut Ctx) {
+        let mut r = self.red.borrow_mut();
+        let ruta = |r: &Red, id: u32| r.descargas.items.iter().find(|i| i.id == id).map(|i| i.ruta.clone()).unwrap_or_default();
+        match h {
+            Hit::DescAbrir(id) => cx.open = Some(ruta(&r, id)).filter(|p| !p.is_empty()),
+            // La carpeta de Descargas (la del archivo) se abre en el Explorador.
+            Hit::DescCarpeta(id) => cx.open = ruta(&r, id).rsplit_once('\\').map(|(d, _)| String::from(d)),
+            Hit::DescCancelar(id) => r.descargas.cancelar(cx.sys, id),
+            Hit::DescCerrar => r.descargas.barra = false,
+            _ => {}
+        }
+    }
+
+    /// Responde a la pregunta de la descarga.
+    fn responder_descarga(&mut self, si: bool, cx: &mut Ctx) {
+        self.red.borrow_mut().descargas.responder(cx.sys, si);
     }
 
     /// Ancho que ocupan las pestañas (en incógnito, sin el rótulo de la derecha).
@@ -376,6 +505,8 @@ impl Navegador {
                 Hit::Menu
             } else if self.estrella_visible() && rect_estrella(rect_omnibox(w)).contains(x, y) {
                 Hit::Estrella
+            } else if self.candado_visible() && rect_candado(rect_omnibox(w), self.pest[self.act].seguridad()).contains(x, y) {
+                Hit::Candado
             } else if rect_omnibox(w).contains(x, y) {
                 Hit::Barra
             } else {
@@ -386,7 +517,23 @@ impl Navegador {
             let (items, mas) = self.items_fav();
             return items.iter().find(|(r, _)| r.contains(x, y)).map(|&(_, id)| Hit::Fav(id)).or_else(|| mas.filter(|r| r.contains(x, y)).map(|_| Hit::FavMas)).unwrap_or(Hit::Nada);
         }
+        if self.barra_descargas() && y >= self.size.1 - DESC_H {
+            if rect_cerrar_descargas(w, self.size.1).contains(x, y) {
+                return Hit::DescCerrar;
+            }
+            for (i, id) in self.tarjetas().into_iter().enumerate() {
+                if let Some((_, _, h)) = self.acciones(rect_tarjeta(i, self.size.1), id).into_iter().find(|(_, r, _)| r.contains(x, y)) {
+                    return h;
+                }
+            }
+            return Hit::Descargas;
+        }
         Hit::Pagina
+    }
+
+    /// El candado (o «No seguro») se puede pulsar: la página es http o https y no se está editando la dirección.
+    fn candado_visible(&self) -> bool {
+        self.foco != Foco::Barra && matches!(self.pest[self.act].seguridad(), Seguridad::Segura | Seguridad::NoSegura)
     }
 
     // ------------------------------------------------------------ favoritos
@@ -471,6 +618,8 @@ impl Navegador {
             }
         }
         self.datos.cambio_favoritos(cx.now_ms);
+        // Los sitios en favoritos conservan la sesión: las cookies se vuelven a escribir.
+        self.red.borrow_mut().cambio_cookies(cx.now_ms);
     }
 
     // ------------------------------------------------------------ páginas internas e incógnito
@@ -492,7 +641,18 @@ impl Navegador {
         self.enlace = None;
         self.foco = Foco::Pagina;
         let a = self.act;
-        match internas::aplicar(&mut self.datos, url, ahora, cx.now_ms) {
+        let hecho = internas::aplicar(&mut self.datos, url, ahora, cx.now_ms);
+        if hecho.is_some() {
+            // «También las cookies» vacía el tarro; otras acciones (favoritos) cambian qué sitios se recuerdan.
+            let todas = core::mem::take(&mut self.datos.borrar_cookies);
+            let mut r = self.red.borrow_mut();
+            if todas {
+                r.borrar_todo(cx.now_ms);
+            } else {
+                r.cambio_cookies(cx.now_ms);
+            }
+        }
+        match hecho {
             Some(destino) => self.pest[a].reemplazar(cx.sys, &destino, cx.now_ms),
             None => self.pest[a].ir(cx.sys, Entrada::Web(String::from(url)), cx.now_ms),
         }
@@ -511,6 +671,7 @@ impl Navegador {
             MenuItem::new(M_INCOG, "Nueva ventana de incógnito").shortcut("Ctrl+Mayús+N"),
             MenuItem::sep(),
             MenuItem::new(M_HIST, "Historial").shortcut("Ctrl+H"),
+            MenuItem::new(M_DESC, "Descargas").shortcut("Ctrl+J"),
             MenuItem::new(M_FAVS, "Administrar favoritos").shortcut("Ctrl+Mayús+O"),
             MenuItem::new(M_BARRA, "Barra de favoritos").shortcut("Ctrl+Mayús+B").checked(barra),
             MenuItem::new(M_ESTRELLA, if self.es_favorita() { "Quitar de favoritos" } else { "Añadir a favoritos" }).shortcut("Ctrl+D").disabled(!self.estrella_visible()),
@@ -534,14 +695,19 @@ impl Navegador {
     // ------------------------------------------------------------ pestañas
 
     fn nueva(&mut self, sys: &mut dyn Platform, e: Option<Entrada>, activar: bool, junto: bool, ahora: u64) {
+        self.nueva_desde(sys, e, activar, junto, ahora, None);
+    }
+
+    /// Como `nueva`; `ini` es la página desde la que se abre (un enlace con Ctrl+clic), para las cookies.
+    fn nueva_desde(&mut self, sys: &mut dyn Platform, e: Option<Entrada>, activar: bool, junto: bool, ahora: u64, ini: Option<String>) {
         if self.pest.len() >= MAX_PESTANAS {
             return;
         }
         let pos = if junto { self.act + 1 } else { self.pest.len() };
-        self.pest.insert(pos, Pestana::nueva(self.sig_id));
+        self.pest.insert(pos, Pestana::nueva(self.sig_id, self.red.clone()));
         self.sig_id += 1;
         if let Some(e) = e {
-            self.pest[pos].ir(sys, e, ahora);
+            self.pest[pos].ir_desde(sys, e, ahora, ini, false);
         }
         if activar {
             self.activar(pos);
@@ -570,7 +736,7 @@ impl Navegador {
             // Cerrar la última pestaña cierra la ventana.
             cx.close = true;
             self.guardar_datos(cx.sys, cx.now_ms, true);
-            self.pest.push(Pestana::nueva(self.sig_id));
+            self.pest.push(Pestana::nueva(self.sig_id, self.red.clone()));
             self.sig_id += 1;
             self.act = 0;
         } else if i < self.act {
@@ -623,11 +789,14 @@ impl Navegador {
         }
         let e = if t.local { local_de_url(sin).map(Entrada::Local).unwrap_or_else(|| Entrada::Web(String::from(url))) } else { Entrada::Web(String::from(url)) };
         let local = matches!(e, Entrada::Local(_));
-        if nueva {
-            self.nueva(cx.sys, Some(e), false, true, cx.now_ms);
+        // Desde qué página se pide (para las cookies y la red local) y si el enlace pide descargar (`download`).
+        let ini = (!t.base.is_empty()).then(|| t.base.clone());
+        let forzar = matches!(&t.vista, Vista::Documento(d) if d.es_descarga(url));
+        if nueva && !forzar {
+            self.nueva_desde(cx.sys, Some(e), false, true, cx.now_ms, ini);
             return;
         }
-        self.pest[self.act].ir(cx.sys, e, cx.now_ms);
+        self.pest[self.act].ir_desde(cx.sys, e, cx.now_ms, ini, forzar);
         if local {
             self.pest[self.act].ancla = frag.filter(|f| !f.is_empty()).map(String::from);
         }
@@ -1063,6 +1232,110 @@ impl Navegador {
         favs.into_iter().enumerate().map(|(i, f)| (Rect::new(x0 + (i % cols) as i32 * 112, y0 + (i / cols) as i32 * 82, 108, 76), f)).collect()
     }
 
+    /// La pregunta «¿Descargar…?» arriba de la página.
+    fn dibujar_pregunta(&self, s: &mut Surface) {
+        let red = self.red.borrow();
+        let (Some(r), Some(it)) = (self.rect_pregunta(), red.descargas.pregunta()) else { return };
+        let (l1, l2) = it.pregunta();
+        let programa = it.es_programa();
+        let (fondo, linea) = if programa { (0xFCE8E6, ROJO) } else { (0xE8F0FE, 0x1A73E8) };
+        s.fill_rect(r, fondo);
+        s.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), linea);
+        let ancho = (rect_aviso_si(r).x - r.x - 24).max(0);
+        font::draw(s, r.x + 14, r.y + 8, &dialogs::fit(&l1, TS, ancho), TS, true, TINTA);
+        font::draw(s, r.x + 14, r.y + 8 + font::line_h(TS) + 2, &dialogs::fit(l2.unwrap_or("Se guardará en la carpeta Descargas."), TS_S, ancho), TS_S, false, if programa { ROJO } else { TINTA });
+        for (b, t, tinta, fondo) in [(rect_aviso_si(r), "Descargar", 0xFFFFFF, linea), (rect_aviso_no(r), "Cancelar", TINTA, 0xFFFFFF)] {
+            capsula(s, b, if fondo == 0xFFFFFF { LINEA } else { fondo });
+            capsula(s, b.inflate(-1), fondo);
+            font::draw_in(s, b, t, TS, false, tinta, font::Align::Center);
+        }
+    }
+
+    /// Barra de descargas de abajo: una tarjeta por descarga, con su progreso y sus botones.
+    fn dibujar_descargas(&self, s: &mut Surface, theme: &Theme) {
+        if !self.barra_descargas() {
+            return;
+        }
+        let (w, h, c) = (self.size.0, self.size.1, paleta(self.incognito));
+        s.fill_rect(Rect::new(0, h - DESC_H, w, DESC_H), c.tira);
+        s.fill_rect(Rect::new(0, h - DESC_H, w, 1), c.linea);
+        let red = self.red.borrow();
+        for (i, id) in self.tarjetas().into_iter().enumerate() {
+            let Some(it) = red.descargas.items.iter().find(|x| x.id == id) else { continue };
+            let t = rect_tarjeta(i, h);
+            caja(s, t, c.linea);
+            caja(s, t.inflate(-1), c.barra);
+            let lh = font::line_h(TS);
+            font::draw(s, t.x + 10, t.y + 6, &dialogs::fit(&it.nombre, TS, t.w - 20), TS, true, c.tinta);
+            let tinta = if matches!(it.estado, Estado::Fallo(_)) { ROJO } else { c.apagado };
+            font::draw(s, t.x + 10, t.y + 6 + lh + 2, &dialogs::fit(&it.texto_estado(), TS_S, t.w - 20), TS_S, false, tinta);
+            if it.estado == Estado::Bajando {
+                let b = Rect::new(t.x + 10, t.y + 6 + lh + 2 + font::line_h(TS_S) + 3, t.w - 20, 4);
+                s.fill_rect(b, c.linea);
+                match it.total.filter(|&n| n > 0) {
+                    Some(n) => s.fill_rect(Rect::new(b.x, b.y, (b.w as u64 * it.recibido.min(n) / n) as i32, b.h), theme.accent),
+                    // Sin tamaño: un trozo que va y viene.
+                    None => s.fill_rect(Rect::new(b.x + (self.reloj / 8 % (b.w - 40).max(1) as u64) as i32, b.y, 40, b.h), theme.accent),
+                }
+            }
+            for (txt, r, hit) in self.acciones(t, id) {
+                if self.hover == hit {
+                    caja(s, r, c.sobre);
+                }
+                font::draw_in(s, r, txt, TS_S, false, theme.accent, font::Align::Center);
+            }
+        }
+        let x = rect_cerrar_descargas(w, h);
+        let (cx, cy) = ((x.x + 14) as f32, (x.y + 14) as f32);
+        if self.hover == Hit::DescCerrar {
+            s.fill_circle(cx, cy, 14.0, c.sobre, 255);
+        }
+        icono(s, Ico::Cerrar, cx, cy, c.apagado);
+    }
+
+    /// Panel del candado: estado de la conexión, «Recordar sesión» y «Borrar cookies de este sitio».
+    fn dibujar_panel(&self, s: &mut Surface, theme: &Theme) {
+        if !self.candado || !self.candado_visible() {
+            return;
+        }
+        let t = &self.pest[self.act];
+        let Some(h) = host(t.url_visible()) else { return };
+        let (c, p, red) = (paleta(self.incognito), rect_panel(rect_omnibox(self.size.0)), self.red.borrow());
+        caja(s, p, c.linea);
+        caja(s, p.inflate(-1), c.barra);
+        font::draw(s, p.x + 16, p.y + 14, &dialogs::fit(&h, TS + 1, p.w - 32), TS + 1, true, c.tinta);
+        let (txt, tinta) = if t.seguridad() == Seguridad::Segura { ("Conexión segura (https).", VERDE) } else { ("Conexión no segura (http): lo que envíes puede leerse por el camino.", ROJO) };
+        let lh = font::line_h(TS_S);
+        let mut y = p.y + 14 + font::line_h(TS + 1) + 6;
+        for l in envolver(txt, TS_S, p.w - 32) {
+            font::draw(s, p.x + 16, y, &l, TS_S, false, tinta);
+            y += lh;
+        }
+        let n = red.cuantas(&h);
+        font::draw(s, p.x + 16, y + 6, &if n == 1 { String::from("1 cookie de este sitio") } else { alloc::format!("{n} cookies de este sitio") }, TS_S, false, c.apagado);
+        let r = rect_recordar(p);
+        let caja_r = Rect::new(r.x, r.y + 3, 16, 16);
+        let marcada = red.es_recordado(&h);
+        s.frame(caja_r, if self.incognito { c.inactivo } else { c.apagado });
+        if marcada {
+            s.fill_rect(caja_r.inflate(-3), theme.accent);
+        }
+        let etiqueta = if self.incognito { "Recordar sesión (no en incógnito)" } else { "Recordar sesión en este sitio" };
+        font::draw(s, r.x + 26, r.y + 3, etiqueta, TS, false, if self.incognito { c.inactivo } else { c.tinta });
+        let nota = if self.incognito {
+            "En incógnito las cookies solo viven en esta ventana."
+        } else if self.datos.favs.es_sitio(&h) {
+            "Está en tus favoritos: su sesión ya se recuerda."
+        } else {
+            "Si no, la sesión se pierde al cerrar la ventana."
+        };
+        font::draw(s, r.x + 26, r.y + 3 + font::line_h(TS) + 2, &dialogs::fit(nota, TS_S, p.w - 58), TS_S, false, c.gris);
+        let b = rect_borrar_cookies(p);
+        capsula(s, b, c.linea);
+        capsula(s, b.inflate(-1), c.barra);
+        font::draw_in(s, b, "Borrar cookies de este sitio", TS, false, theme.accent, font::Align::Center);
+    }
+
     fn dibujar_pagina(&mut self, s: &mut Surface, theme: &Theme, focused: bool) {
         let p = self.pagina();
         let w = (p.w - SB_W).max(1);
@@ -1137,10 +1410,13 @@ impl App for Navegador {
         self.pest[a].scroll = self.pest[a].scroll.clamp(0, max);
         s.fill_rect(Rect::new(0, 0, s.w, s.h), 0xFFFFFF);
         self.dibujar_pagina(s, theme, focused);
+        self.dibujar_pregunta(s);
+        self.dibujar_descargas(s, theme);
         self.dibujar_pestanas(s, theme);
         self.dibujar_barra(s, theme);
         self.dibujar_favoritos(s);
         self.dibujar_sugerencias(s, theme);
+        self.dibujar_panel(s, theme);
     }
 
     fn key(&mut self, ev: &KeyEvent, cx: &mut Ctx) {
@@ -1161,6 +1437,7 @@ impl App for Navegador {
                 }
                 Key::Char('o') if ev.shift => return self.abrir_interna(URL_FAVORITOS, cx),
                 Key::Char('h') => return self.abrir_interna(URL_HISTORIAL, cx),
+                Key::Char('j') => return self.abrir_interna(URL_DESCARGAS, cx),
                 Key::Char('d') => return self.alternar_favorito(cx),
                 Key::Char('t') => return self.nueva(cx.sys, None, true, false, ahora),
                 Key::Char('w') => return self.cerrar(a, cx),
@@ -1179,9 +1456,18 @@ impl App for Navegador {
             Key::F(5) => return self.mover(0, cx),
             Key::Left if ev.alt => return self.mover(-1, cx),
             Key::Right if ev.alt => return self.mover(1, cx),
+            // Con la pregunta de una descarga: Alt+Intro descarga y Escape cancela.
+            Key::Enter if ev.alt && self.rect_pregunta().is_some() => return self.responder_descarga(true, cx),
             Key::Escape => {
+                if self.candado {
+                    self.candado = false;
+                    return;
+                }
                 if self.aviso.take().is_some() {
                     return;
+                }
+                if self.rect_pregunta().is_some() {
+                    return self.responder_descarga(false, cx);
                 }
                 if !self.sug.is_empty() {
                     return self.limpiar_sugerencias();
@@ -1274,9 +1560,23 @@ impl App for Navegador {
             if !matches!(self.hit(x, y), Hit::Sug(_) | Hit::Barra) {
                 self.limpiar_sugerencias();
             }
+            // Panel del candado: dentro se atiende; fuera se cierra (y pulsar otra vez el candado solo lo cierra).
+            if self.candado {
+                let p = rect_panel(rect_omnibox(self.size.0));
+                if p.contains(x, y) {
+                    return self.clic_panel(x, y, p, cx);
+                }
+                self.candado = false;
+                if self.hit(x, y) == Hit::Candado {
+                    return;
+                }
+            }
         }
         match ev {
             MouseEv::Down { x, y } => match self.hit(x, y) {
+                Hit::Candado => self.candado = true,
+                h @ (Hit::DescAbrir(_) | Hit::DescCarpeta(_) | Hit::DescCancelar(_) | Hit::DescCerrar) => self.accion_descarga(h, cx),
+                Hit::Descargas => {}
                 Hit::Sug(i) => {
                     if let Some(g) = self.sug.get(i) {
                         let u = g.url.clone();
@@ -1316,6 +1616,14 @@ impl App for Navegador {
                     let m = self.metricas();
                     if m.needed() && !matches!(self.pest[a].vista, Vista::Inicio) && m.rect.contains(x, y) {
                         self.evento_barra(ev, ahora);
+                        return;
+                    }
+                    // La pregunta de una descarga tapa lo que hay debajo.
+                    if let Some(r) = self.rect_pregunta().filter(|r| r.contains(x, y)) {
+                        let si = rect_aviso_si(r).contains(x, y);
+                        if si || rect_aviso_no(r).contains(x, y) {
+                            self.responder_descarga(si, cx);
+                        }
                         return;
                     }
                     self.foco = Foco::Pagina;
@@ -1427,6 +1735,8 @@ impl App for Navegador {
             }
         }
         self.servir_internas(cx.sys);
+        // Las descargas siguen aunque la pestaña haya cambiado de página o se haya cerrado.
+        anima |= self.red.borrow_mut().descargas.tick(cx.sys, ahora);
         self.guardar_datos(cx.sys, ahora, false);
         let m = self.metricas();
         if let Some(p) = self.sb.tick(&m, ahora) {
@@ -1446,6 +1756,7 @@ impl App for Navegador {
             (TAG_MENU, M_NUEVA) => self.nueva(cx.sys, None, true, false, cx.now_ms),
             (TAG_MENU, M_INCOG) => self.nueva_incognito(cx),
             (TAG_MENU, M_HIST) => self.abrir_interna(URL_HISTORIAL, cx),
+            (TAG_MENU, M_DESC) => self.abrir_interna(URL_DESCARGAS, cx),
             (TAG_MENU, M_FAVS) => self.abrir_interna(URL_FAVORITOS, cx),
             (TAG_MENU, M_BARRA) => self.barra_fav = Some(!self.barra_fav_visible()),
             (TAG_MENU, M_ESTRELLA) => self.alternar_favorito(cx),
@@ -1479,6 +1790,8 @@ impl App for Navegador {
         for t in self.pest.iter_mut() {
             t.cancelar(sys);
         }
+        // Cerrar la ventana corta las descargas que sigan en marcha.
+        self.red.borrow_mut().descargas.cortar_todo(sys);
         self.guardar_datos(sys, 0, true);
     }
 }

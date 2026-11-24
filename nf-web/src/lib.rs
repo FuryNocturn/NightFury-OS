@@ -217,6 +217,12 @@ impl Documento {
         self.refresco.as_ref().map(|(s, u)| (*s, u.as_str()))
     }
 
+    /// ¿Algún enlace maquetado con esta URL absoluta lleva el atributo `download`? (Hay que haber maquetado.)
+    pub fn es_descarga(&self, url: &str) -> bool {
+        let Some(r) = &self.res else { return false };
+        r.enlaces.iter().zip(&r.enl_nodo).skip(1).any(|(u, &n)| u == url && self.dom.attr(n as usize, "download").is_some())
+    }
+
     /// La base efectiva (`<base href>` si lo hay).
     pub fn url(&self) -> &str {
         &self.base
