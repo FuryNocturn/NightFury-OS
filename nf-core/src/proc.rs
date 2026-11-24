@@ -773,7 +773,7 @@ impl App for ProcApp {
         let now = sys.uptime_ms();
         if self.sent_theme != Some(*theme) {
             self.sent_theme = Some(*theme);
-            self.post(WireEvent { kind: EV_THEME, a: theme.wallpaper as i32, d: theme.accent, ..Default::default() }, now);
+            self.post(WireEvent { kind: EV_THEME, a: theme.wallpaper as i32, b: theme.letra as i32, d: theme.accent, ..Default::default() }, now);
         }
         if self.sent_size != Some((s.w, s.h)) {
             self.sent_size = Some((s.w, s.h));
@@ -1398,7 +1398,7 @@ pub(crate) mod tests {
             q.push_back(dialogo(7));
             q.push_back(dialogo(8));
             q.push_back(Request::Menu(MenuRequest { tag: 4, x: 1, y: 2, items: vec![] }));
-            q.push_back(Request::SetTheme(Theme { accent: 0x123456, wallpaper: 1 }));
+            q.push_back(Request::SetTheme(Theme { accent: 0x123456, wallpaper: 1, letra: 0 }));
             q.push_back(Request::Open(String::from("C:\\e")));
         }
         let mut cx = Ctx::new(&mut sys, &mut theme, 1);

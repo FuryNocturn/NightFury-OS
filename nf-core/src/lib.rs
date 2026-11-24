@@ -29,6 +29,7 @@ pub mod icons;
 pub mod img;
 pub mod input;
 pub mod keys;
+pub mod letra;
 pub mod login;
 pub mod math;
 pub mod menu;

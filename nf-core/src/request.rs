@@ -229,7 +229,7 @@ mod tests {
             Request::Dialog(DialogRequest::Entropy { tag: 7, title: s("t") }),
             Request::Menu(menu),
             Request::Drag(vec![s("C:\\a"), s("C:\\b")]),
-            Request::SetTheme(Theme { accent: 0x112233, wallpaper: 2 }),
+            Request::SetTheme(Theme { accent: 0x112233, wallpaper: 2, letra: 1 }),
             Request::DragAnswer(true),
             Request::DragSourceAnswer(None),
             Request::DragSourceAnswer(Some(vec![s("C:\\a")])),

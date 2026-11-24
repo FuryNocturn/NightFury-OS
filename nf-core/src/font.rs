@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Tipografía propia de trazos. CONTRATO: estas firmas públicas no cambian.
+//! Letra del sistema. CONTRATO: estas firmas públicas no cambian.
 //! `size` es la altura de las mayúsculas en píxeles (9 = texto normal de interfaz).
 //!
-//! Cada glifo se define como trazos (ver `glyphs.rs`), se ajusta a la rejilla de píxeles
+//! Si hay una fuente TrueType registrada (`set_ttf`, ver `letra`), mide y dibuja con ella, suavizada; lo
+//! que la fuente no tiene, y todo si no hay ninguna, sale con la letra de trazos de abajo. El ancho de un
+//! texto es siempre la suma de `adv` de sus caracteres (sin kerning): `draw`, `width` y los cursores de
+//! los campos de texto cuadran entre sí.
+//!
+//! Letra de trazos: cada glifo se define como trazos (ver `glyphs.rs`), se ajusta a la rejilla de píxeles
 //! (así los trazos rectos de 1 px caen exactamente en una columna o fila), se rasteriza una
 //! sola vez a un mapa de opacidad y queda en caché.
 use crate::geom::Rect;
@@ -11,6 +16,7 @@ use crate::glyphs::{glyph, Glyph, ACCENTS, S, UNKNOWN};
 use crate::math::{ceil, clamp01, cos, floor, iround, seg_dist, sin, PI};
 use crate::surface::{blend, Surface};
 use crate::sync::SpinLock;
+use crate::ttf::{self, Font, Raster, TextCache};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
@@ -74,7 +80,94 @@ fn glyph_of(c: char) -> &'static Glyph {
     parts(c).map_or(&UNKNOWN, |p| p.0)
 }
 
-/// Alto de una línea de texto, en píxeles.
+// ---- TrueType ----
+
+/// Altura de las mayúsculas de Liberation y Arial sobre el em: pasa `size` a píxeles de em.
+const CAP: f32 = 0.69;
+
+fn px(size: u32) -> f32 {
+    size as f32 / CAP
+}
+
+/// Fuentes registradas: sans normal, sans negrita, mono. Su posición es el id en la caché de glifos.
+struct Ttf {
+    fuentes: [Option<Font>; 3],
+    cache: TextCache,
+}
+
+static TTF: SpinLock<Option<Ttf>> = SpinLock::new(None);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fam {
+    Sans,
+    Mono,
+}
+
+impl Ttf {
+    fn nueva(fuentes: [Option<Font>; 3]) -> Ttf {
+        Ttf { fuentes, cache: TextCache::new() }
+    }
+
+    /// Fuente que toca, y si la negrita hay que fabricarla (no hay variante en negrita).
+    fn elegir(&self, fam: Fam, bold: bool) -> Option<(usize, bool)> {
+        let hay = |k: usize| self.fuentes[k].is_some();
+        match fam {
+            Fam::Sans if bold && hay(1) => Some((1, false)),
+            Fam::Sans if hay(0) => Some((0, bold)),
+            Fam::Mono if hay(2) => Some((2, bold)),
+            _ => None,
+        }
+    }
+
+    /// (fuente, negrita sintética, avance en píxeles) de `c`; `None` si la fuente no tiene el carácter.
+    fn glifo(&self, fam: Fam, bold: bool, c: char, size: u32) -> Option<(usize, bool, i32)> {
+        let (k, sint) = self.elegir(fam, bold)?;
+        let f = self.fuentes[k].as_ref()?;
+        let g = f.glyph_index(c);
+        (g != 0).then(|| (k, sint, iround(f.advance(g) as f32 * px(size) / f.units_per_em().max(1) as f32)))
+    }
+
+    /// Dibuja `c` con el lápiz en `x` y devuelve su avance, o `None` si hay que usar los trazos.
+    #[allow(clippy::too_many_arguments)]
+    fn pintar(&mut self, s: &mut Surface, fam: Fam, bold: bool, c: char, sc: &str, size: u32, x: i32, base: i32, color: u32) -> Option<i32> {
+        let (k, sint, a) = self.glifo(fam, bold, c, size)?;
+        let f = self.fuentes[k].as_ref()?;
+        ttf::draw_text(s, &mut self.cache, k as u32, f, x as f32, base as f32, px(size), color, Raster { bold: sint, ..Default::default() }, sc);
+        Some(a)
+    }
+}
+
+/// Registra la TrueType del sistema (`neg`: su negrita; si falta se fabrica). Conserva la mono.
+pub fn set_ttf(sans: Font, neg: Option<Font>) {
+    let mut g = TTF.lock();
+    let mono = g.as_mut().and_then(|t| t.fuentes[2].take());
+    *g = Some(Ttf::nueva([Some(sans), neg, mono]));
+}
+
+/// Registra la TrueType monoespaciada de `draw_mono` (la Terminal).
+pub fn set_mono(mono: Font) {
+    let mut g = TTF.lock();
+    let t = g.get_or_insert_with(|| Ttf::nueva([None, None, None]));
+    t.fuentes[2] = Some(mono);
+    t.cache = TextCache::new();
+}
+
+/// Vuelve a la letra de trazos en todo el sistema.
+pub fn quitar_ttf() {
+    *TTF.lock() = None;
+}
+
+/// ¿Hay una TrueType normal registrada?
+pub fn hay_ttf() -> bool {
+    TTF.lock().as_ref().is_some_and(|t| t.fuentes[0].is_some())
+}
+
+/// ¿Hay una TrueType monoespaciada registrada?
+pub fn hay_mono() -> bool {
+    TTF.lock().as_ref().is_some_and(|t| t.fuentes[2].is_some())
+}
+
+/// Alto de una línea de texto, en píxeles (igual con trazos y con TrueType: los controles cuadran).
 pub fn line_h(size: u32) -> i32 {
     let sc = scale(size);
     iround(1.5 * sc) + size as i32 + 1 + iround(2.2 * sc) + 1
@@ -82,6 +175,20 @@ pub fn line_h(size: u32) -> i32 {
 
 /// Avance horizontal de un carácter, en píxeles.
 pub fn adv(c: char, size: u32, bold: bool) -> i32 {
+    adv_fam(c, size, bold, Fam::Sans)
+}
+
+/// Como `adv`, con la letra monoespaciada.
+pub fn adv_mono(c: char, size: u32) -> i32 {
+    adv_fam(c, size, false, Fam::Mono)
+}
+
+fn adv_fam(c: char, size: u32, bold: bool, fam: Fam) -> i32 {
+    let a = TTF.lock().as_ref().and_then(|t| t.glifo(fam, bold, c, size)).map(|g| g.2);
+    a.unwrap_or_else(|| adv_trazos(c, size, bold))
+}
+
+fn adv_trazos(c: char, size: u32, bold: bool) -> i32 {
     let sc = scale(size);
     if c == ' ' {
         return iround(2.6 * sc);
@@ -189,29 +296,51 @@ fn raster(c: char, size: u32, bold: bool) -> GlyphBmp {
 /// Dibuja `text` con la esquina superior izquierda de su caja de línea en (x, y).
 /// Devuelve la x final (x + ancho).
 pub fn draw(s: &mut Surface, x: i32, y: i32, text: &str, size: u32, bold: bool, color: u32) -> i32 {
+    dibujar(s, x, y, text, size, bold, color, Fam::Sans)
+}
+
+/// Como `draw`, con la letra monoespaciada.
+pub fn draw_mono(s: &mut Surface, x: i32, y: i32, text: &str, size: u32, color: u32) -> i32 {
+    dibujar(s, x, y, text, size, false, color, Fam::Mono)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dibujar(s: &mut Surface, x: i32, y: i32, text: &str, size: u32, bold: bool, color: u32, fam: Fam) -> i32 {
     let base = y + iround(1.5 * scale(size)) + size as i32;
-    let clip = s.clip();
     let mut pen = x;
-    let mut cache = CACHE.lock();
-    for c in text.chars() {
-        let key = c as u32 | (size.min(255) << 21) | ((bold as u32) << 29);
-        let g = cache.entry(key).or_insert_with(|| raster(c, size, bold));
-        let (gx, gy) = (pen + g.ox, base + g.oy);
-        let (cx0, cx1) = (gx.max(clip.x), (gx + g.w).min(clip.right()));
-        let (cy0, cy1) = (gy.max(clip.y), (gy + g.h).min(clip.bottom()));
-        for yy in cy0..cy1 {
-            let fila = ((yy - gy) * g.w) as usize;
-            for xx in cx0..cx1 {
-                let a = g.a[fila + (xx - gx) as usize] as u32;
-                if a > 0 {
-                    let o = (yy * s.w + xx) as usize;
-                    s.px[o] = blend(s.px[o], color, a);
-                }
+    let mut tt = TTF.lock();
+    for (i, c) in text.char_indices() {
+        let sc = &text[i..i + c.len_utf8()];
+        pen += match tt.as_mut().and_then(|t| t.pintar(s, fam, bold, c, sc, size, pen, base, color)) {
+            Some(a) => a,
+            None => {
+                trazo(s, pen, base, c, size, bold, color);
+                adv_trazos(c, size, bold)
             }
-        }
-        pen += adv(c, size, bold);
+        };
     }
     pen
+}
+
+/// Dibuja un carácter con la letra de trazos, con el lápiz en `pen` y la línea base en `base`.
+fn trazo(s: &mut Surface, pen: i32, base: i32, c: char, size: u32, bold: bool, color: u32) {
+    let clip = s.clip();
+    let mut cache = CACHE.lock();
+    let key = c as u32 | (size.min(255) << 21) | ((bold as u32) << 29);
+    let g = cache.entry(key).or_insert_with(|| raster(c, size, bold));
+    let (gx, gy) = (pen + g.ox, base + g.oy);
+    let (cx0, cx1) = (gx.max(clip.x), (gx + g.w).min(clip.right()));
+    let (cy0, cy1) = (gy.max(clip.y), (gy + g.h).min(clip.bottom()));
+    for yy in cy0..cy1 {
+        let fila = ((yy - gy) * g.w) as usize;
+        for xx in cx0..cx1 {
+            let a = g.a[fila + (xx - gx) as usize] as u32;
+            if a > 0 {
+                let o = (yy * s.w + xx) as usize;
+                s.px[o] = blend(s.px[o], color, a);
+            }
+        }
+    }
 }
 
 /// Dibuja `text` centrado en vertical dentro de `r` y alineado en horizontal según `align`.
@@ -265,6 +394,46 @@ mod tests {
         draw(&mut s, 500, 500, "fuera", 9, false, 0xFFFFFF);
         draw(&mut s, -500, -500, "fuera", 9, false, 0xFFFFFF);
         draw_in(&mut s, Rect::new(0, 0, 10, 10), "Largo largo", 12, false, 0xFFFFFF, Align::Center);
+    }
+
+    fn liberation() -> Ttf {
+        let d = concat!(env!("CARGO_MANIFEST_DIR"), "/data/fuentes/");
+        let leer = |n: &str| Font::parse(std::fs::read(format!("{d}{n}")).unwrap()).unwrap();
+        Ttf::nueva([Some(leer("LiberationSans-Regular.ttf")), Some(leer("LiberationSans-Bold.ttf")), Some(leer("LiberationMono-Regular.ttf"))])
+    }
+
+    #[test]
+    fn truetype_ancho_igual_a_lo_dibujado() {
+        let mut t = liberation();
+        let mut s = Surface::new(200, 40, 0);
+        let texto = "Hola, ñandú";
+        let (mut pen, mut suma) = (2, 0);
+        for (i, c) in texto.char_indices() {
+            let a = t.pintar(&mut s, Fam::Sans, false, c, &texto[i..i + c.len_utf8()], 9, pen, 20, 0xFFFFFF).expect("Liberation tiene el glifo");
+            assert_eq!(Some(a), t.glifo(Fam::Sans, false, c, 9).map(|g| g.2));
+            pen += a;
+            suma += a;
+        }
+        assert!(suma > 0 && s.px.iter().any(|&p| p != 0));
+        // La negrita usa su propia fuente; la mono tiene el mismo avance en todo.
+        assert!(t.glifo(Fam::Sans, true, 'n', 9).unwrap().2 >= t.glifo(Fam::Sans, false, 'n', 9).unwrap().2);
+        assert_eq!(t.glifo(Fam::Mono, false, 'i', 9).unwrap().2, t.glifo(Fam::Mono, false, 'W', 9).unwrap().2);
+    }
+
+    #[test]
+    fn truetype_sin_glifo_cae_a_trazos() {
+        let t = liberation();
+        assert!(t.glifo(Fam::Sans, false, '\u{3042}', 9).is_none());
+        // Sin ninguna fuente, nada elige.
+        assert!(Ttf::nueva([None, None, None]).elegir(Fam::Sans, false).is_none());
+    }
+
+    #[test]
+    fn fuente_rota_no_se_registra() {
+        assert!(Font::parse(alloc::vec![0u8; 64]).is_err());
+        assert!(Font::parse(alloc::vec::Vec::new()).is_err());
+        // Sin bytes incluidos ni disco no hay Liberation que cargar: se queda como estaba.
+        assert!(!crate::letra::aplicar_liberacion_sin_fuentes());
     }
 
     #[test]

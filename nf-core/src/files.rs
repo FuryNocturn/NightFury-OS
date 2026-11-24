@@ -240,6 +240,15 @@ pub fn in_system(path: &str) -> bool {
     resolve("C:\\", path).is_ok_and(|c| is_c(&c) && same(first(rel(&c)), SYSTEM))
 }
 
+/// ¿Es un fichero de `C:\Sistema\fuentes` (las letras que trae el sistema, públicas)? Cualquier programa
+/// puede leerlas para dibujar con ellas; el resto de `C:\Sistema` sigue cerrado.
+pub fn is_system_font(path: &str) -> bool {
+    resolve("C:\\", path).is_ok_and(|c| {
+        let mut p = rel(&c).split('\\');
+        is_c(&c) && p.next().is_some_and(|s| same(s, SYSTEM)) && p.next().is_some_and(|s| same(s, "fuentes")) && p.next().is_some_and(|f| !f.is_empty()) && p.next().is_none()
+    })
+}
+
 /// ¿Es una carpeta que no se puede eliminar, mover ni renombrar? (raíz, `Usuarios`, `Sistema` y
 /// sus subcarpetas, la carpeta de cada cuenta y sus carpetas estándar, `.config` y `.papelera`). En
 /// las demás unidades solo lo es la raíz.
@@ -4319,6 +4328,10 @@ mod tests {
         assert_eq!(f.read("C:\\Sistema\\fuentes\\a.ttf").as_deref(), Ok(&b"A"[..]));
         assert_eq!(f.write("C:\\Sistema\\fuentes\\a.ttf", b"x", d(3)), Err(FsError::Denied));
         assert_eq!(f.install_system_files("..\\config", &[], d(3)), Err(FsError::Invalid));
+        // Solo los ficheros de `fuentes` son públicos para los programas.
+        assert!(is_system_font("C:\\Sistema\\fuentes\\a.ttf") && is_system_font("c:\\sistema\\FUENTES\\a.ttf"));
+        assert!(!is_system_font("C:\\Sistema\\fuentes") && !is_system_font("C:\\Sistema\\config\\a.ttf") && !is_system_font("C:\\Sistema\\fuentes\\..\\config\\a"));
+        assert!(!is_system_font("C:\\Sistema\\fuentes\\sub\\a.ttf") && !is_system_font("D:\\Sistema\\fuentes\\a.ttf"));
         // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
         f.login("Ana", "").unwrap();
         assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Denied));

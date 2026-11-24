@@ -13,6 +13,8 @@ pub struct Theme {
     pub accent: u32,
     /// Índice en `WALLPAPERS`.
     pub wallpaper: u8,
+    /// Letra del sistema (ver `letra`): 0 TrueType Liberation, 1 trazos, n >= 2 una fuente de Windows.
+    pub letra: u8,
 }
 
 /// Paleta de colores de énfasis que ofrece Configuración. El primero es el de por defecto.
@@ -26,7 +28,7 @@ pub const WALLPAPERS: [&str; 4] = ["Noche", "Aurora", "Amanecer", "Color sólido
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme { accent: ACCENTS[0], wallpaper: 0 }
+        Theme { accent: ACCENTS[0], wallpaper: 0, letra: 0 }
     }
 }
 
