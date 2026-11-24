@@ -25,7 +25,7 @@
 use crate::accounts::{self, Account, AccountError};
 use crate::block::{BlockDev, RamDisk};
 use crate::cryptdev::{self, Core, CryptDev, Header, State};
-use crate::crypto::wipe;
+use crate::crypto::{wipe, Pbkdf2Paso};
 use crate::fs::{same, Entry, FsError, Nffs};
 use crate::homecrypt::{self, HState, KeyFile, Keys};
 use crate::drives::{DriveAction, DriveInfo, FormatRequest, Locked};
@@ -412,11 +412,20 @@ struct XDrive {
     locked: Option<LockedDrive>,
 }
 
+/// Desbloqueo en curso: el PBKDF2 de la unidad `letter`, que se avanza con `unlock_step`.
+struct UnlockJob {
+    letter: char,
+    recovery: bool,
+    kdf: Pbkdf2Paso,
+}
+
 #[derive(Default)]
 struct XDrives {
     list: Vec<XDrive>,
     actions: Vec<DriveAction>,
     result: Option<Result<Option<String>, FsError>>,
+    job: Option<UnlockJob>,
+    unlocked: Option<Result<(), KeyError>>,
 }
 
 /// Línea de `unidades.cfg`: la serie sin saltos de línea ni `|`.
@@ -3167,12 +3176,21 @@ impl Files {
         Ok(self.fs.write(rel(UNITS_FILE), new.as_bytes(), now)?)
     }
 
-    /// Abre una unidad cifrada con su contraseña o con el código de recuperación.
+    /// Abre una unidad cifrada con su contraseña o con el código de recuperación (de golpe: el
+    /// PBKDF2 congela todo unos segundos; la interfaz usa `begin_unlock`).
     pub fn unlock_drive(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError> {
+        self.unlock_with(letter, |l| l.unlock(secret, recovery))
+    }
+
+    fn unlock_with(
+        &mut self,
+        letter: char,
+        f: impl FnOnce(LockedDrive) -> Result<Box<dyn Volume>, (LockedDrive, KeyError)>,
+    ) -> Result<(), KeyError> {
         let letter = letter.to_ascii_uppercase();
         let d = self.xd.list.iter_mut().find(|d| d.letter == letter).ok_or(FsError::BadPath)?;
         let locked = d.locked.take().ok_or(KeyError::NotEncrypted)?;
-        match locked.unlock(secret, recovery) {
+        match f(locked) {
             Ok(vol) => {
                 d.vol = Some(vol);
                 self.generation += 1;
@@ -3183,6 +3201,38 @@ impl Files {
                 Err(e)
             }
         }
+    }
+
+    /// Empieza a abrir una unidad cifrada sin bloquear: `unlock_step` avanza el trabajo y
+    /// `unlock_result` da el final. El secreto no se guarda (solo el PBKDF2 en marcha). Un trabajo
+    /// anterior sin terminar se descarta.
+    pub fn begin_unlock(&mut self, letter: char, secret: &str, recovery: bool) -> Result<(), KeyError> {
+        let letter = letter.to_ascii_uppercase();
+        let d = self.xd.list.iter().find(|d| d.letter == letter).ok_or(FsError::BadPath)?;
+        let kdf = d.locked.as_ref().ok_or(KeyError::NotEncrypted)?.unlock_paso(secret, recovery)?;
+        self.xd.unlocked = None;
+        self.xd.job = Some(UnlockJob { letter, recovery, kdf });
+        Ok(())
+    }
+
+    /// Avanza hasta `iters` vueltas el desbloqueo en curso; `true` mientras falte trabajo. Al
+    /// acabar deja el resultado para `unlock_result` (y la unidad abierta si era buena).
+    pub fn unlock_step(&mut self, iters: u32) -> bool {
+        let Some(j) = self.xd.job.as_mut() else { return false };
+        if j.kdf.step(iters) {
+            return true;
+        }
+        let Some(mut j) = self.xd.job.take() else { return false };
+        let mut dk = j.kdf.take();
+        let r = self.unlock_with(j.letter, |l| l.unlock_con(&mut dk, j.recovery));
+        wipe(&mut dk);
+        self.xd.unlocked = Some(r);
+        false
+    }
+
+    /// Resultado del último desbloqueo, una sola vez.
+    pub fn unlock_result(&mut self) -> Option<Result<(), KeyError>> {
+        self.xd.unlocked.take()
     }
 
     /// Pide expulsar, formatear o cifrar el disco de la unidad `letter` (solo programas del sistema;
@@ -5733,6 +5783,7 @@ mod tests {
 mod drive_tests {
     use super::*;
     use crate::drives::FormatKind;
+    use crate::drives::Locked;
     use crate::vol::{self, FsKind, MemSectors, SectorDev};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -6009,6 +6060,60 @@ mod drive_tests {
         assert_eq!(f.read("C:\\Sistema\\unidades.cfg").unwrap().iter().filter(|&&c| c == b'\n').count(), 2);
         // Un programa de terceros no lo lee ni lo escribe (el servicio bloquea C:\Sistema).
         assert!(crate::service::blocked(false, "C:\\Sistema\\unidades.cfg"));
+    }
+
+    /// Disco cifrado en memoria con contraseña `clave-buena`: la unidad cerrada y su código de recuperación.
+    fn cifrada() -> (Files, char, String) {
+        let s = Shared(Rc::new(RefCell::new(MemSectors::new((16 << 20) / 512, 512))));
+        let mut pool = Pool::new();
+        for i in 0..keys::POOL_EVENTS_NEEDED as i32 {
+            pool.add_event(i, i * 3, i as u64, i as u64 * 7);
+        }
+        let code = vol::nfvol::format(Box::new(s.clone()), "Sec", Some(("clave-buena", &mut pool)), NOW).unwrap().unwrap();
+        let p = vol::partitions(&mut s.clone()).unwrap();
+        let vol::nfvol::Opened::Locked(drive) = vol::nfvol::open(Box::new(s.clone()), &p[0]).unwrap() else { panic!("debía estar cerrada") };
+        let mut f = Files::default();
+        let l = f.attach_locked(Locked { disk: 1, part: 0, removable: true, device: String::from("USB"), drive }).unwrap();
+        (f, l, code)
+    }
+
+    /// Avanza el desbloqueo en trozos pequeños hasta que acaba.
+    fn por_pasos(f: &mut Files) -> Result<(), KeyError> {
+        let mut n = 0;
+        while f.unlock_step(7) {
+            n += 1;
+            assert!(n < 100_000);
+        }
+        f.unlock_result().unwrap()
+    }
+
+    #[test]
+    fn desbloqueo_por_pasos() {
+        let (mut f, l, _) = cifrada();
+        assert!(f.drives().iter().any(|d| d.letter == l && d.locked));
+        // Sin trabajo no hay nada que avanzar ni resultado.
+        assert!(!f.unlock_step(10) && f.unlock_result().is_none());
+        // Contraseña mala: error y sigue cerrada; un código mal tecleado ni empieza.
+        f.begin_unlock(l, "otra-clave", false).unwrap();
+        assert_eq!(por_pasos(&mut f), Err(KeyError::WrongSecret));
+        assert_eq!(f.begin_unlock(l, "AAAAA", true), Err(KeyError::WrongSecret));
+        assert_eq!(f.begin_unlock('Q', "x", false), Err(KeyError::Fs(FsError::BadPath)));
+        assert!(f.drives().iter().any(|d| d.letter == l && d.locked));
+        // Un trabajo a medias se descarta al empezar otro; no queda resultado viejo.
+        f.begin_unlock(l, "otra-clave", false).unwrap();
+        assert!(f.unlock_step(3));
+        f.begin_unlock(l, "clave-buena", false).unwrap();
+        assert!(f.unlock_result().is_none());
+        let gen = f.generation();
+        assert_eq!(por_pasos(&mut f), Ok(()));
+        assert_ne!(f.generation(), gen);
+        assert!(f.drives().iter().any(|d| d.letter == l && !d.locked));
+        assert_eq!(f.begin_unlock(l, "clave-buena", false), Err(KeyError::NotEncrypted));
+        // Con el código de recuperación.
+        let (mut f, l, code) = cifrada();
+        f.begin_unlock(l, &code.to_lowercase().replace('-', ""), true).unwrap();
+        assert_eq!(por_pasos(&mut f), Ok(()));
+        assert!(f.drives().iter().any(|d| d.letter == l && !d.locked));
     }
 
     #[test]

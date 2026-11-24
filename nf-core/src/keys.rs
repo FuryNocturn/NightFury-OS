@@ -12,7 +12,7 @@
 //! 64 bytes, la mitad para AES-256-CTR y la mitad para HMAC-SHA-256 sobre todo el registro.
 //! Un secreto equivocado o un registro alterado se detectan por la marca, sin revelar nada.
 use crate::cipher::ctr;
-use crate::crypto::{ct_eq, from_hex, pbkdf2, to_hex, wipe, Hmac, Sha256};
+use crate::crypto::{ct_eq, from_hex, pbkdf2, to_hex, wipe, Hmac, Pbkdf2Paso, Sha256};
 use crate::fs::FsError;
 use alloc::format;
 use alloc::string::String;
@@ -167,17 +167,27 @@ pub struct Slot {
     tag: [u8; 32],
 }
 
-fn derive(secret: &[u8], salt: &[u8; 16], iters: u32) -> ([u8; 32], [u8; 32]) {
+/// Sal del PBKDF2 de un registro: la del registro más la etiqueta de uso.
+fn kdf_salt(salt: &[u8; 16]) -> [u8; 16 + LABEL.len()] {
     let mut s = [0u8; 16 + LABEL.len()];
     s[..16].copy_from_slice(salt);
     s[16..].copy_from_slice(LABEL);
-    let mut dk = [0u8; 64];
-    pbkdf2(secret, &s, iters, &mut dk);
+    s
+}
+
+/// Parte la clave derivada de 64 bytes en la de cifrado y la de marca, y la borra.
+fn split(dk: &mut [u8]) -> ([u8; 32], [u8; 32]) {
     let (mut ke, mut km) = ([0u8; 32], [0u8; 32]);
     ke.copy_from_slice(&dk[..32]);
     km.copy_from_slice(&dk[32..]);
-    wipe(&mut dk);
+    wipe(dk);
     (ke, km)
+}
+
+fn derive(secret: &[u8], salt: &[u8; 16], iters: u32) -> ([u8; 32], [u8; 32]) {
+    let mut dk = [0u8; 64];
+    pbkdf2(secret, &kdf_salt(salt), iters, &mut dk);
+    split(&mut dk)
 }
 
 impl Slot {
@@ -199,16 +209,37 @@ impl Slot {
     /// Devuelve la llave maestra si `secret` es el correcto y el registro no se ha alterado.
     pub fn unwrap(&self, secret: &[u8]) -> Option<[u8; MASTER]> {
         let (mut ke, mut km) = derive(secret, &self.salt, self.iters);
-        let ok = ct_eq(&self.mac(&km), &self.tag);
+        self.open(&mut ke, &mut km)
+    }
+
+    /// Como `unwrap` pero por pasos: esto empieza el PBKDF2 (hay que avanzarlo con `step` hasta
+    /// que acabe) y `unwrap_con` termina con la clave que da `take`.
+    pub fn unwrap_paso(&self, secret: &[u8]) -> Pbkdf2Paso {
+        Pbkdf2Paso::new(secret, &kdf_salt(&self.salt), self.iters, 64)
+    }
+
+    /// Termina `unwrap_paso`. Borra `dk`.
+    pub fn unwrap_con(&self, dk: &mut [u8]) -> Option<[u8; MASTER]> {
+        if dk.len() != 64 {
+            wipe(dk);
+            return None;
+        }
+        let (mut ke, mut km) = split(dk);
+        self.open(&mut ke, &mut km)
+    }
+
+    /// Comprueba la marca y descifra; borra las dos claves.
+    fn open(&self, ke: &mut [u8; 32], km: &mut [u8; 32]) -> Option<[u8; MASTER]> {
+        let ok = ct_eq(&self.mac(km), &self.tag);
         let out = if ok {
             let mut m = self.ct;
-            ctr(&ke, &self.iv, &mut m);
+            ctr(ke, &self.iv, &mut m);
             Some(m)
         } else {
             None
         };
-        wipe(&mut ke);
-        wipe(&mut km);
+        wipe(ke);
+        wipe(km);
         out
     }
 

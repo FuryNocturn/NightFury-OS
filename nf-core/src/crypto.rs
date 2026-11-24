@@ -207,17 +207,69 @@ pub fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// PBKDF2-HMAC-SHA-256: rellena `out` (cualquier longitud).
 pub fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
-    let h = Hmac::new(password);
-    for (n, chunk) in out.chunks_mut(32).enumerate() {
-        let mut u = h.mac(&[salt, &(n as u32 + 1).to_be_bytes()]);
-        let mut t = u;
-        for _ in 1..iters.max(1) {
-            u = h.mac(&[&u]);
-            for (a, b) in t.iter_mut().zip(u) {
-                *a ^= b;
+    let mut p = Pbkdf2Paso::new(password, salt, iters, out.len());
+    while p.step(u32::MAX) {}
+    out.copy_from_slice(&p.out);
+}
+
+/// PBKDF2-HMAC-SHA-256 por pasos: avanza unas vueltas por llamada para no congelar el escritorio.
+/// Da lo mismo que `pbkdf2`. Borra sus restos al soltarse.
+pub struct Pbkdf2Paso {
+    h: Hmac,
+    salt: Vec<u8>,
+    iters: u32,
+    out: Vec<u8>,
+    /// Bloque de 32 bytes en curso y vueltas ya hechas en él (0: aún sin empezar).
+    block: usize,
+    done: u32,
+    u: [u8; 32],
+    t: [u8; 32],
+}
+
+impl Pbkdf2Paso {
+    pub fn new(password: &[u8], salt: &[u8], iters: u32, out_len: usize) -> Pbkdf2Paso {
+        Pbkdf2Paso { h: Hmac::new(password), salt: salt.to_vec(), iters: iters.max(1), out: alloc::vec![0; out_len], block: 0, done: 0, u: [0; 32], t: [0; 32] }
+    }
+
+    /// Hace como mucho `n` vueltas más; `true` mientras falte trabajo.
+    pub fn step(&mut self, mut n: u32) -> bool {
+        while n > 0 && self.block * 32 < self.out.len() {
+            if self.done == 0 {
+                self.u = self.h.mac(&[&self.salt, &(self.block as u32 + 1).to_be_bytes()]);
+                self.t = self.u;
+                self.done = 1;
+            }
+            let k = (self.iters - self.done).min(n);
+            for _ in 0..k {
+                self.u = self.h.mac(&[&self.u]);
+                for (a, b) in self.t.iter_mut().zip(self.u) {
+                    *a ^= b;
+                }
+            }
+            self.done += k;
+            n -= k;
+            if self.done == self.iters {
+                let (s, e) = (self.block * 32, ((self.block + 1) * 32).min(self.out.len()));
+                self.out[s..e].copy_from_slice(&self.t[..e - s]);
+                self.block += 1;
+                self.done = 0;
             }
         }
-        chunk.copy_from_slice(&t[..chunk.len()]);
+        self.block * 32 < self.out.len()
+    }
+
+    /// La clave derivada, cuando `step` ya dijo `false`. Quien la recibe debe borrarla (`wipe`).
+    pub fn take(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.out)
+    }
+}
+
+impl Drop for Pbkdf2Paso {
+    fn drop(&mut self) {
+        wipe(&mut self.u);
+        wipe(&mut self.t);
+        wipe(&mut self.out);
+        wipe(&mut self.salt);
     }
 }
 
@@ -949,6 +1001,23 @@ mod tests {
         let mut o = [0u8; 40];
         pbkdf2(b"passwordPASSWORDpassword", b"saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, &mut o);
         assert_eq!(hx(&o), "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+    }
+
+    #[test]
+    fn pbkdf2_por_pasos_da_lo_mismo() {
+        for (iters, len) in [(1u32, 32usize), (7, 40), (50, 64), (1000, 64), (3, 0), (0, 5)] {
+            let mut a = alloc::vec![0u8; len];
+            pbkdf2(b"clave", b"sal", iters, &mut a);
+            for n in [1u32, 3, 10, 999, u32::MAX] {
+                let mut p = Pbkdf2Paso::new(b"clave", b"sal", iters, len);
+                let mut pasos = 0;
+                while p.step(n) {
+                    pasos += 1;
+                    assert!(pasos < 1_000_000);
+                }
+                assert_eq!(p.take(), a, "iters {iters} len {len} n {n}");
+            }
+        }
     }
 
     #[test]

@@ -2440,7 +2440,8 @@ impl Desktop {
     fn request_close(&mut self, id: u32, sys: &mut dyn Platform) {
         let Some(i) = self.pos(id) else { return };
         if self.wins[i].dlg.is_some() {
-            self.dlg_event(id, sys, |d, _| Some(d.cancel()));
+            // Mientras desbloquea una unidad no se cierra (como Cancelar): el trabajo quedaría a medias.
+            self.dlg_event(id, sys, |d, _| (!d.is_busy()).then(|| d.cancel()));
             return;
         }
         let mut ok = false;
@@ -3393,10 +3394,7 @@ impl Desktop {
         // Los diálogos repiten la flecha o la pista de su barra mientras se mantiene pulsada.
         let dlgs: Vec<u32> = self.wins.iter().filter(|w| w.dlg.is_some()).map(|w| w.id).collect();
         for id in dlgs {
-            self.dlg_event(id, sys, |d, s| {
-                d.tick(s);
-                None
-            });
+            self.dlg_event(id, sys, |d, s| d.tick(s));
         }
         if ms >= self.next_clock {
             self.next_clock = ms + 250;
