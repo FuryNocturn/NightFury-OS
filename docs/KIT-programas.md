@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.12.4)
+# Kit de programas de NightFury (v0.12.5)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -280,6 +280,11 @@ los vectores de los RFC 7748, 8439 y 5869, pero son implementaciones propias **n
   `maquetar`, `pintar`) convierte HTML y CSS en una imagen; tú das las letras con el trait `nf_web::Fuentes`.
   `HttpGet` ya descomprime `Content-Encoding: gzip`. El ejemplo completo es el **Navegador**
   (`programs\navegador`).
+- **Formularios (v0.12.5)**: `Documento::pulsar(x, y, fuentes)` y `Documento::tecla(Tecla, mayus)` llevan
+  el ratón y el teclado a los controles y devuelven un `Efecto`; `Efecto::Enviar(Envio)` trae método, URL y
+  cuerpo ya codificados. `HttpGet::start_post(net, url, cuerpo)` envía un POST
+  `application/x-www-form-urlencoded` y `HttpGet::poner_cookie(valor)` añade la cabecera `Cookie` (los
+  saltos de línea se rechazan).
 
 ## Guardar un archivo (`SAVE_AS`)
 
