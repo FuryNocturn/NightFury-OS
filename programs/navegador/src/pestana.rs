@@ -4,6 +4,7 @@
 use crate::campo::Campo;
 use crate::entrada::{es_ruta_local, local_de_url, recurso_permitido, sin_fragmento, tipo_de_extension, tipo_vista, url_de_local, Entrada, TipoVista, HOST_LOCAL};
 use crate::fuentes::Letras;
+use crate::internas;
 use crate::paginas;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -226,6 +227,10 @@ pub struct Pestana {
     /// Redirección pedida por la página (`<meta http-equiv="refresh">`): cuándo (`uptime_ms`) y adónde.
     refresco: Option<(u64, String)>,
     refrescos: u8,
+    /// Página interna (`nightfury://…`) que el navegador tiene que generar y entregar con `servir_interna`.
+    pub interna: Option<String>,
+    /// Acaba de mostrarse una página de la red para el historial (el navegador lo recoge y lo apaga).
+    pub visita: bool,
 }
 
 impl Pestana {
@@ -254,7 +259,27 @@ impl Pestana {
             ultima_maqueta: 0,
             refresco: None,
             refrescos: 0,
+            interna: None,
+            visita: false,
         }
+    }
+
+    /// Lo mostrado es una página interna (la dirección es suya, no de la red).
+    pub fn es_interna(&self) -> bool {
+        internas::es_interna(&self.url)
+    }
+
+    /// Entrega el HTML de la página interna pedida: sustituye a la que había.
+    pub fn servir_interna(&mut self, url: &str, html: &str) {
+        self.interna = None;
+        self.poner_documento(url, internas::BASE, false, Documento::cargar(html.as_bytes(), Some("text/html; charset=utf-8"), internas::BASE));
+    }
+
+    /// Carga `url` en lugar de la entrada actual del historial (el resultado de una acción, no una página más).
+    pub fn reemplazar(&mut self, sys: &mut dyn Platform, url: &str, ahora: u64) {
+        self.historial[self.pos].url = String::from(url);
+        self.historial[self.pos].post = None;
+        self.cargar(sys, url, ahora, None);
     }
 
     pub fn cargando(&self) -> bool {
@@ -315,6 +340,7 @@ impl Pestana {
         self.pendiente = None;
         self.refresco = None;
         self.refrescos = 0;
+        self.interna = None;
     }
 
     /// Navega a `e` y la apunta en el historial.
@@ -388,6 +414,11 @@ impl Pestana {
         self.ancla = None;
         if url.is_empty() {
             return self.mostrar_inicio();
+        }
+        if internas::es_interna(url) {
+            self.pendiente = Some(String::from(url));
+            self.interna = Some(String::from(url));
+            return;
         }
         if es_ruta_local(url) {
             return self.abrir_local(sys, url);
@@ -574,7 +605,8 @@ impl Pestana {
                 let (codigo, motivo, tipo) = d.estado.map_or((200, String::new(), None), |e| (e.codigo, e.motivo, e.tipo));
                 let url = String::from(sin_fragmento(&d.url).0);
                 // Tras una redirección que lo convirtió en GET, la entrada del historial ya no es un POST.
-                if d.post.is_none() {
+                let es_post = d.post.is_some();
+                if !es_post {
                     self.historial[self.pos].post = None;
                 }
                 if codigo >= 400 && d.cuerpo.is_empty() {
@@ -585,6 +617,8 @@ impl Pestana {
                 let ancla = self.ancla.take();
                 self.mostrar(sys, &url, &url, false, tipo.as_deref(), d.cuerpo);
                 self.ancla = ancla;
+                // Lo que sale de un formulario POST no va al historial (volver a ello reenvía datos).
+                self.visita = !es_post && !self.es_error;
             }
             (Rol::Recurso(r), res) => {
                 let bien = res.is_ok() && d.estado.as_ref().is_some_and(|e| (200..300).contains(&e.codigo));

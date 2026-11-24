@@ -389,3 +389,228 @@ fn una_pagina_publica_no_envia_a_la_red_local() {
     t.enviar(&mut sys, Envio { metodo: Metodo::Post, url: String::from("http://192.168.1.1/admin"), cuerpo: Some(b"a=1".to_vec()), tiene_password: false }, 0);
     assert!(t.titulo.contains("Bloqueado") && !t.cargando(), "{:?}", t.titulo);
 }
+
+// ---------------------------------------------------------------- historial, favoritos e incógnito
+
+const DIR_DATOS: &str = "C:\\Usuarios\\Usuario\\AppData\\Navegador";
+
+/// Una página de la red recién mostrada (lo que deja `Pestana::terminar`) y un tick para que el navegador la recoja.
+fn visita(b: &mut Banco, url: &str, titulo: &str) {
+    let a = b.n.act;
+    let t = &mut b.n.pest[a];
+    t.url = String::from(url);
+    t.titulo = String::from(titulo);
+    t.visita = true;
+    b.tick();
+}
+
+/// Deja pasar el retraso de escritura en disco.
+fn espera_disco(b: &mut Banco) {
+    for _ in 0..100 {
+        b.tick();
+    }
+}
+
+/// Ejecuta `f` con un `Ctx` y devuelve lo que ha pedido (menú y ruta a abrir).
+fn pide(b: &mut Banco, f: impl FnOnce(&mut Navegador, &mut Ctx)) -> (Option<MenuRequest>, Option<String>) {
+    let mut cx = Ctx::new(&mut b.sys, &mut b.th, b.ms);
+    f(&mut b.n, &mut cx);
+    (cx.menu.take(), cx.open.take())
+}
+
+#[test]
+fn el_historial_se_apunta_se_guarda_y_se_recupera() {
+    let mut b = Banco::nuevo();
+    visita(&mut b, "https://a.com/x", "Página\tuno ñ");
+    visita(&mut b, "https://b.org/", "Dos");
+    assert_eq!(b.n.datos.hist.v.len(), 2);
+    assert!(b.sys.files.read(&format!("{DIR_DATOS}\\historial")).is_err(), "no se escribe en cada cambio");
+    espera_disco(&mut b);
+    let texto = String::from_utf8(b.sys.files.read(&format!("{DIR_DATOS}\\historial")).unwrap()).unwrap();
+    assert_eq!(texto.lines().count(), 2);
+    let mut otro = Navegador::nuevo();
+    otro.cargar_datos(&mut b.sys);
+    assert_eq!(otro.datos.hist.v, b.n.datos.hist.v);
+    // Una página de error, un formulario POST o una página del disco no se apuntan: no ponen `visita`.
+    assert!(!b.n.pest[0].visita);
+}
+
+#[test]
+fn incognito_no_escribe_historial_ni_lo_sugiere() {
+    let mut b = Banco::nuevo();
+    visita(&mut b, "https://a.com/", "Antes");
+    espera_disco(&mut b);
+    // Una ventana nueva avisada con la marca del escritorio (comparte el disco).
+    let mut c = Banco::nuevo();
+    c.sys = std::mem::take(&mut b.sys);
+    c.abrir(&format!("{DIR_DATOS}\\incognito.nfinc"));
+    assert!(c.n.es_incognito() && c.n.title().ends_with("(incógnito)"));
+    visita(&mut c, "https://secreto.com/", "Secreto");
+    assert!(c.n.datos.hist.v.is_empty(), "ni se lee ni se apunta");
+    espera_disco(&mut c);
+    let texto = String::from_utf8(c.sys.files.read(&format!("{DIR_DATOS}\\historial")).unwrap()).unwrap();
+    assert!(texto.contains("a.com") && !texto.contains("secreto"), "{texto}");
+    // Los favoritos sí se pueden añadir y usar; el aspecto es oscuro.
+    c.tecla(Key::Char('d'), true, false, false);
+    assert_eq!(c.n.datos.favs.v.len(), 1);
+    assert!(c.n.es_favorito_sitio("secreto.com"));
+    let s = c.foto(1024, 700);
+    assert!(s.px.iter().any(|&p| p == 0x202124) && s.px.iter().any(|&p| p == 0x35363A), "tira y barra oscuras");
+    // Las sugerencias solo traen favoritos.
+    c.tecla(Key::Char('l'), true, false, false);
+    c.escribe("a");
+    assert!(c.n.sug.is_empty());
+    c.tecla(Key::Char('l'), true, false, false);
+    c.escribe("sec");
+    assert_eq!(c.n.sug.len(), 1);
+}
+
+#[test]
+fn ctrl_mayus_n_y_el_menu_piden_una_ventana_de_incognito() {
+    let mut b = Banco::nuevo();
+    b.foto(1024, 700);
+    let ev = KeyEvent { key: Key::Char('n'), ch: None, down: true, shift: true, ctrl: true, alt: false };
+    let (_, abre) = pide(&mut b, |n, cx| n.key(&ev, cx));
+    assert_eq!(abre.as_deref(), Some(format!("{DIR_DATOS}\\incognito.nfinc").as_str()));
+    // Desde el menú de los tres puntos.
+    let m = rect_menu(1024);
+    let (menu, _) = pide(&mut b, |n, cx| n.mouse(MouseEv::Down { x: m.x + 5, y: m.y + 5 }, cx));
+    let menu = menu.expect("el botón abre el menú");
+    assert!(menu.items.iter().any(|i| i.id == M_INCOG && i.text.contains("incógnito")));
+    let (_, abre) = pide(&mut b, |n, cx| n.menu_result(TAG_MENU, M_INCOG, cx));
+    assert!(abre.is_some_and(|r| r.ends_with(".nfinc")));
+    // La página de incógnito explica lo que pasa.
+    let mut c = Banco::nuevo();
+    c.n.poner_incognito();
+    c.foto(1024, 700);
+    assert!(c.n.lineas_incognito(c.n.pagina()).join(" ").contains("las cookies se borran al cerrar"));
+}
+
+#[test]
+fn una_pagina_web_no_abre_ni_enlaza_las_internas() {
+    let mut b = Banco::nuevo();
+    visita(&mut b, "https://a.com/", "Antes");
+    b.n.pest[0].url = String::from("https://web.com/");
+    b.foto(900, 600);
+    let n = b.n.datos.hist.v.len();
+    for u in ["http://interno.invalid/historial?limpiar=todo&ok=1", "http://INTERNO.invalid/favoritos", "nightfury://historial"] {
+        pide(&mut b, |n, cx| n.abrir_enlace(u, false, cx));
+        let e = Envio { metodo: Metodo::Get, url: String::from(u), cuerpo: None, tiene_password: false };
+        pide(&mut b, |n, cx| n.enviar(e, cx));
+        assert!(b.n.pest[0].interna.is_none() && b.n.pest[0].url == "https://web.com/", "{u}");
+    }
+    assert_eq!(b.n.datos.hist.v.len(), n, "y no ha borrado nada");
+    // Escrito en la barra por el usuario, sí se abre.
+    b.tecla(Key::Char('l'), true, false, false);
+    b.escribe("nightfury://historial");
+    b.tecla(Key::Enter, false, false, false);
+    b.foto(900, 600);
+    assert_eq!((b.n.pest[0].url.as_str(), b.n.pest[0].titulo.as_str()), ("nightfury://historial", "Historial"));
+}
+
+#[test]
+fn pagina_de_historial_busca_borra_y_limpia() {
+    let mut b = Banco::nuevo();
+    visita(&mut b, "https://a.com/", "Gatos");
+    visita(&mut b, "https://b.org/", "Perros");
+    b.n.pest[0].url = String::new();
+    b.tecla(Key::Char('h'), true, false, false);
+    b.foto(900, 600);
+    assert_eq!(b.n.pest.len(), 1, "la pestaña vacía se aprovecha");
+    assert_eq!(b.n.pest[0].url, "nightfury://historial");
+    pide(&mut b, |n, cx| n.abrir_enlace("http://interno.invalid/historial?q=gat", false, cx));
+    b.foto(900, 600);
+    assert_eq!(b.n.pest[0].url, "nightfury://historial?q=gat");
+    // Eliminar una entrada la quita y reemplaza la entrada del historial de la pestaña (no añade otra).
+    let ts = b.n.datos.hist.v[0].ts;
+    let antes = b.n.pest[0].puede_atras();
+    pide(&mut b, |n, cx| n.abrir_enlace(&format!("http://interno.invalid/historial?borrar={ts}&q=gat"), false, cx));
+    b.foto(900, 600);
+    assert_eq!((b.n.datos.hist.v.len(), b.n.pest[0].url.as_str(), b.n.pest[0].puede_atras()), (1, "nightfury://historial?q=gat", antes));
+    // Borrar todo pide confirmación antes.
+    pide(&mut b, |n, cx| n.abrir_enlace("http://interno.invalid/historial?limpiar=todo", false, cx));
+    b.foto(900, 600);
+    assert_eq!((b.n.datos.hist.v.len(), b.n.pest[0].titulo.as_str()), (1, "Borrar datos de navegación"));
+    pide(&mut b, |n, cx| n.abrir_enlace("http://interno.invalid/historial?limpiar=todo&ok=1", false, cx));
+    b.foto(900, 600);
+    assert!(b.n.datos.hist.v.is_empty());
+    assert_eq!(b.n.pest[0].url, "nightfury://historial");
+}
+
+#[test]
+fn favoritos_estrella_barra_accesos_y_carpetas() {
+    let mut b = Banco::nuevo();
+    b.foto(1024, 700);
+    assert_eq!(b.n.pagina().y, TAB_H + TOOL_H, "sin favoritos no hay barra");
+    b.n.pest[0].url = String::from("https://a.com/");
+    b.n.pest[0].titulo = String::from("Sitio A");
+    b.foto(1024, 700);
+    let e = rect_estrella(rect_omnibox(1024));
+    b.raton(MouseEv::Down { x: e.x + 10, y: e.y + 10 });
+    assert_eq!(b.n.datos.favs.v.len(), 1);
+    assert_eq!(b.n.pagina().y, TAB_H + TOOL_H + FAV_H, "ya hay barra de favoritos");
+    assert!(b.n.es_favorito_sitio("a.com") && !b.n.es_favorito_sitio("b.com"));
+    b.foto(1024, 700);
+    b.raton(MouseEv::Down { x: e.x + 10, y: e.y + 10 });
+    assert!(b.n.datos.favs.v.is_empty());
+    b.tecla(Key::Char('d'), true, false, false);
+    assert_eq!(b.n.datos.favs.v.len(), 1, "Ctrl+D también");
+    // Ctrl+Mayús+B oculta y muestra la barra.
+    b.tecla(Key::Char('b'), true, true, false);
+    assert_eq!(b.n.pagina().y, TAB_H + TOOL_H);
+    b.tecla(Key::Char('b'), true, true, false);
+    assert_eq!(b.n.pagina().y, TAB_H + TOOL_H + FAV_H);
+    // Una carpeta con dos favoritos: el clic abre su menú; el elemento elegido abre el favorito.
+    let c = b.n.datos.favs.nueva_carpeta("Trabajo").unwrap();
+    let f1 = b.n.datos.favs.anadir("https://c.com/", "C", c).unwrap();
+    b.n.datos.favs.anadir("https://d.com/", "D", c).unwrap();
+    b.foto(1024, 700);
+    let (items, _) = b.n.items_fav();
+    let r = items.iter().find(|(_, id)| *id == c).unwrap().0;
+    let (menu, _) = pide(&mut b, |n, cx| n.mouse(MouseEv::Down { x: r.x + 5, y: r.y + 5 }, cx));
+    assert_eq!(menu.unwrap().items.iter().map(|i| i.id).collect::<Vec<_>>(), [f1, f1 + 1]);
+    b.tecla(Key::Char('t'), true, false, false);
+    pide(&mut b, |n, cx| n.menu_result(TAG_FAV, f1, cx));
+    assert_eq!(b.n.pest[1].url_visible(), "https://c.com/");
+    // La pestaña nueva enseña los accesos (los favoritos, no las carpetas).
+    b.tecla(Key::Char('t'), true, false, false);
+    b.foto(1024, 700);
+    let accesos = b.n.accesos(b.n.pagina());
+    assert_eq!(accesos.len(), 3);
+    let t = accesos[0].0;
+    // Soltar Ctrl (el escritorio lo avisa con `Key::Other`): el clic abre en la misma pestaña.
+    b.tecla(Key::Other, false, false, false);
+    b.raton(MouseEv::Down { x: t.x + 10, y: t.y + 10 });
+    assert_eq!(b.n.pest[2].url_visible(), "https://a.com/", "el primero en el orden de la barra");
+}
+
+#[test]
+fn sugerencias_de_la_barra_con_flechas_y_enter() {
+    let mut b = Banco::nuevo();
+    visita(&mut b, "https://www.ejemplo.com/gatos", "Gatos graciosos");
+    visita(&mut b, "https://otra.org/", "Otra");
+    b.n.datos.favs.anadir("https://favorita.net/", "Mi favorita", 0);
+    b.tecla(Key::Char('t'), true, false, false);
+    b.foto(1024, 700);
+    b.escribe("g");
+    assert_eq!(b.n.sug.len(), 2, "«gatos» y «org»");
+    b.escribe("a");
+    assert_eq!(b.n.sug.len(), 1, "solo «gatos»");
+    b.tecla(Key::Down, false, false, false);
+    assert_eq!(b.n.sug_sel, Some(0));
+    b.foto(1024, 700);
+    b.tecla(Key::Enter, false, false, false);
+    assert_eq!(b.n.pest[b.n.act].url_visible(), "https://www.ejemplo.com/gatos");
+    assert!(b.n.sug.is_empty());
+    // Escape cierra la lista sin salir de la barra; un clic en una sugerencia la abre.
+    b.tecla(Key::Char('t'), true, false, false);
+    b.escribe("fav");
+    assert_eq!(b.n.sug.len(), 1);
+    b.tecla(Key::Escape, false, false, false);
+    assert!(b.n.sug.is_empty() && b.n.foco == Foco::Barra);
+    b.escribe("o");
+    b.foto(1024, 700);
+    let r = rect_sug(0, 1024);
+    b.raton(MouseEv::Down { x: r.x + 20, y: r.y + 10 });
+    assert_eq!(b.n.pest[b.n.act].url_visible(), "https://favorita.net/");
+}
