@@ -7,12 +7,17 @@
 extern crate alloc;
 
 pub mod css;
+mod controles;
 pub mod estilo;
+pub mod forms;
 pub mod html;
 mod maqueta;
 mod pinta;
 pub mod url;
 pub mod valores;
+
+pub use controles::{Efecto, Tecla};
+pub use forms::{Envio, Metodo};
 
 #[cfg(test)]
 mod pruebas;
@@ -71,6 +76,12 @@ struct FuenteCss {
 pub struct Documento {
     dom: html::Dom,
     base: String,
+    /// La URL del documento tal como se cargó (la del envío si la `action` está vacía).
+    doc_url: String,
+    forms: forms::Forms,
+    /// Foco de teclado y lista desplegable abierta (índice de control).
+    foco: Option<controles::Foco>,
+    abierto: Option<usize>,
     titulo: Option<String>,
     css: Vec<FuenteCss>,
     imgs: Vec<Img>,
@@ -123,6 +134,10 @@ impl Documento {
             }
         }
         let mut d = Documento {
+            forms: forms::Forms::construir(&dom),
+            foco: None,
+            abierto: None,
+            doc_url: url.to_string(),
             dom,
             base,
             titulo: None,
@@ -189,6 +204,7 @@ impl Documento {
                 _ => {}
             }
         }
+        d.foco = d.forms.ctl.iter().position(|c| c.auto && !c.deshab && c.tipo != forms::Tipo::Oculto).map(controles::Foco::Ctl);
         d
     }
 
@@ -246,7 +262,7 @@ impl Documento {
             self.estilos = Some((e, ancho));
         }
         let Some((est, _)) = &self.estilos else { return 0 };
-        let r = Maq::nuevo(&self.dom, est, &self.imgs, &self.img_de, &self.base, f).maquetar(ancho);
+        let r = Maq::nuevo(&self.dom, est, &self.imgs, &self.img_de, &self.forms, &self.base, f).maquetar(ancho);
         let alto = r.alto;
         self.res = Some(r);
         alto

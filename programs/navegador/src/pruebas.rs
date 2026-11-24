@@ -315,3 +315,77 @@ fn inicio_dibuja_y_busca() {
     b.foto(1024, 700);
     b.tick();
 }
+
+#[test]
+fn formulario_get_de_pagina_local_con_teclado() {
+    let mut b = Banco::nuevo();
+    escribe(&mut b.sys, "C:\\Pruebas\\dest.html", "<title>Destino</title><p>llegaste");
+    escribe(&mut b.sys, "C:\\Pruebas\\f.html", "<title>Form</title><form action='dest.html'><input name=q autofocus><input type=submit></form>");
+    b.abrir("C:\\Pruebas\\f.html");
+    b.foto(900, 600);
+    b.escribe("hola ñ");
+    // Retroceso borra en el campo (no navega) y Enter envía el formulario: se abre el archivo de destino
+    b.tecla(Key::Backspace, false, false, false);
+    b.tecla(Key::Backspace, false, false, false);
+    assert_eq!(b.n.pest[0].titulo, "Form");
+    b.tecla(Key::Enter, false, false, false);
+    assert_eq!((b.n.pest[0].titulo.as_str(), b.n.pest[0].url.as_str()), ("Destino", "C:\\Pruebas\\dest.html"));
+    assert!(b.n.pest[0].puede_atras());
+    // Tab pasa al botón y Espacio lo pulsa
+    b.tecla(Key::Left, false, false, true);
+    b.foto(900, 600);
+    assert_eq!(b.n.pest[0].titulo, "Form");
+    b.tecla(Key::Tab, false, false, false);
+    b.escribe(" ");
+    assert_eq!(b.n.pest[0].titulo, "Destino");
+}
+
+#[test]
+fn post_avisa_de_contrasena_y_pide_confirmacion_al_repetir() {
+    let mut b = Banco::nuevo();
+    escribe(&mut b.sys, "C:\\Pruebas\\f.html", "<title>Form</title><p>x");
+    b.abrir("C:\\Pruebas\\f.html");
+    b.foto(900, 600);
+    let envio = |url: &str, pass: bool| Envio { metodo: Metodo::Post, url: String::from(url), cuerpo: Some(b"u=a&p=b".to_vec()), tiene_password: pass };
+    // contraseña por http: aviso y no se envía hasta que se acepte; Escape cancela
+    {
+        let mut cx = Ctx::new(&mut b.sys, &mut b.th, 0);
+        b.n.enviar(envio("http://pagina.test/login", true), &mut cx);
+    }
+    assert!(matches!(b.n.aviso, Some(Aviso::Password(_))));
+    assert_eq!(b.n.pest[0].url, "C:\\Pruebas\\f.html");
+    b.foto(900, 600);
+    b.tecla(Key::Escape, false, false, false);
+    assert!(b.n.aviso.is_none() && b.n.pest[0].url == "C:\\Pruebas\\f.html");
+    // por https no hay aviso y el POST queda en el historial
+    {
+        let mut cx = Ctx::new(&mut b.sys, &mut b.th, 0);
+        b.n.enviar(envio("https://pagina.test/login", true), &mut cx);
+    }
+    assert!(b.n.aviso.is_none() && b.n.pest[0].pide_post(0));
+    // recargar pregunta antes de reenviar; Cancelar lo deja como estaba
+    b.tecla(Key::F(5), false, false, false);
+    assert!(matches!(b.n.aviso, Some(Aviso::Reenviar(0))));
+    b.foto(900, 600);
+    let r = rect_aviso_no(rect_aviso(b.n.pagina()));
+    b.raton(MouseEv::Down { x: r.x + 4, y: r.y + 4 });
+    assert!(b.n.aviso.is_none());
+    // atrás, a una página que no vino de un POST, no pregunta; adelante sí
+    b.tecla(Key::Left, false, false, true);
+    assert!(b.n.aviso.is_none() && b.n.pest[0].titulo == "Form");
+    b.tecla(Key::Right, false, false, true);
+    assert!(matches!(b.n.aviso, Some(Aviso::Reenviar(1))));
+    b.foto(900, 600);
+    let r = rect_aviso_si(rect_aviso(b.n.pagina()));
+    b.raton(MouseEv::Down { x: r.x + 4, y: r.y + 4 });
+    assert!(b.n.aviso.is_none() && b.n.pest[0].pide_post(0), "se reenvió: la entrada sigue siendo un POST");
+}
+
+#[test]
+fn una_pagina_publica_no_envia_a_la_red_local() {
+    let mut t = Pestana::nueva(0);
+    let mut sys = sistema();
+    t.base = String::from("https://ejemplo.com/f.html");
+    t.enviar(&mut sys, Envio { metodo: Metodo::Post, url: String::from("http://192.168.1.1/admin"), cuerpo: Some(b"a=1".to_vec()), tiene_password: false }, 0);
+    assert!(t.titulo.contains("Bloqueado") && !t.cargando(), "{:?}", t.titulo);
+}

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Pintado de la lista de dibujo y consultas sobre ella (enlaces, selección de texto, anclas).
+use crate::controles::Foco;
 use crate::estilo::{Lista, DECO_SUBRAYA, DECO_TACHA};
 use crate::maqueta::{EstadoImg, Item, Texto};
 use crate::{Documento, Fuentes};
@@ -21,6 +22,7 @@ impl Documento {
     pub fn pintar(&self, s: &mut Surface, scroll_y: i32, f: &mut dyn Fuentes) {
         let Some(res) = &self.res else { return };
         let clip = s.clip();
+        let mut lista = None;
         let (v0, v1) = (scroll_y.saturating_add(clip.y), scroll_y.saturating_add(clip.bottom()));
         for it in &res.items {
             match it {
@@ -60,6 +62,16 @@ impl Documento {
                         s.fill_rect(Rect::new(t.x, t.y - scroll_y - t.asc * 3 / 10, t.w, grosor), t.color);
                     }
                 }
+                Item::Control { r, ctl, px, letra, color, fondo } => {
+                    if r.bottom() < v0 || r.y > v1 {
+                        continue;
+                    }
+                    let r = Rect::new(r.x, r.y - scroll_y, r.w, r.h);
+                    self.pintar_control(s, f, r, *ctl as usize, *px, *letra, *color, *fondo);
+                    if self.abierto == Some(*ctl as usize) {
+                        lista = Some((r, *ctl as usize, *px, *letra));
+                    }
+                }
                 Item::Imagen { r, img, .. } => {
                     if r.bottom() < v0 || r.y > v1 {
                         continue;
@@ -79,6 +91,14 @@ impl Documento {
                         _ => s.fill_circle(*cx as f32, cy as f32, *r as f32, *color, 255),
                     }
                 }
+            }
+        }
+        if let Some((r, k, px, letra)) = lista {
+            self.pintar_lista(s, f, r, k, px, letra);
+        }
+        if let Some(Foco::Enlace(e)) = self.foco {
+            if let Some(r) = self.caja_enlace(e) {
+                s.frame(Rect::new(r.x - 1, r.y - scroll_y - 1, r.w + 2, r.h + 2), 0x0078D7);
             }
         }
     }

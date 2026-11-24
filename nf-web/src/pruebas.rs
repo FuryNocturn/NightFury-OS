@@ -702,6 +702,8 @@ const PIEZAS: &[&str] = &[
     "<span style=\"float:left;width:50%;margin:-9999px auto;padding:1e9px\">", "texto ", "palabralarguísimaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ", "&amp;", "&#xFFFFFFFF;",
     "<", ">", "<!--", "-->", "\"", "'", "<br>", "<pre>", " \n ", "<style>p{color:red}</style>", "<td colspan=999999 rowspan=3>", "<h1>", "<center>", "<font size=+99 color=zz>",
     "<div style=\"display:inline-block;width:10px\">", "<div style=\"position:absolute;float:right;clear:both\">", "<li style=\"list-style:square\">", "<input>", "<textarea>", "</textarea>",
+    "<form action=\"x?a=1\" method=post>", "</form>", "<input name=a value=é maxlength=2>", "<input type=password name=p>", "<select name=s><option selected>é<option value=2>", "</select>", "<label for=a>",
+    "<input type=checkbox checked name=c>", "<input type=radio name=r>", "<button type=submit formaction=\"//y/\">", "<input type=image src=a.png name=i>", "<form id=a>",
 ];
 
 fn aleatorio(sem: u64, n: usize) -> String {
@@ -720,6 +722,13 @@ fn recorre(h: &str, ancho: i32) {
     let _ = d.enlace_en(5, 5);
     let _ = d.texto_en(0, 0, 400, 400);
     let _ = d.ancla("x");
+    // la entrada hostil también llega a los controles: clics y teclas por todas partes
+    for (i, x) in (0..ancho.min(400)).step_by(37).enumerate() {
+        let _ = d.pulsar(x, (i as i32 * 23) % (alto + 1), &mut Falsa);
+        let t = [Tecla::Tab, Tecla::Car('é'), Tecla::Enter, Tecla::Car(' '), Tecla::Borrar, Tecla::Izq, Tecla::Abajo, Tecla::Todo, Tecla::Suprimir, Tecla::Fin][i % 10];
+        let _ = d.tecla(t, i % 2 == 0);
+        d.pintar(&mut s, 0, &mut Falsa);
+    }
 }
 
 #[test]
@@ -827,4 +836,230 @@ fn meta_refresh() {
     // Un carácter de varios bytes al empezar el resto no debe hacer saltar el análisis.
     let d = Documento::cargar("<meta http-equiv=refresh content=\"1;ab€\">".as_bytes(), None, "http://a.test/");
     assert_eq!(d.refresco().map(|r| r.0), Some(1));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Formularios
+
+/// Caja (coordenadas del documento) del control con ese `name`.
+fn caja_de(d: &Documento, nombre: &str) -> Rect {
+    let k = d.forms.ctl.iter().position(|c| c.nombre == nombre).unwrap_or_else(|| panic!("sin control {nombre}"));
+    d.caja_de(k).unwrap_or_else(|| panic!("{nombre} no se maqueta"))
+}
+
+fn clic(d: &mut Documento, nombre: &str) -> Efecto {
+    let r = caja_de(d, nombre);
+    d.pulsar(r.x + r.w / 2, r.y + r.h / 2, &mut Falsa)
+}
+
+fn escribe(d: &mut Documento, t: &str) {
+    for c in t.chars() {
+        d.tecla(Tecla::Car(c), false);
+    }
+}
+
+fn envio(e: Efecto) -> Envio {
+    match e {
+        Efecto::Enviar(e) => e,
+        otro => panic!("se esperaba un envío y fue {otro:?}"),
+    }
+}
+
+fn cuerpo(e: &Envio) -> String {
+    String::from_utf8(e.cuerpo.clone().unwrap()).unwrap()
+}
+
+#[test]
+fn urlencoded() {
+    let mut s = String::new();
+    forms::urlencode("a b&c=d+é*-._~\n\r\nx\ry", &mut s);
+    assert_eq!(s, "a+b%26c%3Dd%2B%C3%A9*-._%7E%0D%0A%0D%0Ax%0D%0Ay");
+}
+
+#[test]
+fn conjunto_de_datos() {
+    let mut d = doc(&format!(
+        "{SIN_MARGEN}<form action=\"/buscar?viejo=1\" method=GET>\
+        <input name=q value=\"hola mundo\"><input type=hidden name=h value=oculto>\
+        <input type=checkbox name=c1 value=uno checked><input type=checkbox name=c2 value=dos><input type=checkbox name=c3 checked>\
+        <input type=radio name=r value=a><input type=radio name=r value=b checked><input type=radio name=r value=c>\
+        <select name=s><option value=1>Uno<option selected>Dos<option value=3>Tres</select>\
+        <textarea name=t>l1\nl2</textarea><input name=off value=x disabled><input value=sinnombre>\
+        <input type=submit name=ok value=Ir><input type=submit name=otro value=Otro><button name=b value=bb>B</button>\
+        </form>"
+    ));
+    maq(&mut d, 600);
+    let e = envio(clic(&mut d, "ok"));
+    assert_eq!(e.metodo, Metodo::Get);
+    assert_eq!(e.url, "http://ej.com/buscar?q=hola+mundo&h=oculto&c1=uno&c3=on&r=b&s=Dos&t=l1%0D%0Al2&ok=Ir", "la consulta vieja se reemplaza");
+    assert!(e.cuerpo.is_none() && !e.tiene_password);
+    // otro botón pulsado: solo ese va en los datos
+    let e = envio(clic(&mut d, "b"));
+    assert!(e.url.ends_with("&b=bb") && !e.url.contains("ok="), "{}", e.url);
+}
+
+#[test]
+fn casillas_radios_y_select() {
+    let mut d = doc(&format!(
+        "{SIN_MARGEN}<form><input type=checkbox name=c><input type=radio name=r value=a checked><input type=radio name=r value=b>\
+        <select name=s><option>A<option>B<option>C</select><input type=submit name=z value=1></form>"
+    ));
+    maq(&mut d, 600);
+    clic(&mut d, "c");
+    let b = d.forms.ctl.iter().position(|c| c.valor == "b").unwrap();
+    let r = d.caja_de(b).unwrap();
+    d.pulsar(r.x + 2, r.y + 2, &mut Falsa);
+    assert!(d.forms.ctl[b].marcado && !d.forms.ctl[b - 1].marcado, "un solo radio por grupo");
+    // la lista desplegable: abrir y elegir la tercera opción
+    let r = caja_de(&d, "s");
+    d.pulsar(r.x + 2, r.y + 2, &mut Falsa);
+    assert!(d.abierto.is_some());
+    d.pulsar(r.x + 4, r.bottom() + 1 + 2 * 20 + 5, &mut Falsa);
+    assert!(d.abierto.is_none());
+    let e = envio(clic(&mut d, "z"));
+    assert_eq!(e.url, "http://ej.com/dir/pag.html?c=on&r=b&s=C&z=1", "action vacía = URL del documento");
+    // el foco en la casilla y espacio la desmarca
+    let c = d.forms.ctl.iter().position(|c| c.nombre == "c").unwrap();
+    d.foco = Some(controles::Foco::Ctl(c));
+    d.tecla(Tecla::Car(' '), false);
+    assert!(!d.forms.ctl[c].marcado);
+}
+
+#[test]
+fn post_password_formaction_y_reset() {
+    let mut d = doc(&format!(
+        "{SIN_MARGEN}<form action=\"http://otro.com/login\" method=post><input name=u value=ana><input type=password name=p>\
+        <input type=submit name=go value=Entrar><button formaction=\"/otra\" formmethod=get name=alt>Alt</button><input type=reset name=rs value=Borrar></form>"
+    ));
+    maq(&mut d, 600);
+    let e = envio(clic(&mut d, "go"));
+    assert_eq!((e.metodo, e.url.as_str()), (Metodo::Post, "http://otro.com/login"));
+    assert!(!e.tiene_password, "contraseña vacía: nada que avisar");
+    clic(&mut d, "p");
+    escribe(&mut d, "s3creto&");
+    let e = envio(clic(&mut d, "go"));
+    assert_eq!(cuerpo(&e), "u=ana&p=s3creto%26&go=Entrar");
+    assert!(e.tiene_password);
+    let e = envio(clic(&mut d, "alt"));
+    assert_eq!((e.metodo, e.url.as_str()), (Metodo::Get, "http://ej.com/otra?u=ana&p=s3creto%26&alt="), "formaction y formmethod del botón");
+    clic(&mut d, "rs");
+    assert_eq!(d.forms.ctl[0].valor, "ana");
+    assert_eq!(d.forms.ctl[1].valor, "");
+}
+
+#[test]
+fn edicion_enter_envia_y_tab() {
+    let mut d = doc(&format!("{SIN_MARGEN}<form action=/x><input name=a maxlength=5 autofocus><input name=b readonly value=ro><textarea name=t></textarea><input type=submit><a href=/enlace>e</a></form>"));
+    maq(&mut d, 600);
+    assert!(d.hay_foco() && d.foco_texto(), "autofocus");
+    escribe(&mut d, "añbcdefg");
+    assert_eq!(d.forms.ctl[0].valor, "añbcd", "maxlength cuenta letras");
+    d.tecla(Tecla::Izq, false);
+    d.tecla(Tecla::Borrar, false);
+    d.tecla(Tecla::Izq, true);
+    d.tecla(Tecla::Izq, true);
+    escribe(&mut d, "Z");
+    assert_eq!(d.forms.ctl[0].valor, "aZd", "la selección con Mayús+Izq se sustituye");
+    let e = envio(d.tecla(Tecla::Enter, false));
+    assert_eq!(e.url, "http://ej.com/x?a=aZd&b=ro&t=");
+    // Tab recorre controles y enlaces en orden y sale por el final
+    assert_eq!(d.tecla(Tecla::Tab, false), Efecto::Cambio);
+    escribe(&mut d, "x");
+    assert_eq!(d.forms.ctl[1].valor, "ro", "solo lectura");
+    d.tecla(Tecla::Tab, false);
+    d.tecla(Tecla::Enter, false);
+    assert_eq!(d.forms.ctl[2].valor, "\n");
+    d.tecla(Tecla::Tab, false);
+    d.tecla(Tecla::Tab, false);
+    assert_eq!(d.tecla(Tecla::Enter, false), Efecto::Enlace("http://ej.com/enlace".to_string()));
+    assert_eq!(d.tecla(Tecla::Tab, false), Efecto::Ignorado);
+    assert!(!d.hay_foco());
+    d.tecla(Tecla::Tab, true);
+    assert!(matches!(d.foco, Some(controles::Foco::Enlace(_))));
+}
+
+#[test]
+fn label_activa_su_control_y_boton_sin_formulario() {
+    let mut d = doc(&format!(
+        "{SIN_MARGEN}<form><input type=checkbox id=k name=c><label for=k>Acepto</label> <label><input type=checkbox name=d>Otro</label></form><input type=submit name=suelto>"
+    ));
+    maq(&mut d, 600);
+    let t = textos(&d).into_iter().find(|t| t.0 == "Acepto").unwrap();
+    d.pulsar(t.1 + 2, t.2 - 3, &mut Falsa);
+    assert!(d.forms.ctl[0].marcado, "clic en la etiqueta con for");
+    let t = textos(&d).into_iter().find(|t| t.0 == "Otro").unwrap();
+    d.pulsar(t.1 + 2, t.2 - 3, &mut Falsa);
+    assert!(d.forms.ctl[1].marcado, "etiqueta que contiene el control");
+    assert_eq!(clic(&mut d, "suelto"), Efecto::Cambio, "sin formulario no hay envío");
+}
+
+#[test]
+fn imagen_envia_coordenadas_y_enter_sin_boton() {
+    let mut d = doc(&format!(
+        "{SIN_MARGEN}<form action=/m><input type=image name=mapa alt=Ir width=50 height=30></form><form action=/u method=post><input name=solo value=1></form>\
+        <form><input name=a><input name=b></form>"
+    ));
+    maq(&mut d, 600);
+    // sin imagen cargada se pinta como botón con el texto alternativo y envía igual
+    let r = caja_de(&d, "mapa");
+    let e = envio(d.pulsar(r.x + 7, r.y + 9, &mut Falsa));
+    assert_eq!(e.url, "http://ej.com/m?mapa.x=7&mapa.y=9");
+    clic(&mut d, "solo");
+    let e = envio(d.tecla(Tecla::Enter, false));
+    assert_eq!(cuerpo(&e), "solo=1", "un solo campo: Enter envía sin botón");
+    clic(&mut d, "a");
+    assert_eq!(d.tecla(Tecla::Enter, false), Efecto::Cambio, "dos campos y sin botón: no envía");
+}
+
+#[test]
+fn limites_y_entrada_hostil() {
+    // más controles de los admitidos
+    let h: String = (0..5000).map(|i| format!("<input name=n{i} value=v>")).collect();
+    let mut d = doc(&format!("<form>{h}</form>"));
+    maq(&mut d, 400);
+    assert_eq!(d.forms.ctl.len(), forms::MAX_CONTROLES);
+    // esquema no admitido en la acción
+    let mut d = doc("<form action=\"javascript:x\" method=post><input name=a><input type=submit></form>");
+    maq(&mut d, 400);
+    let k = d.forms.ctl.len() - 1;
+    let r = d.caja_de(k).unwrap();
+    assert_eq!(d.pulsar(r.x + 1, r.y + 1, &mut Falsa), Efecto::Cambio, "esquema no admitido: no se envía");
+    // valor larguísimo: se corta al tope; por GET la URL no cabe y por POST el cuerpo sí
+    for (metodo, cabe) in [("get", false), ("post", true)] {
+        let mut d = doc(&format!("<form method={metodo}><textarea name=t></textarea><input type=submit></form>"));
+        maq(&mut d, 400);
+        clic(&mut d, "t");
+        for _ in 0..forms::MAX_VALOR + 10 {
+            d.tecla(Tecla::Car('é'), false);
+        }
+        assert_eq!(d.forms.ctl[0].n(), forms::MAX_VALOR);
+        let r = d.caja_de(d.forms.ctl.len() - 1).unwrap();
+        assert_eq!(matches!(d.pulsar(r.x + 1, r.y + 1, &mut Falsa), Efecto::Enviar(_)), cabe, "{metodo}");
+    }
+    // texto con letras de varios bytes: editar en cualquier posición no entra en pánico
+    let mut d = doc("<input name=a value=\"ñ€😀\" autofocus>");
+    maq(&mut d, 400);
+    for t in [Tecla::Izq, Tecla::Borrar, Tecla::Inicio, Tecla::Suprimir, Tecla::Fin, Tecla::Der, Tecla::Car('😀'), Tecla::Todo, Tecla::Borrar] {
+        d.tecla(t, true);
+    }
+    assert_eq!(d.forms.ctl[0].valor, "");
+}
+
+#[test]
+fn pintado_de_controles_con_scroll() {
+    let mut d = doc(
+        "<form><input name=a value=hola autofocus><input type=password value=abc><input type=checkbox checked><input type=radio checked>\
+        <select><option>x<option>y</select><textarea>a\nb\nc</textarea><button>Ok</button></form>",
+    );
+    let alto = maq(&mut d, 300);
+    let mut s = Surface::new(300, 60, 0xFFFFFF);
+    for y in [-40, 0, alto / 2, alto] {
+        d.pintar(&mut s, y, &mut Falsa);
+    }
+    let r = caja_de(&d, "a");
+    d.pulsar(r.x + 1, r.y + 1, &mut Falsa);
+    let sel = d.forms.ctl.iter().position(|c| c.tipo == forms::Tipo::Select).unwrap();
+    let r = d.caja_de(sel).unwrap();
+    d.pulsar(r.x + 1, r.y + 1, &mut Falsa);
+    d.pintar(&mut s, 0, &mut Falsa);
 }

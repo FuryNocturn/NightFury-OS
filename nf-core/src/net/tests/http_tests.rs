@@ -483,3 +483,22 @@ fn cuerpo_comprimido_roto_incompleto_o_bomba() {
     assert_eq!(ev.last(), Some(&HttpEvent::Error(NetError::Protocol("cuerpo descomprimido demasiado grande"))));
     assert!(body(&ev).len() <= 32 * 1024 * 1024);
 }
+
+#[test]
+fn post_de_formulario() {
+    let mut l = lan();
+    l.router.srv.listen_any(8080, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    let mut g = HttpGet::start_post(&mut l.net, "http://example.org:8080/enviar", b"a=1&b=%C3%A9".to_vec()).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..6000 {
+        l.run(20);
+        ev.extend(g.poll(&mut l.net, l.now));
+        if matches!(ev.last(), Some(HttpEvent::Done | HttpEvent::Error(_))) {
+            break;
+        }
+    }
+    l.run(6_000);
+    assert_eq!((body(&ev), ev.last()), (b"ok".to_vec(), Some(&HttpEvent::Done)));
+    let pedido = alloc::format!("POST /enviar HTTP/1.1\r\nHost: example.org:8080\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 12\r\nConnection: close\r\n\r\na=1&b=%C3%A9", crate::VERSION);
+    assert_eq!(String::from_utf8_lossy(&l.router.srv.conns[0].got), pedido);
+}

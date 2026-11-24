@@ -181,7 +181,7 @@ html, address, blockquote, body, center, dd, details, dir, div, dl, dt, fieldset
 header, hgroup, legend, main, menu, nav, ol, p, section, summary, ul, article, aside, h1, h2, h3, h4, h5, h6, hr, pre,
 listing, xmp, noscript, optgroup { display: block }
 head, title, meta, link, style, script, base, template, area, param, source, track, datalist, svg, canvas, video,
-audio, iframe, object, embed, noembed, input, select, textarea, colgroup, col, map, frame, frameset, [hidden] { display: none }
+audio, iframe, object, embed, noembed, colgroup, col, map, frame, frameset, [hidden] { display: none }
 li { display: list-item }
 table { display: table; border-spacing: 2px }
 caption { display: table-caption; text-align: center }
@@ -212,7 +212,9 @@ hr { margin: 8px 0; border-top: 1px solid #9a9a9a; border-bottom: 1px solid #eee
 center { text-align: center }
 nobr { white-space: nowrap }
 fieldset { margin: 0 2px; padding: .35em .75em .625em; border: 1px solid #c0c0c0 }
-button { display: inline-block; padding: 1px 6px; border: 1px solid #767676; background-color: #efefef; text-align: center }
+input, select, textarea, button { display: inline-block; font-family: sans-serif; font-size: 13.3333px; color: #000000; text-align: left }
+textarea { font-family: monospace }
+input[type=checkbox], input[type=radio] { margin: 3px 3px 3px 4px }
 ";
 
 // ---------------------------------------------------------------------------------------------------------
@@ -982,9 +984,8 @@ pub fn calcular(dom: &Dom, hojas: &[FuenteHoja<'_>], ancho: f32) -> Estilos {
         if el.etq == "html" {
             rem = e.px;
         }
-        // shortcut: sin controles de formulario, select/input/textarea se ocultan aunque la página les dé
-        // otro `display` (si no, las opciones salen como texto suelto); llegan con los formularios en 0.12.5.
-        if matches!(el.etq.as_str(), "select" | "input" | "textarea" | "datalist") {
+        // los controles que el motor no pinta (type=hidden se envía pero no se ve; type=file no se admite)
+        if el.etq == "input" && el.attrs.iter().any(|(k, v)| k == "type" && matches!(v.trim().to_ascii_lowercase().as_str(), "hidden" | "file")) {
             e.display = Display::None;
         }
         idx[n] = lista.len() as u32;

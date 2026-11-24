@@ -3,6 +3,7 @@
 //! Maquetado: flujo de bloques y líneas, flotantes, listas e imágenes. Produce una lista de dibujo
 //! (`Item`) en coordenadas del documento. Las líneas están en `linea` y las tablas en `tabla`.
 use crate::estilo::{Display, Estilo, Estilos, Flot, Lista, ABA, ARR, DER, IZQ};
+use crate::forms::{Forms, SIN_CTL};
 use crate::html::{Dato, Dom};
 use crate::valores::Len;
 use crate::{Fuentes, Letra};
@@ -12,6 +13,7 @@ use nf_core::bmp::Picture;
 use nf_core::geom::Rect;
 use nf_core::math::iround;
 
+mod ctl;
 mod linea;
 mod tabla;
 
@@ -50,13 +52,17 @@ pub struct Texto {
     pub color: u32,
     pub deco: u8,
     pub enlace: u32,
+    /// Control al que apunta su `<label>` (índice + 1; 0 = ninguno).
+    pub etiq: u32,
     pub s: String,
 }
 
 pub enum Item {
     Caja { r: Rect, fondo: Option<u32>, borde: [i32; 4], color: [u32; 4] },
     Texto(Texto),
-    Imagen { r: Rect, img: u32, enlace: u32 },
+    Imagen { r: Rect, img: u32, enlace: u32, ctl: u32 },
+    /// Control de formulario: se pinta con su estado (`Documento::forms`), con la letra del elemento.
+    Control { r: Rect, ctl: u32, px: f32, letra: Letra, color: u32, fondo: Option<u32> },
     Vineta { cx: i32, cy: i32, r: i32, tipo: Lista, color: u32 },
 }
 
@@ -64,7 +70,7 @@ impl Item {
     /// Desplaza el elemento (para colocar lo maquetado en origen local).
     fn mover(&mut self, dx: i32, dy: i32) {
         match self {
-            Item::Caja { r, .. } | Item::Imagen { r, .. } => {
+            Item::Caja { r, .. } | Item::Imagen { r, .. } | Item::Control { r, .. } => {
                 r.x += dx;
                 r.y += dy;
             }
@@ -129,6 +135,8 @@ impl Geom {
 pub struct Resultado {
     pub items: Vec<Item>,
     pub enlaces: Vec<String>,
+    /// Nodo de cada enlace (el 0 no tiene).
+    pub enl_nodo: Vec<u32>,
     pub anclas: Vec<(String, i32)>,
     pub alto: i32,
 }
@@ -138,9 +146,11 @@ pub struct Maq<'a> {
     est: &'a Estilos,
     imgs: &'a [Img],
     img_de: &'a [u32],
+    forms: &'a Forms,
     f: &'a mut dyn Fuentes,
     enlace_de: Vec<u32>,
     enlaces: Vec<String>,
+    enl_nodo: Vec<u32>,
     num_item: Vec<i32>,
     items: Vec<Item>,
     anclas: Vec<(String, i32)>,
@@ -186,9 +196,10 @@ fn resolver_enlace(base: &str, href: &str) -> Option<String> {
 }
 
 impl<'a> Maq<'a> {
-    pub fn nuevo(dom: &'a Dom, est: &'a Estilos, imgs: &'a [Img], img_de: &'a [u32], base: &str, f: &'a mut dyn Fuentes) -> Self {
+    pub fn nuevo(dom: &'a Dom, est: &'a Estilos, imgs: &'a [Img], img_de: &'a [u32], forms: &'a Forms, base: &str, f: &'a mut dyn Fuentes) -> Self {
         let n = dom.nodos.len();
         let mut enlaces = alloc::vec![String::new()]; // el 0 es «sin enlace»
+        let mut enl_nodo = alloc::vec![0u32];
         let mut enlace_de = alloc::vec![0u32; n];
         let mut num_item = alloc::vec![0i32; n];
         let mut contador = alloc::vec![0i32; n];
@@ -199,6 +210,7 @@ impl<'a> Maq<'a> {
                 if let Some(u) = dom.attr(i, "href").and_then(|h| resolver_enlace(base, h)) {
                     enlace_de[i] = enlaces.len() as u32;
                     enlaces.push(u);
+                    enl_nodo.push(i as u32);
                 }
             }
             if dom.elem(i).is_some() && est.de(i).display == Display::ListItem {
@@ -217,9 +229,11 @@ impl<'a> Maq<'a> {
             est,
             imgs,
             img_de,
+            forms,
             f,
             enlace_de,
             enlaces,
+            enl_nodo,
             num_item,
             items: Vec::new(),
             anclas: Vec::new(),
@@ -239,7 +253,7 @@ impl<'a> Maq<'a> {
         self.fluir(0, 0, ancho, 0);
         self.y += self.pend;
         let alto = self.y.max(self.fondo_flot(3)).clamp(0, MAX_ALTO);
-        Resultado { items: self.items, enlaces: self.enlaces, anclas: self.anclas, alto }
+        Resultado { items: self.items, enlaces: self.enlaces, enl_nodo: self.enl_nodo, anclas: self.anclas, alto }
     }
 
     fn push(&mut self, it: Item) -> usize {
@@ -545,6 +559,7 @@ impl<'a> Maq<'a> {
                     color,
                     deco: 0,
                     enlace: 0,
+                    etiq: 0,
                     s,
                 }));
             }
