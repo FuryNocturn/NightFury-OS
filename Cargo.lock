@@ -50,6 +50,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "navegador"
+version = "1.0.0"
+dependencies = [
+ "nf-app",
+ "nf-core",
+ "nf-web",
+]
+
+[[package]]
 name = "nf-app"
 version = "0.12.3"
 dependencies = [
@@ -86,6 +95,7 @@ name = "nfprog"
 version = "0.12.3"
 dependencies = [
  "mensajes",
+ "navegador",
  "nf-core",
  "paint",
  "reloj",

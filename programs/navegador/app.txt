@@ -1,0 +1,6 @@
+nombre=Navegador
+version=1.0
+autor=NightFury
+icono=app
+ancho=1024
+alto=700

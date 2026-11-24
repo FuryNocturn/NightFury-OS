@@ -12,3 +12,4 @@ nf-core = { path = "../../nf-core" }
 reloj = { path = "../../programs/reloj" }
 paint = { path = "../../programs/paint" }
 mensajes = { path = "../../programs/mensajes" }
+navegador = { path = "../../programs/navegador" }

@@ -104,50 +104,69 @@ impl Documento {
     // reparte en proporción a su ancho (sin medir letra a letra). Afinar si hace falta precisión.
     pub fn texto_en(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> String {
         let Some(res) = &self.res else { return String::new() };
-        let ((ax, ay), (bx, by)) = if (y0, x0) <= (y1, x1) { ((x0, y0), (x1, y1)) } else { ((x1, y1), (x0, y0)) };
         let textos: alloc::vec::Vec<&Texto> = res.items.iter().filter_map(|i| if let Item::Texto(t) = i { Some(t) } else { None }).collect();
-        // primer trozo que no queda del todo antes del punto A y último que no queda del todo después del B
-        let antes = |t: &Texto| abajo(t) <= ay || (ay >= arriba(t) && t.x + t.w <= ax);
-        let despues = |t: &Texto| arriba(t) > by || (by < abajo(t) && t.x >= bx);
-        let Some(ini) = textos.iter().position(|t| !antes(t)) else { return String::new() };
-        let Some(fin) = textos.iter().rposition(|t| !despues(t)) else { return String::new() };
-        if ini > fin {
-            return String::new();
-        }
-        // posición (en letras) del punto dentro de un trozo
-        let corte = |t: &Texto, px: i32, py: i32| -> Option<usize> {
-            if py < arriba(t) || py >= abajo(t) || t.w <= 0 {
-                return None;
-            }
-            let n = t.s.chars().count() as i64;
-            Some(((px - t.x).clamp(0, t.w) as i64 * n / t.w as i64) as usize)
-        };
         let mut r = String::new();
-        for k in ini..=fin {
+        for (k, desde, hasta) in tramos(&textos, x0, y0, x1, y1) {
             let t = textos[k];
-            let n = t.s.chars().count();
-            let desde = if k == ini { corte(t, ax, ay).unwrap_or(0) } else { 0 };
-            let hasta = if k == fin { corte(t, bx, by).unwrap_or(n) } else { n };
-            if hasta > desde {
-                if k > ini {
-                    let p = textos[k - 1];
-                    if t.y != p.y {
-                        while r.ends_with(' ') {
-                            r.pop();
-                        }
-                        r.push('\n');
-                    } else if t.x - (p.x + p.w) > 2 && !r.ends_with(' ') {
-                        r.push(' ');
+            if !r.is_empty() && k > 0 {
+                let p = textos[k - 1];
+                if t.y != p.y {
+                    while r.ends_with(' ') {
+                        r.pop();
                     }
+                    r.push('\n');
+                } else if t.x - (p.x + p.w) > 2 && !r.ends_with(' ') {
+                    r.push(' ');
                 }
-                r.extend(t.s.chars().skip(desde).take(hasta - desde));
             }
+            r.extend(t.s.chars().skip(desde).take(hasta - desde));
         }
         r
+    }
+
+    /// Rectángulos (en coordenadas del documento) que cubren el texto entre dos puntos, para resaltar la selección.
+    pub fn rects_seleccion(&self, x0: i32, y0: i32, x1: i32, y1: i32) -> alloc::vec::Vec<Rect> {
+        let Some(res) = &self.res else { return alloc::vec::Vec::new() };
+        let textos: alloc::vec::Vec<&Texto> = res.items.iter().filter_map(|i| if let Item::Texto(t) = i { Some(t) } else { None }).collect();
+        tramos(&textos, x0, y0, x1, y1)
+            .into_iter()
+            .map(|(k, desde, hasta)| {
+                let t = textos[k];
+                let n = t.s.chars().count().max(1) as i64;
+                let (a, b) = (t.x + (t.w as i64 * desde as i64 / n) as i32, t.x + (t.w as i64 * hasta as i64 / n) as i32);
+                Rect::new(a, arriba(t), b - a, abajo(t) - arriba(t))
+            })
+            .collect()
     }
 
     /// Posición vertical del elemento con ese `id` (o `<a name>`), en coordenadas del documento.
     pub fn ancla(&self, id: &str) -> Option<i32> {
         self.res.as_ref()?.anclas.iter().find(|(k, _)| k == id).map(|&(_, y)| y)
     }
+}
+
+/// Trozos de texto tocados por la selección entre dos puntos: (índice, desde, hasta) en letras, en orden de lectura.
+fn tramos(textos: &[&Texto], x0: i32, y0: i32, x1: i32, y1: i32) -> alloc::vec::Vec<(usize, usize, usize)> {
+    let ((ax, ay), (bx, by)) = if (y0, x0) <= (y1, x1) { ((x0, y0), (x1, y1)) } else { ((x1, y1), (x0, y0)) };
+    // primer trozo que no queda del todo antes del punto A y último que no queda del todo después del B
+    let antes = |t: &Texto| abajo(t) <= ay || (ay >= arriba(t) && t.x + t.w <= ax);
+    let despues = |t: &Texto| arriba(t) > by || (by < abajo(t) && t.x >= bx);
+    let (Some(ini), Some(fin)) = (textos.iter().position(|t| !antes(t)), textos.iter().rposition(|t| !despues(t))) else { return alloc::vec::Vec::new() };
+    // posición (en letras) del punto dentro de un trozo
+    let corte = |t: &Texto, px: i32, py: i32| -> Option<usize> {
+        if py < arriba(t) || py >= abajo(t) || t.w <= 0 {
+            return None;
+        }
+        let n = t.s.chars().count() as i64;
+        Some(((px - t.x).clamp(0, t.w) as i64 * n / t.w as i64) as usize)
+    };
+    (ini..=fin)
+        .filter_map(|k| {
+            let t = textos[k];
+            let n = t.s.chars().count();
+            let desde = if k == ini { corte(t, ax, ay).unwrap_or(0) } else { 0 };
+            let hasta = if k == fin { corte(t, bx, by).unwrap_or(n) } else { n };
+            (hasta > desde).then_some((k, desde, hasta))
+        })
+        .collect()
 }

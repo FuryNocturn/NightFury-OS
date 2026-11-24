@@ -125,6 +125,15 @@ const PROGRAMAS_SISTEMA: &[(&str, &[(&str, &[u8])])] = &[
             ("programa.nfx", include_bytes!("../../target/programas/Explorador de archivos/programa.nfx")),
         ],
     ),
+    // v0.12.4: el navegador (programa del sistema: no pide permiso de red).
+    (
+        "Navegador",
+        &[
+            ("app.txt", include_bytes!("../../programs/navegador/app.txt")),
+            ("programa.nfx", include_bytes!("../../target/programas/Navegador/programa.nfx")),
+            ("icono.bmp", include_bytes!("../../programs/navegador/icono.bmp")),
+        ],
+    ),
 ];
 
 /// Fuentes que trae el sistema (v0.12.4; Liberation, licencia OFL 1.1 en LICENSE), en `C:\Sistema\fuentes`.

@@ -1,0 +1,22 @@
+[package]
+name = "navegador"
+version = "1.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NightFury: Navegador, páginas web (HTTP y HTTPS) con pestañas, sin JavaScript"
+
+# La lógica va en la biblioteca para poder probarla y sacarle capturas en el PC (tools/nfprog).
+[lib]
+name = "navegador_app"
+
+[[bin]]
+name = "navegador"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+nf-core = { path = "../../nf-core" }
+nf-app = { path = "../../nf-app" }
+nf-web = { path = "../../nf-web" }
