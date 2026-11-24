@@ -1,4 +1,4 @@
-# Kit de programas de NightFury (v0.12.3)
+# Kit de programas de NightFury (v0.12.4)
 
 Un programa NightFury es un ejecutable en modo usuario escrito en Rust, sin dependencias externas:
 usa el mismo trait `App` que las apps del sistema (`nf-core`) y el runtime `nf-app`.
@@ -262,6 +262,20 @@ la misma red.
 **Cifrado.** `nf_core::crypto` trae `sha256`, `hmac`, `hkdf_extract`/`hkdf_expand`, `x25519` (y
 `X25519_BASE`), `chacha20_xor`, `poly1305` y `aead_seal`/`aead_open` (ChaCha20-Poly1305). Están probados con
 los vectores de los RFC 7748, 8439 y 5869, pero son implementaciones propias **no auditadas**.
+
+### Letra TrueType, imágenes y páginas web (v0.12.4)
+
+- **Letra**: `nf_core::ttf::Font::parse(bytes)` lee un `.ttf` (o `parse_collection` para un `.ttc`);
+  `ttf::measure` mide un texto y `ttf::draw_text` lo pinta suavizado en una `Surface`, con una `TextCache`
+  para no volver a rasterizar los glifos. Las fuentes del sistema están en `C:\Sistema\fuentes\`
+  (Liberation Sans, Serif y Mono; licencia OFL al lado) y se leen con `cx.sys.files()`.
+- **Imágenes**: `nf_core::img::decode(bytes, Limits)` abre PNG, JPEG y GIF y devuelve un `Picture`;
+  `img::sniff` dice el formato y `img::dimensions` el tamaño sin decodificar. Pon `Limits` acordes a lo que
+  esperas: la imagen puede venir de cualquier sitio. `img::inflate` descomprime DEFLATE, zlib y gzip.
+- **Páginas web**: el crate `nf-web` (`Documento::cargar`, `recursos`, `poner_css`, `poner_imagen`,
+  `maquetar`, `pintar`) convierte HTML y CSS en una imagen; tú das las letras con el trait `nf_web::Fuentes`.
+  `HttpGet` ya descomprime `Content-Encoding: gzip`. El ejemplo completo es el **Navegador**
+  (`programs\navegador`).
 
 ## Guardar un archivo (`SAVE_AS`)
 

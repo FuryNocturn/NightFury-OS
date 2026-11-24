@@ -1,0 +1,11 @@
+[package]
+name = "nf-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NightFury: motor de páginas web (HTML, CSS, maquetado y pintado; sin JavaScript)"
+
+[dependencies]
+nf-core = { path = "../nf-core" }

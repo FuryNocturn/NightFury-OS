@@ -75,8 +75,21 @@ fn icono_paint(s: &mut Surface) {
     s.fill_circle(14.6, 17.4, 3.2, 0x2F7BE0, 255);
 }
 
+fn icono_navegador(s: &mut Surface) {
+    // Globo azul con meridianos y una brújula (aguja roja y blanca) encima.
+    let c = 16.0;
+    s.fill_circle(c, c, 14.5, 0x2F7BE0, 255);
+    s.arc(c, c, 11.5, 0.0, 360.0, 1.4, 0xFFFFFF);
+    s.stroke(&[(3.5, c), (28.5, c)], 1.4, 0xFFFFFF);
+    s.stroke(&[(c, 3.5), (c, 28.5)], 1.4, 0xFFFFFF);
+    s.arc(c - 9.0, c, 11.0, -50.0, 50.0, 1.4, 0xFFFFFF);
+    s.arc(c + 9.0, c, 11.0, 130.0, 230.0, 1.4, 0xFFFFFF);
+    s.stroke(&[(9.0, 23.0), (14.0, 14.0), (23.0, 9.0), (18.0, 18.0), (9.0, 23.0)], 1.0, 0x1B3F7A);
+    s.fill_circle(c, c, 1.6, 0xFFFFFF, 255);
+}
+
 fn iconos(dir: &str) -> Result<(), String> {
-    for (nombre, f) in [("reloj", icono_reloj as fn(&mut Surface)), ("paint", icono_paint)] {
+    for (nombre, f) in [("reloj", icono_reloj as fn(&mut Surface)), ("paint", icono_paint), ("navegador", icono_navegador)] {
         let ruta = format!("{dir}/{nombre}/icono.bmp");
         std::fs::write(&ruta, bmp::encode(&icono(f))).map_err(|e| format!("{ruta}: {e}"))?;
         println!("{ruta}");
@@ -155,6 +168,25 @@ impl Banco {
         }
         let u = pts[pts.len() - 1];
         self.ratón(MouseEv::Up { x: u.0, y: u.1 }, 0);
+    }
+
+    fn tecla(&mut self, key: nf_core::input::Key, ctrl: bool) {
+        let ev = nf_core::input::KeyEvent { key, ch: None, down: true, shift: false, ctrl, alt: false };
+        let mut cx = Ctx::new(&mut self.sys, &mut self.th, 0);
+        self.app.key(&ev, &mut cx);
+    }
+
+    fn escribe(&mut self, texto: &str) {
+        for c in texto.chars() {
+            let ev = nf_core::input::KeyEvent { key: nf_core::input::Key::Char(c), ch: Some(c), down: true, shift: false, ctrl: false, alt: false };
+            let mut cx = Ctx::new(&mut self.sys, &mut self.th, 0);
+            self.app.key(&ev, &mut cx);
+        }
+    }
+
+    fn abrir(&mut self, ruta: &str) {
+        let mut cx = Ctx::new(&mut self.sys, &mut self.th, 0);
+        self.app.open_path(ruta, &mut cx);
     }
 
     fn tick(&mut self, ms: u64) {
@@ -288,6 +320,115 @@ fn capturas_mensajes(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn crc32(d: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in d {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+    }
+    !c
+}
+
+/// PNG sin comprimir (bloques «stored» de zlib): solo para tener una imagen real que mostrar en las capturas.
+fn png(s: &Surface) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for y in 0..s.h as usize {
+        raw.push(0);
+        for x in 0..s.w as usize {
+            let p = s.px[y * s.w as usize + x];
+            raw.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+        }
+    }
+    let mut z = vec![0x78, 0x01];
+    let trozos: Vec<&[u8]> = raw.chunks(65535).collect();
+    for (i, t) in trozos.iter().enumerate() {
+        z.push((i + 1 == trozos.len()) as u8);
+        z.extend_from_slice(&(t.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(!(t.len() as u16)).to_le_bytes());
+        z.extend_from_slice(t);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + x as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    z.extend_from_slice(&(b << 16 | a).to_be_bytes());
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut trozo = |tipo: &[u8; 4], datos: &[u8]| {
+        out.extend_from_slice(&(datos.len() as u32).to_be_bytes());
+        let mut td = tipo.to_vec();
+        td.extend_from_slice(datos);
+        out.extend_from_slice(&td);
+        out.extend_from_slice(&crc32(&td).to_be_bytes());
+    };
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&(s.w as u32).to_be_bytes());
+    ihdr.extend_from_slice(&(s.h as u32).to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    trozo(b"IHDR", &ihdr);
+    trozo(b"IDAT", &z);
+    trozo(b"IEND", &[]);
+    out
+}
+
+const PAGINA_NAVEGADOR: &str = "<html><head><title>Cuaderno de viaje: Lisboa</title><style>
+body { font-family: sans-serif; margin: 0; color: #222 }
+.cab { background: #1a3c6e; color: white; padding: 18px 40px }
+.cab h1 { margin: 0; font-size: 30px }
+.cuerpo { max-width: 760px; margin: 0 auto; padding: 10px 24px 40px 24px }
+img { border: 1px solid #ccc }
+.nota { background: #fff3cd; border: 1px solid #c9a227; padding: 8px 12px; margin: 14px 0 }
+table { border-collapse: collapse } td, th { border: 1px solid #999; padding: 4px 10px }
+a { color: #0645ad }
+</style></head><body>
+<div class=cab><h1>Cuaderno de viaje: Lisboa</h1>Cinco días entre colinas, tranvías y azulejos</div>
+<div class=cuerpo>
+<h2>Primer día</h2>
+<p>Llegamos por la tarde y subimos hasta el mirador. Desde allí se ve todo el río, los tejados rojos y, al fondo, el puente. Más fotos en <a href=\"fotos.html\">la galería</a> y el <a href=\"#horarios\">horario de los tranvías</a>.</p>
+<p><img src=\"foto.png\" width=360 height=200 alt=\"El mirador al atardecer\"> <img src=\"falta.png\" alt=\"Imagen que no existe\"></p>
+<div class=nota>Consejo: lleva calzado cómodo; las cuestas son largas y el suelo resbala.</div>
+<h2>Lo que vimos</h2>
+<ul><li>El castillo y sus murallas<li>La catedral<ol><li>Fachada<li>Claustro</ol><li>El barrio de Alfama</ul>
+<h2 id=horarios>Horarios</h2>
+<table><tr><th>Línea<th>Primera salida<th>Última salida<tr><td>28<td>06:30<td>23:00<tr><td>12<td>08:00<td>21:30</table>
+</div></body></html>";
+
+fn capturas_navegador(dir: &str) -> Result<(), String> {
+    use nf_core::input::Key;
+    let mut b = Banco::new(navegador_app::crear(), vec![]);
+    guarda(dir, "navegador-inicio", &b.foto(1024, 700, 0))?;
+    // Un disco con las fuentes del sistema y una página con una imagen.
+    let ahora = b.sys.base.now();
+    let f = &mut b.sys.base.files;
+    let fuentes = concat!(env!("CARGO_MANIFEST_DIR"), "/../../nf-core/data/fuentes/");
+    f.mkdir("C:\\Sistema\\fuentes", ahora).ok();
+    for n in ["Sans-Regular", "Sans-Bold", "Sans-Italic", "Sans-BoldItalic", "Serif-Regular", "Mono-Regular"] {
+        let datos = std::fs::read(format!("{fuentes}Liberation{n}.ttf")).map_err(|e| e.to_string())?;
+        f.write(&format!("C:\\Sistema\\fuentes\\Liberation{n}.ttf"), &datos, ahora).map_err(|e| format!("{e:?}"))?;
+    }
+    f.mkdir("C:\\Pruebas", ahora).map_err(|e| format!("{e:?}"))?;
+    f.write("C:\\Pruebas\\viaje.html", PAGINA_NAVEGADOR.as_bytes(), ahora).map_err(|e| format!("{e:?}"))?;
+    let mut foto = Surface::new(360, 200, 0x2F7BE0);
+    foto.vgradient(nf_core::geom::Rect::new(0, 0, 360, 200), 0xF2A03D, 0x7A3E8C);
+    foto.fill_circle(250.0, 70.0, 28.0, 0xFFE9A8, 255);
+    foto.fill_rect(nf_core::geom::Rect::new(0, 150, 360, 50), 0x2B2F36);
+    for i in 0..9 {
+        foto.fill_rect(nf_core::geom::Rect::new(10 + i * 38, 120 - (i % 3) * 14, 30, 60), 0xB5483A);
+    }
+    f.write("C:\\Pruebas\\foto.png", &png(&foto), ahora).map_err(|e| format!("{e:?}"))?;
+    b.tecla(Key::Char('t'), true);
+    b.abrir("C:\\Pruebas\\viaje.html");
+    guarda(dir, "navegador-pagina", &b.foto(1024, 700, 0))?;
+    // Una pestaña más, con una dirección que no se puede abrir sin red.
+    b.tecla(Key::Char('t'), true);
+    b.escribe("ejemplo.com");
+    b.tecla(Key::Enter, false);
+    guarda(dir, "navegador-error", &b.foto(1024, 700, 0))?;
+    Ok(())
+}
+
 fn capturas_tareas(dir: &str) -> Result<(), String> {
     let p = |id, nombre: &str, mb: u64, cpu, ok| ProcInfo { id, name: nombre.into(), mem: mb * 1_048_576 + 300_000, cpu_ms: cpu, responding: ok };
     let mut b = Banco::new(apps::create(AppKind::TaskManager), vec![p(1, "Calculadora", 3, 0, true), p(2, "Paint", 38, 0, true), p(3, "Reloj", 4, 0, true), p(4, "Plantilla", 3, 0, false)]);
@@ -316,7 +457,7 @@ fn main() -> ExitCode {
     let r = match args.get(1).map(String::as_str) {
         Some("iconos") => iconos(args.get(2).map_or("programs", String::as_str)),
         Some("capturas") => match args.get(2) {
-            Some(d) => std::fs::create_dir_all(d).map_err(|e| e.to_string()).and_then(|_| capturas_reloj(d)).and_then(|_| capturas_paint(d)).and_then(|_| capturas_mensajes(d)).and_then(|_| capturas_tareas(d)),
+            Some(d) => std::fs::create_dir_all(d).map_err(|e| e.to_string()).and_then(|_| capturas_reloj(d)).and_then(|_| capturas_paint(d)).and_then(|_| capturas_mensajes(d)).and_then(|_| capturas_navegador(d)).and_then(|_| capturas_tareas(d)),
             None => Err(String::from("uso: nfprog capturas <carpeta>")),
         },
         _ => Err(String::from("uso: nfprog iconos [programs] | nfprog capturas <carpeta>")),

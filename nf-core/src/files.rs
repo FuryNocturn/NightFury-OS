@@ -111,8 +111,8 @@ const KEYS_DIR: &str = "Sistema\\config\\llaves";
 const OLD_DIR: &str = "C:\\Sistema\\config\\antiguo";
 /// Tamaño máximo del registro.
 const LOG_MAX: usize = 64 * 1024;
-/// Bloques del disco en memoria (4 MiB).
-const MEMORY_BLOCKS: u64 = 1024;
+/// Bloques del disco en memoria (32 MiB: caben los programas y las fuentes del sistema, ~4,5 MiB).
+const MEMORY_BLOCKS: u64 = 8192;
 
 const NOTICE_NO_DISK: &str = "No hay disco: los archivos se guardan solo en la memoria y se perderán al apagar.";
 const NOTICE_IGNORED: &str =
@@ -1471,6 +1471,25 @@ impl Files {
             // El escritorio rehace sus iconos y el menú Inicio.
             self.generation += 1;
             self.log(&format!("Programa del sistema instalado: {folder}"), now);
+        }
+        Ok(changed)
+    }
+
+    /// Instala (o actualiza) ficheros que trae el sistema en `C:\Sistema\<sub>` (v0.12.4: las fuentes).
+    /// Solo escribe los que cambian. Devuelve si cambió alguno.
+    pub fn install_system_files(&mut self, sub: &str, items: &[(&str, &[u8])], now: DateTime) -> Result<bool, FsError> {
+        if sub.is_empty() || sub.contains(['\\', '/', ':']) || sub.starts_with('.') {
+            return Err(FsError::Invalid);
+        }
+        let dir = join_rel(SYSTEM, sub);
+        mk(&mut self.fs, &dir, now);
+        let mut changed = false;
+        for (name, data) in items {
+            let p = join_rel(&dir, name);
+            if self.fs.read(&p).ok().as_deref() != Some(*data) {
+                self.fs.write(&p, data, now)?;
+                changed = true;
+            }
         }
         Ok(changed)
     }
@@ -3648,7 +3667,7 @@ mod tests {
         }
         assert!(f.exists("C:\\"));
         let (total, free) = f.space();
-        assert_eq!(total, 4 << 20);
+        assert_eq!(total, 32 << 20);
         assert!(free > 3 << 20);
         // el almacén de la Papelera no se ve ni se toca
         for p in ["C:\\$Papelera", "c:\\$PAPELERA\\indice", "C:\\$Papelera\\x"] {
@@ -3729,9 +3748,9 @@ mod tests {
     #[test]
     fn copy_that_runs_out_of_space_leaves_nothing() {
         let mut f = Files::default();
-        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande", &vec![1u8; 2_500_000], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande", &vec![1u8; 20_000_000], d(1)).unwrap();
         f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
-        f.write("C:\\Usuarios\\Usuario\\Documentos\\c\\g", &vec![2u8; 1_200_000], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\c\\g", &vec![2u8; 9_600_000], d(1)).unwrap();
         let (_, free) = f.space();
         assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\c", "C:\\Usuarios\\Usuario\\Escritorio\\c", d(2)), Err(FsError::NoSpace));
         assert!(!f.exists("C:\\Usuarios\\Usuario\\Escritorio\\c"));
@@ -4294,6 +4313,12 @@ mod tests {
         assert_eq!(f.mkdir("C:\\Programas\\Malo", d(3)), Err(FsError::Denied));
         assert_eq!(f.delete("C:\\Programas\\Calc\\app.txt"), Err(FsError::Denied));
         assert!(f.user_trash("C:\\Programas", d(3)).is_err());
+        // Ficheros del sistema (fuentes): se instalan con sesión normal, se leen, no se tocan, y solo se reescriben si cambian.
+        assert_eq!(f.install_system_files("fuentes", &[("a.ttf", b"A")], d(3)), Ok(true));
+        assert_eq!(f.install_system_files("fuentes", &[("a.ttf", b"A")], d(3)), Ok(false));
+        assert_eq!(f.read("C:\\Sistema\\fuentes\\a.ttf").as_deref(), Ok(&b"A"[..]));
+        assert_eq!(f.write("C:\\Sistema\\fuentes\\a.ttf", b"x", d(3)), Err(FsError::Denied));
+        assert_eq!(f.install_system_files("..\\config", &[], d(3)), Err(FsError::Invalid));
         // Nadie crea carpetas sueltas dentro de `Usuarios`, ni siquiera un administrador.
         f.login("Ana", "").unwrap();
         assert_eq!(f.mkdir("C:\\Usuarios\\Falsa", d(3)), Err(FsError::Denied));

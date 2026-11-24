@@ -69,7 +69,7 @@ fn content_length_y_peticion() {
         HttpEvent::Head { status: 200, reason: "OK".to_string(), headers: alloc::vec![("Content-Type".to_string(), "text/plain".to_string()), ("Content-Length".to_string(), "5".to_string())] }
     );
     assert_eq!((&ev[1], &ev[2]), (&HttpEvent::Body(b"hello".to_vec()), &HttpEvent::Done));
-    let pedido = alloc::format!("GET /x?y=1 HTTP/1.1\r\nHost: example.org:8080\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n", crate::VERSION);
+    let pedido = alloc::format!("GET /x?y=1 HTTP/1.1\r\nHost: example.org:8080\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n", crate::VERSION);
     assert_eq!(String::from_utf8_lossy(&l.router.srv.conns[0].got), pedido);
     l.run(6_000);
     assert!(l.net.socks.is_empty(), "la conexión se cerró sola");
@@ -377,4 +377,109 @@ fn analisis_de_cabeceras_directo() {
     assert_eq!((st, rz.as_str()), (404, "No encontrado"));
     assert_eq!(h, [("A".to_string(), "1".to_string()), ("b".to_string(), "dos".to_string())]);
     assert_eq!(parse_head(b"HTTP/1.1 200 ").unwrap().1, "");
+}
+
+// ---- v0.12.4: Content-Encoding gzip / deflate ----
+
+fn con_cabecera(cab: &str, cuerpo: &[u8]) -> Vec<u8> {
+    let mut r = alloc::format!("HTTP/1.1 200 OK\r\n{cab}\r\n\r\n").into_bytes();
+    r.extend_from_slice(cuerpo);
+    r
+}
+
+fn comprimido(cod: &str, z: &[u8]) -> Vec<u8> {
+    con_cabecera(&alloc::format!("Content-Encoding: {cod}\r\nContent-Length: {}", z.len()), z)
+}
+
+#[test]
+fn pide_gzip_y_deflate_y_descomprime() {
+    let esperado = crate::img::tests::var(800);
+    let casos: [(&str, &[u8]); 6] = [
+        ("gzip", include_bytes!("../../img/testdata/var.gz")),
+        ("GZIP", include_bytes!("../../img/testdata/var.gz")),
+        ("x-gzip", include_bytes!("../../img/testdata/var.gz")),
+        ("deflate", include_bytes!("../../img/testdata/var_l9.zlib")),
+        ("deflate", include_bytes!("../../img/testdata/var_l6.raw")), // DEFLATE crudo, sin cabecera zlib
+        ("identity", &[]),
+    ];
+    for (cod, z) in casos {
+        let mut l = lan();
+        let r = if z.is_empty() { comprimido(cod, &esperado) } else { comprimido(cod, z) };
+        l.router.srv.listen(80, &r, true, false);
+        let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+        assert_eq!(body(&ev), esperado, "{cod}");
+        assert_eq!(ev.last(), Some(&HttpEvent::Done), "{cod}");
+        let pedido = String::from_utf8_lossy(&l.router.srv.conns[0].got).into_owned();
+        assert!(pedido.contains("\r\nAccept-Encoding: gzip, deflate\r\n"), "{pedido}");
+        // las cabeceras que ve el usuario siguen siendo las del servidor (también el Content-Length comprimido)
+        let HttpEvent::Head { headers, .. } = &ev[0] else { panic!("{ev:?}") };
+        assert!(headers.iter().any(|(k, v)| k == "Content-Encoding" && v == cod));
+    }
+}
+
+#[test]
+fn gzip_con_chunked_y_sin_longitud() {
+    let esperado = crate::img::tests::var(800);
+    let gz = include_bytes!("../../img/testdata/var.gz");
+    let mut r = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+    for t in gz.chunks(100) {
+        r.extend_from_slice(alloc::format!("{:x}\r\n", t.len()).as_bytes());
+        r.extend_from_slice(t);
+        r.extend_from_slice(b"\r\n");
+    }
+    r.extend_from_slice(b"0\r\n\r\n");
+    let mut l = lan();
+    l.router.srv.listen(80, &r, true, false);
+    assert_eq!(body(&fetch(&mut l, "http://example.org/", false, true).unwrap()), esperado);
+    // sin Content-Length: termina al cerrar el servidor
+    let r = con_cabecera("Content-Encoding: deflate", include_bytes!("../../img/testdata/var_l9.zlib"));
+    l.router.srv.listen(80, &r, true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert_eq!((body(&ev), ev.last()), (esperado, Some(&HttpEvent::Done)));
+}
+
+#[test]
+fn otros_codigos_y_casos_sin_cuerpo_pasan_tal_cual() {
+    let mut l = lan();
+    let r = comprimido("br", b"\x1b\x03datos de otro codec");
+    l.router.srv.listen(80, &r, true, false);
+    assert_eq!(body(&fetch(&mut l, "http://example.org/", false, true).unwrap()), b"\x1b\x03datos de otro codec");
+    let r = comprimido("gzip, br", b"xyz");
+    l.router.srv.listen(80, &r, true, false);
+    assert_eq!(body(&fetch(&mut l, "http://example.org/", false, true).unwrap()), b"xyz");
+    // HEAD y cuerpo vacío con la cabecera puesta: nada que descomprimir, ningún error
+    let r = con_cabecera("Content-Encoding: gzip\r\nContent-Length: 50", b"");
+    l.router.srv.listen(80, &r, true, false);
+    let ev = fetch(&mut l, "http://example.org/", true, true).unwrap();
+    assert_eq!(ev.last(), Some(&HttpEvent::Done));
+    let r = con_cabecera("Content-Encoding: gzip\r\nContent-Length: 0", b"");
+    l.router.srv.listen(80, &r, true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert_eq!((body(&ev).len(), ev.last()), (0, Some(&HttpEvent::Done)));
+}
+
+#[test]
+fn cuerpo_comprimido_roto_incompleto_o_bomba() {
+    let gz = include_bytes!("../../img/testdata/var.gz");
+    let mut l = lan();
+    let mut roto = gz.to_vec();
+    let n = roto.len();
+    roto[n - 6] ^= 0xFF; // el CRC-32 ya no cuadra
+    l.router.srv.listen(80, &comprimido("gzip", &roto), true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert_eq!(ev.last(), Some(&HttpEvent::Error(NetError::Protocol("cuerpo comprimido no válido"))));
+    // la longitud declarada casa, pero al flujo gzip le falta el final
+    l.router.srv.listen(80, &comprimido("gzip", &gz[..gz.len() - 5]), true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert_eq!(ev.last(), Some(&HttpEvent::Error(NetError::Protocol("cuerpo comprimido incompleto"))));
+    // basura que no es DEFLATE
+    l.router.srv.listen(80, &comprimido("gzip", &[0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]), true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert!(matches!(ev.last(), Some(HttpEvent::Error(NetError::Protocol(_)))), "{:?}", ev.last());
+    // una bomba (≈ 39 MB desde 250 KB) se corta en el tope de 32 MB
+    let bomba = crate::img::tests::bomba(150_000);
+    l.router.srv.listen(80, &comprimido("deflate", &bomba), true, false);
+    let ev = fetch(&mut l, "http://example.org/", false, true).unwrap();
+    assert_eq!(ev.last(), Some(&HttpEvent::Error(NetError::Protocol("cuerpo descomprimido demasiado grande"))));
+    assert!(body(&ev).len() <= 32 * 1024 * 1024);
 }
