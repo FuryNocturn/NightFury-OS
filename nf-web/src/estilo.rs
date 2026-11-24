@@ -982,6 +982,11 @@ pub fn calcular(dom: &Dom, hojas: &[FuenteHoja<'_>], ancho: f32) -> Estilos {
         if el.etq == "html" {
             rem = e.px;
         }
+        // shortcut: sin controles de formulario, select/input/textarea se ocultan aunque la página les dé
+        // otro `display` (si no, las opciones salen como texto suelto); llegan con los formularios en 0.12.5.
+        if matches!(el.etq.as_str(), "select" | "input" | "textarea" | "datalist") {
+            e.display = Display::None;
+        }
         idx[n] = lista.len() as u32;
         lista.push(e);
     }

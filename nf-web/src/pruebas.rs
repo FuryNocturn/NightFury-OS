@@ -804,3 +804,24 @@ fn display_none_y_visibility() {
     assert_eq!(alto, 18 + 16 + 18 + 16, "la línea invisible ocupa su sitio; el p lleva márgenes de 16");
     let _ = Display::None;
 }
+
+#[test]
+fn select_con_display_de_autor_no_saca_sus_opciones() {
+    let mut d = doc("<style>select{display:inline-block}</style><p>antes<select><option>Uno<option>Dos</select>después</p>");
+    maq(&mut d, 400);
+    let t: String = textos(&d).into_iter().map(|(s, _, _)| s).collect();
+    assert!(!t.contains("Uno") && !t.contains("Dos"), "{t}");
+    assert!(t.contains("antes"), "{t}");
+}
+
+#[test]
+fn meta_refresh() {
+    let d = doc("<html><head></head><body><noscript><META http-equiv='refresh' content=\"0;URL=https://www.ejemplo.org/\"></noscript></body></html>");
+    assert_eq!(d.refresco(), Some((0, "https://www.ejemplo.org/")));
+    let d = Documento::cargar(b"<meta http-equiv=Refresh content=\"5; url='otra.html'\">", None, "http://a.test/dir/x.html");
+    assert_eq!(d.refresco(), Some((5, "http://a.test/dir/otra.html")));
+    for c in ["5", "x;url=a", "3; url="] {
+        let h = alloc::format!("<meta http-equiv=refresh content=\"{c}\">");
+        assert_eq!(doc(&h).refresco(), None, "{c}");
+    }
+}

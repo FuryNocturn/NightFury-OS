@@ -26,6 +26,9 @@ const TOPE_CSS: usize = 2 << 20;
 const TOPE_IMG: usize = 16 << 20;
 /// Mientras carga, la página se vuelve a maquetar como mucho cada tanto.
 const REMAQUETAR_MS: u64 = 250;
+/// `<meta http-equiv="refresh">`: espera máxima que se respeta y redirecciones seguidas que se siguen.
+const REFRESCO_MAX_S: u32 = 30;
+const MAX_REFRESCOS: u8 = 5;
 /// Margen alrededor de una imagen suelta.
 pub const MARGEN_IMG: i32 = 20;
 /// Base con la que se maquetan las páginas de error (no tienen recursos).
@@ -209,6 +212,9 @@ pub struct Pestana {
     sucia: bool,
     ancho_maquetado: i32,
     ultima_maqueta: u64,
+    /// Redirección pedida por la página (`<meta http-equiv="refresh">`): cuándo (`uptime_ms`) y adónde.
+    refresco: Option<(u64, String)>,
+    refrescos: u8,
 }
 
 impl Pestana {
@@ -235,6 +241,8 @@ impl Pestana {
             sucia: false,
             ancho_maquetado: 0,
             ultima_maqueta: 0,
+            refresco: None,
+            refrescos: 0,
         }
     }
 
@@ -294,6 +302,8 @@ impl Pestana {
         self.descargas.clear();
         self.cola.clear();
         self.pendiente = None;
+        self.refresco = None;
+        self.refrescos = 0;
     }
 
     /// Navega a `e` y la apunta en el historial.
@@ -413,7 +423,13 @@ impl Pestana {
     fn mostrar(&mut self, sys: &mut dyn Platform, mostrada: &str, base: &str, local: bool, ct: Option<&str>, cuerpo: Vec<u8>) {
         match tipo_vista(ct, &cuerpo) {
             TipoVista::Html if cuerpo.len() <= TOPE_DOC => {
-                self.poner_documento(mostrada, base, local, Documento::cargar(&cuerpo, ct, base));
+                let d = Documento::cargar(&cuerpo, ct, base);
+                // Redirección sin JavaScript; una página pública no puede mandar a la red local.
+                self.refresco = d
+                    .refresco()
+                    .filter(|&(s, u)| s <= REFRESCO_MAX_S && (u.starts_with("https://") || u.starts_with("http://")) && recurso_permitido(base, u))
+                    .map(|(s, u)| (sys.uptime_ms() + s as u64 * 1000, String::from(u)));
+                self.poner_documento(mostrada, base, local, d);
                 self.encolar_recursos(sys);
             }
             TipoVista::Texto if cuerpo.len() <= TOPE_DOC => {
@@ -458,6 +474,17 @@ impl Pestana {
     /// Atiende la red. `true` si algo ha cambiado y hay que dibujar.
     pub fn tick(&mut self, sys: &mut dyn Platform, ahora: u64) -> bool {
         let mut cambio = false;
+        if self.refresco.as_ref().is_some_and(|r| sys.uptime_ms() >= r.0) {
+            let (_, url) = self.refresco.take().unwrap_or_default();
+            let n = self.refrescos;
+            if n < MAX_REFRESCOS {
+                // Sustituye la entrada actual del historial (Atrás no vuelve a la página que redirige).
+                self.historial[self.pos].url = url.clone();
+                self.cargar(sys, &url, ahora, None);
+                self.refrescos = n + 1;
+                cambio = true;
+            }
+        }
         if !self.descargas.is_empty() {
             match sys.net() {
                 Some(net) => {

@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(o[5], [FsError::NotFound.message()]);
         let d = ejecuta("disco").0;
         assert_eq!(d[0], "Disco C:");
-        assert_eq!(d[1], "Tamaño: 4,0 MB");
+        assert_eq!(d[1], "Tamaño: 32,0 MB");
         assert!(d[2].starts_with("Libre: ") && d[3].contains("En memoria"));
     }
 

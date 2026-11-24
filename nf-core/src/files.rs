@@ -111,8 +111,8 @@ const KEYS_DIR: &str = "Sistema\\config\\llaves";
 const OLD_DIR: &str = "C:\\Sistema\\config\\antiguo";
 /// Tamaño máximo del registro.
 const LOG_MAX: usize = 64 * 1024;
-/// Bloques del disco en memoria (4 MiB).
-const MEMORY_BLOCKS: u64 = 1024;
+/// Bloques del disco en memoria (32 MiB: caben los programas y las fuentes del sistema, ~4,5 MiB).
+const MEMORY_BLOCKS: u64 = 8192;
 
 const NOTICE_NO_DISK: &str = "No hay disco: los archivos se guardan solo en la memoria y se perderán al apagar.";
 const NOTICE_IGNORED: &str =
@@ -3667,7 +3667,7 @@ mod tests {
         }
         assert!(f.exists("C:\\"));
         let (total, free) = f.space();
-        assert_eq!(total, 4 << 20);
+        assert_eq!(total, 32 << 20);
         assert!(free > 3 << 20);
         // el almacén de la Papelera no se ve ni se toca
         for p in ["C:\\$Papelera", "c:\\$PAPELERA\\indice", "C:\\$Papelera\\x"] {
@@ -3748,9 +3748,9 @@ mod tests {
     #[test]
     fn copy_that_runs_out_of_space_leaves_nothing() {
         let mut f = Files::default();
-        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande", &vec![1u8; 2_500_000], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\grande", &vec![1u8; 20_000_000], d(1)).unwrap();
         f.mkdir("C:\\Usuarios\\Usuario\\Documentos\\c", d(1)).unwrap();
-        f.write("C:\\Usuarios\\Usuario\\Documentos\\c\\g", &vec![2u8; 1_200_000], d(1)).unwrap();
+        f.write("C:\\Usuarios\\Usuario\\Documentos\\c\\g", &vec![2u8; 9_600_000], d(1)).unwrap();
         let (_, free) = f.space();
         assert_eq!(f.copy("C:\\Usuarios\\Usuario\\Documentos\\c", "C:\\Usuarios\\Usuario\\Escritorio\\c", d(2)), Err(FsError::NoSpace));
         assert!(!f.exists("C:\\Usuarios\\Usuario\\Escritorio\\c"));

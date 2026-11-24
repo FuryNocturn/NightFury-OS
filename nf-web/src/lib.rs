@@ -80,6 +80,25 @@ pub struct Documento {
     ua: Hoja,
     estilos: Option<(Estilos, i32)>,
     res: Option<Resultado>,
+    /// `<meta http-equiv="refresh" content="N; url=…">`: segundos y adónde (ya resuelta).
+    refresco: Option<(u32, String)>,
+}
+
+/// `content` de un `<meta http-equiv="refresh">`: `N` o `N; url=…` (comillas opcionales). Solo con URL.
+fn leer_refresco(base: &str, c: &str) -> Option<(u32, String)> {
+    let (n, resto) = c.split_once([';', ',']).unwrap_or((c, ""));
+    let seg = n.trim().split('.').next()?.parse::<u32>().ok()?;
+    let resto = resto.trim_start();
+    let u = if resto.len() >= 3 && resto[..3].eq_ignore_ascii_case("url") {
+        resto[3..].trim_start().strip_prefix('=')?.trim()
+    } else {
+        resto.trim()
+    };
+    let u = u.trim_matches(|c| c == '\'' || c == '"').trim();
+    if u.is_empty() {
+        return None;
+    }
+    Some((seg, url::resolver(base, u)?))
 }
 
 fn media_vale(m: Option<&str>) -> Medias {
@@ -113,12 +132,16 @@ impl Documento {
             ua: css::parsear_hoja(estilo::UA, Vec::new()),
             estilos: None,
             res: None,
+            refresco: None,
         };
         let mut n_css = 0;
         for i in 0..n {
             let dom = &d.dom;
             match dom.etq(i) {
                 "title" if d.titulo.is_none() => d.titulo = Some(html::compactar(&dom.texto(i))),
+                "meta" if d.refresco.is_none() && dom.attr(i, "http-equiv").is_some_and(|h| h.trim().eq_ignore_ascii_case("refresh")) => {
+                    d.refresco = dom.attr(i, "content").and_then(|c| leer_refresco(&d.base, c));
+                }
                 "style" => {
                     let tipo_ok = dom.attr(i, "type").map_or(true, |t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("text/css"));
                     if tipo_ok {
@@ -170,6 +193,11 @@ impl Documento {
 
     pub fn titulo(&self) -> Option<String> {
         self.titulo.clone().filter(|t| !t.is_empty())
+    }
+
+    /// Redirección por `<meta http-equiv="refresh">` (segundos, URL absoluta), si la página la pide.
+    pub fn refresco(&self) -> Option<(u32, &str)> {
+        self.refresco.as_ref().map(|(s, u)| (*s, u.as_str()))
     }
 
     /// La base efectiva (`<base href>` si lo hay).
