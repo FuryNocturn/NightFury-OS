@@ -522,6 +522,7 @@ fn step_curl(c: &mut Curl, sys: &mut dyn Platform, now: u64, out: &mut Vec<Strin
                         out.push(format!("* Emitido por: {}", i.issuer));
                         out.push(format!("* Caduca el: {d:02}/{m:02}/{y:04}"));
                     }
+                    out.push(format!("* Revocación: {}", i.revocation));
                 }
             }
             HttpEvent::Body(b) => match &mut c.save {

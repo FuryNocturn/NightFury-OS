@@ -18,7 +18,7 @@ mod tests;
 
 use crate::crypto::Rng;
 use crate::pk::PubKey;
-use crate::x509::{CertError, ChainInfo, RootStore, Time};
+use crate::x509::{CertError, ChainInfo, Revocacion, RootStore, Time};
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -93,6 +93,8 @@ pub struct SessionInfo {
     /// Por qué falló la cadena (solo con `insecure`).
     pub cert_error: Option<CertError>,
     pub group: &'static str,
+    /// Qué dice la respuesta OCSP que adjuntó el servidor (si adjuntó alguna).
+    pub revocation: Revocacion,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -176,7 +178,8 @@ pub struct Client {
     sid: Vec<u8>,
     x_priv: [u8; 32],
     p_priv: Option<[u8; 32]>,
-    /// Grupo del key_share enviado: 0x001d (x25519) o 0x0017 (secp256r1).
+    q_priv: Option<[u8; 48]>,
+    /// Grupo del key_share enviado: 0x001d (x25519), 0x0017 (secp256r1) o 0x0018 (secp384r1).
     grupo: u16,
     cookie: Vec<u8>,
     hrr_visto: bool,
@@ -192,6 +195,12 @@ pub struct Client {
     leaf: Option<PubKey>,
     chain: Option<ChainInfo>,
     cert_error: Option<CertError>,
+    /// Respuesta OCSP adjunta, a la espera de comprobarla (vacía si venía mal formada).
+    stapled: Option<Vec<u8>>,
+    /// DER de la hoja y de su emisor en el camino válido (vacío si la cadena no se validó, con `-k`).
+    leaf_der: Vec<u8>,
+    issuer_der: Vec<u8>,
+    revoc: Revocacion,
     /// El servidor pidió certificado: contexto a devolver en el Certificate vacío.
     cert_ctx: Option<Vec<u8>>,
     s12: hs12::S12,
@@ -237,6 +246,7 @@ impl Client {
             sid,
             x_priv,
             p_priv: None,
+            q_priv: None,
             grupo: 0x001d,
             cookie: Vec::new(),
             hrr_visto: false,
@@ -251,6 +261,10 @@ impl Client {
             leaf: None,
             chain: None,
             cert_error: None,
+            stapled: None,
+            leaf_der: Vec::new(),
+            issuer_der: Vec::new(),
+            revoc: Revocacion::NoAdjunta,
             cert_ctx: None,
             s12: hs12::S12::nuevo(),
             info: None,
@@ -438,6 +452,9 @@ impl Drop for Client {
     fn drop(&mut self) {
         crate::crypto::wipe(&mut self.x_priv);
         if let Some(p) = self.p_priv.as_mut() {
+            crate::crypto::wipe(p);
+        }
+        if let Some(p) = self.q_priv.as_mut() {
             crate::crypto::wipe(p);
         }
     }

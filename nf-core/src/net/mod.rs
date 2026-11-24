@@ -207,6 +207,8 @@ pub struct TlsInfo {
     pub expires: (u16, u8, u8),
     /// Solo con `-k`: por qué el certificado no vale.
     pub cert_error: Option<String>,
+    /// Revocación según el OCSP que adjunta el servidor, ya en texto («comprobada (OCSP)», «no comprobada (…)»).
+    pub revocation: String,
 }
 
 /// Plazos (ms).

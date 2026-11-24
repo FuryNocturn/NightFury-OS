@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Curvas P-256 y P-384 (FIPS 186-4, SEC 1; y² = x³ − 3x + b) en coordenadas jacobianas sobre el
-//! dominio de Montgomery de `bn`, ECDSA (verificación) y ECDH P-256 (RFC 5903).
+//! dominio de Montgomery de `bn`, ECDSA (verificación) y ECDH P-256 y P-384 (RFC 5903).
 //!
 //! Tiempo constante en las operaciones con la privada: el producto escalar recorre siempre todos los
 //! bits (doblar, sumar y elegir con máscara) y la suma trata el infinito, P = Q y P = -Q con máscaras,
@@ -197,26 +197,25 @@ impl Curve {
     }
 }
 
-/// Clave pública P-256 (0x04 ‖ X ‖ Y) de una privada de 32 bytes; `None` si no está en [1, n-1].
-pub fn p256_public(priv_: &[u8; 32]) -> Option<[u8; 65]> {
-    let c = Curve::new(Id::P256);
+/// Clave pública (0x04 ‖ X ‖ Y) de una privada big endian de `c.bytes` bytes; `None` si no está en [1, n-1].
+fn public(id: Id, priv_: &[u8]) -> Option<Vec<u8>> {
+    let c = Curve::new(id);
     let mut k = c.scalar(priv_)?;
     let mut q = c.mul(&k, &c.g);
     bn::wipe64(&mut k);
     let a = c.affine(&q);
     q.wipe();
     let (x, y) = a?;
-    let mut out = [0u8; 65];
-    out[0] = 4;
-    out[1..33].copy_from_slice(&bn::to_be(&x, 32));
-    out[33..].copy_from_slice(&bn::to_be(&y, 32));
+    let mut out = vec![4u8];
+    out.extend_from_slice(&bn::to_be(&x, c.bytes));
+    out.extend_from_slice(&bn::to_be(&y, c.bytes));
     Some(out)
 }
 
-/// ECDH P-256: coordenada X compartida. `None` si la privada no está en [1, n-1] o el punto del otro
-/// lado no es válido (formato, fuera de la curva o infinito).
-pub fn p256_ecdh(priv_: &[u8; 32], peer: &[u8]) -> Option<[u8; 32]> {
-    let c = Curve::new(Id::P256);
+/// ECDH: coordenada X compartida. `None` si la privada no está en [1, n-1] o el punto del otro lado no
+/// es válido (formato, fuera de la curva o infinito).
+fn ecdh(id: Id, priv_: &[u8], peer: &[u8]) -> Option<Vec<u8>> {
+    let c = Curve::new(id);
     let mut k = c.scalar(priv_)?;
     let Some(q) = c.parse(peer) else {
         bn::wipe64(&mut k);
@@ -227,11 +226,30 @@ pub fn p256_ecdh(priv_: &[u8; 32], peer: &[u8]) -> Option<[u8; 32]> {
     let r = c.affine(&s);
     s.wipe();
     let (mut x, mut y) = r?;
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bn::to_be(&x, 32));
+    let out = bn::to_be(&x, c.bytes);
     bn::wipe64(&mut x);
     bn::wipe64(&mut y);
     Some(out)
+}
+
+/// Clave pública P-256 (0x04 ‖ X ‖ Y) de una privada de 32 bytes; `None` si no está en [1, n-1].
+pub fn p256_public(priv_: &[u8; 32]) -> Option<[u8; 65]> {
+    public(Id::P256, priv_)?.try_into().ok()
+}
+
+/// ECDH P-256 (RFC 5903 §8.1).
+pub fn p256_ecdh(priv_: &[u8; 32], peer: &[u8]) -> Option<[u8; 32]> {
+    ecdh(Id::P256, priv_, peer)?.try_into().ok()
+}
+
+/// Clave pública P-384 (0x04 ‖ X ‖ Y) de una privada de 48 bytes; `None` si no está en [1, n-1].
+pub fn p384_public(priv_: &[u8; 48]) -> Option<[u8; 97]> {
+    public(Id::P384, priv_)?.try_into().ok()
+}
+
+/// ECDH P-384 (RFC 5903 §8.2).
+pub fn p384_ecdh(priv_: &[u8; 48], peer: &[u8]) -> Option<[u8; 48]> {
+    ecdh(Id::P384, priv_, peer)?.try_into().ok()
 }
 
 #[cfg(test)]
@@ -331,5 +349,33 @@ mod tests {
             o
         };
         assert_eq!(&p256_public(&one).unwrap()[1..33], &hx(P256[3])[..]);
+    }
+
+    #[test]
+    fn ecdh_p384() {
+        // i: RFC 5903 §8.2 (su clave pública empieza por 667842d7…); r y el secreto compartido, de OpenSSL 3.5.
+        let i: [u8; 48] = hx("099f3c7034d4a2c699884d73a375a67f7624ef7c6b3c0f160647b67414dce655e35b538041e649ee3faef896783ab194").try_into().unwrap();
+        let r: [u8; 48] = hx("679c60d3e703d6f80c4fcc26617c3d19b44132fec4fea11449e1f50a7ef2484ab68201c36c7bfdfeaeaf0c236d06843b").try_into().unwrap();
+        let gi = p384_public(&i).unwrap();
+        let gr = p384_public(&r).unwrap();
+        assert_eq!(
+            to_hex(&gi[1..]),
+            "667842d7d180ac2cde6f74f37551f55755c7645c20ef73e31634fe72b4c55ee6de3ac808acb4bdb4c88732aee95f41aa9482ed1fc0eeb9cafc4984625ccfc23f65032149e0e144ada024181535a0f38eeb9fcff3c2c947dae69b4c634573a81c"
+        );
+        assert_eq!(
+            to_hex(&gr[1..]),
+            "34e4193393fa87a3c924e09eb7a47844df4617754881568ac8e50d87368bec0f9e3022aac89c87882eb6b1fa03be8d718842a29133bdf11bce4623201cc1d9e8626b24d602186b4d1147d9722cc114ac9a3e0bb8889d1e0fc37a83d0c5ead1b3"
+        );
+        let shared = "a21f2c9c67537d8c094a186b75af59842cd2df98dfe99490402cd8c7ce9189b858ace26270259037d93f865761a11d0e";
+        assert_eq!(to_hex(&p384_ecdh(&i, &gr).unwrap()), shared);
+        assert_eq!(to_hex(&p384_ecdh(&r, &gi).unwrap()), shared);
+        // Entradas no válidas.
+        assert!(p384_ecdh(&[0u8; 48], &gr).is_none());
+        assert!(p384_public(&[0xff; 48]).is_none());
+        let mut bad = gr;
+        bad[96] ^= 1;
+        assert!(p384_ecdh(&i, &bad).is_none());
+        assert!(p384_ecdh(&i, &gr[..96]).is_none());
+        assert!(p384_ecdh(&i, &p256_public(&[7; 32]).unwrap()).is_none());
     }
 }

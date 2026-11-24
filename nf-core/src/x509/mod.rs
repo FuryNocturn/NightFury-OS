@@ -9,13 +9,15 @@
 //! Qué se comprueba: firma de cada eslabón, fechas de todos (raíz incluida), CA con
 //! basicConstraints cA y pathLen, keyUsage keyCertSign, EKU serverAuth, nameConstraints (solo
 //! dNSName; otro tipo rechaza la cadena) y el nombre contra los SAN (nunca el CN).
-//! Qué no: revocación (CRL/OCSP), políticas de certificado, nombres de intermedios.
+//! Revocación: solo la respuesta OCSP que adjunta el servidor (`ocsp`), nunca consultas por nuestra cuenta.
+//! Qué no: CRL, políticas de certificado, nombres de intermedios.
 //!
 //! # Paquete de raíces
 //! `raices.bin` es una secuencia de `[u16 longitud big endian][certificado DER]`, sin cabecera ni
 //! relleno. Lo genera `tools/raices.ps1` desde el `certdata.txt` de Mozilla.
 
 mod der;
+mod ocsp;
 mod pem;
 #[cfg(test)]
 mod tests;
@@ -27,6 +29,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use der::{bool_val, int_bytes, uint_bytes, DerError, Reader, Tlv, MAX_DER};
 
+pub use ocsp::comprobar_ocsp;
 pub use pem::pem_or_der;
 
 /// Eslabones máximos del camino (hoja + intermedios + raíz).
@@ -48,6 +51,7 @@ pub enum CertError {
     CadenaDemasiadoLarga,
     NoSoportado,
     Formato,
+    Revocado,
 }
 
 impl CertError {
@@ -63,6 +67,30 @@ impl CertError {
             CertError::CadenaDemasiadoLarga => "La cadena de certificados es demasiado larga.",
             CertError::NoSoportado => "El certificado usa algo que este sistema no admite.",
             CertError::Formato => "El certificado está mal formado.",
+            CertError::Revocado => "El certificado ha sido revocado por quien lo emitió.",
+        }
+    }
+}
+
+/// Qué se sabe de la revocación de la hoja, según la respuesta OCSP que adjuntó el servidor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Revocacion {
+    /// El servidor no adjuntó respuesta.
+    NoAdjunta,
+    /// Adjuntó una, pero no vale (mal formada, firma mala, de otro certificado, fuera de fecha, desconocido…).
+    Invalida,
+    Buena,
+    Revocada,
+}
+
+impl Revocacion {
+    /// Texto para `curl -v`, tras «Revocación: ».
+    pub fn texto(&self) -> &'static str {
+        match self {
+            Revocacion::NoAdjunta => "no comprobada (el servidor no la adjunta)",
+            Revocacion::Invalida => "no comprobada (respuesta no válida)",
+            Revocacion::Buena => "comprobada (OCSP)",
+            Revocacion::Revocada => "el certificado está revocado (OCSP)",
         }
     }
 }
@@ -141,6 +169,7 @@ const OID_EKU: &[u8] = &[0x55, 0x1d, 0x25];
 const OID_INHIBIT_ANY: &[u8] = &[0x55, 0x1d, 0x36];
 const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 const OID_ANY_EKU: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+const OID_OCSP_SIGNING: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x09];
 
 // ---- tiempo ----
 
@@ -317,6 +346,14 @@ fn parse_spki(spki: Tlv) -> R<Option<PubKey>> {
     Ok(None)
 }
 
+/// Contenido del BIT STRING de un SubjectPublicKeyInfo (sin el byte de bits sin usar).
+fn spki_bits<'a>(spki: Tlv<'a>) -> R<&'a [u8]> {
+    let mut r = Reader::new(spki.content);
+    r.expect(0x30)?;
+    let [0, key @ ..] = r.expect(0x03)?.content else { return Err(CertError::Formato) };
+    Ok(key)
+}
+
 // ---- certificado ----
 
 #[derive(Default)]
@@ -344,6 +381,11 @@ pub struct Cert {
     key_cert_sign: Option<bool>,
     /// EKU presente: ¿incluye serverAuth (o anyExtendedKeyUsage)?
     eku_server: Option<bool>,
+    /// EKU con id-kp-OCSPSigning (respondedor delegado de OCSP).
+    eku_ocsp: bool,
+    serial: Vec<u8>,
+    /// Contenido del BIT STRING de la clave pública (lo que se resume en el CertID de OCSP).
+    key_bits: Vec<u8>,
     dns: Vec<String>,
     ips: Vec<Vec<u8>>,
     nc: Option<NameConstraints>,
@@ -381,7 +423,7 @@ impl Cert {
             vr.finish()?;
             v3 = true;
         }
-        int_bytes(t.expect(0x02)?)?; // serie
+        let serial = int_bytes(t.expect(0x02)?)?.to_vec();
         let alg_in = t.expect(0x30)?;
         if alg_in.raw != alg_out.raw {
             return Err(CertError::Formato);
@@ -395,7 +437,9 @@ impl Cert {
         v.finish()?;
         let subject = t.expect(0x30)?;
         let subject_name = parse_name(subject.content)?;
-        let key = parse_spki(t.expect(0x30)?)?;
+        let spki = t.expect(0x30)?;
+        let key = parse_spki(spki)?;
+        let key_bits = spki_bits(spki)?.to_vec();
         if v3 {
             t.optional(0x81)?; // issuerUniqueID
             t.optional(0x82)?; // subjectUniqueID
@@ -417,6 +461,9 @@ impl Cert {
             bc: None,
             key_cert_sign: None,
             eku_server: None,
+            eku_ocsp: false,
+            serial,
+            key_bits,
             dns: Vec::new(),
             ips: Vec::new(),
             nc: None,
@@ -469,14 +516,17 @@ impl Cert {
                 OID_EKU => {
                     let mut l = Reader::new(Reader::new(val).expect(0x30)?.content);
                     let mut ok = false;
+                    let mut ocsp = false;
                     if l.is_empty() {
                         return Err(CertError::Formato);
                     }
                     while !l.is_empty() {
                         let o = l.expect(0x06)?.content;
                         ok |= o == OID_SERVER_AUTH || o == OID_ANY_EKU;
+                        ocsp |= o == OID_OCSP_SIGNING;
                     }
                     self.eku_server = Some(ok);
+                    self.eku_ocsp = ocsp;
                 }
                 OID_SAN => self.parse_san(val)?,
                 OID_NC => self.parse_nc(val)?,
@@ -883,6 +933,12 @@ fn search<'a>(path: &mut Vec<&'a Cert>, sent: &'a [Cert], used: &mut [bool], roo
 /// Valida lo que manda el servidor (`chain`, hoja primero) contra `roots`, para el nombre `host`
 /// y la fecha `now`. `verify` comprueba una firma (normalmente `pk::verify`).
 pub fn verify_server(chain: &[&[u8]], host: &str, now: Time, roots: &RootStore, verify: VerifyFn) -> Result<ChainInfo, CertError> {
+    verify_server_emisor(chain, host, now, roots, verify).map(|r| r.0)
+}
+
+/// Como `verify_server`, y devuelve también el DER del emisor de la hoja dentro del camino válido
+/// (hace falta para comprobar la respuesta OCSP).
+pub fn verify_server_emisor(chain: &[&[u8]], host: &str, now: Time, roots: &RootStore, verify: VerifyFn) -> Result<(ChainInfo, Vec<u8>), CertError> {
     let leaf = Cert::parse(chain.first().ok_or(CertError::Formato)?)?;
     // Los certificados de más que no se entiendan se ignoran: no tienen por qué ser del camino.
     let sent: Vec<Cert> = chain[1..].iter().take(MAX_SENT).filter_map(|d| Cert::parse(d).ok()).collect();
@@ -900,5 +956,5 @@ pub fn verify_server(chain: &[&[u8]], host: &str, now: Time, roots: &RootStore, 
             CertError::RaizDesconocida
         });
     }
-    Ok(ChainInfo { leaf: path[0].info(), issuer: path[1].info() })
+    Ok((ChainInfo { leaf: path[0].info(), issuer: path[1].info() }, path[1].der.clone()))
 }

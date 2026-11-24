@@ -1589,6 +1589,7 @@ mod tests {
                 "* Certificado de: prueba.nf (NightFury Prueba)",
                 "* Emitido por: NF TLS Raiz de Prueba (NightFury Prueba)",
                 "* Caduca el: 01/01/2050",
+                "* Revocación: no comprobada (el servidor no la adjunta)",
                 cerrada
             ]
         );

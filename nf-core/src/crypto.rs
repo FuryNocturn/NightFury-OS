@@ -7,6 +7,7 @@
 //! - HMAC-SHA-256: RFC 2104 (vectores de RFC 4231).
 //! - PBKDF2-HMAC-SHA-256: RFC 8018.
 //! - HKDF-SHA-256: RFC 5869.
+//! - SHA-1: FIPS 180-4, solo para comparar el CertID de OCSP (RFC 6960); nunca para firmas.
 //! - SHA-384 y SHA-512: FIPS 180-4; HMAC-SHA-384 y HKDF-SHA-384.
 //! - Rng: generador sobre ChaCha20 (la semilla la pone la plataforma).
 //! - ChaCha20, Poly1305 y su AEAD: RFC 8439.
@@ -124,6 +125,46 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut s = Sha256::new();
     s.update(data);
     s.finish()
+}
+
+/// SHA-1 (FIPS 180-4 §6.1). Roto para firmas: solo sirve para comparar el CertID de OCSP, que lo
+/// define la norma con ese algoritmo. Opera en memoria (la entrada es pequeña).
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let mut m = data.to_vec();
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    m.extend_from_slice(&(data.len() as u64).wrapping_mul(8).to_be_bytes());
+    for b in m.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (x, c) in w.iter_mut().zip(b.chunks_exact(4)) {
+            *x = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b2, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b2 & c) | (!b2 & d), 0x5a827999),
+                20..=39 => (b2 ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b2 & c) | (b2 & d) | (c & d), 0x8f1bbcdc),
+                _ => (b2 ^ c ^ d, 0xca62c1d6u32),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            (e, d, c, b2, a) = (d, c, b2.rotate_left(30), a, t);
+        }
+        for (x, y) in h.iter_mut().zip([a, b2, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (o, x) in out.chunks_exact_mut(4).zip(h) {
+        o.copy_from_slice(&x.to_be_bytes());
+    }
+    out
 }
 
 /// HMAC-SHA-256 con la clave ya absorbida: se clona para cada mensaje.
@@ -874,6 +915,14 @@ mod tests {
             left -= k;
         }
         assert_eq!(hx(&s.finish()), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+    }
+
+    #[test]
+    fn sha1_vectores_fips_180_4() {
+        assert_eq!(hx(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(hx(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(hx(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")), "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+        assert_eq!(hx(&sha1(&[b'a'; 1_000_000])), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
     }
 
     #[test]

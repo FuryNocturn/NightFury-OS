@@ -611,10 +611,10 @@ impl Wire for NetError {
 impl Wire for TlsInfo {
     fn put(&self, w: &mut Writer) {
         w.put(&self.version).put(&self.suite).put(&self.group).put(&self.subject).put(&self.issuer);
-        w.put(&self.expires.0).put(&self.expires.1).put(&self.expires.2).put(&self.cert_error);
+        w.put(&self.expires.0).put(&self.expires.1).put(&self.expires.2).put(&self.cert_error).put(&self.revocation);
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
-        Ok(TlsInfo { version: r.get()?, suite: r.get()?, group: r.get()?, subject: r.get()?, issuer: r.get()?, expires: (r.get()?, r.get()?, r.get()?), cert_error: r.get()? })
+        Ok(TlsInfo { version: r.get()?, suite: r.get()?, group: r.get()?, subject: r.get()?, issuer: r.get()?, expires: (r.get()?, r.get()?, r.get()?), cert_error: r.get()?, revocation: r.get()? })
     }
 }
 
@@ -2248,7 +2248,7 @@ pub(crate) mod tests {
         assert!(decode::<NetError>(&[99]).is_err() && decode::<TcpState>(&[9]).is_err() && decode::<State>(&[9]).is_err());
         let t = TcpState::Failed(NetError::Reset);
         assert_eq!(decode::<TcpState>(&encode(&t)), Ok(t));
-        let i = TlsInfo { version: s("TLS 1.3"), suite: s("TLS_AES_128_GCM_SHA256"), group: s("x25519"), subject: s("ñ (O)"), issuer: s("R"), expires: (2050, 1, 1), cert_error: Some(s("mal")) };
+        let i = TlsInfo { version: s("TLS 1.3"), suite: s("TLS_AES_128_GCM_SHA256"), group: s("x25519"), subject: s("ñ (O)"), issuer: s("R"), expires: (2050, 1, 1), cert_error: Some(s("mal")), revocation: s("comprobada (OCSP)") };
         assert_eq!(decode::<TlsInfo>(&encode(&i)), Ok(i));
         let r = PingReply { from: SRV, bytes: 32, rtt_ms: 7, ttl: 60 };
         assert_eq!(decode::<PingReply>(&encode(&r)), Ok(r));
