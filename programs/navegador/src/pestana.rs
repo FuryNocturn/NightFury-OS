@@ -16,7 +16,7 @@ use nf_core::img::{self, Limits};
 use nf_core::net::http::{HttpEvent, HttpGet};
 use nf_core::net::{NetApi, NetError};
 use nf_core::platform::Platform;
-use nf_web::{url, Documento, Recurso, TipoRecurso};
+use nf_web::{url, Documento, Envio, Recurso, TipoRecurso};
 
 /// Descargas a la vez por pestaña (la principal cuenta).
 pub const SIMULTANEAS: usize = 6;
@@ -53,6 +53,8 @@ pub enum Seguridad {
 struct Nav {
     url: String,
     scroll: i32,
+    /// Cuerpo del formulario que llevó a esta página (POST): volver a ella lo reenvía.
+    post: Option<Vec<u8>>,
 }
 
 enum Rol {
@@ -76,6 +78,8 @@ struct Descarga {
     redirs: u8,
     estado: Option<Estado>,
     cuerpo: Vec<u8>,
+    /// Lo que se envía por POST (se conserva en las redirecciones 307 y 308).
+    post: Option<Vec<u8>>,
     tope: usize,
     fin: Option<Result<(), Fallo>>,
 }
@@ -89,7 +93,7 @@ fn tope(t: TipoRecurso) -> usize {
 
 impl Descarga {
     fn nueva(get: HttpGet, rol: Rol, url: &str, tope: usize) -> Descarga {
-        Descarga { get, rol, url: String::from(url), redirs: 0, estado: None, cuerpo: Vec::new(), tope, fin: None }
+        Descarga { get, rol, url: String::from(url), redirs: 0, estado: None, cuerpo: Vec::new(), post: None, tope, fin: None }
     }
 
     fn fallar(&mut self, net: &mut dyn NetApi, titulo: &str, detalle: &str) {
@@ -104,7 +108,7 @@ impl Descarga {
                 HttpEvent::Head { status, reason, headers } => {
                     let cab = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
                     if let (301 | 302 | 303 | 307 | 308, Some(loc)) = (status, cab("location")) {
-                        return self.redirigir(net, &loc, pagina);
+                        return self.redirigir(net, &loc, pagina, status);
                     }
                     self.estado = Some(Estado { codigo: status, motivo: reason, tipo: cab("content-type") });
                 }
@@ -124,21 +128,28 @@ impl Descarga {
         }
     }
 
-    fn redirigir(&mut self, net: &mut dyn NetApi, loc: &str, pagina: &str) {
+    fn redirigir(&mut self, net: &mut dyn NetApi, loc: &str, pagina: &str, status: u16) {
         if self.redirs >= MAX_REDIRECCIONES {
             return self.fallar(net, "Demasiadas redirecciones", "La página redirige una y otra vez sin llegar a ningún sitio.");
         }
         let Some(sig) = url::resolver(&self.url, loc) else {
             return self.fallar(net, "Redirección no válida", "La página redirige a una dirección que el navegador no admite (solo http y https).");
         };
-        // Un recurso de una página pública no puede acabar en la red local por una redirección.
-        if matches!(self.rol, Rol::Recurso(_)) && !recurso_permitido(pagina, &sig) {
-            return self.fallar(net, "Bloqueado", "Una página de Internet no puede cargar recursos de la red local.");
+        // Un recurso o un formulario de una página pública no puede acabar en la red local por una redirección.
+        if (matches!(self.rol, Rol::Recurso(_)) || self.post.is_some()) && !recurso_permitido(pagina, &sig) {
+            return self.fallar(net, "Bloqueado", "Una página de Internet no puede enviar ni cargar nada de la red local.");
         }
         self.get.cancel(net);
-        match HttpGet::start(net, &sig, false, false) {
+        // 307 y 308 repiten el POST; 301, 302 y 303 lo cambian por un GET.
+        let post = self.post.take().filter(|_| matches!(status, 307 | 308));
+        let g = match &post {
+            Some(b) => HttpGet::start_post(net, &sig, b.clone()),
+            None => HttpGet::start(net, &sig, false, false),
+        };
+        match g {
             Ok(g) => {
                 self.get = g;
+                self.post = post;
                 self.url = sig;
                 self.redirs += 1;
                 self.estado = None;
@@ -234,7 +245,7 @@ impl Pestana {
             sel: None,
             ancla: None,
             restaurar: None,
-            historial: alloc::vec![Nav { url: String::new(), scroll: 0 }],
+            historial: alloc::vec![Nav { url: String::new(), scroll: 0, post: None }],
             pos: 0,
             descargas: Vec::new(),
             cola: VecDeque::new(),
@@ -314,9 +325,30 @@ impl Pestana {
         };
         self.historial[self.pos].scroll = self.scroll;
         self.historial.truncate(self.pos + 1);
-        self.historial.push(Nav { url: url.clone(), scroll: 0 });
+        self.historial.push(Nav { url: url.clone(), scroll: 0, post: None });
         self.pos += 1;
         self.cargar(sys, &url, ahora, None);
+    }
+
+    /// Envía un formulario: la página nueva entra en el historial (con su cuerpo si es un POST). Una página
+    /// pública no puede enviar a la red local.
+    pub fn enviar(&mut self, sys: &mut dyn Platform, e: Envio, ahora: u64) {
+        self.historial[self.pos].scroll = self.scroll;
+        self.historial.truncate(self.pos + 1);
+        self.historial.push(Nav { url: e.url.clone(), scroll: 0, post: e.cuerpo });
+        self.pos += 1;
+        if recurso_permitido(&self.base, &e.url) {
+            self.cargar(sys, &e.url, ahora, None);
+        } else {
+            self.cancelar(sys);
+            self.error("Bloqueado", "Una página de Internet no puede enviar un formulario a la red local.", &e.url);
+        }
+    }
+
+    /// Ir `d` pasos por el historial (0 = recargar) volvería a enviar un formulario.
+    pub fn pide_post(&self, d: i32) -> bool {
+        let i = self.pos as i64 + d as i64;
+        usize::try_from(i).ok().and_then(|i| self.historial.get(i)).is_some_and(|n| n.post.is_some())
     }
 
     pub fn atras(&mut self, sys: &mut dyn Platform, ahora: u64) {
@@ -367,8 +399,17 @@ impl Pestana {
             let (t, d) = paginas::error_de_red(&NetError::NoAdapter, url);
             return self.error(&t, &d, url);
         };
-        match HttpGet::start(net, sin, false, false) {
-            Ok(get) => self.descargas.push(Descarga::nueva(get, Rol::Principal, sin, TOPE_DOC)),
+        let post = self.historial[self.pos].post.clone();
+        let get = match &post {
+            Some(b) => HttpGet::start_post(net, sin, b.clone()),
+            None => HttpGet::start(net, sin, false, false),
+        };
+        match get {
+            Ok(get) => {
+                let mut d = Descarga::nueva(get, Rol::Principal, sin, TOPE_DOC);
+                d.post = post;
+                self.descargas.push(d);
+            }
             Err(e) => {
                 let (t, d) = paginas::error_de_red(&e, url);
                 self.error(&t, &d, url);
@@ -480,6 +521,7 @@ impl Pestana {
             if n < MAX_REFRESCOS {
                 // Sustituye la entrada actual del historial (Atrás no vuelve a la página que redirige).
                 self.historial[self.pos].url = url.clone();
+                self.historial[self.pos].post = None;
                 self.cargar(sys, &url, ahora, None);
                 self.refrescos = n + 1;
                 cambio = true;
@@ -531,6 +573,10 @@ impl Pestana {
             (Rol::Principal, Ok(())) => {
                 let (codigo, motivo, tipo) = d.estado.map_or((200, String::new(), None), |e| (e.codigo, e.motivo, e.tipo));
                 let url = String::from(sin_fragmento(&d.url).0);
+                // Tras una redirección que lo convirtió en GET, la entrada del historial ya no es un POST.
+                if d.post.is_none() {
+                    self.historial[self.pos].post = None;
+                }
                 if codigo >= 400 && d.cuerpo.is_empty() {
                     let (t, m) = paginas::error_http(codigo, &motivo);
                     return self.error(&t, &m, &url);

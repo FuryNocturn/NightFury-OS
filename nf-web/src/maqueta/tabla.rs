@@ -196,7 +196,13 @@ impl<'a> Maq<'a> {
                 a.cerrar();
                 continue;
             }
-            if el.etq == "img" || (e.display == Display::InlineBlock && e.flot == Flot::No) {
+            let k = self.forms.ctl_de[h];
+            if k != SIN_CTL {
+                let w = self.tam_control(h, k, MAX_ANCHO).0.saturating_add(Self::extras_h(e, true) - Self::extras_h(e, false));
+                a.min = a.min.max(w);
+                a.linea = a.linea.saturating_add(w);
+                a.espacio = false;
+            } else if el.etq == "img" || (e.display == Display::InlineBlock && e.flot == Flot::No) {
                 let (mn, mx) = self.mm(h, prof + 1);
                 a.min = a.min.max(mn);
                 a.linea = a.linea.saturating_add(mx);

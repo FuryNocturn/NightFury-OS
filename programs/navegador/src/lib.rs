@@ -32,7 +32,7 @@ use nf_core::platform::Platform;
 use nf_core::scrollbar::{Metrics, ScrollBar, SB_W};
 use nf_core::surface::Surface;
 use nf_core::theme::Theme;
-use nf_web::{Familia, Fuentes, Letra};
+use nf_web::{Efecto, Envio, Familia, Fuentes, Letra, Metodo, Tecla};
 use pestana::{ajustar_imagen, Pestana, Seguridad, Vista, MARGEN_IMG};
 
 const TAB_H: i32 = 36;
@@ -56,6 +56,26 @@ const PASO_FLECHA: i32 = 40;
 enum Foco {
     Pagina,
     Barra,
+}
+
+/// Pregunta que espera respuesta bajo la barra (en rojo), antes de enviar un formulario.
+enum Aviso {
+    /// Contraseña que viajaría sin cifrar.
+    Password(Envio),
+    /// Atrás, adelante o recargar volverían a enviar un formulario: el paso (-1, 1 o 0).
+    Reenviar(i32),
+}
+
+const AVISO_H: i32 = 52;
+
+fn rect_aviso(p: Rect) -> Rect {
+    Rect::new(p.x, p.y, p.w - SB_W, AVISO_H)
+}
+fn rect_aviso_si(r: Rect) -> Rect {
+    Rect::new(r.right() - 196, r.y + 12, 90, 28)
+}
+fn rect_aviso_no(r: Rect) -> Rect {
+    Rect::new(r.right() - 100, r.y + 12, 90, 28)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -116,6 +136,7 @@ pub struct Navegador {
     lienzo: Surface,
     /// Último reloj visto (ms), para animar el indicador de carga.
     reloj: u64,
+    aviso: Option<Aviso>,
 }
 
 /// App lista para `nf_app::programa!`.
@@ -149,6 +170,7 @@ impl Navegador {
             copiado: String::new(),
             lienzo: Surface::empty(),
             reloj: 0,
+            aviso: None,
         }
     }
 
@@ -207,6 +229,7 @@ impl Navegador {
 
     fn activar(&mut self, i: usize) {
         self.act = i;
+        self.aviso = None;
         self.sb = ScrollBar::new(false);
         self.enlace = None;
         self.pulsado = None;
@@ -243,6 +266,7 @@ impl Navegador {
 
     fn ir_a(&mut self, texto: &str, cx: &mut Ctx) {
         if let Some(e) = clasificar(texto) {
+            self.aviso = None;
             self.pest[self.act].ir(cx.sys, e, cx.now_ms);
             self.foco = Foco::Pagina;
             self.enlace = None;
@@ -272,6 +296,134 @@ impl Navegador {
             self.pest[self.act].ancla = frag.filter(|f| !f.is_empty()).map(String::from);
         }
         self.enlace = None;
+    }
+
+    // ------------------------------------------------------------ formularios
+
+    /// Atrás (-1), adelante (1) o recargar (0); si volvería a enviar un formulario, antes se pregunta.
+    fn mover(&mut self, d: i32, cx: &mut Ctx) {
+        let a = self.act;
+        self.aviso = None;
+        if self.pest[a].pide_post(d) {
+            self.aviso = Some(Aviso::Reenviar(d));
+            return;
+        }
+        self.hacer_mover(d, cx);
+    }
+
+    fn hacer_mover(&mut self, d: i32, cx: &mut Ctx) {
+        let (a, ahora) = (self.act, cx.now_ms);
+        match d {
+            0 => self.pest[a].recargar(cx.sys, ahora),
+            d if d < 0 => self.pest[a].atras(cx.sys, ahora),
+            _ => self.pest[a].adelante(cx.sys, ahora),
+        }
+    }
+
+    /// Lo que han hecho los controles de la página: enviar, seguir un enlace con Enter.
+    fn aplicar(&mut self, ef: Efecto, cx: &mut Ctx) {
+        match ef {
+            Efecto::Enviar(e) => self.enviar(e, cx),
+            Efecto::Enlace(u) => self.abrir_enlace(&u, false, cx),
+            Efecto::Cambio | Efecto::Ignorado => {}
+        }
+    }
+
+    fn enviar(&mut self, e: Envio, cx: &mut Ctx) {
+        let (a, ahora) = (self.act, cx.now_ms);
+        self.enlace = None;
+        // Una página del disco que envía a otra del disco: se abre el archivo (sin consulta).
+        if let (true, Metodo::Get, Some(ruta)) = (self.pest[a].local, e.metodo, local_de_url(&e.url)) {
+            self.aviso = None;
+            self.pest[a].ir(cx.sys, Entrada::Local(ruta), ahora);
+            return;
+        }
+        if e.tiene_password && e.url.starts_with("http://") {
+            self.aviso = Some(Aviso::Password(e));
+            return;
+        }
+        self.aviso = None;
+        self.pest[a].enviar(cx.sys, e, ahora);
+        self.foco = Foco::Pagina;
+    }
+
+    /// Respuesta a la pregunta de la barra roja.
+    fn responder(&mut self, si: bool, cx: &mut Ctx) {
+        match self.aviso.take() {
+            Some(Aviso::Password(e)) if si => {
+                let a = self.act;
+                self.pest[a].enviar(cx.sys, e, cx.now_ms);
+                self.foco = Foco::Pagina;
+            }
+            Some(Aviso::Reenviar(d)) if si => self.hacer_mover(d, cx),
+            _ => {}
+        }
+    }
+
+    /// Teclas para el foco de la página (campos, botones, enlaces). `true` si las ha tomado.
+    fn tecla_doc(&mut self, ev: &KeyEvent, cx: &mut Ctx) -> bool {
+        let a = self.act;
+        let Vista::Documento(d) = &mut self.pest[a].vista else { return false };
+        let t = match ev.key {
+            Key::Tab => Tecla::Tab,
+            Key::Enter => Tecla::Enter,
+            Key::Backspace => Tecla::Borrar,
+            Key::Delete => Tecla::Suprimir,
+            Key::Left => Tecla::Izq,
+            Key::Right => Tecla::Der,
+            Key::Up => Tecla::Arriba,
+            Key::Down => Tecla::Abajo,
+            Key::Home => Tecla::Inicio,
+            Key::End => Tecla::Fin,
+            Key::Char('a') if ev.ctrl => Tecla::Todo,
+            _ => match ev.ch {
+                Some(c) if !ev.ctrl && !ev.alt && !c.is_control() => Tecla::Car(c),
+                _ => return false,
+            },
+        };
+        // Con un botón o un enlace enfocado, solo Tab, Enter y espacio son suyos; el resto desplaza la página.
+        if t != Tecla::Tab && (!d.hay_foco() || !(d.foco_texto() || matches!(t, Tecla::Enter | Tecla::Car(' ')))) {
+            return false;
+        }
+        let ef = d.tecla(t, ev.shift);
+        let r = d.rect_foco();
+        if ef == Efecto::Ignorado {
+            // Tab sin más controles: el foco pasa a la barra de direcciones
+            if t == Tecla::Tab && !ev.shift {
+                self.enfocar_barra();
+                return true;
+            }
+            return false;
+        }
+        if let Some(r) = r {
+            let (sc, h) = (self.pest[a].scroll, self.pagina().h);
+            if r.y < sc {
+                self.desplazar_a(r.y - 20);
+            } else if r.bottom() > sc + h {
+                self.desplazar_a(r.bottom() - h + 20);
+            }
+        }
+        self.aplicar(ef, cx);
+        true
+    }
+
+    fn dibujar_aviso(&self, s: &mut Surface, p: Rect) {
+        let Some(av) = &self.aviso else { return };
+        let r = rect_aviso(p);
+        s.fill_rect(r, 0xFCE8E6);
+        s.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), ROJO);
+        let (l1, l2, si) = match av {
+            Aviso::Password(_) => ("Este formulario envía una contraseña sin cifrar.", "¿Enviar igualmente?", "Enviar"),
+            Aviso::Reenviar(_) => ("¿Volver a enviar el formulario?", "Se repetirán los datos enviados antes a esta página.", "Reenviar"),
+        };
+        let ancho = (rect_aviso_si(r).x - r.x - 24).max(0);
+        font::draw(s, r.x + 14, r.y + 8, &dialogs::fit(l1, TS, ancho), TS, true, ROJO);
+        font::draw(s, r.x + 14, r.y + 8 + font::line_h(TS) + 2, &dialogs::fit(l2, TS_S, ancho), TS_S, false, TINTA);
+        for (b, t, tinta, fondo) in [(rect_aviso_si(r), si, 0xFFFFFF, ROJO), (rect_aviso_no(r), "Cancelar", TINTA, 0xFFFFFF)] {
+            capsula(s, b, if fondo == ROJO { ROJO } else { LINEA });
+            capsula(s, b.inflate(-1), fondo);
+            font::draw_in(s, b, t, TS, false, tinta, font::Align::Center);
+        }
     }
 
     // ------------------------------------------------------------ desplazamiento y selección
@@ -487,6 +639,7 @@ impl Navegador {
         if m.needed() {
             self.sb.draw(s, &m, theme);
         }
+        self.dibujar_aviso(s, p);
         if let Some(u) = &self.enlace {
             let txt = dialogs::fit(u, TS_S, (p.w * 6 / 10).max(40));
             let r = Rect::new(p.x, p.bottom() - 22, font::width(&txt, TS_S, false) + 20, 22);
@@ -542,17 +695,25 @@ impl App for Navegador {
                     return self.activar(if ev.shift { (a + n - 1) % n } else { (a + 1) % n });
                 }
                 Key::Char('l') => return self.enfocar_barra(),
-                Key::Char('r') => return self.pest[a].recargar(cx.sys, ahora),
+                Key::Char('r') => return self.mover(0, cx),
                 Key::Char('c') => return self.copiar(),
                 _ => {}
             }
         }
         match ev.key {
             Key::F(6) => return self.enfocar_barra(),
-            Key::F(5) => return self.pest[a].recargar(cx.sys, ahora),
-            Key::Left if ev.alt => return self.pest[a].atras(cx.sys, ahora),
-            Key::Right if ev.alt => return self.pest[a].adelante(cx.sys, ahora),
+            Key::F(5) => return self.mover(0, cx),
+            Key::Left if ev.alt => return self.mover(-1, cx),
+            Key::Right if ev.alt => return self.mover(1, cx),
             Key::Escape => {
+                if self.aviso.take().is_some() {
+                    return;
+                }
+                if let (Foco::Pagina, Vista::Documento(d)) = (self.foco, &mut self.pest[a].vista) {
+                    if d.tecla(Tecla::Escape, false) != Efecto::Ignorado {
+                        return;
+                    }
+                }
                 if self.foco == Foco::Barra && !self.pest[a].url_visible().is_empty() {
                     self.foco = Foco::Pagina;
                 } else if self.pest[a].cargando() || self.pest[a].pendiente.is_some() {
@@ -561,6 +722,19 @@ impl App for Navegador {
                 return;
             }
             _ => {}
+        }
+        if self.aviso.is_some() {
+            return;
+        }
+        if self.foco == Foco::Barra && ev.key == Key::Tab && !ev.shift && matches!(self.pest[a].vista, Vista::Documento(_)) {
+            self.foco = Foco::Pagina;
+            if let Vista::Documento(d) = &mut self.pest[a].vista {
+                d.quitar_foco();
+            }
+            if !self.tecla_doc(ev, cx) {
+                self.foco = Foco::Barra;
+            }
+            return;
         }
         if self.foco == Foco::Barra {
             if self.barra.tecla(ev) == Accion::Enter {
@@ -574,6 +748,9 @@ impl App for Navegador {
                 let t = self.pest[a].caja.texto();
                 self.ir_a(&t, cx);
             }
+            return;
+        }
+        if self.tecla_doc(ev, cx) {
             return;
         }
         let pagina = (self.pagina().h - PASO_FLECHA).max(PASO_FLECHA);
@@ -597,10 +774,10 @@ impl App for Navegador {
                 Hit::Pestana(i) => self.activar(i),
                 Hit::Cerrar(i) => self.cerrar(i, cx),
                 Hit::Mas => self.nueva(cx.sys, None, true, false, ahora),
-                Hit::Atras => self.pest[a].atras(cx.sys, ahora),
-                Hit::Adelante => self.pest[a].adelante(cx.sys, ahora),
+                Hit::Atras => self.mover(-1, cx),
+                Hit::Adelante => self.mover(1, cx),
                 Hit::Recargar if self.pest[a].cargando() || self.pest[a].pendiente.is_some() => self.pest[a].detener(cx.sys),
-                Hit::Recargar => self.pest[a].recargar(cx.sys, ahora),
+                Hit::Recargar => self.mover(0, cx),
                 Hit::Barra if self.foco != Foco::Barra => self.enfocar_barra(),
                 Hit::Barra => {
                     let r = rect_omnibox(self.size.0);
@@ -614,15 +791,28 @@ impl App for Navegador {
                     }
                     self.foco = Foco::Pagina;
                     let p = self.pagina();
+                    if self.aviso.is_some() {
+                        let r = rect_aviso(p);
+                        if rect_aviso_si(r).contains(x, y) || rect_aviso_no(r).contains(x, y) {
+                            self.responder(rect_aviso_si(r).contains(x, y), cx);
+                        }
+                        return;
+                    }
                     let t = &mut self.pest[a];
-                    match &t.vista {
+                    match &mut t.vista {
                         Vista::Inicio => {
                             let r = rect_caja(p);
                             if r.contains(x, y) {
                                 t.caja.clic(x - (r.x + 48), r.w - 72, TS + 2);
                             }
                         }
-                        Vista::Documento(_) => {
+                        Vista::Documento(d) => {
+                            let ef = if x < p.w - SB_W { d.pulsar(x, y - p.y + t.scroll, &mut self.letras) } else { Efecto::Ignorado };
+                            if ef != Efecto::Ignorado {
+                                self.pulsado = None;
+                                t.sel = None;
+                                return self.aplicar(ef, cx);
+                            }
                             self.pulsado = Some((x, y - p.y + t.scroll));
                             self.arrastro = false;
                             t.sel = None;
