@@ -29,6 +29,7 @@ use crate::platform::{DateTime, Platform};
 use crate::programs::{self, Program};
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
+use crate::letra;
 use crate::theme::{render_wallpaper, Theme, ACCENTS, WALLPAPERS};
 use alloc::boxed::Box;
 use alloc::format;
@@ -138,6 +139,8 @@ enum Hit {
     Nav(usize),
     Wall(u8),
     Accent(usize),
+    /// Letra del sistema que se elige (valor de `Theme::letra`).
+    Letra(u8),
     Act(Act),
 }
 
@@ -188,6 +191,9 @@ struct Job {
 
 struct Settings {
     page: usize,
+    /// Fuentes de Windows ofrecidas (se listan al abrir Personalización) y la TrueType elegida por última vez.
+    fuentes: Option<Vec<String>>,
+    tt: u8,
     thumbs: Vec<Surface>,
     /// Color de énfasis con el que se generó la miniatura de "Color sólido".
     thumb_accent: u32,
@@ -232,6 +238,8 @@ pub fn new() -> Box<dyn App> {
 fn init() -> Settings {
     Settings {
         page: 0,
+        fuentes: None,
+        tt: letra::LIBERATION,
         thumbs: Vec::new(),
         thumb_accent: 0,
         hover: None,
@@ -279,11 +287,11 @@ impl Settings {
         }
     }
 
-    fn personalization(&mut self, s: &mut Surface, theme: &Theme) {
+    fn personalization(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
         let compact = s.h < 440;
         let x0 = PANEL_W + 24;
         let avail = (s.w - x0 - if compact { 12 } else { 24 }).max(1);
-        let mut y = if compact { 14 } else { 24 };
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
         font::draw(s, x0, y, "Personalización", 18, false, TEXT);
         y += font::line_h(18) + if compact { 4 } else { 10 };
         font::draw(s, x0, y, "Fondo", 11, true, TEXT);
@@ -321,6 +329,45 @@ impl Settings {
             }
             self.hits.push((r, Hit::Accent(i)));
         }
+        y += ((ACCENTS.len() as i32 + per - 1) / per) * (sz + gap) + 10;
+        self.letra_section(s, theme, sys, x0, avail, y);
+    }
+
+    /// «Letra del sistema»: TrueType o trazos y, con TrueType, qué fuente (Liberation u otra de Windows).
+    fn letra_section(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, x0: i32, avail: i32, mut y: i32) {
+        let fuentes = self.fuentes.get_or_insert_with(|| letra::lista(sys.fs())).clone();
+        if theme.letra != letra::TRAZOS {
+            self.tt = theme.letra;
+        }
+        // Una fuente que ya no está en la lista (se quitó el disco) se muestra como Liberation.
+        let cur = if self.tt >= 2 && self.tt as usize - 1 > fuentes.len() { letra::LIBERATION } else { self.tt };
+        font::draw(s, x0, y, "Letra del sistema", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        for (i, (nombre, valor)) in [("TrueType", cur), ("Trazos", letra::TRAZOS)].into_iter().enumerate() {
+            let r = Rect::new(x0 + i as i32 * 118, y, 110, 28);
+            chip(s, r, nombre, (theme.letra == letra::TRAZOS) == (valor == letra::TRAZOS), theme);
+            self.hits.push((r, Hit::Letra(valor)));
+        }
+        y += 28 + 8;
+        if theme.letra != letra::TRAZOS {
+            // Posición en «Liberation + fuentes de Windows»: 0 es Liberation, p >= 1 es `fuentes[p - 1]`.
+            let (n, p) = (fuentes.len() as i32 + 1, if cur == letra::LIBERATION { 0 } else { cur as i32 - 1 });
+            let valor = |p: i32| if p == 0 { letra::LIBERATION } else { p as u8 + 1 };
+            let nombre = if p == 0 { "Liberation (incluida)" } else { fuentes[p as usize - 1].trim_end_matches(".ttf") };
+            let nw = (avail - 72).clamp(100, 260);
+            let ra = Rect::new(x0, y, 28, 28);
+            let rn = Rect::new(x0 + 34, y, nw, 28);
+            let rb = Rect::new(rn.right() + 6, y, 28, 28);
+            chip(s, ra, "<", false, theme);
+            chip(s, rb, ">", false, theme);
+            s.fill_rect(rn, OFF);
+            s.frame(rn, OFF_LINE);
+            font::draw_in(s, Rect::new(rn.x + 8, rn.y, rn.w - 16, rn.h), nombre, 9, false, TEXT, Align::Left);
+            self.hits.push((ra, Hit::Letra(valor((p + n - 1) % n))));
+            self.hits.push((rb, Hit::Letra(valor((p + 1) % n))));
+            y += 28 + 8;
+        }
+        self.content_h = y + self.scroll + 16;
     }
 
     fn net_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
@@ -857,7 +904,7 @@ impl Settings {
     }
 
     fn scrolls(&self) -> bool {
-        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || self.page == PAGE_TIME || (self.page == PAGE_DEVICES && self.testing.is_none())
+        self.page == 0 || self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || self.page == PAGE_TIME || (self.page == PAGE_DEVICES && self.testing.is_none())
     }
 
     fn metrics(&self) -> Metrics {
@@ -1546,7 +1593,7 @@ impl App for Settings {
             // Lo de la derecha no se sale de su zona.
             s.set_clip(Rect::new(PANEL_W, 0, (s.w - PANEL_W).max(0), s.h));
             match self.page {
-                0 => self.personalization(s, theme),
+                0 => self.personalization(s, theme, sys),
                 PAGE_ACCOUNTS => self.accounts_page(s, theme, sys),
                 PAGE_DISK => self.disk_page(s, theme, sys),
                 PAGE_APPS => self.apps_page(s, theme, sys),
@@ -1633,6 +1680,11 @@ impl App for Settings {
                 Some(Hit::Act(a)) => self.start(a, cx),
                 Some(Hit::Wall(i)) if cx.theme.wallpaper != i => {
                     cx.theme.wallpaper = i;
+                    cx.theme_changed = true;
+                    cx.redraw = true;
+                }
+                Some(Hit::Letra(v)) if cx.theme.letra != v => {
+                    cx.theme.letra = v;
                     cx.theme_changed = true;
                     cx.redraw = true;
                 }
@@ -1975,6 +2027,22 @@ mod tests {
         b.clic(x + 2, y + 2);
         assert_eq!(b.theme.accent, ACCENTS[5]);
         assert!(b.changed && b.redraw);
+    }
+
+    #[test]
+    fn letra_trazos_se_elige_y_se_vuelve() {
+        let mut b = Banco::new();
+        b.dibuja(780, 520);
+        let r = b.app.hits.iter().find(|h| h.1 == Hit::Letra(letra::TRAZOS)).expect("falta el botón Trazos").0;
+        b.clic(r.x + 2, r.y + 2);
+        assert_eq!(b.theme.letra, letra::TRAZOS);
+        assert!(b.changed && b.redraw);
+        // Con trazos ya no se ofrece elegir fuente; el botón TrueType devuelve a Liberation.
+        b.dibuja(780, 520);
+        assert!(b.app.hits.iter().filter(|h| matches!(h.1, Hit::Letra(_))).count() == 2);
+        let r = b.app.hits.iter().find(|h| h.1 == Hit::Letra(letra::LIBERATION)).expect("falta el botón TrueType").0;
+        b.clic(r.x + 2, r.y + 2);
+        assert_eq!(b.theme.letra, letra::LIBERATION);
     }
 
     #[test]

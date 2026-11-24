@@ -104,9 +104,13 @@ Un programa tiene lo mismo que una app del sistema:
   `dialog_result`, `menu_result`, `drop_files`, `open_path`, `drag_over` y `drag_source`. Los diálogos de
   Abrir y Guardar devuelven la ruta elegida.
 
+La letra: `nf_core::font` (`draw`, `width`, `adv`, `line_h`) dibuja con la letra TrueType del sistema (Liberation
+o la que el usuario elija en Configuración → Personalización) y, si no se pudo cargar, con la de trazos. El runtime
+la carga solo al recibir el tema: el programa no hace nada. `font::draw_mono` es la monoespaciada.
+
 Lo que un programa **de terceros** no puede (se le contesta `FsError::Denied` o se ignora):
 
-- escribir, borrar, mover o leer en `C:\Sistema`;
+- escribir, borrar, mover o leer en `C:\Sistema` (salvo leer las letras de `C:\Sistema\fuentes`);
 - escribir, borrar o mover en `C:\Programas` (instalar y desinstalar es cosa de Configuración);
 - arrastrar rutas de esas carpetas;
 - cuentas, contraseñas, cifrado, reiniciar o apagar.

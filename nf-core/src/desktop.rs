@@ -16,6 +16,7 @@ use crate::bmp::Picture;
 use crate::icons::{self, Icon};
 use crate::input::{Event, Key, KeyEvent};
 use crate::keys::KeyError;
+use crate::letra;
 use crate::login::{Login, Mode, Out};
 use crate::menu::{Menu, MenuAct, MenuItem};
 use crate::net::{self, State};
@@ -626,7 +627,7 @@ fn normalize(list: Vec<Rect>, screen: Rect) -> Vec<Rect> {
     v
 }
 
-/// Aplica `fondo=`, `enfasis=`, `iconos=` y `orden=` de la configuración del usuario si son válidos.
+/// Aplica `fondo=`, `enfasis=`, `letra=`, `iconos=` y `orden=` de la configuración del usuario si son válidos.
 fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, order: &mut Order) {
     let cfg = sys.files().config_file();
     let Ok(bytes) = sys.files().read(&cfg) else { return };
@@ -648,6 +649,7 @@ fn load_config(sys: &mut dyn Platform, theme: &mut Theme, size: &mut IconSize, o
                     }
                 }
             }
+            Some(("letra", v)) => theme.letra = letra::indice(sys.fs(), v),
             Some(("iconos", v)) => {
                 if let Some(e) = IconSize::ALL.iter().find(|e| e.1 == v.trim()) {
                     *size = e.0;
@@ -680,8 +682,12 @@ fn save_config(sys: &mut dyn Platform, theme: &Theme, size: IconSize, order: Ord
         IconSize::ALL.iter().find(|e| e.0 == size).map_or("mediano", |e| e.1),
         Order::ALL.iter().find(|e| e.0 == order).map_or("nombre", |e| e.1)
     );
+    // Solo se escribe si no es la de siempre (Liberation): los ficheros de quien no la toca no cambian.
+    if theme.letra != letra::LIBERATION {
+        text.push_str(&format!("letra={}\n", letra::nombre(f, theme.letra)));
+    }
     for line in old.lines() {
-        let ours = matches!(line.split_once('=').map(|p| p.0.trim()), Some("fondo" | "enfasis" | "iconos" | "orden"));
+        let ours = matches!(line.split_once('=').map(|p| p.0.trim()), Some("fondo" | "enfasis" | "letra" | "iconos" | "orden"));
         if !ours && !line.trim().is_empty() {
             text.push_str(line);
             text.push('\n');
@@ -861,6 +867,7 @@ impl Desktop {
         self.size = IconSize::Mid;
         self.order = Order::Name;
         load_config(sys, &mut self.theme, &mut self.size, &mut self.order);
+        letra::aplicar(sys.fs(), self.theme.letra);
         self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
         self.show_ext = sys.files().show_ext();
         self.icons = build_icons(sys, self.order, self.show_ext);
@@ -1249,6 +1256,7 @@ impl Desktop {
                 self.logout_wait = None;
                 sys.files().logout();
                 self.theme = Theme::default();
+                letra::aplicar(sys.fs(), self.theme.letra);
                 self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
                 self.icons.clear();
                 self.show_pick(sys);
@@ -2190,6 +2198,7 @@ impl Desktop {
         let open_term = cx.open_terminal.take();
         let drag = cx.drag.take();
         if themed {
+            letra::aplicar(sys.fs(), self.theme.letra);
             self.wall = theme::render_wallpaper(self.theme.wallpaper, self.w, self.h, self.theme.accent);
             for w in self.wins.iter_mut() {
                 w.dirty = true;

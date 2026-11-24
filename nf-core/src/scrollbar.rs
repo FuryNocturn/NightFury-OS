@@ -442,7 +442,7 @@ mod tests {
         assert!(!sb.mouse(MouseEv::Move { x: 106, y: 6 }, &m(0), 1).redraw);
         assert!(sb.mouse(MouseEv::Leave, &m(0), 2).redraw);
         let mut s = Surface::new(200, 200, 0xFFFFFF);
-        let th = Theme { accent: 0x2D7DD2, wallpaper: 0 };
+        let th = Theme { accent: 0x2D7DD2, wallpaper: 0, letra: 0 };
         sb.draw(&mut s, &m(0), &th);
         assert_eq!(s.px[(100 * 200 + 99) as usize], 0xFFFFFF);
         assert_ne!(s.px[(100 * 200 + 108) as usize], 0xFFFFFF);
