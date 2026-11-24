@@ -101,26 +101,26 @@ fn leer_windows(fs: &mut dyn FilesApi, fichero: &str) -> Option<Font> {
 }
 
 /// Registra la letra `letra` en este proceso. Si no se puede cargar (fichero ausente o fuente rota) no
-/// cambia nada: sin ninguna anterior, se queda la letra de trazos.
-pub fn aplicar(fs: &mut dyn FilesApi, letra: u8) {
+/// cambia nada: sin ninguna anterior, se queda la letra de trazos. Devuelve si la letra cambió (hay que
+/// redibujar aunque el resto del tema sea el mismo).
+pub fn aplicar(fs: &mut dyn FilesApi, letra: u8) -> bool {
     if ACTUAL.load(Ordering::Relaxed) == letra {
-        return;
+        return false;
     }
     match letra {
         TRAZOS => {
             font::quitar_ttf();
             ACTUAL.store(TRAZOS, Ordering::Relaxed);
+            true
         }
-        LIBERATION => {
-            aplicar_liberation(Some(fs));
-        }
+        LIBERATION => aplicar_liberation(Some(fs)),
         n => {
-            let Some(nombre) = lista(fs).get(n as usize - 2).cloned() else { return };
-            if let Some(f) = leer_windows(fs, &nombre) {
-                // shortcut: sin variante en negrita la fabrica `ttf` (más tosca); buscar la `bd` si molesta.
-                font::set_ttf(f, None);
-                ACTUAL.store(n, Ordering::Relaxed);
-            }
+            let Some(nombre) = lista(fs).get(n as usize - 2).cloned() else { return false };
+            let Some(f) = leer_windows(fs, &nombre) else { return false };
+            // shortcut: sin variante en negrita la fabrica `ttf` (más tosca); buscar la `bd` si molesta.
+            font::set_ttf(f, None);
+            ACTUAL.store(n, Ordering::Relaxed);
+            true
         }
     }
 }

@@ -289,8 +289,10 @@ impl Bucle<'_> {
             EV_THEME => {
                 let t = Theme { accent: ev.d, wallpaper: ev.a as u8, letra: ev.b as u8 };
                 // Cada programa carga la letra por su cuenta (también la primera vez, aunque el tema coincida).
-                letra::aplicar(&mut self.plat.fs, t.letra);
-                self.dirty |= t != self.theme;
+                // Si la letra cambió hay que redibujar aunque el tema ya fuera este (el propio programa pudo
+                // cambiarlo antes, como Configuración).
+                let cambio = letra::aplicar(&mut self.plat.fs, t.letra);
+                self.dirty |= cambio || t != self.theme;
                 self.theme = t;
             }
             EV_RESIZE => {
