@@ -16,7 +16,7 @@
 //! - la fecha, la sal y el acumulador de aleatoriedad los pone siempre el sistema.
 use crate::accounts::{salt_from, Account, AccountError};
 use crate::drives::{DriveInfo, FormatKind, FormatRequest};
-use crate::files::{in_system, resolve, Files, TrashItem, PROGRAMS_DIR};
+use crate::files::{in_system, is_system_font, resolve, Files, TrashItem, PROGRAMS_DIR};
 use crate::vol::FsKind;
 use crate::fs::{Entry, FsError};
 use crate::fsapi::FilesApi;
@@ -870,7 +870,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         Stat { path } => encode(&sys.files().stat(&path)),
         Exists { path } => encode(&sys.files().exists(&path)),
         // Un programa de terceros no lee `C:\Sistema` (con sesión de administrador vería las cuentas).
-        Read { path } => gate(system || !in_system(&path), Err(denied), || sys.files().read(&path).map(Blob)),
+        Read { path } => gate(system || !in_system(&path) || is_system_font(&path), Err(denied), || sys.files().read(&path).map(Blob)),
         Write { path, data } => {
             let now = sys.now();
             gate(outside(system, &[&path]), Err(denied), || sys.files().write(&path, &data.0, now))

@@ -5,6 +5,7 @@ use super::netcmd::{self, Job, NetCmd};
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::font;
 use crate::geom::Rect;
+use crate::letra;
 use crate::files::{file_name, in_system, join, parent, resolve, valid_name};
 use crate::fs::FsError;
 use crate::input::{Key, KeyEvent};
@@ -396,7 +397,7 @@ fn wrap(text: &str, max_w: i32) -> Vec<String> {
     let mut rows = Vec::new();
     let (mut cur, mut w) = (String::new(), 0);
     for c in text.chars() {
-        let a = font::adv(c, SIZE, false);
+        let a = font::adv_mono(c, SIZE);
         if w + a > max_w && !cur.is_empty() {
             rows.push(core::mem::take(&mut cur));
             w = 0;
@@ -564,6 +565,7 @@ impl App for Terminal {
 
     fn draw(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform, focused: bool) {
         self.ready(sys);
+        letra::asegurar_mono(sys.fs());
         self.focused = focused;
         s.fill_rect(s.bounds(), BG);
         let lh = font::line_h(SIZE);
@@ -599,12 +601,12 @@ impl App for Terminal {
             if is_cursor_row {
                 // Sin el espacio final: el bloque se pinta justo detrás.
                 let txt = &r[..r.len() - 1];
-                let end = font::draw(s, MARGIN, y, txt, SIZE, false, FG);
+                let end = font::draw_mono(s, MARGIN, y, txt, SIZE, FG);
                 if focused && self.shown {
-                    s.fill_rect(Rect::new(end, y + 1, font::adv('0', SIZE, false), lh - 2), FG);
+                    s.fill_rect(Rect::new(end, y + 1, font::adv_mono('0', SIZE), lh - 2), FG);
                 }
             } else {
-                font::draw(s, MARGIN, y, r, SIZE, false, FG);
+                font::draw_mono(s, MARGIN, y, r, SIZE, FG);
             }
         }
         if sbw > 0 {
@@ -1269,7 +1271,7 @@ mod tests {
     #[test]
     fn partir_por_ancho() {
         assert_eq!(wrap("", 100), [""]);
-        let w = font::width("abc", SIZE, false);
+        let w: i32 = "abc".chars().map(|c| font::adv_mono(c, SIZE)).sum();
         let r = wrap("abcabcabc", w);
         assert_eq!(r, ["abc", "abc", "abc"]);
         assert_eq!(wrap("x", 0), ["x"]);

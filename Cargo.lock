@@ -36,7 +36,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "nf-core",
 ]
@@ -60,39 +60,39 @@ dependencies = [
 
 [[package]]
 name = "nf-app"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.12.4"
+version = "0.12.5"
 
 [[package]]
 name = "nf-web"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfdisk"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfpack"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfprog"
-version = "0.12.4"
+version = "0.12.5"
 dependencies = [
  "mensajes",
  "navegador",

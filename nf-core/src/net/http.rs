@@ -275,6 +275,10 @@ pub struct HttpGet {
     mode: Mode,
     descomp: Option<Descomp>,
     last: Option<u64>,
+    /// Cuerpo de un `POST` (`application/x-www-form-urlencoded`); sin él, la petición es GET o HEAD.
+    post: Option<Vec<u8>>,
+    /// Valor de la cabecera `Cookie` (lo pone el Navegador con su tarro; se quita en una redirección interna).
+    cookie: Option<String>,
 }
 
 fn find(h: &[u8], pat: &[u8]) -> Option<usize> {
@@ -320,15 +324,41 @@ impl HttpGet {
     pub fn start_tls(net: &mut dyn NetApi, url: &str, head_only: bool, follow: bool, insecure: bool) -> Result<HttpGet, NetError> {
         let url = parse_url(url)?;
         let q = net.resolve(&url.host)?;
-        let mut g = HttpGet { head_only, follow, insecure, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, descomp: None, last: None };
+        let mut g = HttpGet { head_only, follow, insecure, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, descomp: None, last: None, post: None, cookie: None };
         g.build_request();
         Ok(g)
     }
 
+    /// `POST` de un formulario: `cuerpo` va tal cual con `Content-Type: application/x-www-form-urlencoded`.
+    pub fn start_post(net: &mut dyn NetApi, url: &str, cuerpo: Vec<u8>) -> Result<HttpGet, NetError> {
+        let mut g = HttpGet::start(net, url, false, false)?;
+        g.post = Some(cuerpo);
+        g.build_request();
+        Ok(g)
+    }
+
+    /// Pone la cabecera `Cookie` antes de enviar la petición. Con saltos de línea o caracteres de control
+    /// no se pone (no se pueden colar cabeceras).
+    pub fn poner_cookie(&mut self, valor: &str) {
+        if !valor.is_empty() && !valor.chars().any(|c| c.is_control()) {
+            self.cookie = Some(String::from(valor));
+            self.build_request();
+        }
+    }
+
     fn build_request(&mut self) {
         let host = self.url.authority();
-        let m = if self.head_only { "HEAD" } else { "GET" };
-        self.req = format!("{m} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n", self.url.path, crate::VERSION).into_bytes();
+        let (m, mut extra) = match &self.post {
+            Some(b) => ("POST", format!("Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n", b.len())),
+            None => (if self.head_only { "HEAD" } else { "GET" }, String::new()),
+        };
+        if let Some(c) = &self.cookie {
+            extra = format!("Cookie: {c}\r\n{extra}");
+        }
+        self.req = format!("{m} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\n{extra}Connection: close\r\n\r\n", self.url.path, crate::VERSION).into_bytes();
+        if let Some(b) = &self.post {
+            self.req.extend_from_slice(b);
+        }
         self.sent = 0;
     }
 
@@ -523,6 +553,8 @@ impl HttpGet {
         self.url = url;
         self.stage = Stage::Resolving(q);
         self.buf.clear();
+        // Las cookies eran para la dirección de antes: quien sigue redirecciones con cookies lo hace a mano.
+        self.cookie = None;
         self.build_request();
         true
     }

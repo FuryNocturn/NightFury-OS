@@ -63,6 +63,10 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/net/http.rs` (v0.12.4) | `Content-Encoding: gzip` y `deflate` | RFC 9110 §8.4 y los RFC de compresión anteriores |
 | `nf-web` (v0.12.4) | Motor de páginas: HTML tolerante, CSS (análisis, cascada, herencia), maquetado en bloques, líneas, listas y tablas, pintado | HTML Living Standard (WHATWG; tokenizador y árbol simplificados), CSS 2.1, CSS Syntax 3 y Media Queries; RFC 3986 (URL). Diseño propio. No se ha mirado el código de ningún navegador ni motor |
 | `programs/navegador` (v0.12.4) | El programa Navegador (pestañas, barra de direcciones, carga de recursos) | Diseño propio; el aspecto se parece al de los navegadores habituales, con dibujos y textos propios |
+| `nf-core/src/font.rs` y `letra.rs` (v0.12.5) | Letra TrueType en todo el sistema, con la de trazos como opción | Diseño propio sobre `ttf.rs` |
+| `nf-web` formularios (v0.12.5) | `form`, `input`, `select`, `textarea`, `button`, `label`; conjunto de datos y codificación `application/x-www-form-urlencoded` | HTML Living Standard (WHATWG), secciones de formularios y «URL-encoded form data» (URL Standard). Diseño propio |
+| `programs/navegador/src/cookies.rs` (v0.12.5) | Cookies: Set-Cookie, envío, SameSite, prefijos `__Secure-`/`__Host-`, bloqueo de terceros | RFC 6265 y el borrador rfc6265bis (IETF). Lista corta propia de sufijos públicos, escrita a mano |
+| `programs/navegador` (v0.12.5) | Historial, favoritos, incógnito, descargas y POST | RFC 6266 y RFC 5987 (`Content-Disposition`, nombres de fichero); RFC 9110 (POST, redirecciones 303/307/308). Diseño propio |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
 
 ## Sala limpia en dos equipos (desde v0.11.1)
@@ -101,7 +105,7 @@ para hacer la letra propia del sistema (`glyphs.rs`). El Navegador también lee,
 fuentes de `\Windows\Fonts\` si hay un Windows en otro disco; no se copian ni se reparten.
 
 ## Firmware de terceros
-La versión 0.12.4 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
+La versión 0.12.5 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa

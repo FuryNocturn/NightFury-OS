@@ -379,6 +379,9 @@ extern "C" fn kmain() -> ! {
     }
     let mut plat = Plat { info, files, pool, net };
     let (w, h) = (info.width as i32, info.height as i32);
+    // La letra TrueType del sistema sale de los bytes incluidos: no depende del disco (bloqueado al iniciar sesión).
+    let fuente = |n: &str| FUENTES_SISTEMA.iter().find(|f| f.0 == n).map_or(&[][..], |f| f.1);
+    nf_core::letra::incluidas(fuente("LiberationSans-Regular.ttf"), fuente("LiberationSans-Bold.ttf"), fuente("LiberationMono-Regular.ttf"));
     let mut desk = Desktop::new(w, h, &mut plat);
 
     if TRAZA {

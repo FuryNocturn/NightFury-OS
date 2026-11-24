@@ -2,8 +2,12 @@
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Una pestaña: historial, página mostrada y las descargas en curso (documento principal y recursos).
 use crate::campo::Campo;
+use crate::cookies::{es_tercero, Contexto};
+use crate::descargas;
+use crate::red::RedRc;
 use crate::entrada::{es_ruta_local, local_de_url, recurso_permitido, sin_fragmento, tipo_de_extension, tipo_vista, url_de_local, Entrada, TipoVista, HOST_LOCAL};
 use crate::fuentes::Letras;
+use crate::internas;
 use crate::paginas;
 use alloc::collections::VecDeque;
 use alloc::format;
@@ -16,7 +20,7 @@ use nf_core::img::{self, Limits};
 use nf_core::net::http::{HttpEvent, HttpGet};
 use nf_core::net::{NetApi, NetError};
 use nf_core::platform::Platform;
-use nf_web::{url, Documento, Recurso, TipoRecurso};
+use nf_web::{url, Documento, Envio, Recurso, TipoRecurso};
 
 /// Descargas a la vez por pestaña (la principal cuenta).
 pub const SIMULTANEAS: usize = 6;
@@ -50,9 +54,12 @@ pub enum Seguridad {
     Archivo,
 }
 
+#[derive(Clone)]
 struct Nav {
     url: String,
     scroll: i32,
+    /// Cuerpo del formulario que llevó a esta página (POST): volver a ella lo reenvía.
+    post: Option<Vec<u8>>,
 }
 
 enum Rol {
@@ -76,8 +83,26 @@ struct Descarga {
     redirs: u8,
     estado: Option<Estado>,
     cuerpo: Vec<u8>,
+    /// Lo que se envía por POST (se conserva en las redirecciones 307 y 308).
+    post: Option<Vec<u8>>,
     tope: usize,
     fin: Option<Result<(), Fallo>>,
+    /// Página que inició la petición (un enlace, un formulario, un recurso); `None` si la escribió el usuario o es
+    /// atrás, adelante o recargar. De ella depende el contexto de las cookies y la política de la red local.
+    ini: Option<String>,
+    /// El enlace pedía descargar (`download`).
+    forzar: bool,
+    /// La respuesta del documento principal se ha decidido descargar: pasa a las descargas de la ventana.
+    desvio: Option<Desvio>,
+}
+
+struct Desvio {
+    nombre: String,
+    total: Option<u64>,
+    /// El servidor ya había terminado de enviar.
+    completo: bool,
+    /// Descarga prohibida (no llega ni a preguntarse).
+    bloqueo: Option<&'static str>,
 }
 
 fn tope(t: TipoRecurso) -> usize {
@@ -89,7 +114,28 @@ fn tope(t: TipoRecurso) -> usize {
 
 impl Descarga {
     fn nueva(get: HttpGet, rol: Rol, url: &str, tope: usize) -> Descarga {
-        Descarga { get, rol, url: String::from(url), redirs: 0, estado: None, cuerpo: Vec::new(), tope, fin: None }
+        Descarga { get, rol, url: String::from(url), redirs: 0, estado: None, cuerpo: Vec::new(), post: None, tope, fin: None, ini: None, forzar: false, desvio: None }
+    }
+
+    /// Desde dónde se hace esta petición para las cookies: la propia barra, la misma web, un enlace o formulario hacia
+    /// otro sitio, o el recurso de un tercero (sin cookies). Las redirecciones se miran respecto a quien inició todo.
+    fn contexto(&self) -> Contexto {
+        match &self.ini {
+            Some(p) if es_tercero(p, &self.url) => match (&self.rol, self.post.is_some()) {
+                (Rol::Recurso(_), _) => Contexto::Subrecurso,
+                (_, true) => Contexto::NavegacionPost,
+                _ => Contexto::Navegacion,
+            },
+            _ => Contexto::PrimeraParte,
+        }
+    }
+
+    /// Pone la cabecera `Cookie` de la petición que se acaba de crear.
+    fn poner_cookies(&mut self, red: &RedRc, utc: i64) {
+        let ctx = self.contexto();
+        if let Some(c) = red.borrow_mut().tarro.cabecera(&self.url, utc, ctx) {
+            self.get.poner_cookie(&c);
+        }
     }
 
     fn fallar(&mut self, net: &mut dyn NetApi, titulo: &str, detalle: &str) {
@@ -98,51 +144,96 @@ impl Descarga {
     }
 
     /// Avanza la descarga: cabeceras, redirecciones (a mano, para vigilar adónde van), cuerpo y fin.
-    fn sondear(&mut self, net: &mut dyn NetApi, ahora: u64, pagina: &str) {
+    fn sondear(&mut self, net: &mut dyn NetApi, ahora: u64, pagina: &str, red: &RedRc, utc: i64) {
         for ev in self.get.poll(net, ahora) {
             match ev {
                 HttpEvent::Head { status, reason, headers } => {
+                    // Las cookies de toda respuesta, también las de una redirección (puede haber varias).
+                    let ctx = self.contexto();
+                    {
+                        let mut r = red.borrow_mut();
+                        let mut nuevas = false;
+                        for (_, v) in headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie")) {
+                            nuevas |= r.tarro.guardar_desde_respuesta(&self.url, v, utc, ctx);
+                        }
+                        if nuevas {
+                            r.cambio_cookies(ahora);
+                        }
+                    }
                     let cab = |n: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone());
                     if let (301 | 302 | 303 | 307 | 308, Some(loc)) = (status, cab("location")) {
-                        return self.redirigir(net, &loc, pagina);
+                        return self.redirigir(net, &loc, pagina, status, red, utc);
                     }
-                    self.estado = Some(Estado { codigo: status, motivo: reason, tipo: cab("content-type") });
+                    let (cd, ct) = (cab("content-disposition"), cab("content-type"));
+                    if matches!(self.rol, Rol::Principal) && descargas::es_descarga(self.forzar, status, cd.as_deref(), ct.as_deref()) {
+                        let nombre = descargas::nombre_descarga(cd.as_deref(), &self.url);
+                        // Con el cuerpo comprimido, Content-Length no es el tamaño del archivo.
+                        let comprimido = cab("content-encoding").is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
+                        let total = cab("content-length").and_then(|v| v.trim().parse::<u64>().ok()).filter(|_| !comprimido);
+                        // Una descarga iniciada por una página pública no puede venir de la red local.
+                        let bloqueo = self.ini.as_deref().filter(|p| !recurso_permitido(p, &self.url)).map(|_| "Una página de Internet no puede descargar nada de la red local.");
+                        if bloqueo.is_some() {
+                            self.get.cancel(net);
+                        }
+                        self.desvio = Some(Desvio { nombre, total, completo: false, bloqueo });
+                    }
+                    self.estado = Some(Estado { codigo: status, motivo: reason, tipo: ct });
                 }
                 HttpEvent::Body(b) => {
+                    if self.desvio.as_ref().is_some_and(|d| d.bloqueo.is_some()) {
+                        continue;
+                    }
                     if self.cuerpo.len() + b.len() > self.tope {
                         return self.fallar(net, "El archivo es demasiado grande", "Supera el tamaño máximo que admite el navegador.");
                     }
                     self.cuerpo.extend_from_slice(&b);
                 }
                 HttpEvent::Secure(_) => {}
-                HttpEvent::Done => self.fin = Some(Ok(())),
+                HttpEvent::Done => {
+                    self.fin = Some(Ok(()));
+                    if let Some(d) = &mut self.desvio {
+                        d.completo = true;
+                    }
+                }
                 HttpEvent::Error(e) => {
                     self.fin = Some(Err(paginas::error_de_red(&e, &self.url)));
                     return;
                 }
             }
         }
+        // Una descarga deja la pestaña en cuanto se sabe que lo es (sin esperar al final del archivo).
+        if self.desvio.is_some() && self.fin.is_none() {
+            self.fin = Some(Ok(()));
+        }
     }
 
-    fn redirigir(&mut self, net: &mut dyn NetApi, loc: &str, pagina: &str) {
+    fn redirigir(&mut self, net: &mut dyn NetApi, loc: &str, pagina: &str, status: u16, red: &RedRc, utc: i64) {
         if self.redirs >= MAX_REDIRECCIONES {
             return self.fallar(net, "Demasiadas redirecciones", "La página redirige una y otra vez sin llegar a ningún sitio.");
         }
         let Some(sig) = url::resolver(&self.url, loc) else {
             return self.fallar(net, "Redirección no válida", "La página redirige a una dirección que el navegador no admite (solo http y https).");
         };
-        // Un recurso de una página pública no puede acabar en la red local por una redirección.
-        if matches!(self.rol, Rol::Recurso(_)) && !recurso_permitido(pagina, &sig) {
-            return self.fallar(net, "Bloqueado", "Una página de Internet no puede cargar recursos de la red local.");
+        // Un recurso, un formulario o un enlace de una página pública no puede acabar en la red local por una redirección.
+        if (matches!(self.rol, Rol::Recurso(_)) || self.post.is_some() || self.ini.is_some()) && !recurso_permitido(self.ini.as_deref().unwrap_or(pagina), &sig) {
+            return self.fallar(net, "Bloqueado", "Una página de Internet no puede enviar ni cargar nada de la red local.");
         }
         self.get.cancel(net);
-        match HttpGet::start(net, &sig, false, false) {
+        // 307 y 308 repiten el POST; 301, 302 y 303 lo cambian por un GET.
+        let post = self.post.take().filter(|_| matches!(status, 307 | 308));
+        let g = match &post {
+            Some(b) => HttpGet::start_post(net, &sig, b.clone()),
+            None => HttpGet::start(net, &sig, false, false),
+        };
+        match g {
             Ok(g) => {
                 self.get = g;
+                self.post = post;
                 self.url = sig;
                 self.redirs += 1;
                 self.estado = None;
                 self.cuerpo.clear();
+                self.poner_cookies(red, utc);
             }
             Err(e) => self.fin = Some(Err(paginas::error_de_red(&e, &sig))),
         }
@@ -215,11 +306,26 @@ pub struct Pestana {
     /// Redirección pedida por la página (`<meta http-equiv="refresh">`): cuándo (`uptime_ms`) y adónde.
     refresco: Option<(u64, String)>,
     refrescos: u8,
+    /// Página interna (`nightfury://…`) que el navegador tiene que generar y entregar con `servir_interna`.
+    pub interna: Option<String>,
+    /// Acaba de mostrarse una página de la red para el historial (el navegador lo recoge y lo apaga).
+    pub visita: bool,
+    /// Cookies y descargas de la ventana.
+    red: RedRc,
+    /// El historial como estaba antes de la navegación en curso: si resulta ser una descarga, la pestaña se queda como estaba.
+    previo: Option<(Vec<Nav>, usize)>,
+    /// Quién inicia la próxima navegación (una página, por un enlace o un formulario) y si es una descarga forzada.
+    ini: Option<String>,
+    forzar: bool,
 }
 
 impl Pestana {
-    pub fn nueva(id: u32) -> Pestana {
+    pub fn nueva(id: u32, red: RedRc) -> Pestana {
         Pestana {
+            red,
+            previo: None,
+            ini: None,
+            forzar: false,
             id,
             vista: Vista::Inicio,
             titulo: String::new(),
@@ -234,7 +340,7 @@ impl Pestana {
             sel: None,
             ancla: None,
             restaurar: None,
-            historial: alloc::vec![Nav { url: String::new(), scroll: 0 }],
+            historial: alloc::vec![Nav { url: String::new(), scroll: 0, post: None }],
             pos: 0,
             descargas: Vec::new(),
             cola: VecDeque::new(),
@@ -243,7 +349,28 @@ impl Pestana {
             ultima_maqueta: 0,
             refresco: None,
             refrescos: 0,
+            interna: None,
+            visita: false,
         }
+    }
+
+    /// Lo mostrado es una página interna (la dirección es suya, no de la red).
+    pub fn es_interna(&self) -> bool {
+        internas::es_interna(&self.url)
+    }
+
+    /// Entrega el HTML de la página interna pedida: sustituye a la que había.
+    pub fn servir_interna(&mut self, url: &str, html: &str) {
+        self.interna = None;
+        self.poner_documento(url, internas::BASE, false, Documento::cargar(html.as_bytes(), Some("text/html; charset=utf-8"), internas::BASE));
+    }
+
+    /// Carga `url` en lugar de la entrada actual del historial (el resultado de una acción, no una página más).
+    pub fn reemplazar(&mut self, sys: &mut dyn Platform, url: &str, ahora: u64) {
+        self.historial[self.pos].url = String::from(url);
+        self.historial[self.pos].post = None;
+        self.previo = None;
+        self.cargar(sys, url, ahora, None);
     }
 
     pub fn cargando(&self) -> bool {
@@ -304,23 +431,75 @@ impl Pestana {
         self.pendiente = None;
         self.refresco = None;
         self.refrescos = 0;
+        self.interna = None;
     }
 
-    /// Navega a `e` y la apunta en el historial.
+    /// Navega a `e` (escrita por el usuario, un favorito…) y la apunta en el historial.
     pub fn ir(&mut self, sys: &mut dyn Platform, e: Entrada, ahora: u64) {
+        self.ir_desde(sys, e, ahora, None, false);
+    }
+
+    /// Como `ir`, pero iniciada por una página (un enlace): `ini` es su dirección y `forzar`, si el enlace pide descargar.
+    pub fn ir_desde(&mut self, sys: &mut dyn Platform, e: Entrada, ahora: u64, ini: Option<String>, forzar: bool) {
         let url = match e {
             Entrada::Web(u) => u,
             Entrada::Local(p) => p,
         };
+        self.guardar_previo();
+        self.ini = ini;
+        self.forzar = forzar;
         self.historial[self.pos].scroll = self.scroll;
         self.historial.truncate(self.pos + 1);
-        self.historial.push(Nav { url: url.clone(), scroll: 0 });
+        self.historial.push(Nav { url: url.clone(), scroll: 0, post: None });
         self.pos += 1;
         self.cargar(sys, &url, ahora, None);
     }
 
+    /// Envía un formulario: la página nueva entra en el historial (con su cuerpo si es un POST). Una página
+    /// pública no puede enviar a la red local.
+    pub fn enviar(&mut self, sys: &mut dyn Platform, e: Envio, ahora: u64) {
+        self.guardar_previo();
+        self.ini = Some(self.base.clone());
+        self.historial[self.pos].scroll = self.scroll;
+        self.historial.truncate(self.pos + 1);
+        self.historial.push(Nav { url: e.url.clone(), scroll: 0, post: e.cuerpo });
+        self.pos += 1;
+        if recurso_permitido(&self.base, &e.url) {
+            self.cargar(sys, &e.url, ahora, None);
+        } else {
+            self.ini = None;
+            self.cancelar(sys);
+            self.error("Bloqueado", "Una página de Internet no puede enviar un formulario a la red local.", &e.url);
+        }
+    }
+
+    /// Ir `d` pasos por el historial (0 = recargar) volvería a enviar un formulario.
+    pub fn pide_post(&self, d: i32) -> bool {
+        let i = self.pos as i64 + d as i64;
+        usize::try_from(i).ok().and_then(|i| self.historial.get(i)).is_some_and(|n| n.post.is_some())
+    }
+
+    /// Apunta cómo está el historial antes de navegar (ver `previo`).
+    fn guardar_previo(&mut self) {
+        self.previo = Some((self.historial.clone(), self.pos));
+        self.ini = None;
+        self.forzar = false;
+    }
+
+    /// La navegación en curso era una descarga: el historial y la dirección vuelven a como estaban.
+    fn deshacer_navegacion(&mut self) {
+        if let Some((h, p)) = self.previo.take() {
+            self.historial = h;
+            self.pos = p;
+        }
+        self.pendiente = None;
+        self.ancla = None;
+        self.restaurar = None;
+    }
+
     pub fn atras(&mut self, sys: &mut dyn Platform, ahora: u64) {
         if self.puede_atras() {
+            self.guardar_previo();
             self.historial[self.pos].scroll = self.scroll;
             self.pos -= 1;
             self.cargar_actual(sys, ahora, None);
@@ -329,6 +508,7 @@ impl Pestana {
 
     pub fn adelante(&mut self, sys: &mut dyn Platform, ahora: u64) {
         if self.puede_adelante() {
+            self.guardar_previo();
             self.historial[self.pos].scroll = self.scroll;
             self.pos += 1;
             self.cargar_actual(sys, ahora, None);
@@ -336,6 +516,7 @@ impl Pestana {
     }
 
     pub fn recargar(&mut self, sys: &mut dyn Platform, ahora: u64) {
+        self.guardar_previo();
         self.cargar_actual(sys, ahora, Some(self.scroll));
     }
 
@@ -351,11 +532,23 @@ impl Pestana {
 
     fn cargar(&mut self, sys: &mut dyn Platform, url: &str, ahora: u64, restaurar: Option<i32>) {
         let _ = ahora;
+        let (ini, forzar) = (self.ini.take(), core::mem::take(&mut self.forzar));
+        // Un enlace de una página pública que descarga de la red local: ni se pide, y la pestaña no cambia.
+        if forzar && !es_ruta_local(url) && !internas::es_interna(url) && ini.as_deref().is_some_and(|p| !recurso_permitido(p, url)) {
+            self.deshacer_navegacion();
+            self.red.borrow_mut().descargas.fallida(descargas::nombre_descarga(None, url), String::from(url), "Una página de Internet no puede descargar nada de la red local.");
+            return;
+        }
         self.cancelar(sys);
         self.restaurar = restaurar.filter(|&s| s > 0);
         self.ancla = None;
         if url.is_empty() {
             return self.mostrar_inicio();
+        }
+        if internas::es_interna(url) {
+            self.pendiente = Some(String::from(url));
+            self.interna = Some(String::from(url));
+            return;
         }
         if es_ruta_local(url) {
             return self.abrir_local(sys, url);
@@ -363,12 +556,25 @@ impl Pestana {
         let (sin, frag) = sin_fragmento(url);
         self.ancla = frag.filter(|f| !f.is_empty()).map(String::from);
         self.pendiente = Some(String::from(url));
+        let utc = self.red.borrow_mut().ahora_utc(sys);
         let Some(net) = sys.net() else {
             let (t, d) = paginas::error_de_red(&NetError::NoAdapter, url);
             return self.error(&t, &d, url);
         };
-        match HttpGet::start(net, sin, false, false) {
-            Ok(get) => self.descargas.push(Descarga::nueva(get, Rol::Principal, sin, TOPE_DOC)),
+        let post = self.historial[self.pos].post.clone();
+        let get = match &post {
+            Some(b) => HttpGet::start_post(net, sin, b.clone()),
+            None => HttpGet::start(net, sin, false, false),
+        };
+        match get {
+            Ok(get) => {
+                let mut d = Descarga::nueva(get, Rol::Principal, sin, TOPE_DOC);
+                d.post = post;
+                d.ini = ini;
+                d.forzar = forzar;
+                d.poner_cookies(&self.red, utc);
+                self.descargas.push(d);
+            }
             Err(e) => {
                 let (t, d) = paginas::error_de_red(&e, url);
                 self.error(&t, &d, url);
@@ -377,7 +583,7 @@ impl Pestana {
     }
 
     fn mostrar_inicio(&mut self) {
-        *self = Pestana { id: self.id, historial: core::mem::take(&mut self.historial), pos: self.pos, caja: core::mem::take(&mut self.caja), ..Pestana::nueva(self.id) };
+        *self = Pestana { id: self.id, historial: core::mem::take(&mut self.historial), pos: self.pos, caja: core::mem::take(&mut self.caja), ..Pestana::nueva(self.id, self.red.clone()) };
     }
 
     fn abrir_local(&mut self, sys: &mut dyn Platform, ruta: &str) {
@@ -409,6 +615,7 @@ impl Pestana {
         self.url = String::from(mostrada);
         self.base = String::from(base);
         self.local = local;
+        self.previo = None;
         self.es_error = false;
         self.pendiente = None;
         self.scroll = 0;
@@ -480,16 +687,18 @@ impl Pestana {
             if n < MAX_REFRESCOS {
                 // Sustituye la entrada actual del historial (Atrás no vuelve a la página que redirige).
                 self.historial[self.pos].url = url.clone();
+                self.historial[self.pos].post = None;
                 self.cargar(sys, &url, ahora, None);
                 self.refrescos = n + 1;
                 cambio = true;
             }
         }
         if !self.descargas.is_empty() {
+            let utc = self.red.borrow_mut().ahora_utc(sys);
             match sys.net() {
                 Some(net) => {
                     for d in self.descargas.iter_mut() {
-                        d.sondear(net, ahora, &self.base);
+                        d.sondear(net, ahora, &self.base, &self.red, utc);
                     }
                 }
                 None => {
@@ -521,8 +730,23 @@ impl Pestana {
         cambio
     }
 
+    /// El documento principal era una descarga: pasa a la ventana (que pregunta) y la pestaña se queda como estaba.
+    fn desviar(&mut self, d: Descarga, fin: Result<(), Fallo>) {
+        let Some(dv) = d.desvio else { return };
+        self.deshacer_navegacion();
+        let mut red = self.red.borrow_mut();
+        match (fin, dv.bloqueo) {
+            (_, Some(m)) => red.descargas.fallida(dv.nombre, d.url, m),
+            (Err((_, m)), None) => red.descargas.fallida(dv.nombre, d.url, &m),
+            (Ok(()), None) => red.descargas.anadir(d.get, dv.nombre, d.url, dv.total, d.cuerpo, dv.completo),
+        }
+    }
+
     fn terminar(&mut self, sys: &mut dyn Platform, d: Descarga) {
-        let Some(fin) = d.fin else { return };
+        let Some(fin) = d.fin.clone() else { return };
+        if d.desvio.is_some() {
+            return self.desviar(d, fin);
+        }
         match (d.rol, fin) {
             (Rol::Principal, Err((t, m))) => {
                 let url = self.pendiente.take().unwrap_or(d.url);
@@ -531,6 +755,11 @@ impl Pestana {
             (Rol::Principal, Ok(())) => {
                 let (codigo, motivo, tipo) = d.estado.map_or((200, String::new(), None), |e| (e.codigo, e.motivo, e.tipo));
                 let url = String::from(sin_fragmento(&d.url).0);
+                // Tras una redirección que lo convirtió en GET, la entrada del historial ya no es un POST.
+                let es_post = d.post.is_some();
+                if !es_post {
+                    self.historial[self.pos].post = None;
+                }
                 if codigo >= 400 && d.cuerpo.is_empty() {
                     let (t, m) = paginas::error_http(codigo, &motivo);
                     return self.error(&t, &m, &url);
@@ -539,6 +768,8 @@ impl Pestana {
                 let ancla = self.ancla.take();
                 self.mostrar(sys, &url, &url, false, tipo.as_deref(), d.cuerpo);
                 self.ancla = ancla;
+                // Lo que sale de un formulario POST no va al historial (volver a ello reenvía datos).
+                self.visita = !es_post && !self.es_error;
             }
             (Rol::Recurso(r), res) => {
                 let bien = res.is_ok() && d.estado.as_ref().is_some_and(|e| (200..300).contains(&e.codigo));
@@ -554,11 +785,15 @@ impl Pestana {
     fn lanzar(&mut self, sys: &mut dyn Platform) {
         while self.descargas.len() < SIMULTANEAS {
             let Some(r) = self.cola.front().cloned() else { return };
+            let utc = self.red.borrow_mut().ahora_utc(sys);
             let Some(net) = sys.net() else { return };
             match HttpGet::start(net, &r.url, false, false) {
                 Ok(get) => {
                     self.cola.pop_front();
-                    self.descargas.push(Descarga::nueva(get, Rol::Recurso(r.clone()), &r.url, tope(r.tipo)));
+                    let mut d = Descarga::nueva(get, Rol::Recurso(r.clone()), &r.url, tope(r.tipo));
+                    d.ini = Some(self.base.clone());
+                    d.poner_cookies(&self.red, utc);
+                    self.descargas.push(d);
                 }
                 Err(NetError::Busy) => return,
                 Err(_) => {

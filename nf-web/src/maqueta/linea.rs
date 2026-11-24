@@ -4,6 +4,7 @@
 //! alineación y emisión de los trozos de texto.
 use super::*;
 use crate::estilo::{Alin, Blanco};
+use crate::forms::{alto_linea, Tipo};
 
 /// Espacios fijos seguidos que se mantienen como mucho (los `pre` hostiles).
 const MAX_ESP: u32 = 1024;
@@ -11,7 +12,9 @@ const MAX_ESP: u32 = 1024;
 enum Atomo<'a> {
     Texto { s: &'a str, w: i32, nodo: usize, nobr: bool },
     Espacio { w: i32, n: u32, nodo: usize, fijo: bool, nobr: bool },
-    Img { w: i32, h: i32, img: u32, nodo: usize },
+    Img { w: i32, h: i32, img: u32, nodo: usize, ctl: u32 },
+    /// Control de formulario; `baja` px quedan bajo la línea base.
+    Ctl { w: i32, h: i32, baja: i32, ctl: u32, nodo: usize },
     Bloque { w: i32, h: i32, items: Vec<Item> },
     Hueco(i32),
     Ancla(usize),
@@ -39,12 +42,12 @@ impl<'a> Linea<'a> {
             .atomos
             .iter()
             .map(|a| match a {
-                Atomo::Texto { w, .. } | Atomo::Espacio { w, .. } | Atomo::Img { w, .. } | Atomo::Bloque { w, .. } => *w,
+                Atomo::Texto { w, .. } | Atomo::Espacio { w, .. } | Atomo::Img { w, .. } | Atomo::Bloque { w, .. } | Atomo::Ctl { w, .. } => *w,
                 Atomo::Hueco(w) => *w,
                 Atomo::Ancla(_) => 0,
             })
             .fold(0i32, |a, b| a.saturating_add(b));
-        self.contenido = self.atomos.iter().any(|a| matches!(a, Atomo::Texto { .. } | Atomo::Img { .. } | Atomo::Bloque { .. } | Atomo::Espacio { fijo: true, .. }));
+        self.contenido = self.atomos.iter().any(|a| matches!(a, Atomo::Texto { .. } | Atomo::Img { .. } | Atomo::Bloque { .. } | Atomo::Ctl { .. } | Atomo::Espacio { fijo: true, .. }));
     }
 }
 
@@ -105,6 +108,11 @@ impl<'a> Maq<'a> {
                 self.emitir(&mut l, true);
                 continue;
             }
+            let k = self.forms.ctl_de[h];
+            if k != SIN_CTL {
+                self.control(&mut l, h, k);
+                continue;
+            }
             if e.flot != Flot::No && prof < MAX_PROF {
                 self.emitir(&mut l, false);
                 self.colocar_flotante(h, cx, cw, prof);
@@ -154,6 +162,36 @@ impl<'a> Maq<'a> {
         self.marcador = marc;
         self.anclas.truncate(na);
         self.poner(l, Atomo::Bloque { w: ow, h, items: local });
+    }
+
+    /// Un control de formulario como átomo de la línea (sus hijos, las opciones o el rótulo, no se maquetan).
+    fn control(&mut self, l: &mut Linea<'a>, n: usize, k: u32) {
+        let (est, forms) = (self.est, self.forms);
+        let c = &forms.ctl[k as usize];
+        if c.tipo == Tipo::Oculto {
+            return;
+        }
+        // `input type=image` con su imagen: se pone como imagen que, además, envía el formulario.
+        let im = self.img_de[n];
+        if c.tipo == Tipo::Imagen && im != SIN_IMG && !matches!(self.imgs.get(im as usize).map(|i| &i.estado), Some(EstadoImg::Fallo) | None) {
+            return self.imagen(l, n);
+        }
+        let e = est.de(n);
+        let (w, h) = self.tam_control(n, k, l.cw);
+        let (ml, mr) = (largo(e.margen[IZQ], l.cw).unwrap_or(0).max(0), largo(e.margen[DER], l.cw).unwrap_or(0).max(0));
+        if ml != 0 {
+            self.poner(l, Atomo::Hueco(ml));
+        }
+        self.poner(l, Atomo::Ancla(n));
+        // el texto de un campo se centra en su caja; casillas y radios apoyan en la línea base
+        let baja = match c.tipo {
+            Tipo::Casilla | Tipo::Radio => 0,
+            _ => ((h - alto_linea(e.px)) / 2).max(0) + px_i(self.metricas(est.idx[n] as usize).desc),
+        };
+        self.poner(l, Atomo::Ctl { w, h, baja: baja.min(h), ctl: k, nodo: n });
+        if mr != 0 {
+            self.poner(l, Atomo::Hueco(mr));
+        }
     }
 
     /// Tamaño con el que se reserva una imagen (0×0 si aún no se sabe).
@@ -207,7 +245,7 @@ impl<'a> Maq<'a> {
             self.poner(l, Atomo::Hueco(ml));
         }
         self.poner(l, Atomo::Ancla(n));
-        self.poner(l, Atomo::Img { w, h, img: k, nodo: n });
+        self.poner(l, Atomo::Img { w, h, img: k, nodo: n, ctl: self.forms.ctl_de[n] });
         if mr != 0 {
             self.poner(l, Atomo::Hueco(mr));
         }
@@ -274,7 +312,7 @@ impl<'a> Maq<'a> {
 
     /// Índice (exclusivo) hasta donde se puede cortar la línea: tras el último espacio o caja.
     fn corte(l: &Linea<'a>) -> Option<usize> {
-        l.atomos.iter().rposition(|a| matches!(a, Atomo::Espacio { nobr: false, .. } | Atomo::Img { .. } | Atomo::Bloque { .. })).map(|i| i + 1)
+        l.atomos.iter().rposition(|a| matches!(a, Atomo::Espacio { nobr: false, .. } | Atomo::Img { .. } | Atomo::Bloque { .. } | Atomo::Ctl { .. })).map(|i| i + 1)
     }
 
     /// Sitúa un átomo en la línea, partiéndola si no cabe.
@@ -299,7 +337,7 @@ impl<'a> Maq<'a> {
                 return;
             }
             Atomo::Texto { w, nobr, .. } => (*w, !*nobr),
-            Atomo::Img { w, .. } | Atomo::Bloque { w, .. } => (*w, true),
+            Atomo::Img { w, .. } | Atomo::Bloque { w, .. } | Atomo::Ctl { w, .. } => (*w, true),
         };
         for _ in 0..10_000 {
             if l.ancho.saturating_add(w) <= l.disp {
@@ -394,6 +432,7 @@ impl<'a> Maq<'a> {
             color: e.color,
             deco: e.deco,
             enlace: self.enlace_de[t.nodo],
+            etiq: self.forms.etiqueta_de[t.nodo],
             s: t.s,
         }));
     }
@@ -427,6 +466,7 @@ impl<'a> Maq<'a> {
             let (t, b) = match a {
                 Atomo::Texto { nodo, .. } | Atomo::Espacio { nodo, .. } => self.alturas(est.idx[*nodo] as usize),
                 Atomo::Img { h, .. } | Atomo::Bloque { h, .. } => (*h, 0),
+                Atomo::Ctl { h, baja, .. } => (*h - *baja, *baja),
                 _ => continue,
             };
             top = top.max(t);
@@ -478,11 +518,20 @@ impl<'a> Maq<'a> {
                     }
                     x += w;
                 }
-                Atomo::Img { w, h, img, nodo } => {
+                Atomo::Img { w, h, img, nodo, ctl } => {
                     let ant = trozo.take();
                     self.soltar_trozo(ant, base);
                     if est.de(nodo).visible {
-                        self.push(Item::Imagen { r: Rect::new(x, base - h, w, h), img, enlace: self.enlace_de[nodo] });
+                        self.push(Item::Imagen { r: Rect::new(x, base - h, w, h), img, enlace: self.enlace_de[nodo], ctl });
+                    }
+                    x += w;
+                }
+                Atomo::Ctl { w, h, baja, ctl, nodo } => {
+                    let ant = trozo.take();
+                    self.soltar_trozo(ant, base);
+                    let e = est.de(nodo);
+                    if e.visible {
+                        self.push(Item::Control { r: Rect::new(x, base + baja - h, w, h), ctl, px: e.px, letra: e.letra(), color: e.color, fondo: e.fondo });
                     }
                     x += w;
                 }

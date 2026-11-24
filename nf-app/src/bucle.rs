@@ -24,6 +24,7 @@ use nf_core::service::{Call, RemoteFiles, RemoteNet, Transport};
 use nf_core::wire::Wire;
 use nf_core::surface::Surface;
 use nf_core::sync::SpinLock;
+use nf_core::letra;
 use nf_core::theme::Theme;
 
 /// Etiqueta con la que llega a `App::dialog_result` el resultado de `guardar_como`.
@@ -286,8 +287,12 @@ impl Bucle<'_> {
         // Estado que manda el escritorio: no llega a la app, solo cambia lo que se dibuja.
         match ev.kind {
             EV_THEME => {
-                let t = Theme { accent: ev.d, wallpaper: ev.a as u8 };
-                self.dirty |= t != self.theme;
+                let t = Theme { accent: ev.d, wallpaper: ev.a as u8, letra: ev.b as u8 };
+                // Cada programa carga la letra por su cuenta (también la primera vez, aunque el tema coincida).
+                // Si la letra cambió hay que redibujar aunque el tema ya fuera este (el propio programa pudo
+                // cambiarlo antes, como Configuración).
+                let cambio = letra::aplicar(&mut self.plat.fs, t.letra);
+                self.dirty |= cambio || t != self.theme;
                 self.theme = t;
             }
             EV_RESIZE => {
@@ -740,7 +745,7 @@ mod tests {
         assert_eq!(r[2], Request::DragSourceAnswer(None));
         assert!(matches!(r[3], Request::OpenNew(_)) && matches!(r[4], Request::OpenTerminal(_)));
         assert!(matches!(r[5], Request::Dialog(_)) && matches!(r[6], Request::Menu(_)) && matches!(r[7], Request::Drag(_)));
-        assert_eq!(r[8], Request::SetTheme(Theme { accent: 0x010203, wallpaper: 2 }));
+        assert_eq!(r[8], Request::SetTheme(Theme { accent: 0x010203, wallpaper: 2, letra: 0 }));
         assert_eq!(r.len(), 9);
         assert!(c.datos.is_empty());
     }
@@ -854,7 +859,8 @@ mod tests {
         c.cola.push(tecla);
         ejecutar(&mut c, Box::new(PideApp(visto.clone())), None);
         assert_eq!(*visto.borrow(), [(true, (1280, 720))]);
-        let pedidas: Vec<Call> = c.servicios.iter().map(|r| nf_core::wire::decode(r).unwrap()).collect();
+        // Las lecturas de la letra del sistema (al llegar el tema) no cuentan.
+        let pedidas: Vec<Call> = c.servicios.iter().map(|r| nf_core::wire::decode(r).unwrap()).filter(|c| !matches!(c, Call::Read { path } if path.contains("fuentes"))).collect();
         assert!(matches!(&pedidas[0], Call::Exists { path } if path == r"C:\a.txt"));
         assert!(matches!(pedidas[1], Call::Screen));
         // Sin respuesta (el núcleo la rechaza): valores neutros, sin pánico.

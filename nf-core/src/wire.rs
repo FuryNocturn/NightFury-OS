@@ -224,10 +224,10 @@ impl Wire for DateTime {
 
 impl Wire for Theme {
     fn put(&self, w: &mut Writer) {
-        w.put(&self.accent).put(&self.wallpaper);
+        w.put(&self.accent).put(&self.wallpaper).put(&self.letra);
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
-        Ok(Theme { accent: r.get()?, wallpaper: r.get()? })
+        Ok(Theme { accent: r.get()?, wallpaper: r.get()?, letra: r.get()? })
     }
 }
 
@@ -240,7 +240,7 @@ mod tests {
     fn ida_y_vuelta() {
         let v: (Vec<String>, Option<u64>, bool) = (vec![String::from("C:\\Usuarios\\ñu"), String::new()], Some(u64::MAX), true);
         assert_eq!(decode::<(Vec<String>, Option<u64>, bool)>(&encode(&v)), Ok(v));
-        let t = Theme { accent: 0x123456, wallpaper: 3 };
+        let t = Theme { accent: 0x123456, wallpaper: 3, letra: 4 };
         assert_eq!(decode::<Theme>(&encode(&t)), Ok(t));
         let d = DateTime { year: 2026, month: 11, day: 18, hour: 1, minute: 2, second: 3 };
         assert_eq!(decode::<DateTime>(&encode(&d)), Ok(d));
