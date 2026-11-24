@@ -8,6 +8,7 @@
 extern crate alloc;
 
 mod campo;
+mod cookies;
 mod dibujo;
 mod entrada;
 mod fuentes;
