@@ -58,6 +58,11 @@ Todo el código y todo el arte de este repositorio se escriben aquí, desde cero
 | `nf-core/src/raices.rs`, `tools/raices.ps1` | Raíces de confianza (Mozilla + propias) | Formato público de `certdata.txt` de NSS; los datos de las raíces son de Mozilla (ver «Datos de terceros») |
 | `nf-core/src/netperm.rs` | Permisos de red de los programas (avisos «usar la red» y «aceptar conexiones») | Diseño propio; la idea de preguntar por programa es la de cualquier cortafuegos, sin código ni textos de otros |
 | `programs/mensajes` | Chat cifrado de extremo a extremo en la red local | Protocolo propio (`docs/Mensajes-protocolo.md`) sobre RFC 7748, 8439 y 5869. No se ha mirado el código ni la especificación de otros programas de mensajería; la lista de palabras de verificación es propia |
+| `nf-core/src/ttf.rs` (v0.12.4) | Letra TrueType: tablas cmap, glyf, loca, head, hhea, hmtx, maxp, kern y name; contornos cuadráticos con suavizado; negrita y cursiva sintéticas | Especificación OpenType 1.9 (tablas TrueType) y documentación pública de Apple sobre TrueType. Rasterizador de diseño propio, sin hinting |
+| `nf-core/src/img/` (v0.12.4) | DEFLATE, zlib y gzip; PNG (todos los tipos de color y entrelazado), JPEG básico y progresivo, GIF (primer fotograma) | RFC 1950, 1951 y 1952; PNG Specification (W3C, 3.ª ed.); ITU-T T.81 (JPEG) y JFIF 1.02; GIF89a. Código propio; los ficheros de prueba se crearon con herramientas (Python y System.Drawing de .NET) solo ejecutándolas |
+| `nf-core/src/net/http.rs` (v0.12.4) | `Content-Encoding: gzip` y `deflate` | RFC 9110 §8.4 y los RFC de compresión anteriores |
+| `nf-web` (v0.12.4) | Motor de páginas: HTML tolerante, CSS (análisis, cascada, herencia), maquetado en bloques, líneas, listas y tablas, pintado | HTML Living Standard (WHATWG; tokenizador y árbol simplificados), CSS 2.1, CSS Syntax 3 y Media Queries; RFC 3986 (URL). Diseño propio. No se ha mirado el código de ningún navegador ni motor |
+| `programs/navegador` (v0.12.4) | El programa Navegador (pestañas, barra de direcciones, carga de recursos) | Diseño propio; el aspecto se parece al de los navegadores habituales, con dibujos y textos propios |
 | Resto de `nf-core` | Gráficos, ventanas, apps, montón | Diseño propio |
 
 ## Sala limpia en dos equipos (desde v0.11.1)
@@ -89,8 +94,14 @@ Sigue prohibido mirar código de Microsoft, filtrado o descompilado. Las pruebas
 distribuyen bajo la **Mozilla Public License 2.0**. Solo son datos (certificados públicos), no código; van en un
 fichero aparte con su licencia y su origen en `nf-core/data/raices/LEEME.md`, y se renuevan con cada versión.
 
+`nf-core/data/fuentes/` contiene las fuentes **Liberation 2.1.5** (Sans, Serif y Mono, cuatro estilos cada una),
+sin modificar, bajo la **SIL Open Font License 1.1**; su licencia y sus autores van al lado (`LICENSE`, `AUTHORS`).
+El sistema las instala en `C:\Sistema\fuentes\` con esos dos ficheros. Son datos, no código, y no se han usado
+para hacer la letra propia del sistema (`glyphs.rs`). El Navegador también lee, solo para mostrar páginas, las
+fuentes de `\Windows\Fonts\` si hay un Windows en otro disco; no se copian ni se reparten.
+
 ## Firmware de terceros
-La versión 0.12.3 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
+La versión 0.12.4 no carga ningún firmware. Si una tarjeta lo necesita más adelante (algunas Realtek 8125/8126, el Wi-Fi), irá en una carpeta aparte con su licencia y se anotará aquí.
 
 ## Criptografía
 Los algoritmos son estándares públicos, pero **la implementación es propia y no está auditada por terceros**. AES usa

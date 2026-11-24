@@ -89,7 +89,8 @@ fn leer_refresco(base: &str, c: &str) -> Option<(u32, String)> {
     let (n, resto) = c.split_once([';', ',']).unwrap_or((c, ""));
     let seg = n.trim().split('.').next()?.parse::<u32>().ok()?;
     let resto = resto.trim_start();
-    let u = if resto.len() >= 3 && resto[..3].eq_ignore_ascii_case("url") {
+    // `get`: un carácter de varios bytes en las tres primeras posiciones no debe cortar la cadena por la mitad.
+    let u = if resto.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("url")) {
         resto[3..].trim_start().strip_prefix('=')?.trim()
     } else {
         resto.trim()

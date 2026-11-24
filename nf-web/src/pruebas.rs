@@ -824,4 +824,7 @@ fn meta_refresh() {
         let h = alloc::format!("<meta http-equiv=refresh content=\"{c}\">");
         assert_eq!(doc(&h).refresco(), None, "{c}");
     }
+    // Un carácter de varios bytes al empezar el resto no debe hacer saltar el análisis.
+    let d = Documento::cargar("<meta http-equiv=refresh content=\"1;ab€\">".as_bytes(), None, "http://a.test/");
+    assert_eq!(d.refresco().map(|r| r.0), Some(1));
 }
