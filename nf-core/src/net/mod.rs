@@ -21,6 +21,7 @@ mod dns;
 mod icmp;
 mod ip;
 mod pkt;
+pub mod sntp;
 mod tcb;
 mod tcp;
 mod tlsconn;

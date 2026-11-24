@@ -476,6 +476,8 @@ pub struct Desktop {
     last_click: Option<(u64, i32, i32, Hit)>,
     now_ms: u64,
     next_clock: u64,
+    /// Hora por internet (v0.12.3).
+    sntp: crate::net::sntp::Sntp,
     clock: DateTime,
     last_active: Option<u32>,
     /// Forma del puntero: 0 flecha; 1..=4 flechas dobles de redimensionado (ver `resize_cursor`).
@@ -801,6 +803,7 @@ impl Desktop {
             last_click: None,
             now_ms: 0,
             next_clock: 0,
+            sntp: Default::default(),
             clock: sys.now(),
             last_active: None,
             cur: 0,
@@ -3404,6 +3407,7 @@ impl Desktop {
                 self.dmg(self.clock_rect());
             }
             self.net_tick(sys);
+            self.sntp.tick(sys, ms);
             self.login.set_clock(t);
             self.flush_login();
         }

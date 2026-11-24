@@ -238,7 +238,7 @@ impl Job {
     /// Empieza `cmd`. `None` si ya está hecha (sale por `out`) o no se pudo empezar.
     pub(super) fn start(cmd: NetCmd, sys: &mut dyn Platform, now: u64, out: &mut Vec<String>) -> Option<Job> {
         // Raíces y hora para comprobar certificados (una redirección puede llevar a https aunque la URL no lo sea).
-        let tls = matches!(cmd, NetCmd::Curl { .. }).then(|| (sys.files().root_store(), crate::service::hora_x509(sys.now())));
+        let tls = matches!(cmd, NetCmd::Curl { .. }).then(|| (sys.files().root_store(), crate::service::hora_utc(sys)));
         let Some(net) = sys.net() else {
             out.push(String::from(NO_CARD));
             return None;

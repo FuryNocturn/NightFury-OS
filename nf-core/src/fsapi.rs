@@ -117,4 +117,12 @@ api! {
     fn custom_roots(&mut self) -> Vec<Vec<u8>>;
     fn add_root(&mut self, der: Vec<u8>, now: DateTime) -> Result<(), FsError>;
     fn remove_root(&mut self, sha: [u8; 32], now: DateTime) -> Result<(), FsError>;
+    // ---- Fecha y hora (v0.12.3): verlas, cualquiera; cambiarlas y sincronizar, solo un administrador ----
+    fn time_cfg(&mut self) -> crate::hora::Ajuste;
+    fn set_time_cfg(&mut self, a: crate::hora::Ajuste, now: DateTime) -> Result<(), FsError>;
+    /// Pide poner el reloj del equipo a esta hora local.
+    fn set_clock(&mut self, t: DateTime) -> Result<(), FsError>;
+    /// Pide sincronizar con internet ahora.
+    fn time_sync(&mut self) -> Result<(), FsError>;
+    fn time_sync_info(&mut self) -> crate::hora::SyncInfo;
 }

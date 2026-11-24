@@ -24,6 +24,7 @@ pub mod geom;
 pub mod glyphs;
 pub mod heap;
 pub mod homecrypt;
+pub mod hora;
 pub mod icons;
 pub mod input;
 pub mod keys;

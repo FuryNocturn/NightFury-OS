@@ -74,6 +74,8 @@ pub enum Icon {
     RedConectada,
     RedSinCable,
     RedSinInternet,
+    /// Fecha y hora: esfera con las dos agujas.
+    Reloj,
 }
 
 /// Rectángulo en unidades de rejilla (x0,y0)-(x1,y1), con bordes redondeados a píxel y mínimo 1 px.
@@ -175,6 +177,11 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
             let (dx, dy) = p(8.0, 4.9);
             s.fill_circle(dx, dy, (0.95 * k).max(0.9), fg, 255);
             s.stroke(&[p(8.0, 7.3), p(8.0, 11.6)], tw(1.8), fg);
+        }
+        Icon::Reloj => {
+            let (cx, cy) = p(8.0, 8.0);
+            s.arc(cx, cy, 6.3 * k, 0.0, 360.0, tw(1.5), fg);
+            s.stroke(&[p(8.0, 4.2), p(8.0, 8.0), p(10.8, 9.6)], tw(1.4), fg);
         }
         Icon::Palette => {
             // Paleta de pintor: disco beige con agujero del pulgar y cuatro gotas de color.
@@ -535,7 +542,7 @@ pub fn draw(s: &mut Surface, icon: Icon, x: i32, y: i32, size: i32, fg: u32) {
 mod tests {
     use super::*;
 
-    const ALL: [Icon; 51] = [
+    const ALL: [Icon; 52] = [
         Icon::Notepad,
         Icon::Calc,
         Icon::Terminal,
@@ -587,6 +594,7 @@ mod tests {
         Icon::RedConectada,
         Icon::RedSinCable,
         Icon::RedSinInternet,
+        Icon::Reloj,
     ];
     const SENT: u32 = 0x123456;
 

@@ -395,6 +395,8 @@ pub struct Files {
     xd: XDrives,
     /// Raíces de confianza ya montadas (`raices::store`); se rehace al añadir o quitar una.
     roots: Option<alloc::sync::Arc<crate::x509::RootStore>>,
+    /// Zona horaria y peticiones de hora (v0.12.3).
+    hora: crate::hora::Estado,
 }
 
 /// Una unidad conectada: abierta (`vol`) o cifrada esperando contraseña (`locked`).
@@ -432,7 +434,7 @@ impl Default for Files {
 
 impl Files {
     fn memory(notice: &'static str, pending: Option<Box<dyn BlockDev>>, now: DateTime) -> Files {
-        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None }
+        Files { fs: new_memory(now), persistent: false, pending, notice: Some(notice), generation: 0, clip: None, undo: None, user: Some((String::from(DEFAULT_USER), true)), disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None, hora: Default::default() }
     }
 
     /// Prepara la unidad C: a partir del disco encontrado al arrancar:
@@ -461,7 +463,7 @@ impl Files {
             // Con NFFS dañado no se formatea nunca: se deja el disco como está.
             return match Nffs::mount(dev) {
                 Ok(fs) => {
-                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None };
+                    let mut f = Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None, hora: Default::default() };
                     f.startup(now);
                     f
                 }
@@ -478,7 +480,7 @@ impl Files {
     /// Para herramientas (nfdisk): trabaja sobre un volumen NFFS ya montado, tal cual: sin arranque
     /// (no crea ni migra nada), sin sesión (hay que usar `login`) y con las reglas de siempre.
     pub fn on_volume(fs: Nffs) -> Files {
-        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None }
+        Files { fs, persistent: true, pending: None, notice: None, generation: 0, clip: None, undo: None, user: None, disk: DiskState::default(), hc: Home::default(), xd: XDrives::default(), roots: None, hora: Default::default() }
     }
 
     /// ¿Se guarda en un disco de verdad?
@@ -604,6 +606,7 @@ impl Files {
         let c = canon(dir)?;
         if let Some(l) = ext(&c) {
             let mut v = self.vol(l)?.list(rel(&c))?;
+            self.a_local(l, &mut v);
             v.sort_by_cached_key(|e| (!e.dir, lower(&e.name)));
             return Ok(v);
         }
@@ -1523,6 +1526,61 @@ impl Files {
             self.generation += 1;
         }
         r
+    }
+
+    /// v0.12.3: zona horaria y «ajustar sola» (`hora`). Cualquiera puede verlos; se leen una vez y se recuerdan.
+    pub fn time_cfg(&mut self) -> crate::hora::Ajuste {
+        if self.hora.ajuste.is_none() {
+            self.hora.ajuste = Some(crate::hora::parse(&self.fs.read(rel(crate::hora::FILE)).unwrap_or_default()));
+        }
+        self.hora.ajuste.unwrap_or_default()
+    }
+
+    /// Configuración → Fecha y hora: guarda la zona y el modo automático. Solo un administrador.
+    pub fn set_time_cfg(&mut self, a: crate::hora::Ajuste, now: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() || a.zona as usize >= crate::hora::ZONAS.len() {
+            return Err(FsError::Denied);
+        }
+        mk(&mut self.fs, rel(SYS_CONFIG_DIR), now);
+        self.fs.write(rel(crate::hora::FILE), &crate::hora::render(&a), now)?;
+        self.hora.ajuste = Some(a);
+        self.generation += 1;
+        self.log("Fecha y hora: ajustes cambiados en Configuración", now);
+        Ok(())
+    }
+
+    /// Configuración → Fecha y hora: pide poner el reloj a `t` (hora local). Solo un administrador; lo hace el escritorio.
+    pub fn set_clock(&mut self, t: DateTime) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Denied);
+        }
+        if !crate::hora::valida(t) {
+            return Err(FsError::Invalid);
+        }
+        self.hora.poner = Some(t);
+        Ok(())
+    }
+
+    /// Configuración → «Sincronizar ahora». Solo un administrador; lo hace el escritorio con internet.
+    pub fn time_sync(&mut self) -> Result<(), FsError> {
+        if !self.is_admin() {
+            return Err(FsError::Denied);
+        }
+        self.hora.sync_pedida = true;
+        Ok(())
+    }
+
+    pub fn time_sync_info(&mut self) -> crate::hora::SyncInfo {
+        self.hora.info
+    }
+
+    /// Lo que el escritorio tiene que hacer con la hora (lo consume): reloj a poner y si hay que sincronizar.
+    pub fn hora_pendiente(&mut self) -> (Option<DateTime>, bool) {
+        (self.hora.poner.take(), core::mem::take(&mut self.hora.sync_pedida))
+    }
+
+    pub fn hora_sync_info(&mut self, info: crate::hora::SyncInfo) {
+        self.hora.info = info;
     }
 
     /// v0.12.2: raíces de confianza propias (DER). Las lee el sistema; cualquiera puede verlas.
@@ -2887,7 +2945,20 @@ impl Files {
         if r.is_empty() {
             return Ok(Entry { name: String::new(), dir: true, size: 0, modified: DateTime::default(), hidden: false });
         }
-        v.stat(r)
+        let mut e = [v.stat(r)?];
+        self.a_local(l, &mut e);
+        let [e] = e;
+        Ok(e)
+    }
+
+    /// NTFS y ext guardan las fechas en UTC: se pasan a la hora local de la zona (FAT y exFAT ya van en local).
+    fn a_local(&mut self, l: char, es: &mut [Entry]) {
+        if matches!(self.vol(l).map(|v| v.kind()), Ok(crate::vol::FsKind::Ntfs | crate::vol::FsKind::Ext)) {
+            let z = self.time_cfg().zona();
+            for e in es.iter_mut().filter(|e| e.modified.year != 0) {
+                e.modified = crate::hora::utc_a_local(e.modified, z);
+            }
+        }
     }
 
     /// Borra `r` y todo lo que contiene en la unidad `l` (las comprueba quien llama).

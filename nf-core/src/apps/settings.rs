@@ -39,13 +39,14 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 7] = [
+const SECTIONS: [(&str, Icon); 8] = [
     ("Personalización", Icon::Palette),
     ("Cuentas", Icon::Cuentas),
     ("Aplicaciones", Icon::VistaIconosGrandes),
     ("Disco", Icon::DiscoSeguro),
     ("Dispositivos", Icon::Mando),
     ("Red", Icon::RedConectada),
+    ("Fecha y hora", Icon::Reloj),
     ("Acerca de", Icon::Info),
 ];
 const PAGE_ACCOUNTS: usize = 1;
@@ -53,7 +54,8 @@ const PAGE_APPS: usize = 2;
 const PAGE_DISK: usize = 3;
 const PAGE_DEVICES: usize = 4;
 const PAGE_NET: usize = 5;
-const PAGE_ABOUT: usize = 6;
+const PAGE_TIME: usize = 6;
+const PAGE_ABOUT: usize = 7;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -86,6 +88,9 @@ const T_APP_DEL: u32 = 62;
 const T_CERT_FILE: u32 = 63;
 const T_CERT_ADD: u32 = 64;
 const T_CERT_DEL: u32 = 65;
+/// Fecha y hora (v0.12.3): cambiar la fecha o la hora a mano.
+const T_DATE: u32 = 66;
+const T_TIME: u32 = 67;
 const NO_MATCH: &str = "Las claves no coinciden.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -120,6 +125,12 @@ enum Act {
     /// Certificados: elegir un archivo para añadir una raíz; quitar la raíz propia `i` de `Settings::certs`.
     CertAdd,
     CertDel(usize),
+    /// Fecha y hora: interruptor «automático», «Sincronizar ahora», zona `i` de `hora::ZONAS`, cambiar fecha u hora a mano.
+    TimeAuto,
+    TimeSync,
+    TimeZone(usize),
+    TimeDate,
+    TimeClock,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -439,6 +450,75 @@ impl Settings {
             y = at.1 + BTN_H;
         }
         y
+    }
+
+    /// v0.12.3: hora actual, zona, hora automática por internet y cambio a mano.
+    fn time_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, "Fecha y hora", 18, false, TEXT);
+        y += font::line_h(18) + if compact { 8 } else { 16 };
+        let admin = sys.fs().is_admin();
+        let cfg = sys.fs().time_cfg();
+        let d = sys.now();
+        font::draw(s, x0, y, &format!("{:02}:{:02}:{:02}", d.hour, d.minute, d.second), 22, true, TEXT);
+        y += font::line_h(22) + 2;
+        font::draw(s, x0, y, &format!("{:02}/{:02}/{}", d.day, d.month, d.year), 11, false, GRAY);
+        y += font::line_h(11) + if compact { 10 } else { 18 };
+        if !admin {
+            y = note(s, x0, y, right - x0, "Solo un administrador puede cambiar la fecha, la hora y la zona horaria.") + 10;
+        }
+        // Interruptor «automático».
+        let sw = Rect::new(x0, y, 38, 18);
+        let (on_c, knob) = (if cfg.auto { theme.accent } else { 0xBDBDBD }, if cfg.auto { sw.x + 29 } else { sw.x + 9 });
+        s.fill_circle((sw.x + 9) as f32, (sw.y + 9) as f32, 9.0, on_c, 255);
+        s.fill_circle((sw.x + 29) as f32, (sw.y + 9) as f32, 9.0, on_c, 255);
+        s.fill_rect(Rect::new(sw.x + 9, sw.y, 20, 18), on_c);
+        s.fill_circle(knob as f32, (sw.y + 9) as f32, 7.0, 0xFFFFFF, 255);
+        if admin {
+            self.hits.push((sw, Hit::Act(Act::TimeAuto)));
+        }
+        font::draw_in(s, Rect::new(x0 + 48, y, (right - x0 - 48).max(0), 18), "Ajustar la hora automáticamente", 10, true, TEXT, Align::Left);
+        y += 18 + 4;
+        y = note(s, x0 + 48, y, right - x0 - 48, "Pide la hora a pool.ntp.org; ese servidor ve la dirección IP del equipo.") + 10;
+        let info = sys.fs().time_sync_info();
+        let mut at = (x0, y);
+        self.button_if(s, &mut at, x0, right, "Sincronizar ahora", Act::TimeSync, admin && info.estado != 1, theme);
+        if !cfg.auto && admin {
+            self.button(s, &mut at, x0, right, "Cambiar fecha…", Act::TimeDate, theme);
+            self.button(s, &mut at, x0, right, "Cambiar hora…", Act::TimeClock, theme);
+        }
+        y = at.1 + BTN_H + 6;
+        let f = info.fin;
+        let hora = format!("{:02}/{:02}/{} {:02}:{:02}", f.day, f.month, f.year, f.hour, f.minute);
+        let estado = match info.estado {
+            1 => String::from("Sincronizando…"),
+            2 => format!("Hora ajustada con internet el {hora}."),
+            3 => format!("La hora ya era correcta ({hora})."),
+            4 => format!("No se pudo obtener la hora de pool.ntp.org ({hora})."),
+            _ => String::from("Todavía no se ha sincronizado."),
+        };
+        font::draw(s, x0, y, &estado, 9, false, GRAY);
+        y += font::line_h(9) + if compact { 10 } else { 18 };
+        font::draw(s, x0, y, "Zona horaria", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        for (i, z) in crate::hora::ZONAS.iter().enumerate() {
+            let r = Rect::new(x0, y, (right - x0).max(1), 24);
+            let sel = cfg.zona as usize == i;
+            if sel {
+                s.fill_rect(r, theme.accent);
+            } else if admin && self.hover_hit == Some(Act::TimeZone(i)) {
+                s.fill_rect(r, 0xEAEAEA);
+            }
+            font::draw_in(s, Rect::new(r.x + 8, r.y, r.w - 8, r.h), z.nombre, 9, sel, if sel { 0xFFFFFF } else { TEXT }, Align::Left);
+            if admin {
+                self.hits.push((r, Hit::Act(Act::TimeZone(i))));
+            }
+            y += 24;
+        }
+        self.content_h = y + self.scroll + 16;
     }
 
     fn about(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
@@ -777,7 +857,7 @@ impl Settings {
     }
 
     fn scrolls(&self) -> bool {
-        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || (self.page == PAGE_DEVICES && self.testing.is_none())
+        self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || self.page == PAGE_TIME || (self.page == PAGE_DEVICES && self.testing.is_none())
     }
 
     fn metrics(&self) -> Metrics {
@@ -1067,6 +1147,36 @@ impl Settings {
                 cx.redraw = true;
                 return;
             }
+            Act::TimeAuto | Act::TimeZone(_) => {
+                let c = cx.sys.fs().time_cfg();
+                let nuevo = match act {
+                    Act::TimeZone(i) => crate::hora::Ajuste { zona: i as u8, ..c },
+                    _ => crate::hora::Ajuste { auto: !c.auto, ..c },
+                };
+                let now = cx.sys.now();
+                if let Err(e) = cx.sys.fs().set_time_cfg(nuevo, now) {
+                    hora_message(cx, e.message());
+                }
+                cx.redraw = true;
+                return;
+            }
+            Act::TimeSync => {
+                if let Err(e) = cx.sys.fs().time_sync() {
+                    hora_message(cx, e.message());
+                }
+                cx.redraw = true;
+                return;
+            }
+            Act::TimeDate | Act::TimeClock => {
+                let d = cx.sys.now();
+                let (tag, label, value) = if act == Act::TimeDate {
+                    (T_DATE, "Fecha (DD/MM/AAAA)", format!("{:02}/{:02}/{}", d.day, d.month, d.year))
+                } else {
+                    (T_TIME, "Hora (HH:MM o HH:MM:SS)", format!("{:02}:{:02}:{:02}", d.hour, d.minute, d.second))
+                };
+                cx.dialog = Some(DialogRequest::Input { tag, title: String::from("Fecha y hora"), label: String::from(label), value });
+                return;
+            }
             Act::NetRenew => {
                 if let Some(n) = cx.sys.net() {
                     n.renew();
@@ -1122,7 +1232,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) | Act::CertAdd | Act::CertDel(_) => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) | Act::CertAdd | Act::CertDel(_) | Act::TimeAuto | Act::TimeSync | Act::TimeZone(_) | Act::TimeDate | Act::TimeClock => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -1442,6 +1552,7 @@ impl App for Settings {
                 PAGE_APPS => self.apps_page(s, theme, sys),
                 PAGE_DEVICES => self.devices_page(s, theme, sys, focused),
                 PAGE_NET => self.net_page(s, theme, sys),
+                PAGE_TIME => self.time_page(s, theme, sys),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
@@ -1591,6 +1702,20 @@ impl App for Settings {
                     }
                 }
             }
+            DialogResult::Text { tag: T_DATE | T_TIME, value: Some(v) } => {
+                let mut d = cx.sys.now();
+                if let Some((y, m, dd)) = parse_fecha(&v) {
+                    (d.year, d.month, d.day) = (y, m, dd);
+                } else if let Some((h, mi, sec)) = parse_hora(&v) {
+                    (d.hour, d.minute, d.second) = (h, mi, sec);
+                } else {
+                    return hora_message(cx, "No se entiende. Escribe la fecha como 24/11/2026 o la hora como 21:30.");
+                }
+                if let Err(e) = cx.sys.fs().set_clock(d) {
+                    hora_message(cx, if e == FsError::Invalid { "Esa fecha u hora no existe." } else { e.message() });
+                }
+            }
+            DialogResult::Text { tag: T_DATE | T_TIME, value: None } => {}
             DialogResult::Text { tag, value } => self.step_text(tag, value.map(Secret), cx),
             DialogResult::Answer { tag, answer } => self.step_answer(tag, answer, cx),
             DialogResult::Path { .. } => {}
@@ -1609,7 +1734,7 @@ impl App for Settings {
         let sec = cx.now_ms / 1000;
         // El avance de las conversiones de cifrado también cambia solo.
         let moving = match self.page {
-            PAGE_ABOUT | PAGE_DISK | PAGE_DEVICES => true,
+            PAGE_ABOUT | PAGE_DISK | PAGE_DEVICES | PAGE_TIME => true,
             PAGE_ACCOUNTS => cx.sys.fs().home_conversion().is_some(),
             _ => false,
         };
@@ -1645,6 +1770,28 @@ impl Settings {
             }
         }
     }
+}
+
+fn hora_message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_MSG, title: String::from("Fecha y hora"), text: String::from(text), buttons: Buttons::Ok });
+}
+
+/// «24/11/2026» → (año, mes, día).
+fn parse_fecha(t: &str) -> Option<(u16, u8, u8)> {
+    let mut p = t.trim().split('/');
+    let (d, m, y) = (p.next()?.trim().parse().ok()?, p.next()?.trim().parse().ok()?, p.next()?.trim().parse().ok()?);
+    p.next().is_none().then_some((y, m, d))
+}
+
+/// «21:30» o «21:30:15» → (hora, minuto, segundo).
+fn parse_hora(t: &str) -> Option<(u8, u8, u8)> {
+    let mut p = t.trim().split(':');
+    let (h, m) = (p.next()?.trim().parse().ok()?, p.next()?.trim().parse().ok()?);
+    let s = match p.next() {
+        Some(s) => s.trim().parse().ok()?,
+        None => 0,
+    };
+    p.next().is_none().then_some((h, m, s))
 }
 
 fn cert_message(cx: &mut Ctx, text: &str) {
@@ -2968,5 +3115,51 @@ mod tests {
         b.pagina(0);
         corre_red(&mut b, &mut lan, 600);
         assert!(!tick_banco(&mut b));
+    }
+
+    #[test]
+    fn fecha_y_hora_texto_de_fecha_y_de_hora() {
+        assert_eq!(parse_fecha(" 24/11/2026 "), Some((2026, 11, 24)));
+        assert_eq!(parse_fecha("24/11"), None);
+        assert_eq!(parse_fecha("24/11/2026/1"), None);
+        assert_eq!(parse_fecha("ab/11/2026"), None);
+        assert_eq!(parse_hora("21:30"), Some((21, 30, 0)));
+        assert_eq!(parse_hora("21:30:15"), Some((21, 30, 15)));
+        assert_eq!(parse_hora("21"), None);
+        assert_eq!(parse_hora("21:30:15:1"), None);
+    }
+
+    #[test]
+    fn fecha_y_hora_solo_administrador_y_a_mano_sin_automatico() {
+        let tokio = crate::hora::ZONAS.iter().position(|z| z.id == "Tokio").unwrap();
+        let mut b = Banco::con_disco("Luis");
+        b.pagina(PAGE_TIME);
+        assert!(!b.hay(Act::TimeAuto) && !b.hay(Act::TimeZone(tokio)), "un usuario normal ve pero no cambia");
+        assert_eq!(b.files().set_clock(DateTime { year: 2027, month: 3, day: 1, hour: 8, minute: 0, second: 0 }), Err(FsError::Denied));
+        assert_eq!(b.files().time_sync(), Err(FsError::Denied));
+        assert_eq!(b.files().set_time_cfg(crate::hora::Ajuste::default(), DateTime::default()), Err(FsError::Denied));
+
+        let mut b = Banco::con_disco("Ana");
+        b.pagina(PAGE_TIME);
+        assert!(b.hay(Act::TimeAuto) && b.hay(Act::TimeSync));
+        assert!(!b.hay(Act::TimeDate), "con el automático no se cambia a mano");
+        b.pulsa(Act::TimeZone(tokio));
+        assert_eq!(b.files().time_cfg().zona().id, "Tokio");
+        b.pulsa(Act::TimeAuto);
+        assert!(!b.files().time_cfg().auto);
+        // A mano: la fecha y la hora válidas quedan pendientes para el escritorio; las que no existen, no.
+        b.pulsa(Act::TimeDate);
+        assert!(matches!(b.dialog.take(), Some(DialogRequest::Input { tag: T_DATE, .. })));
+        b.texto(T_DATE, "01/03/2027");
+        assert_eq!(b.files().hora_pendiente().0, Some(DateTime { year: 2027, month: 3, day: 1, hour: 21, minute: 37, second: 5 }));
+        b.texto(T_DATE, "31/02/2027");
+        assert!(b.mensaje().contains("no existe"));
+        b.texto(T_TIME, "25:00");
+        assert!(b.mensaje().contains("no existe"));
+        b.texto(T_TIME, "hola");
+        assert!(b.mensaje().contains("No se entiende"));
+        assert_eq!(b.files().hora_pendiente(), (None, false));
+        b.pulsa(Act::TimeSync);
+        assert_eq!(b.files().hora_pendiente(), (None, true));
     }
 }
