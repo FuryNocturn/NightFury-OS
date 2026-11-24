@@ -61,6 +61,13 @@ name = "nf-core"
 version = "0.12.3"
 
 [[package]]
+name = "nf-web"
+version = "0.12.3"
+dependencies = [
+ "nf-core",
+]
+
+[[package]]
 name = "nfdisk"
 version = "0.12.3"
 dependencies = [
