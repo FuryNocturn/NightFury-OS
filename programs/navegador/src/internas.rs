@@ -7,6 +7,7 @@
 //! Las acciones (borrar, mover…) viajan en la consulta, pero solo `aplicar` las ejecuta, al navegar a propósito:
 //! la página que queda en el historial no lleva la acción y volver atrás no la repite.
 use crate::datos::{host, Datos, Fav};
+use crate::descargas::Descargas;
 use crate::entrada::codificar_consulta;
 use crate::paginas::{self, escapar};
 use alloc::format;
@@ -112,12 +113,12 @@ fn corto(s: &str, n: usize) -> String {
 }
 
 /// Pregunta antes de una acción que no se puede deshacer: un formulario con la acción y `ok=1`.
-fn confirmar(titulo: &str, pregunta: &str, ruta: &str, campos: &[(&str, &str)]) -> String {
+fn confirmar(titulo: &str, pregunta: &str, ruta: &str, campos: &[(&str, &str)], extra: &str) -> String {
     let mut ocultos = String::new();
     for (k, v) in campos.iter().chain(&[("ok", "1")]) {
         ocultos.push_str(&format!("<input type=hidden name=\"{k}\" value=\"{}\">", escapar(v)));
     }
-    marco(titulo, &format!("<h1>{}</h1><p>{}</p><form action=\"{BASE}{ruta}\">{ocultos}<p><input type=submit value=\"Borrar\"> <a href=\"{BASE}{ruta}\">Cancelar</a></p></form>", escapar(titulo), escapar(pregunta)))
+    marco(titulo, &format!("<h1>{}</h1><p>{}</p><form action=\"{BASE}{ruta}\">{ocultos}{extra}<p><input type=submit value=\"Borrar\"> <a href=\"{BASE}{ruta}\">Cancelar</a></p></form>", escapar(titulo), escapar(pregunta)))
 }
 
 // ------------------------------------------------------------ historial
@@ -143,7 +144,7 @@ fn historial(d: &Datos, p: &[(String, String)], ahora: i64) -> String {
             "dia" => "los datos del último día",
             _ => "todo el historial",
         };
-        return confirmar("Borrar datos de navegación", &format!("¿Borrar {que}? No se puede deshacer."), "historial", &[("limpiar", c)]);
+        return confirmar("Borrar datos de navegación", &format!("¿Borrar {que}? No se puede deshacer."), "historial", &[("limpiar", c)], "<p><label><input type=checkbox name=cookies value=1> También las cookies</label></p>");
     }
     let mut s = String::from("<h1>Historial</h1>");
     s.push_str(&format!("<form action=\"{BASE}historial\"><input type=search name=q value=\"{}\" placeholder=\"Buscar en el historial\"> <input type=submit value=\"Buscar\"></form>", escapar(q)));
@@ -207,7 +208,7 @@ fn favoritos(d: &Datos, p: &[(String, String)]) -> String {
     if let Some(id) = num::<u32>(p, "quitar") {
         // Solo llega aquí una carpeta con cosas dentro (si no, `aplicar` ya la ha borrado).
         let nombre = f.por_id(id).map_or("", |x| x.titulo.as_str());
-        return confirmar("Eliminar carpeta", &format!("¿Eliminar la carpeta «{nombre}» y todos los favoritos que contiene?"), "favoritos", &[("quitar", &format!("{id}"))]);
+        return confirmar("Eliminar carpeta", &format!("¿Eliminar la carpeta «{nombre}» y todos los favoritos que contiene?"), "favoritos", &[("quitar", &format!("{id}"))], "");
     }
     if let Some(x) = num::<u32>(p, "mover").and_then(|id| f.por_id(id)).filter(|x| !x.carpeta) {
         let id = format!("{}", x.id);
@@ -249,6 +250,26 @@ fn favoritos(d: &Datos, p: &[(String, String)]) -> String {
     marco("Favoritos", &s)
 }
 
+// ------------------------------------------------------------ descargas
+
+/// La página `nightfury://descargas`: las descargas de esta ventana (solo en memoria), la última arriba.
+pub fn descargas(d: &Descargas) -> String {
+    let mut s = String::from("<h1>Descargas</h1><p class=u>Esta lista es de esta ventana y no se guarda. Recarga la página para ver cómo avanzan.</p>");
+    if d.items.is_empty() {
+        s.push_str("<p>No has descargado nada en esta ventana.</p>");
+    }
+    for it in d.items.iter().rev() {
+        let donde = if it.ruta.is_empty() { String::new() } else { format!("<br><span class=u>{}</span>", escapar(&it.ruta)) };
+        s.push_str(&format!("<p>{} <span class=u>{} · {}</span>{donde}</p>", escapar(&it.nombre), escapar(&it.texto_estado()), escapar(&it.sitio())));
+    }
+    marco("Descargas", &s)
+}
+
+/// Nombre de la página de una dirección interna (`historial`, `descargas`…).
+pub fn ruta(url: &str) -> String {
+    partir(url).0
+}
+
 /// El HTML de la página interna `url` (con los datos de ahora; `ahora` en segundos del reloj).
 pub fn pagina(d: &Datos, url: &str, ahora: i64) -> String {
     let (ruta, p) = partir(url);
@@ -283,6 +304,8 @@ pub fn aplicar(d: &mut Datos, url: &str, ahora: i64, ms: u64) -> Option<String> 
             if !ok {
                 return None;
             }
+            // El navegador recoge este aviso y vacía el tarro (también en disco).
+            d.borrar_cookies = param(&p, "cookies") == Some("1");
             if d.hist.borrar_desde(desde) {
                 d.cambio_historial(ms);
             }
@@ -378,6 +401,16 @@ mod pruebas {
         assert_eq!(aplicar(&mut d, "nightfury://historial?limpiar=hora&ok=1", AHORA, 0).as_deref(), Some("nightfury://historial"));
         assert!(d.hist.v.is_empty());
         assert_eq!(aplicar(&mut d, "nightfury://historial?limpiar=raro&ok=1", AHORA, 0), None);
+    }
+
+    #[test]
+    fn la_casilla_de_cookies_pide_borrarlas() {
+        let mut d = datos();
+        assert!(pagina(&d, "nightfury://historial?limpiar=todo", AHORA).contains("También las cookies"));
+        assert!(aplicar(&mut d, "nightfury://historial?limpiar=todo&ok=1", AHORA, 0).is_some());
+        assert!(!d.borrar_cookies);
+        assert!(aplicar(&mut d, "nightfury://historial?limpiar=todo&ok=1&cookies=1", AHORA, 0).is_some());
+        assert!(d.borrar_cookies);
     }
 
     #[test]

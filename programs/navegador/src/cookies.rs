@@ -3,8 +3,6 @@
 //! Tarro de cookies según RFC 6265 (y los prefijos `__Secure-`/`__Host-` de rfc6265bis), con SameSite,
 //! bloqueo de cookies de terceros, límites y persistencia en texto. Sin JavaScript no hay `document.cookie`,
 //! así que `HttpOnly` solo se guarda. El Navegador decide qué cookies persistentes se escriben (filtro).
-// Se integra en el paso 3b.
-#![allow(dead_code)]
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,6 +26,8 @@ pub enum Contexto {
     PrimeraParte,
     /// Navegación de la pestaña a otro sitio (clic en un enlace): se envían Lax y None, no Strict.
     Navegacion,
+    /// Envío de un formulario POST a otro sitio: solo viajan las `SameSite=None`.
+    NavegacionPost,
     /// Imagen, hoja de estilo, etc. de un sitio distinto al de la página: terceros bloqueados.
     Subrecurso,
 }
@@ -354,10 +354,12 @@ fn desescapar(s: &str) -> String {
 }
 
 impl Tarro {
+    #[cfg(test)]
     pub fn new() -> Tarro {
         Tarro::default()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cookies.len()
     }
@@ -438,6 +440,7 @@ impl Tarro {
                     && path_match(&u.ruta, &c.ruta)
                     && (!c.seguro || u.https)
                     && !(ctx == Contexto::Navegacion && c.same_site == SameSite::Strict)
+                    && !(ctx == Contexto::NavegacionPost && c.same_site != SameSite::None)
             })
             .collect();
         if idx.is_empty() {
@@ -677,6 +680,15 @@ mod tests {
         assert!(!t.guardar_desde_respuesta("https://track.com/p.png", "t=1", T, Contexto::Subrecurso));
         assert_eq!(t.len(), 3);
         assert!(t.guardar_desde_respuesta("https://y.com/", "t=1", T, Contexto::Navegacion));
+    }
+
+    #[test]
+    fn post_a_otro_sitio_solo_envia_none() {
+        let mut t = Tarro::new();
+        poner(&mut t, "https://x.com/", "s=1; SameSite=Strict");
+        poner(&mut t, "https://x.com/", "l=1");
+        poner(&mut t, "https://x.com/", "n=1; SameSite=None; Secure");
+        assert_eq!(t.cabecera("https://x.com/", T, Contexto::NavegacionPost).as_deref(), Some("n=1"));
     }
 
     #[test]

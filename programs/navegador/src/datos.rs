@@ -385,13 +385,15 @@ pub struct Datos {
     pub cargado: bool,
     /// Ventana de incógnito: no se lee ni se escribe el historial.
     pub incog: bool,
+    /// `internas::aplicar` pide vaciar también las cookies (el navegador lo recoge).
+    pub borrar_cookies: bool,
     /// Reloj (ms) a partir del cual toca escribir cada fichero.
     h_en: Option<u64>,
     f_en: Option<u64>,
 }
 
 impl Datos {
-    fn ruta(fs: &mut dyn FilesApi, nombre: &str) -> String {
+    pub fn ruta(fs: &mut dyn FilesApi, nombre: &str) -> String {
         join(&join(&fs.home(), CARPETA), nombre)
     }
 
@@ -438,7 +440,7 @@ impl Datos {
     }
 
     // `FilesApi::write` ya es atómico (sustituye el fichero entero o no toca nada): no hace falta temporal.
-    fn escribir(fs: &mut dyn FilesApi, nombre: &str, texto: &str, now: DateTime) -> bool {
+    pub fn escribir(fs: &mut dyn FilesApi, nombre: &str, texto: &str, now: DateTime) -> bool {
         let ruta = Self::ruta(fs, nombre);
         if fs.write(&ruta, texto.as_bytes(), now).is_ok() {
             return true;

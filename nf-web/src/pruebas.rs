@@ -1063,3 +1063,11 @@ fn pintado_de_controles_con_scroll() {
     d.pulsar(r.x + 1, r.y + 1, &mut Falsa);
     d.pintar(&mut s, 0, &mut Falsa);
 }
+
+#[test]
+fn enlace_con_download() {
+    let mut d = doc("<a href=\"f.zip\" download>a</a> <a href=\"g.zip\">b</a>");
+    maq(&mut d, 400);
+    assert!(d.es_descarga("http://ej.com/dir/f.zip"));
+    assert!(!d.es_descarga("http://ej.com/dir/g.zip") && !d.es_descarga("http://ej.com/otro"));
+}
