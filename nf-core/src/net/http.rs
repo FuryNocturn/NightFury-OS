@@ -3,11 +3,16 @@
 //! Cliente HTTP/1.1 (RFC 9110 y 9112) para `curl`, sobre `Net`. Sin bloquear: se crea con `start` y
 //! se llama a `poll` en cada tick hasta que devuelve `Done` o `Error`.
 //!
+//! v0.12.4: envía `Accept-Encoding: gzip, deflate` y descomprime `Content-Encoding: gzip`/`deflate` en los
+//! eventos `Body` (los demás códecs, como `br`, pasan tal cual).
+//!
 //! CONTRATO: las firmas públicas no cambian.
 use super::{NetApi, NetError, QueryId, SockId, TcpState, TlsInfo};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
+use crate::img::inflate::{Inflate, Wrapper};
+use crate::img::ImgError;
 
 /// URL `http://` o `https://host[:puerto][/ruta][?consulta]`. El fragmento (`#…`) se descarta.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -97,6 +102,8 @@ const MAX_LINE: usize = 1024;
 const MAX_TRAILERS: usize = 8 * 1024;
 /// Sin recibir ni enviar nada durante este tiempo, se da por perdida.
 const IDLE_MS: u64 = 30_000;
+/// Tope del cuerpo ya descomprimido (contra bombas de descompresión).
+const MAX_DESCOMP: usize = 32 * 1024 * 1024;
 
 enum Stage {
     Resolving(QueryId),
@@ -190,6 +197,60 @@ impl Chunked {
     }
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Codif {
+    Gzip,
+    /// «deflate» de HTTP es zlib, pero hay servidores que mandan DEFLATE crudo: se mira la cabecera.
+    Deflate,
+}
+
+/// `Content-Encoding` gzip o deflate, descomprimido a medida que llega el cuerpo.
+struct Descomp {
+    codif: Codif,
+    inf: Option<Inflate>,
+    /// Los dos primeros bytes de «deflate», para decidir si hay cabecera zlib.
+    previo: Vec<u8>,
+    fin: bool,
+}
+
+impl Descomp {
+    fn new(codif: Codif) -> Descomp {
+        Descomp { codif, inf: None, previo: Vec::new(), fin: false }
+    }
+
+    fn push(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+        if self.fin {
+            return Ok(()); // lo que sobra tras el final del flujo se ignora
+        }
+        let Some(inf) = self.inf.as_mut() else {
+            self.previo.extend_from_slice(data);
+            if self.codif == Codif::Deflate && self.previo.len() < 2 {
+                return Ok(());
+            }
+            let p = &self.previo;
+            let w = match self.codif {
+                Codif::Gzip => Wrapper::Gzip,
+                Codif::Deflate if p[0] & 15 == 8 && ((p[0] as u32) << 8 | p[1] as u32) % 31 == 0 => Wrapper::Zlib,
+                Codif::Deflate => Wrapper::Raw,
+            };
+            self.inf = Some(Inflate::new(w, MAX_DESCOMP));
+            let b = core::mem::take(&mut self.previo);
+            return self.push(&b, out);
+        };
+        match inf.push(data, out) {
+            Ok(f) => self.fin = f,
+            Err(ImgError::Limite) => return Err("cuerpo descomprimido demasiado grande"),
+            Err(_) => return Err("cuerpo comprimido no válido"),
+        }
+        Ok(())
+    }
+
+    /// ¿Llegó el flujo entero? (un cuerpo vacío con la cabecera puesta también vale)
+    fn completo(&self) -> bool {
+        self.fin || (self.inf.is_none() && self.previo.is_empty())
+    }
+}
+
 enum Mode {
     Length(u64),
     Chunked(Chunked),
@@ -212,6 +273,7 @@ pub struct HttpGet {
     sent: usize,
     buf: Vec<u8>,
     mode: Mode,
+    descomp: Option<Descomp>,
     last: Option<u64>,
 }
 
@@ -258,7 +320,7 @@ impl HttpGet {
     pub fn start_tls(net: &mut dyn NetApi, url: &str, head_only: bool, follow: bool, insecure: bool) -> Result<HttpGet, NetError> {
         let url = parse_url(url)?;
         let q = net.resolve(&url.host)?;
-        let mut g = HttpGet { head_only, follow, insecure, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, last: None };
+        let mut g = HttpGet { head_only, follow, insecure, redirects: 0, url, stage: Stage::Resolving(q), req: Vec::new(), sent: 0, buf: Vec::new(), mode: Mode::Close, descomp: None, last: None };
         g.build_request();
         Ok(g)
     }
@@ -266,7 +328,7 @@ impl HttpGet {
     fn build_request(&mut self) {
         let host = self.url.authority();
         let m = if self.head_only { "HEAD" } else { "GET" };
-        self.req = format!("{m} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n", self.url.path, crate::VERSION).into_bytes();
+        self.req = format!("{m} {} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: NightFury/{}\r\nAccept: */*\r\nAccept-Encoding: gzip, deflate\r\nConnection: close\r\n\r\n", self.url.path, crate::VERSION).into_bytes();
         self.sent = 0;
     }
 
@@ -382,10 +444,18 @@ impl HttpGet {
     /// El servidor cerró y ya no queda nada por leer.
     fn eof(&mut self, net: &mut dyn NetApi, ev: &mut Vec<HttpEvent>) -> bool {
         match (&self.stage, &self.mode) {
-            (Stage::Body(_), Mode::Close) => self.finish(net, ev),
+            (Stage::Body(_), Mode::Close) => self.cerrar(net, ev),
             (Stage::Body(_), _) => self.fail(net, NetError::Protocol("respuesta incompleta"), ev),
             _ => self.fail(net, NetError::Protocol("conexión cerrada antes de las cabeceras"), ev),
         }
+    }
+
+    /// Fin del cuerpo: si venía comprimido, el flujo tiene que estar completo.
+    fn cerrar(&mut self, net: &mut dyn NetApi, ev: &mut Vec<HttpEvent>) -> bool {
+        if self.descomp.as_ref().is_some_and(|d| !d.completo()) {
+            return self.fail(net, NetError::Protocol("cuerpo comprimido incompleto"), ev);
+        }
+        self.finish(net, ev)
     }
 
     /// Mira si el búfer ya trae las cabeceras completas y, si es así, las procesa.
@@ -476,6 +546,12 @@ impl HttpGet {
             (false, Some(n)) => Mode::Length(n),
             _ => Mode::Close,
         };
+        self.descomp = match header(&headers, "content-encoding").last().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            _ if no_body => None,
+            Some("gzip" | "x-gzip") => Some(Descomp::new(Codif::Gzip)),
+            Some("deflate") => Some(Descomp::new(Codif::Deflate)),
+            _ => None,
+        };
         ev.push(HttpEvent::Head { status, reason, headers });
         self.stage = Stage::Body(s);
         if no_body || matches!(self.mode, Mode::Length(0)) {
@@ -486,28 +562,42 @@ impl HttpGet {
 
     /// Procesa bytes del cuerpo según la codificación.
     fn body(&mut self, net: &mut dyn NetApi, data: &[u8], ev: &mut Vec<HttpEvent>) -> bool {
-        let mut out = Vec::new();
+        let mut crudo = Vec::new();
         let done = match &mut self.mode {
             Mode::Close => {
-                out.extend_from_slice(data);
+                crudo.extend_from_slice(data);
                 false
             }
             Mode::Length(left) => {
                 let n = data.len().min((*left).min(usize::MAX as u64) as usize);
-                out.extend_from_slice(&data[..n]);
+                crudo.extend_from_slice(&data[..n]);
                 *left -= n as u64;
                 *left == 0
             }
-            Mode::Chunked(c) => match c.feed(data, &mut out) {
+            Mode::Chunked(c) => match c.feed(data, &mut crudo) {
                 Ok(d) => d,
                 Err(m) => return self.fail(net, NetError::Protocol(m), ev),
             },
+        };
+        let out = match self.descomp.as_mut() {
+            None => crudo,
+            Some(d) => {
+                let mut o = Vec::new();
+                let r = d.push(&crudo, &mut o);
+                if !o.is_empty() {
+                    ev.push(HttpEvent::Body(o));
+                }
+                if let Err(m) = r {
+                    return self.fail(net, NetError::Protocol(m), ev);
+                }
+                Vec::new()
+            }
         };
         if !out.is_empty() {
             ev.push(HttpEvent::Body(out));
         }
         if done {
-            return self.finish(net, ev);
+            return self.cerrar(net, ev);
         }
         true
     }
