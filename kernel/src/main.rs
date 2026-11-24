@@ -181,6 +181,9 @@ impl Platform for Plat {
     fn now(&mut self) -> DateTime {
         rtc::now()
     }
+    fn set_now(&mut self, t: DateTime) {
+        rtc::poner(t);
+    }
     fn uptime_ms(&self) -> u64 {
         arch::TICKS.load(Relaxed) * 10
     }

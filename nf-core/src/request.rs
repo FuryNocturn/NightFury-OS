@@ -105,6 +105,8 @@ impl Wire for DialogRequest {
             DialogRequest::Save { tag, title, dir, name } => w.put(&4u8).put(tag).put(title).put(dir).put(name),
             DialogRequest::Folder { tag, title, dir } => w.put(&5u8).put(tag).put(title).put(dir),
             DialogRequest::Entropy { tag, title } => w.put(&6u8).put(tag).put(title),
+            // Solo del sistema: nunca viaja por el protocolo y `get` lo rechaza.
+            DialogRequest::Unlock { tag, .. } => w.put(&7u8).put(tag),
         };
     }
     fn get(r: &mut Reader) -> WireResult<Self> {

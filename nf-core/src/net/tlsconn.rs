@@ -105,7 +105,7 @@ impl Net {
             Some(c) => (name(&c.leaf.cn, &c.leaf.org), name(&c.leaf.issuer.cn, &c.leaf.issuer.org), (c.leaf.not_after.year, c.leaf.not_after.month, c.leaf.not_after.day)),
             None => (String::new(), String::new(), (0, 0, 0)),
         };
-        Some(TlsInfo { version: String::from(i.version), suite: String::from(i.suite), group: String::from(i.group), subject, issuer, expires, cert_error: i.cert_error.map(|e| String::from(e.mensaje())) })
+        Some(TlsInfo { version: String::from(i.version), suite: String::from(i.suite), group: String::from(i.group), subject, issuer, expires, cert_error: i.cert_error.map(|e| String::from(e.mensaje())), revocation: String::from(i.revocation.texto()) })
     }
 
     /// Hace avanzar una conexión TLS y emite lo que salga.

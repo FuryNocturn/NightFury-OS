@@ -13,18 +13,27 @@ use super::hs12::prf;
 use super::hs13::claves;
 use super::*;
 use crate::crypto::{from_hex, Rng};
+use crate::x509::{comprobar_ocsp, pem_or_der, Revocacion};
 use alloc::string::ToString;
 use alloc::vec;
 
 const CA: &[u8] = include_bytes!("testdata/ca.der");
-const VUELOS: [(&str, &[u8], &str, &str); 4] = [
+const VUELOS: [(&str, &[u8], &str, &str); 5] = [
     ("chacha_ec", include_bytes!("testdata/vuelo_chacha_ec.bin"), "TLS_CHACHA20_POLY1305_SHA256", "x25519"),
     ("aes128_rsa", include_bytes!("testdata/vuelo_aes128_rsa.bin"), "TLS_AES_128_GCM_SHA256", "x25519"),
     ("aes256_p384", include_bytes!("testdata/vuelo_aes256_p384.bin"), "TLS_AES_256_GCM_SHA384", "x25519"),
     ("hrr_ec", include_bytes!("testdata/vuelo_hrr_ec.bin"), "TLS_CHACHA20_POLY1305_SHA256", "secp256r1"),
+    ("hrr_p384", include_bytes!("testdata/vuelo_hrr_p384.bin"), "TLS_CHACHA20_POLY1305_SHA256", "secp384r1"),
+];
+/// Vuelos con OCSP engrapado (srv_ec): (nombre, bytes, versión). Los «revocado» se graban con `-k` para que el saludo acabe.
+const VUELOS_OCSP: [(&str, &[u8], &str); 4] = [
+    ("ocsp_bueno", include_bytes!("testdata/vuelo_ocsp_bueno.bin"), "TLS 1.3"),
+    ("ocsp_revocado", include_bytes!("testdata/vuelo_ocsp_revocado.bin"), "TLS 1.3"),
+    ("c12_ocsp_bueno", include_bytes!("testdata/vuelo_c12_ocsp_bueno.bin"), "TLS 1.2"),
+    ("c12_ocsp_revocado", include_bytes!("testdata/vuelo_c12_ocsp_revocado.bin"), "TLS 1.2"),
 ];
 /// Vuelos de TLS 1.2: (nombre, bytes, suite, grupo, ¿extended_master_secret?).
-const VUELOS12: [(&str, &[u8], &str, &str, bool); 7] = [
+const VUELOS12: [(&str, &[u8], &str, &str, bool); 8] = [
     ("c12_chacha_ec", include_bytes!("testdata/vuelo_c12_chacha_ec.bin"), "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true),
     ("c12_chacha_rsa_pss", include_bytes!("testdata/vuelo_c12_chacha_rsa_pss.bin"), "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "x25519", true),
     ("c12_aes128_ec_sha384", include_bytes!("testdata/vuelo_c12_aes128_ec_sha384.bin"), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", true),
@@ -32,6 +41,7 @@ const VUELOS12: [(&str, &[u8], &str, &str, bool); 7] = [
     ("c12_aes256_ec", include_bytes!("testdata/vuelo_c12_aes256_ec.bin"), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "secp256r1", true),
     ("c12_aes256_rsa", include_bytes!("testdata/vuelo_c12_aes256_rsa.bin"), "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384", "x25519", true),
     ("c12_sin_ems", include_bytes!("testdata/vuelo_c12_sin_ems.bin"), "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256", "x25519", false),
+    ("c12_aes256_ec_p384", include_bytes!("testdata/vuelo_c12_aes256_ec_p384.bin"), "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "secp384r1", true),
 ];
 
 fn hex(s: &str) -> Vec<u8> {
@@ -39,7 +49,8 @@ fn hex(s: &str) -> Vec<u8> {
 }
 
 fn ahora() -> Time {
-    Time { year: 2026, month: 11, day: 23, hour: 12, min: 0, sec: 0 }
+    // Posterior al thisUpdate de las respuestas OCSP de testdata (ver gen.sh) y dentro de la vida de los certificados.
+    Time { year: 2027, month: 1, day: 1, hour: 12, min: 0, sec: 0 }
 }
 
 fn almacen() -> Arc<RootStore> {
@@ -135,6 +146,7 @@ fn reproduce_vuelos() {
             assert_eq!((i.version, i.suite, i.group), ("TLS 1.3", suite, grupo), "{nombre}");
             assert_eq!(i.chain.as_ref().unwrap().leaf.cn, "prueba.nf");
             assert!(i.cert_error.is_none());
+            assert_eq!(i.revocation, Revocacion::NoAdjunta, "{nombre}");
             assert!(c.read().starts_with(b"HTTP/1.0 200 ok"), "{nombre}");
             assert!(c.peer_closed(), "{nombre}");
         }
@@ -185,6 +197,9 @@ fn clienthello_bien_formado() {
     assert!(o.windows(4).any(|w| w == [0x00, 0x17, 0x00, 0x00]));
     assert!(o.windows(9).any(|w| w == b"prueba.nf"));
     assert!(o.windows(8).any(|w| w == b"http/1.1"));
+    // status_request (OCSP, sin responder_id ni extensiones) y los tres grupos: x25519, secp256r1 y secp384r1.
+    assert!(o.windows(9).any(|w| w == [0x00, 0x05, 0x00, 0x05, 1, 0, 0, 0, 0]));
+    assert!(o.windows(12).any(|w| w == [0x00, 0x0a, 0x00, 0x08, 0, 6, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18]));
     // Con una IP literal no hay SNI.
     let o = fijo("127.0.0.1", false).take_output();
     assert!(!o.windows(9).any(|w| w == b"127.0.0.1"));
@@ -322,8 +337,15 @@ fn hello_retry_request() {
     assert!(o.windows(4).any(|w| w == [0x00, 0x17, 0x00, 0x41]) && ch1 != o);
     // Un segundo HRR es un error.
     assert!(c.feed(&hello_servidor(&hrr_random, &p256)).is_err());
+    // Lo mismo con P-384: key_share de 97 bytes.
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    let p384 = [sv.as_slice(), &[0x00, 0x33, 0x00, 0x02, 0x00, 0x18]].concat();
+    c.feed(&hello_servidor(&hrr_random, &p384)).unwrap();
+    let o = c.take_output();
+    assert!(o.windows(10).any(|w| w == [0x00, 0x33, 0x00, 0x67, 0x00, 0x65, 0x00, 0x18, 0x00, 0x61]));
     // HRR que no cambia nada (grupo ya enviado) o con grupo desconocido.
-    for g in [[0x00u8, 0x1d], [0x00, 0x18]] {
+    for g in [[0x00u8, 0x1d], [0x00, 0x19]] {
         let ext = [sv.as_slice(), &[0x00, 0x33, 0x00, 0x02, g[0], g[1]]].concat();
         assert!(fijo("prueba.nf", false).feed(&hello_servidor(&hrr_random, &ext)).is_err());
     }
@@ -649,8 +671,8 @@ fn serverkeyexchange_incorrecto() {
         assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("ServerKeyExchange")), "{i}");
         assert_eq!(c.take_output(), [21, 3, 3, 0, 2, 2, 51]);
         assert!(con_parche12(i, |v| v[ske + 4 + 4] ^= 1).1.is_err());
-        // Curva que no se ofreció (secp384r1), tipo de curva que no es «con nombre», punto con longitud rara.
-        let (_, r) = con_parche12(i, |v| v[ske + 5..ske + 7].copy_from_slice(&[0, 0x18]));
+        // Curva que no se ofreció (secp521r1), tipo de curva que no es «con nombre», punto con longitud rara.
+        let (_, r) = con_parche12(i, |v| v[ske + 5..ske + 7].copy_from_slice(&[0, 0x19]));
         assert!(matches!(r, Err(TlsError::Protocolo(m)) if m.contains("curva")), "{i}");
         assert!(con_parche12(i, |v| v[ske + 4] = 1).1.is_err());
         assert!(con_parche12(i, |v| v[ske + 7] = 31).1.is_err());
@@ -812,6 +834,172 @@ fn fuzz12_sin_panico() {
             let _ = c.write(b"x");
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// OCSP engrapado (testdata/gen.sh: respuestas de `openssl ocsp` sobre srv_ec)
+// ---------------------------------------------------------------------------------------------
+
+const OCSP_BUENO: &[u8] = include_bytes!("testdata/ocsp_bueno.der");
+const OCSP_REVOCADO: &[u8] = include_bytes!("testdata/ocsp_revocado.der");
+const OCSP_CADUCADO: &[u8] = include_bytes!("testdata/ocsp_caducado.der");
+const OCSP_OTRO: &[u8] = include_bytes!("testdata/ocsp_otro.der");
+const OCSP_DELEGADO: &[u8] = include_bytes!("testdata/ocsp_delegado.der");
+const OCSP_DELEGADO_SIN_EKU: &[u8] = include_bytes!("testdata/ocsp_delegado_sin_eku.der");
+
+fn ocsp(resp: &[u8], ahora: Time) -> Revocacion {
+    let hoja = pem_or_der(include_bytes!("testdata/srv_ec.pem")).remove(0);
+    comprobar_ocsp(resp, &hoja, CA, ahora, &crate::pk::verify)
+}
+
+#[test]
+fn ocsp_respuestas_de_openssl() {
+    assert_eq!(ocsp(OCSP_BUENO, ahora()), Revocacion::Buena);
+    assert_eq!(ocsp(OCSP_REVOCADO, ahora()), Revocacion::Revocada);
+    // Respondedor delegado: certificado del mismo emisor con id-kp-OCSPSigning, dentro de la respuesta.
+    assert_eq!(ocsp(OCSP_DELEGADO, ahora()), Revocacion::Buena);
+    // Sin esa extensión (o sin certificado, con la firma de otro) no vale.
+    assert_eq!(ocsp(OCSP_DELEGADO_SIN_EKU, ahora()), Revocacion::Invalida);
+    // CertID de otro certificado.
+    assert_eq!(ocsp(OCSP_OTRO, ahora()), Revocacion::Invalida);
+    // Firma mala: último byte de la firma (la respuesta no lleva certificados).
+    for r in [OCSP_BUENO, OCSP_REVOCADO] {
+        let mut m = r.to_vec();
+        *m.last_mut().unwrap() ^= 1;
+        assert_eq!(ocsp(&m, ahora()), Revocacion::Invalida);
+    }
+    // Un emisor que no es el que firmó.
+    let hoja = pem_or_der(include_bytes!("testdata/srv_ec.pem")).remove(0);
+    assert_eq!(comprobar_ocsp(OCSP_BUENO, &hoja, &hoja, ahora(), &crate::pk::verify), Revocacion::Invalida);
+    assert_eq!(comprobar_ocsp(OCSP_BUENO, b"basura", CA, ahora(), &crate::pk::verify), Revocacion::Invalida);
+}
+
+#[test]
+fn ocsp_fechas_con_margen() {
+    let t = |year, month, day, hour, min, sec| Time { year, month, day, hour, min, sec };
+    // La de «caducado» se generó el 24-11-2026 a las 00:00:15 con nextUpdate un día después (gen.sh: si se
+    // regenera, ajustar estas horas). Vale hasta 5 minutos después de nextUpdate.
+    assert_eq!(ocsp(OCSP_CADUCADO, t(2026, 11, 24, 12, 0, 0)), Revocacion::Buena);
+    assert_eq!(ocsp(OCSP_CADUCADO, t(2026, 11, 25, 0, 4, 0)), Revocacion::Buena);
+    assert_eq!(ocsp(OCSP_CADUCADO, t(2026, 11, 25, 0, 6, 0)), Revocacion::Invalida);
+    assert_eq!(ocsp(OCSP_CADUCADO, ahora()), Revocacion::Invalida);
+    // thisUpdate en el futuro (con 5 minutos de margen).
+    assert_eq!(ocsp(OCSP_CADUCADO, t(2026, 11, 23, 23, 56, 0)), Revocacion::Buena);
+    assert_eq!(ocsp(OCSP_CADUCADO, t(2026, 11, 23, 23, 54, 0)), Revocacion::Invalida);
+}
+
+#[test]
+fn ocsp_mal_formada_no_entra_en_panico() {
+    // Cualquier prefijo y cualquier byte alterado: nunca pánico y nunca «bueno» por error con un prefijo.
+    for r in [OCSP_BUENO, OCSP_DELEGADO] {
+        for n in 0..r.len() {
+            assert_eq!(ocsp(&r[..n], ahora()), Revocacion::Invalida, "prefijo {n}");
+        }
+        for i in 0..r.len() {
+            let mut m = r.to_vec();
+            m[i] ^= 0xff;
+            let _ = ocsp(&m, ahora());
+        }
+    }
+    // responseStatus distinto de successful (tryLater = 3) con la misma estructura.
+    let mut m = OCSP_BUENO.to_vec();
+    let i = m.windows(3).position(|w| w == [0x0a, 0x01, 0x00]).unwrap();
+    m[i + 2] = 3;
+    assert_eq!(ocsp(&m, ahora()), Revocacion::Invalida);
+}
+
+#[test]
+fn respuesta_ocsp_del_saludo() {
+    use super::hs13::respuesta_ocsp;
+    assert_eq!(respuesta_ocsp(&[1, 0, 0, 3, 7, 8, 9]), [7, 8, 9]);
+    // Otro status_type, longitud que no cuadra, bytes de más o vacío: sin respuesta (no válida), sin fallo.
+    for malo in [&[2u8, 0, 0, 1, 7][..], &[1, 0, 0, 4, 7], &[1, 0, 0, 1, 7, 7], &[1], &[]] {
+        assert!(respuesta_ocsp(malo).is_empty());
+    }
+}
+
+#[test]
+fn ocsp_engrapado_en_vuelos() {
+    for (nombre, v, version) in VUELOS_OCSP {
+        let revocado = nombre.ends_with("revocado");
+        for trozo in [v.len(), 1] {
+            let (mut c, r) = reproducir("prueba.nf", false, v, trozo);
+            if revocado {
+                // Falla con la alerta certificate_revoked (44) y todo queda cerrado.
+                assert_eq!(r, Err(TlsError::Cert(CertError::Revocado)), "{nombre}");
+                assert!(c.take_output().ends_with(&[21, 3, 3, 0, 2, 2, 44]), "{nombre}");
+                assert_eq!(c.feed(&[0]), Err(TlsError::Cerrado));
+            } else {
+                r.unwrap_or_else(|e| panic!("{nombre}: {}", e.mensaje()));
+                let i = c.info().unwrap();
+                assert_eq!((i.version, i.revocation, i.cert_error), (version, Revocacion::Buena, None), "{nombre}");
+                assert!(c.read().starts_with(b"HTTP/1.0 200 ok"), "{nombre}");
+            }
+        }
+        if revocado {
+            // Con -k sigue y lo apunta (sin quitar la cadena, que sí era buena).
+            let (mut c, r) = reproducir("prueba.nf", true, v, 7);
+            r.unwrap_or_else(|e| panic!("{nombre}: {}", e.mensaje()));
+            assert!(c.is_ready());
+            let i = c.info().unwrap();
+            assert_eq!((i.version, i.revocation, i.cert_error), (version, Revocacion::Revocada, Some(CertError::Revocado)), "{nombre}");
+            assert!(i.chain.is_some());
+            assert!(c.read().starts_with(b"HTTP/1.0 200 ok"), "{nombre}");
+        }
+    }
+    assert_eq!(CertError::Revocado.mensaje(), "El certificado ha sido revocado por quien lo emitió.");
+}
+
+/// Inserta `msg` (un mensaje de saludo de TLS 1.2 en claro) tras el Certificate de un vuelo.
+fn con_certificate_status(v: &[u8], msg: &[u8]) -> Vec<u8> {
+    let (p, q) = mensaje12(v, 11);
+    let fin = q + 4 + (((v[q + 1] as usize) << 16) | ((v[q + 2] as usize) << 8) | v[q + 3] as usize);
+    let mut r = v[..fin].to_vec();
+    r.extend_from_slice(msg);
+    r.extend_from_slice(&v[fin..]);
+    let n = u16::from_be_bytes([v[p + 3], v[p + 4]]) as usize + msg.len();
+    r[p + 3..p + 5].copy_from_slice(&(n as u16).to_be_bytes());
+    r
+}
+
+#[test]
+fn certificate_status_tls12_inesperado_o_malo() {
+    let estado = |resp: &[u8]| {
+        let mut b = vec![1, 0, (resp.len() >> 8) as u8, resp.len() as u8];
+        b.extend_from_slice(resp);
+        hs13::mensaje(22, &b)
+    };
+    // Servidor que no anunció status_request y manda un CertificateStatus: error de protocolo.
+    let v = con_certificate_status(VUELOS12[0].1, &estado(OCSP_BUENO));
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    assert_eq!(c.feed(&v), Err(TlsError::Protocolo("mensaje inesperado")));
+    assert!(c.take_output().ends_with(&[21, 3, 3, 0, 2, 2, 10]));
+    // Anunciado, pero repetido: el segundo también es inesperado.
+    let (_, ini) = mensaje12(VUELOS_OCSP[2].1, 22);
+    let largo = 4 + (((VUELOS_OCSP[2].1[ini + 1] as usize) << 16) | ((VUELOS_OCSP[2].1[ini + 2] as usize) << 8) | VUELOS_OCSP[2].1[ini + 3] as usize);
+    let cs = VUELOS_OCSP[2].1[ini..ini + largo].to_vec();
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    let (p, _) = mensaje12(VUELOS_OCSP[2].1, 22);
+    let doble = {
+        let v = VUELOS_OCSP[2].1;
+        let mut r = v[..ini + largo].to_vec();
+        r.extend_from_slice(&cs);
+        r.extend_from_slice(&v[ini + largo..]);
+        let n = u16::from_be_bytes([v[p + 3], v[p + 4]]) as usize + cs.len();
+        r[p + 3..p + 5].copy_from_slice(&(n as u16).to_be_bytes());
+        r
+    };
+    assert_eq!(c.feed(&doble), Err(TlsError::Protocolo("mensaje inesperado")));
+    // Firma de la respuesta alterada (va en claro en 1.2): no se acepta como comprobada. El Finished ya no
+    // cuadra porque cambió el transcript, pero antes la respuesta queda anotada como no válida.
+    let mut v = VUELOS_OCSP[2].1.to_vec();
+    v[ini + largo - 1] ^= 1;
+    let mut c = fijo("prueba.nf", false);
+    c.take_output();
+    assert!(c.feed(&v).is_err());
+    assert_eq!(c.revoc, Revocacion::Invalida);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1080,5 +1268,75 @@ mod openssl {
         let (r, _) = get(&mut c, puerto);
         assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
         assert_eq!(c.info().unwrap().version, "TLS 1.3");
+    }
+
+    /// GET contra `s_server -status_file <resp>` con srv_ec; con `grabar` guarda el vuelo.
+    fn con_ocsp(proto: &str, nombre: &str, resp: &str, insecure: bool) -> (Client, Result<Vec<u8>, TlsError>) {
+        let f = datos().join(format!("{resp}.der"));
+        let (_s, puerto) = lanzar(proto, "srv_ec", &["-status_file", f.to_str().unwrap()]);
+        let mut c = fijo("prueba.nf", insecure);
+        let (r, recibido) = get(&mut c, puerto);
+        if std::env::var("NF_TLS_GRABAR").is_ok() && VUELOS_OCSP.iter().any(|v| v.0 == nombre) {
+            std::fs::write(datos().join(format!("vuelo_{nombre}.bin")), recibido).unwrap();
+        }
+        (c, r)
+    }
+
+    fn ocsp_en(proto: &str, version: &str, prefijo: &str) {
+        let (c, r) = con_ocsp(proto, &format!("{prefijo}ocsp_bueno"), "ocsp_bueno", false);
+        assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
+        let i = c.info().unwrap();
+        assert_eq!((i.version, i.revocation, i.cert_error), (version, Revocacion::Buena, None));
+        // Revocado: falla; con -k conecta avisando (el vuelo se graba con -k para que acabe el saludo).
+        let (_, r) = con_ocsp(proto, "sin_grabar", "ocsp_revocado", false);
+        assert_eq!(r, Err(TlsError::Cert(CertError::Revocado)));
+        let (c, r) = con_ocsp(proto, &format!("{prefijo}ocsp_revocado"), "ocsp_revocado", true);
+        assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"));
+        let i = c.info().unwrap();
+        assert_eq!((i.revocation, i.cert_error), (Revocacion::Revocada, Some(CertError::Revocado)));
+        // Respuestas que no valen (caducada, de otro certificado, delegado sin permiso): se sigue, sin comprobar.
+        for f in ["ocsp_caducado", "ocsp_otro", "ocsp_delegado_sin_eku"] {
+            let (c, r) = con_ocsp(proto, "sin_grabar", f, false);
+            assert!(r.unwrap().starts_with(b"HTTP/1.0 200 ok"), "{f}");
+            assert_eq!(c.info().unwrap().revocation, Revocacion::Invalida, "{f}");
+        }
+        let (c, r) = con_ocsp(proto, "sin_grabar", "ocsp_delegado", false);
+        assert!(r.is_ok());
+        assert_eq!(c.info().unwrap().revocation, Revocacion::Buena);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls_openssl_ocsp_engrapado() {
+        ocsp_en("-tls1_3", "TLS 1.3", "");
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_ocsp_engrapado() {
+        ocsp_en("-tls1_2", "TLS 1.2", "c12_");
+    }
+
+    #[test]
+    #[ignore]
+    fn tls_openssl_sin_ocsp_no_comprobada() {
+        let (_s, puerto) = lanzar("-tls1_3", "srv_ec", &[]);
+        let mut c = fijo("prueba.nf", false);
+        assert!(get(&mut c, puerto).0.is_ok());
+        assert_eq!(c.info().unwrap().revocation, Revocacion::NoAdjunta);
+    }
+
+    #[test]
+    #[ignore]
+    fn tls_openssl_p384_en_hello_retry() {
+        caso("hrr_p384", "srv_ec", &["-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-groups", "P-384"], "TLS_CHACHA20_POLY1305_SHA256", "secp384r1");
+        caso("sin_grabar_rsa_p384", "srv_rsa", &["-ciphersuites", "TLS_AES_256_GCM_SHA384", "-groups", "P-384"], "TLS_AES_256_GCM_SHA384", "secp384r1");
+    }
+
+    #[test]
+    #[ignore]
+    fn tls12_openssl_p384() {
+        caso12("c12_aes256_ec_p384", "srv_ec", "ECDHE-ECDSA-AES256-GCM-SHA384", &["-groups", "P-384"], "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384", "secp384r1", true);
+        caso12("sin_grabar_rsa_p384", "srv_rsa", "ECDHE-RSA-CHACHA20-POLY1305", &["-groups", "P-384"], "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256", "secp384r1", true);
     }
 }

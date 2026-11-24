@@ -238,7 +238,7 @@ impl Job {
     /// Empieza `cmd`. `None` si ya está hecha (sale por `out`) o no se pudo empezar.
     pub(super) fn start(cmd: NetCmd, sys: &mut dyn Platform, now: u64, out: &mut Vec<String>) -> Option<Job> {
         // Raíces y hora para comprobar certificados (una redirección puede llevar a https aunque la URL no lo sea).
-        let tls = matches!(cmd, NetCmd::Curl { .. }).then(|| (sys.files().root_store(), crate::service::hora_x509(sys.now())));
+        let tls = matches!(cmd, NetCmd::Curl { .. }).then(|| (sys.files().root_store(), crate::service::hora_utc(sys)));
         let Some(net) = sys.net() else {
             out.push(String::from(NO_CARD));
             return None;
@@ -522,6 +522,7 @@ fn step_curl(c: &mut Curl, sys: &mut dyn Platform, now: u64, out: &mut Vec<Strin
                         out.push(format!("* Emitido por: {}", i.issuer));
                         out.push(format!("* Caduca el: {d:02}/{m:02}/{y:04}"));
                     }
+                    out.push(format!("* Revocación: {}", i.revocation));
                 }
             }
             HttpEvent::Body(b) => match &mut c.save {

@@ -30,7 +30,7 @@
 //! Las llaves (la maestra de 64 bytes) solo viven dentro de `Xts`, que las borra al soltarse.
 use crate::block::{BlockDev, DiskError, BLOCK};
 use crate::cipher::Xts;
-use crate::crypto::{ct_eq, sha256, to_hex, from_hex, wipe};
+use crate::crypto::{ct_eq, from_hex, sha256, to_hex, wipe, Pbkdf2Paso};
 use crate::fs::FsError;
 use crate::keys::{normalize_recovery, KeyError, Slot, MASTER};
 use alloc::boxed::Box;
@@ -176,6 +176,37 @@ pub fn unlock(h: &Header, secret: &str, recovery: bool) -> Result<[u8; MASTER], 
         h.disk.unwrap(secret.as_bytes())
     };
     m.ok_or(KeyError::WrongSecret)
+}
+
+/// Primer paso de `unlock` por pasos: el PBKDF2 del registro que toque (clave del disco o código
+/// de recuperación). Se avanza con `step` y su `take` se pasa a `open_con`. El código se borra aquí.
+pub fn unlock_paso(h: &Header, secret: &str, recovery: bool) -> Result<Pbkdf2Paso, KeyError> {
+    if recovery {
+        let mut code = normalize_recovery(secret).ok_or(KeyError::WrongSecret)?.into_bytes();
+        let p = h.recovery.unwrap_paso(&code);
+        wipe(&mut code);
+        Ok(p)
+    } else {
+        Ok(h.disk.unwrap_paso(secret.as_bytes()))
+    }
+}
+
+/// Como `open` pero con la clave ya derivada por `unlock_paso`. Borra `dk`.
+pub fn open_con(
+    dev: Box<dyn BlockDev>,
+    hdr: Header,
+    dk: &mut [u8],
+    recovery: bool,
+) -> Result<Core, (Box<dyn BlockDev>, Header, KeyError)> {
+    let slot = if recovery { &hdr.recovery } else { &hdr.disk };
+    match slot.unwrap_con(dk) {
+        Some(mut m) => {
+            let c = Core::new(dev, hdr, &m);
+            wipe(&mut m);
+            Ok(c)
+        }
+        None => Err((dev, hdr, KeyError::WrongSecret)),
+    }
 }
 
 fn ke(e: DiskError) -> KeyError {

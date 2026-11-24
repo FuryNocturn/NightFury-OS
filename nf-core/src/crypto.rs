@@ -7,6 +7,7 @@
 //! - HMAC-SHA-256: RFC 2104 (vectores de RFC 4231).
 //! - PBKDF2-HMAC-SHA-256: RFC 8018.
 //! - HKDF-SHA-256: RFC 5869.
+//! - SHA-1: FIPS 180-4, solo para comparar el CertID de OCSP (RFC 6960); nunca para firmas.
 //! - SHA-384 y SHA-512: FIPS 180-4; HMAC-SHA-384 y HKDF-SHA-384.
 //! - Rng: generador sobre ChaCha20 (la semilla la pone la plataforma).
 //! - ChaCha20, Poly1305 y su AEAD: RFC 8439.
@@ -126,6 +127,46 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     s.finish()
 }
 
+/// SHA-1 (FIPS 180-4 §6.1). Roto para firmas: solo sirve para comparar el CertID de OCSP, que lo
+/// define la norma con ese algoritmo. Opera en memoria (la entrada es pequeña).
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h: [u32; 5] = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
+    let mut m = data.to_vec();
+    m.push(0x80);
+    while m.len() % 64 != 56 {
+        m.push(0);
+    }
+    m.extend_from_slice(&(data.len() as u64).wrapping_mul(8).to_be_bytes());
+    for b in m.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (x, c) in w.iter_mut().zip(b.chunks_exact(4)) {
+            *x = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b2, mut c, mut d, mut e] = h;
+        for (i, wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b2 & c) | (!b2 & d), 0x5a827999),
+                20..=39 => (b2 ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b2 & c) | (b2 & d) | (c & d), 0x8f1bbcdc),
+                _ => (b2 ^ c ^ d, 0xca62c1d6u32),
+            };
+            let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(*wi);
+            (e, d, c, b2, a) = (d, c, b2.rotate_left(30), a, t);
+        }
+        for (x, y) in h.iter_mut().zip([a, b2, c, d, e]) {
+            *x = x.wrapping_add(y);
+        }
+    }
+    let mut out = [0u8; 20];
+    for (o, x) in out.chunks_exact_mut(4).zip(h) {
+        o.copy_from_slice(&x.to_be_bytes());
+    }
+    out
+}
+
 /// HMAC-SHA-256 con la clave ya absorbida: se clona para cada mensaje.
 #[derive(Clone)]
 pub struct Hmac {
@@ -166,17 +207,69 @@ pub fn hmac(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 /// PBKDF2-HMAC-SHA-256: rellena `out` (cualquier longitud).
 pub fn pbkdf2(password: &[u8], salt: &[u8], iters: u32, out: &mut [u8]) {
-    let h = Hmac::new(password);
-    for (n, chunk) in out.chunks_mut(32).enumerate() {
-        let mut u = h.mac(&[salt, &(n as u32 + 1).to_be_bytes()]);
-        let mut t = u;
-        for _ in 1..iters.max(1) {
-            u = h.mac(&[&u]);
-            for (a, b) in t.iter_mut().zip(u) {
-                *a ^= b;
+    let mut p = Pbkdf2Paso::new(password, salt, iters, out.len());
+    while p.step(u32::MAX) {}
+    out.copy_from_slice(&p.out);
+}
+
+/// PBKDF2-HMAC-SHA-256 por pasos: avanza unas vueltas por llamada para no congelar el escritorio.
+/// Da lo mismo que `pbkdf2`. Borra sus restos al soltarse.
+pub struct Pbkdf2Paso {
+    h: Hmac,
+    salt: Vec<u8>,
+    iters: u32,
+    out: Vec<u8>,
+    /// Bloque de 32 bytes en curso y vueltas ya hechas en él (0: aún sin empezar).
+    block: usize,
+    done: u32,
+    u: [u8; 32],
+    t: [u8; 32],
+}
+
+impl Pbkdf2Paso {
+    pub fn new(password: &[u8], salt: &[u8], iters: u32, out_len: usize) -> Pbkdf2Paso {
+        Pbkdf2Paso { h: Hmac::new(password), salt: salt.to_vec(), iters: iters.max(1), out: alloc::vec![0; out_len], block: 0, done: 0, u: [0; 32], t: [0; 32] }
+    }
+
+    /// Hace como mucho `n` vueltas más; `true` mientras falte trabajo.
+    pub fn step(&mut self, mut n: u32) -> bool {
+        while n > 0 && self.block * 32 < self.out.len() {
+            if self.done == 0 {
+                self.u = self.h.mac(&[&self.salt, &(self.block as u32 + 1).to_be_bytes()]);
+                self.t = self.u;
+                self.done = 1;
+            }
+            let k = (self.iters - self.done).min(n);
+            for _ in 0..k {
+                self.u = self.h.mac(&[&self.u]);
+                for (a, b) in self.t.iter_mut().zip(self.u) {
+                    *a ^= b;
+                }
+            }
+            self.done += k;
+            n -= k;
+            if self.done == self.iters {
+                let (s, e) = (self.block * 32, ((self.block + 1) * 32).min(self.out.len()));
+                self.out[s..e].copy_from_slice(&self.t[..e - s]);
+                self.block += 1;
+                self.done = 0;
             }
         }
-        chunk.copy_from_slice(&t[..chunk.len()]);
+        self.block * 32 < self.out.len()
+    }
+
+    /// La clave derivada, cuando `step` ya dijo `false`. Quien la recibe debe borrarla (`wipe`).
+    pub fn take(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.out)
+    }
+}
+
+impl Drop for Pbkdf2Paso {
+    fn drop(&mut self) {
+        wipe(&mut self.u);
+        wipe(&mut self.t);
+        wipe(&mut self.out);
+        wipe(&mut self.salt);
     }
 }
 
@@ -877,6 +970,14 @@ mod tests {
     }
 
     #[test]
+    fn sha1_vectores_fips_180_4() {
+        assert_eq!(hx(&sha1(b"")), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(hx(&sha1(b"abc")), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        assert_eq!(hx(&sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")), "84983e441c3bd26ebaae4aa1f95129e5e54670f1");
+        assert_eq!(hx(&sha1(&[b'a'; 1_000_000])), "34aa973cd4c4daa4f61eeb2bdbad27316534016f");
+    }
+
+    #[test]
     fn hmac_vectores_rfc_4231() {
         assert_eq!(hx(&hmac(&[0x0b; 20], b"Hi There")), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
         assert_eq!(hx(&hmac(b"Jefe", b"what do ya want for nothing?")), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
@@ -900,6 +1001,23 @@ mod tests {
         let mut o = [0u8; 40];
         pbkdf2(b"passwordPASSWORDpassword", b"saltSALTsaltSALTsaltSALTsaltSALTsalt", 4096, &mut o);
         assert_eq!(hx(&o), "348c89dbcbd32b2f32d814b8116e84cf2b17347ebc1800181c4e2a1fb8dd53e1c635518c7dac47e9");
+    }
+
+    #[test]
+    fn pbkdf2_por_pasos_da_lo_mismo() {
+        for (iters, len) in [(1u32, 32usize), (7, 40), (50, 64), (1000, 64), (3, 0), (0, 5)] {
+            let mut a = alloc::vec![0u8; len];
+            pbkdf2(b"clave", b"sal", iters, &mut a);
+            for n in [1u32, 3, 10, 999, u32::MAX] {
+                let mut p = Pbkdf2Paso::new(b"clave", b"sal", iters, len);
+                let mut pasos = 0;
+                while p.step(n) {
+                    pasos += 1;
+                    assert!(pasos < 1_000_000);
+                }
+                assert_eq!(p.take(), a, "iters {iters} len {len} n {n}");
+            }
+        }
     }
 
     #[test]

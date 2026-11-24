@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 
-//! Clave pública: verificación de firmas (RSA, ECDSA) y ECDH en P-256, para TLS y X.509.
+//! Clave pública: verificación de firmas (RSA, ECDSA) y ECDH en P-256 y P-384, para TLS y X.509.
 //! Contrato fijo de la v0.12.2: `x509` y `tls` solo usan lo que hay aquí.
 //! Normas: RFC 8017 (RSA PKCS#1 v1.5 y PSS), FIPS 186-4 y SEC 1 (ECDSA, curvas), RFC 5903 (ECDH).
 
@@ -14,7 +14,7 @@ mod ec;
 #[cfg(test)]
 mod vectores;
 
-pub use ec::{p256_ecdh, p256_public};
+pub use ec::{p256_ecdh, p256_public, p384_ecdh, p384_public};
 
 /// Clave pública de un certificado (SubjectPublicKeyInfo ya decodificado).
 #[derive(Clone, Debug, PartialEq, Eq)]

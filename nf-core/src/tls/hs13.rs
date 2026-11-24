@@ -9,7 +9,7 @@ use super::record::{Aead, Keys, CT_CCS, CT_SALUDO};
 use super::{ilegal, Client, Fallo, Rd, SessionInfo, St, TlsError, DEC, UNEXP};
 use crate::crypto::{ct_eq, sha256, wipe, x25519, X25519_BASE};
 use crate::pk::{self, PubKey, SigAlg};
-use crate::x509::{verify_server, Cert, CertError};
+use crate::x509::{comprobar_ocsp, verify_server_emisor, Cert, CertError, Revocacion};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -70,6 +70,16 @@ fn extensiones(data: &[u8]) -> Result<Vec<(u16, &[u8])>, Fallo> {
     Ok(v)
 }
 
+/// OCSPResponse de un CertificateStatus (`status_type` ocsp = 1 y respuesta de hasta 2^24-1 bytes); vacía
+/// si no tiene esa forma (se tratará como respuesta no válida, sin tumbar la conexión).
+pub(super) fn respuesta_ocsp(b: &[u8]) -> Vec<u8> {
+    let mut r = Rd(b);
+    match (r.u8(), r.v24()) {
+        (Some(1), Some(o)) if r.0.is_empty() => o.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// ALPN del servidor (RFC 7301): un solo protocolo y tiene que ser el que ofrecimos.
 pub(super) fn alpn(b: &[u8]) -> Result<(), Fallo> {
     let mut l = Rd(Rd(b).v16().ok_or(DEC)?);
@@ -83,8 +93,18 @@ pub(super) fn alpn(b: &[u8]) -> Result<(), Fallo> {
     Ok(())
 }
 
+/// Nombre del grupo para mostrar.
+pub(super) fn nombre_grupo(g: u16) -> &'static str {
+    match g {
+        0x0017 => "secp256r1",
+        0x0018 => "secp384r1",
+        _ => "x25519",
+    }
+}
+
 fn alerta_cert(e: CertError) -> u8 {
     match e {
+        CertError::Revocado => 44,
         CertError::Caducado | CertError::AunNoValido => 45,
         CertError::RaizDesconocida | CertError::Autofirmado => 48,
         CertError::NoSoportado => 43,
@@ -118,9 +138,10 @@ impl Client {
             v.extend_from_slice(&x.to_be_bytes());
         }
         ext(&mut e, 0x002b, &v);
-        ext(&mut e, 0x000a, &[0, 4, 0x00, 0x1d, 0x00, 0x17]);
+        ext(&mut e, 0x000a, &[0, 6, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18]);
         let share: Vec<u8> = match (self.grupo, &self.p_priv) {
             (0x0017, Some(p)) => pk::p256_public(p).map(|k| k.to_vec()).unwrap_or_default(),
+            (0x0018, _) => self.q_priv.as_ref().and_then(pk::p384_public).map(|k| k.to_vec()).unwrap_or_default(),
             _ => x25519(&self.x_priv, &X25519_BASE).to_vec(),
         };
         let mut k = ((share.len() + 4) as u16).to_be_bytes().to_vec();
@@ -134,6 +155,8 @@ impl Client {
         }
         ext(&mut e, 0x000d, &sa);
         ext(&mut e, 0x0010, b"\x00\x09\x08http/1.1");
+        // status_request (RFC 6066 §8): OCSP, sin responder_id ni extensiones.
+        ext(&mut e, 0x0005, &[1, 0, 0, 0, 0]);
         // TLS 1.2: formatos de punto (solo sin comprimir), extended_master_secret y renegotiation_info vacía.
         ext(&mut e, 0x000b, &[1, 0]);
         ext(&mut e, 0x0017, &[]);
@@ -203,6 +226,13 @@ impl Client {
                 (St::Esp12Ske, 12) => {
                     self.agregar(&msg)?;
                     self.en_ske(&msg)?
+                }
+                // CertificateStatus (RFC 6066 §8): solo si el servidor anunció status_request, y una vez.
+                (St::Esp12Ske, 22) if self.s12.status => {
+                    self.agregar(&msg)?;
+                    self.s12.status = false;
+                    self.stapled = Some(respuesta_ocsp(&msg[4..]));
+                    self.revisar_ocsp()?
                 }
                 (St::Esp12Hd, 13) if self.cert_ctx.is_none() => {
                     self.agregar(&msg)?;
@@ -282,9 +312,12 @@ impl Client {
                 return Err(ilegal("secreto x25519 nulo"));
             }
             s.to_vec()
-        } else {
+        } else if grupo == 0x0017 {
             let p = self.p_priv.as_ref().ok_or(UNEXP)?;
             pk::p256_ecdh(p, share).ok_or(ilegal("key_share P-256 no válido"))?.to_vec()
+        } else {
+            let q = self.q_priv.as_ref().ok_or(UNEXP)?;
+            pk::p384_ecdh(q, share).ok_or(ilegal("key_share P-384 no válido"))?.to_vec()
         };
         self.suite = Some(suite);
         self.agregar(msg)?;
@@ -293,6 +326,10 @@ impl Client {
         wipe(&mut shared);
         wipe(&mut self.x_priv);
         self.p_priv = None;
+        if let Some(q) = self.q_priv.as_mut() {
+            wipe(q);
+        }
+        self.q_priv = None;
         self.rx = Some(claves(h, suite.aead, &s));
         (self.hs_secret, self.c_hs, self.s_hs) = (hs, c, s);
         self.st = St::EsperaEe;
@@ -306,14 +343,14 @@ impl Client {
             return Err(UNEXP);
         }
         let mut cambia = false;
-        let mut p256 = false;
+        let mut nuevo = 0;
         if let Some(k) = ks {
-            // Solo puede pedir un grupo que ofrecimos y que aún no mandamos: P-256.
+            // Solo puede pedir un grupo que ofrecimos y que aún no mandamos: P-256 o P-384.
             let [a, b] = *k else { return Err(DEC) };
-            if u16::from_be_bytes([a, b]) != 0x0017 || self.grupo == 0x0017 {
+            nuevo = u16::from_be_bytes([a, b]);
+            if !matches!(nuevo, 0x0017 | 0x0018) || nuevo == self.grupo {
                 return Err(ilegal("grupo no válido en HelloRetryRequest"));
             }
-            p256 = true;
             cambia = true;
         }
         if let Some(c) = cookie {
@@ -334,8 +371,10 @@ impl Client {
         self.suite = Some(suite);
         self.hrr_visto = true;
         self.agregar(msg)?;
-        if p256 {
-            self.nueva_p256()?;
+        match nuevo {
+            0x0017 => self.nueva_p256()?,
+            0x0018 => self.nueva_p384()?,
+            _ => {}
         }
         if !self.ccs_enviado {
             self.out.extend_from_slice(&CCS);
@@ -361,6 +400,24 @@ impl Client {
         wipe(&mut k);
         if self.p_priv.is_none() {
             return Err(Fallo(80, TlsError::Protocolo("no se pudo generar la clave P-256")));
+        }
+        Ok(())
+    }
+
+    /// Genera la privada P-384 (y pasa el grupo a secp384r1).
+    pub(super) fn nueva_p384(&mut self) -> Result<(), Fallo> {
+        let mut k = [0u8; 48];
+        for _ in 0..8 {
+            self.rng.fill(&mut k);
+            if pk::p384_public(&k).is_some() {
+                self.q_priv = Some(k);
+                self.grupo = 0x0018;
+                break;
+            }
+        }
+        wipe(&mut k);
+        if self.q_priv.is_none() {
+            return Err(Fallo(80, TlsError::Protocolo("no se pudo generar la clave P-384")));
         }
         Ok(())
     }
@@ -407,7 +464,13 @@ impl Client {
         let mut ders: Vec<&[u8]> = Vec::new();
         while !l.0.is_empty() {
             let der = l.v24().ok_or(DEC)?;
-            l.v16().ok_or(DEC)?; // extensiones de la entrada (OCSP, SCT…): se ignoran
+            let ex = l.v16().ok_or(DEC)?;
+            // Solo la primera entrada (la hoja) puede traer status_request (§4.4.2.1); las demás extensiones se ignoran.
+            if ders.is_empty() {
+                if let Some((_, b)) = extensiones(ex)?.into_iter().find(|e| e.0 == 0x0005) {
+                    self.stapled = Some(respuesta_ocsp(b));
+                }
+            }
             if der.is_empty() {
                 return Err(DEC);
             }
@@ -420,6 +483,7 @@ impl Client {
             return Err(DEC);
         }
         self.cadena(&ders)?;
+        self.revisar_ocsp()?;
         self.st = St::EsperaCv;
         Ok(())
     }
@@ -427,14 +491,36 @@ impl Client {
     /// Valida la cadena (hoja primero) y guarda la clave de la hoja; con `insecure` solo anota el fallo.
     pub(super) fn cadena(&mut self, ders: &[&[u8]]) -> Result<(), Fallo> {
         let hoja = ders[0];
-        match verify_server(ders, &self.host, self.now, &self.roots, &pk::verify) {
-            Ok(ci) => self.chain = Some(ci),
+        match verify_server_emisor(ders, &self.host, self.now, &self.roots, &pk::verify) {
+            Ok((ci, emisor)) => {
+                self.chain = Some(ci);
+                self.leaf_der = hoja.to_vec();
+                self.issuer_der = emisor;
+            }
             Err(e) if self.insecure => self.cert_error = Some(e),
             Err(e) => return Err(Fallo(alerta_cert(e), TlsError::Cert(e))),
         }
         // Con -k también se comprueba el CertificateVerify, así que hace falta la clave de la hoja.
         let key = Cert::parse(hoja).ok().and_then(|c| c.public_key().cloned());
         self.leaf = Some(key.ok_or(Fallo(43, TlsError::Cert(CertError::NoSoportado)))?);
+        Ok(())
+    }
+
+    /// Comprueba la respuesta OCSP adjunta (si la hay). Revocado: error, o solo aviso con `-k`; cualquier
+    /// otro resultado deja seguir (anotado en `revoc`).
+    pub(super) fn revisar_ocsp(&mut self) -> Result<(), Fallo> {
+        let Some(r) = self.stapled.take() else { return Ok(()) };
+        self.revoc = if self.issuer_der.is_empty() {
+            Revocacion::Invalida // sin cadena validada (-k) no hay emisor contra el que comprobarla
+        } else {
+            comprobar_ocsp(&r, &self.leaf_der, &self.issuer_der, self.now, &pk::verify)
+        };
+        if self.revoc == Revocacion::Revocada {
+            if !self.insecure {
+                return Err(Fallo(44, TlsError::Cert(CertError::Revocado)));
+            }
+            self.cert_error.get_or_insert(CertError::Revocado);
+        }
         Ok(())
     }
 
@@ -510,7 +596,8 @@ impl Client {
             suite: s.nombre,
             chain: self.chain.take(),
             cert_error: self.cert_error,
-            group: if self.grupo == 0x0017 { "secp256r1" } else { "x25519" },
+            group: nombre_grupo(self.grupo),
+            revocation: self.revoc,
         });
         self.listo = true;
         self.st = St::Conectado;

@@ -11,7 +11,7 @@
 //! es el contenido del archivo oculto `.nflabel` de la raíz.
 use super::{part, FsKind, Partition, SectorDev, Volume};
 use crate::block::{BlockDev, DiskError, BLOCK};
-use crate::crypto::wipe;
+use crate::crypto::{wipe, Pbkdf2Paso};
 use crate::cryptdev::{self, Core, CryptDev, Header, State};
 use crate::fs::{same, Entry, FsError, Nffs};
 use crate::keys::{self, KeyError, Pool};
@@ -97,10 +97,28 @@ impl LockedDrive {
     /// la unidad para poder reintentar.
     pub fn unlock(self, secret: &str, recovery: bool) -> Result<Box<dyn Volume>, (LockedDrive, KeyError)> {
         let LockedDrive { dev, hdr, ro } = self;
-        let core = match cryptdev::open(dev, hdr, secret, recovery) {
-            Ok(c) => Rc::new(RefCell::new(c)),
-            Err((dev, hdr, e)) => return Err((LockedDrive { dev, hdr, ro }, e)),
-        };
+        match cryptdev::open(dev, hdr, secret, recovery) {
+            Ok(c) => Self::montar(c, ro),
+            Err((dev, hdr, e)) => Err((LockedDrive { dev, hdr, ro }, e)),
+        }
+    }
+
+    /// Empieza el `unlock` por pasos: el PBKDF2 que hay que avanzar (`Pbkdf2Paso::step`) antes de `unlock_con`.
+    pub fn unlock_paso(&self, secret: &str, recovery: bool) -> Result<Pbkdf2Paso, KeyError> {
+        cryptdev::unlock_paso(&self.hdr, secret, recovery)
+    }
+
+    /// Termina el `unlock` por pasos con la clave derivada (`Pbkdf2Paso::take`); la borra.
+    pub fn unlock_con(self, dk: &mut [u8], recovery: bool) -> Result<Box<dyn Volume>, (LockedDrive, KeyError)> {
+        let LockedDrive { dev, hdr, ro } = self;
+        match cryptdev::open_con(dev, hdr, dk, recovery) {
+            Ok(c) => Self::montar(c, ro),
+            Err((dev, hdr, e)) => Err((LockedDrive { dev, hdr, ro }, e)),
+        }
+    }
+
+    fn montar(core: Core, ro: bool) -> Result<Box<dyn Volume>, (LockedDrive, KeyError)> {
+        let core = Rc::new(RefCell::new(core));
         // Con la clave buena ya se puede escribir: rehace el bloque que quedó a medias o remata la
         // conversión. Si algo falla, la unidad vuelve a quedar cerrada.
         // shortcut: una unidad a medio convertir se monta tal cual y la conversión no sigue; aquí solo se crean unidades cifradas del todo.

@@ -157,6 +157,11 @@ calls! {
     RemoveRoot { sha: [u8; 32] } = 87,
     NetConnectTls { dst: Ipv4, port: u16, host: String, insecure: bool } = 88,
     NetTlsInfo { id: SockId } = 89,
+    TimeCfg = 90,
+    SetTimeCfg { zona: u8, auto: bool } = 91,
+    SetClock { t: DateTime } = 92,
+    TimeSync = 93,
+    TimeSyncInfo = 94,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -426,6 +431,24 @@ impl Wire for netperm::Perm {
     }
 }
 
+impl Wire for crate::hora::Ajuste {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.zona).put(&self.auto);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(crate::hora::Ajuste { zona: r.get()?, auto: r.get()? })
+    }
+}
+
+impl Wire for crate::hora::SyncInfo {
+    fn put(&self, w: &mut Writer) {
+        w.put(&self.estado).put(&self.fin);
+    }
+    fn get(r: &mut Reader) -> WireResult<Self> {
+        Ok(crate::hora::SyncInfo { estado: r.get()?, fin: r.get()? })
+    }
+}
+
 macro_rules! net_id {
     ($($t:ident),*) => {$(
         impl Wire for $t {
@@ -588,10 +611,10 @@ impl Wire for NetError {
 impl Wire for TlsInfo {
     fn put(&self, w: &mut Writer) {
         w.put(&self.version).put(&self.suite).put(&self.group).put(&self.subject).put(&self.issuer);
-        w.put(&self.expires.0).put(&self.expires.1).put(&self.expires.2).put(&self.cert_error);
+        w.put(&self.expires.0).put(&self.expires.1).put(&self.expires.2).put(&self.cert_error).put(&self.revocation);
     }
     fn get(r: &mut Reader) -> WireResult<Self> {
-        Ok(TlsInfo { version: r.get()?, suite: r.get()?, group: r.get()?, subject: r.get()?, issuer: r.get()?, expires: (r.get()?, r.get()?, r.get()?), cert_error: r.get()? })
+        Ok(TlsInfo { version: r.get()?, suite: r.get()?, group: r.get()?, subject: r.get()?, issuer: r.get()?, expires: (r.get()?, r.get()?, r.get()?), cert_error: r.get()?, revocation: r.get()? })
     }
 }
 
@@ -768,9 +791,13 @@ fn no_status() -> NetStatus {
     NetStatus { state: State::NoAdapter, adapter: String::new(), mac: [0; 6], speed_mbps: 0, full_duplex: false, ip: None, mask: None, gateway: None, dns: Vec::new(), dhcp_server: None, lease_s: 0, lease_since_ms: 0 }
 }
 
-/// La hora del equipo como la quiere `x509`. shortcut: el reloj (RTC) va en hora local y aquí se toma como
-/// UTC; el desfase (como mucho unas horas) solo importa con un certificado que nace o caduca ese mismo día.
-/// Mejorar cuando el sistema conozca su zona horaria.
+/// La hora UTC del equipo como la quiere `x509`: el reloj va en hora local y se pasa a UTC con la zona guardada.
+pub(crate) fn hora_utc(sys: &mut dyn Platform) -> crate::x509::Time {
+    let z = sys.files().time_cfg().zona();
+    hora_x509(crate::hora::local_a_utc(sys.now(), z))
+}
+
+/// Una fecha y hora que ya es UTC, en el formato de `x509`.
 pub(crate) fn hora_x509(d: DateTime) -> crate::x509::Time {
     crate::x509::Time { year: d.year, month: d.month, day: d.day, hour: d.hour, min: d.minute, sec: d.second }
 }
@@ -988,6 +1015,15 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
             let now = sys.now();
             gate(system, Err(denied), || sys.files().remove_root(sha, now))
         }
+        // ---- Fecha y hora: ver, cualquiera; cambiar, el sistema y un administrador (lo comprueba `Files`) ----
+        TimeCfg => encode(&sys.files().time_cfg()),
+        SetTimeCfg { zona, auto } => {
+            let now = sys.now();
+            gate(system, Err(denied), || sys.files().set_time_cfg(crate::hora::Ajuste { zona, auto }, now))
+        }
+        SetClock { t } => gate(system, Err(denied), || sys.files().set_clock(t)),
+        TimeSync => gate(system, Err(denied), || sys.files().time_sync()),
+        TimeSyncInfo => encode(&sys.files().time_sync_info()),
         NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetConnectTls { .. } | NetTlsInfo { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             if !system {
@@ -1007,7 +1043,7 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
                 }
             }
             // Raíces de confianza y hora UTC para validar el certificado (solo si se va a abrir una conexión segura).
-            let tls_env = matches!(call, NetConnectTls { .. }).then(|| (sys.files().root_store(), hora_x509(sys.now())));
+            let tls_env = matches!(call, NetConnectTls { .. }).then(|| (sys.files().root_store(), hora_utc(sys)));
             match sys.net() {
                 // `renew` cambia la red de todo el equipo: solo el sistema. La MAC identifica el equipo:
                 // un programa de terceros no la ve.
@@ -1439,6 +1475,21 @@ impl<T: Transport> FilesApi for RemoteFiles<T> {
     fn drive_result(&mut self) -> Option<Result<Option<String>, FsError>> {
         self.ask(Call::DriveResult, None)
     }
+    fn time_cfg(&mut self) -> crate::hora::Ajuste {
+        self.ask(Call::TimeCfg, crate::hora::Ajuste::default())
+    }
+    fn set_time_cfg(&mut self, a: crate::hora::Ajuste, _now: DateTime) -> Result<(), FsError> {
+        self.fs(Call::SetTimeCfg { zona: a.zona, auto: a.auto })
+    }
+    fn set_clock(&mut self, t: DateTime) -> Result<(), FsError> {
+        self.fs(Call::SetClock { t })
+    }
+    fn time_sync(&mut self) -> Result<(), FsError> {
+        self.fs(Call::TimeSync)
+    }
+    fn time_sync_info(&mut self) -> crate::hora::SyncInfo {
+        self.ask(Call::TimeSyncInfo, crate::hora::SyncInfo::default())
+    }
 }
 
 /// `NetApi` de un programa: cada método es un viaje al sistema. Sin respuesta o con una rota, no
@@ -1623,6 +1674,35 @@ pub(crate) mod tests {
         let via = || Via { real: real.clone(), system, own: own.clone() };
         let p = Prog { real: real.clone(), fs: RemoteFiles(via()), dummy: Files::default(), pool: Pool::new(), net: RemoteNet(via()), own: own.clone() };
         (real, p)
+    }
+
+    #[test]
+    fn hora_por_el_servicio_y_utc_de_x509() {
+        use crate::hora::Ajuste;
+        // El sistema (como Configuración): ve, cambia la zona y pide poner el reloj.
+        let (real, mut p) = prog(true);
+        assert_eq!(p.fs().time_cfg(), Ajuste::default());
+        // El reloj de pruebas marca 21:37:05 locales en Madrid (invierno): 20:37:05 UTC.
+        assert_eq!(hora_utc(&mut *real.borrow_mut()).hour, 20);
+        assert_eq!(p.fs().set_time_cfg(Ajuste { zona: 1, auto: false }, NOW), Ok(()));
+        assert_eq!(p.fs().time_cfg(), Ajuste { zona: 1, auto: false });
+        // Canarias es UTC+0: la UTC es la hora local.
+        assert_eq!(hora_utc(&mut *real.borrow_mut()).hour, 21);
+        assert_eq!(p.fs().set_time_cfg(Ajuste { zona: 200, auto: false }, NOW), Err(FsError::Denied));
+        let t = DateTime { year: 2027, month: 3, day: 1, hour: 8, minute: 30, second: 0 };
+        assert_eq!(p.fs().set_clock(t), Ok(()));
+        assert_eq!(p.fs().set_clock(DateTime { month: 13, ..t }), Err(FsError::Invalid));
+        assert_eq!(real.borrow_mut().files().hora_pendiente(), (Some(t), false));
+        assert_eq!(p.fs().time_sync(), Ok(()));
+        assert_eq!(real.borrow_mut().files().hora_pendiente(), (None, true));
+        assert_eq!(p.fs().time_sync_info().estado, 0);
+        // Un programa de terceros ve la zona, pero no cambia nada.
+        let (real, mut q) = prog(false);
+        assert_eq!(q.fs().time_cfg(), Ajuste::default());
+        assert_eq!(q.fs().set_time_cfg(Ajuste { zona: 1, auto: false }, NOW), Err(FsError::Denied));
+        assert_eq!(q.fs().set_clock(t), Err(FsError::Denied));
+        assert_eq!(q.fs().time_sync(), Err(FsError::Denied));
+        assert_eq!(real.borrow_mut().files().hora_pendiente(), (None, false));
     }
 
     fn tecla(app: &mut Box<dyn apps::App>, p: &mut Prog, key: Key, ch: Option<char>, ctrl: bool) -> Option<DialogRequest> {
@@ -2168,7 +2248,7 @@ pub(crate) mod tests {
         assert!(decode::<NetError>(&[99]).is_err() && decode::<TcpState>(&[9]).is_err() && decode::<State>(&[9]).is_err());
         let t = TcpState::Failed(NetError::Reset);
         assert_eq!(decode::<TcpState>(&encode(&t)), Ok(t));
-        let i = TlsInfo { version: s("TLS 1.3"), suite: s("TLS_AES_128_GCM_SHA256"), group: s("x25519"), subject: s("ñ (O)"), issuer: s("R"), expires: (2050, 1, 1), cert_error: Some(s("mal")) };
+        let i = TlsInfo { version: s("TLS 1.3"), suite: s("TLS_AES_128_GCM_SHA256"), group: s("x25519"), subject: s("ñ (O)"), issuer: s("R"), expires: (2050, 1, 1), cert_error: Some(s("mal")), revocation: s("comprobada (OCSP)") };
         assert_eq!(decode::<TlsInfo>(&encode(&i)), Ok(i));
         let r = PingReply { from: SRV, bytes: 32, rtt_ms: 7, ttl: 60 };
         assert_eq!(decode::<PingReply>(&encode(&r)), Ok(r));

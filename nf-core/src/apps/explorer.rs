@@ -1140,10 +1140,12 @@ impl Explorer {
     /// Pide la contraseña de una unidad cifrada (vacía + Aceptar = usar el código de recuperación).
     fn ask_unlock(&mut self, d: DriveInfo, cx: &mut Ctx) {
         self.job = Some(DrvJob { letter: d.letter, dev: (d.device.clone(), d.total), internal: !d.removable, name: d.name(), op: DrvOp::Unlock, kind: FormatKind::Fat32, label: String::new(), pw: String::new() });
-        cx.dialog = Some(DialogRequest::Password {
+        cx.dialog = Some(DialogRequest::Unlock {
             tag: TAG_DRV_PW,
             title: String::from("Desbloquear unidad"),
             label: format!("Contraseña de {} (vacía: usar el código de recuperación):", d.name()),
+            letter: d.letter,
+            recovery: false,
         });
         cx.redraw = true;
     }
@@ -1248,21 +1250,12 @@ impl Explorer {
         }
     }
 
-    /// Desbloquea con la contraseña o el código y abre la unidad.
-    fn drive_unlock(&mut self, secret: &str, recovery: bool, cx: &mut Ctx) {
-        let Some(j) = self.job.as_ref() else { return };
-        let l = j.letter;
-        match cx.sys.fs().unlock_drive(l, secret, recovery) {
-            Ok(()) => {
-                self.drop_job();
-                self.reload(cx.sys);
-                self.go(&format!("{l}:\\"), true, cx);
-            }
-            Err(e) => {
-                self.drop_job();
-                self.drive_msg("Desbloquear unidad", String::from(e.text()), cx);
-            }
-        }
+    /// El diálogo de desbloqueo ya abrió la unidad (lo hace él, con «Desbloqueando…»).
+    fn drive_unlocked(&mut self, cx: &mut Ctx) {
+        let Some(l) = self.job.as_ref().map(|j| j.letter) else { return };
+        self.drop_job();
+        self.reload(cx.sys);
+        self.go(&format!("{l}:\\"), true, cx);
     }
 
     fn go(&mut self, path: &str, push: bool, cx: &mut Ctx) {
@@ -2547,14 +2540,15 @@ impl App for Explorer {
             DialogResult::Text { tag: TAG_DRV_PW, value: Some(mut pw) } => {
                 match self.job.as_ref().map(|j| j.op) {
                     Some(DrvOp::Unlock) if pw.is_empty() => {
-                        cx.dialog = Some(DialogRequest::Input {
+                        let letter = self.job.as_ref().map_or('C', |j| j.letter);
+                        cx.dialog = Some(DialogRequest::Unlock {
                             tag: TAG_DRV_REC,
                             title: String::from("Código de recuperación"),
                             label: String::from("Escribe el código de recuperación de la unidad:"),
-                            value: String::new(),
+                            letter,
+                            recovery: true,
                         });
                     }
-                    Some(DrvOp::Unlock) => self.drive_unlock(&pw, false, cx),
                     Some(DrvOp::Encrypt) if pw.chars().count() < MIN_PASSWORD => {
                         self.drop_job();
                         self.drive_msg("Cifrar unidad", format!("La contraseña debe tener al menos {MIN_PASSWORD} caracteres."), cx);
@@ -2586,10 +2580,7 @@ impl App for Explorer {
                 }
                 scrub(&mut p2);
             }
-            DialogResult::Text { tag: TAG_DRV_REC, value: Some(mut code) } => {
-                self.drive_unlock(code.trim(), true, cx);
-                scrub(&mut code);
-            }
+            DialogResult::Answer { tag: TAG_DRV_PW | TAG_DRV_REC, answer: Answer::Ok } => self.drive_unlocked(cx),
             DialogResult::Text { tag: TAG_DRV_LABEL | TAG_DRV_PW | TAG_DRV_PW2 | TAG_DRV_REC, value: None } => self.drop_job(),
             _ => {}
         }
@@ -4889,7 +4880,7 @@ mod tests {
         t.cx(|e, cx| e.ask_unlock(DriveInfo { locked: true, ..d }, cx));
         // Vacía: se pasa al código de recuperación.
         let d = t.answer(DialogResult::Text { tag: TAG_DRV_PW, value: Some(String::new()) });
-        assert!(matches!(d, Some(DialogRequest::Input { tag: TAG_DRV_REC, .. })));
+        assert!(matches!(d, Some(DialogRequest::Unlock { tag: TAG_DRV_REC, recovery: true, letter: 'D', .. })));
         // Cancelar cierra la operación.
         t.answer(DialogResult::Text { tag: TAG_DRV_REC, value: None });
         assert!(t.e.job.is_none());

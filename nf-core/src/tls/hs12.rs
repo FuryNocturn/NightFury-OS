@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
-//! Saludo de TLS 1.2 del cliente (RFC 5246, 5289, 7905, 8422, 7627 y 5746): solo ECDHE (x25519 y
-//! secp256r1) con AES-GCM o ChaCha20-Poly1305. Sin CBC, sin RSA como intercambio de claves, sin
+//! Saludo de TLS 1.2 del cliente (RFC 5246, 5289, 7905, 8422, 7627 y 5746): solo ECDHE (x25519,
+//! secp256r1 y secp384r1) con AES-GCM o ChaCha20-Poly1305. Sin CBC, sin RSA como intercambio de claves, sin
 //! reanudación ni renegociación (por eso, si el servidor no admite extended_master_secret, se sigue
 //! sin él: sus ataques necesitan reanudar o renegociar).
 
-use super::hs13::{alpn, mensaje, Suite, CCS};
+use super::hs13::{alpn, mensaje, nombre_grupo, Suite, CCS};
 use super::keys::{Hash, Secret};
 use super::record::{Aead, Keys};
 use super::{ilegal, Client, Fallo, Rd, SessionInfo, St, TlsError, DEC, UNEXP};
@@ -29,6 +29,8 @@ pub(super) struct S12 {
     pub activo: bool,
     /// El servidor aceptó extended_master_secret.
     pub ems: bool,
+    /// El servidor anunció status_request: puede llegar un CertificateStatus tras el Certificate.
+    pub status: bool,
     pub srv_random: [u8; 32],
     /// Curva y punto del ServerKeyExchange, ya verificado.
     ske: Option<(u16, Vec<u8>)>,
@@ -40,7 +42,7 @@ pub(super) struct S12 {
 
 impl S12 {
     pub fn nuevo() -> S12 {
-        S12 { activo: false, ems: false, srv_random: [0; 32], ske: None, rx_pend: None, esperado: Secret::vacio() }
+        S12 { activo: false, ems: false, status: false, srv_random: [0; 32], ske: None, rx_pend: None, esperado: Secret::vacio() }
     }
 }
 
@@ -93,10 +95,12 @@ impl Client {
             return Err(DEC);
         }
         let suite = *SUITES12.iter().find(|s| s.id == suite_id).ok_or(ilegal("suite no ofrecida"))?;
-        let mut ems = false;
+        let (mut ems, mut status) = (false, false);
         for &(t, b) in exts {
             match t {
                 0x0000 => {}
+                0x0005 if b.is_empty() => status = true,
+                0x0005 => return Err(DEC),
                 0x000b => {
                     let mut r = Rd(b);
                     let l = r.v8().ok_or(DEC)?;
@@ -118,6 +122,7 @@ impl Client {
         self.suite = Some(suite);
         self.s12.activo = true;
         self.s12.ems = ems;
+        self.s12.status = status;
         self.s12.srv_random.copy_from_slice(random);
         self.st = St::Esp12Cert;
         Ok(())
@@ -169,8 +174,8 @@ impl Client {
         }
         match (curva, punto.len()) {
             (0x001d, 32) => {}
-            (0x0017, 65) if punto[0] == 4 => {}
-            (0x001d | 0x0017, _) => return Err(ilegal("punto de curva de longitud incorrecta")),
+            (0x0017, 65) | (0x0018, 97) if punto[0] == 4 => {}
+            (0x001d | 0x0017 | 0x0018, _) => return Err(ilegal("punto de curva de longitud incorrecta")),
             _ => return Err(ilegal("curva no ofrecida")),
         }
         let key = self.leaf.as_ref().ok_or(UNEXP)?;
@@ -217,11 +222,16 @@ impl Client {
         let (mut pms, publica): (Vec<u8>, Vec<u8>) = if curva == 0x001d {
             let peer: [u8; 32] = punto.as_slice().try_into().map_err(|_| ilegal("punto x25519 de longitud incorrecta"))?;
             (x25519(&self.x_priv, &peer).to_vec(), x25519(&self.x_priv, &X25519_BASE).to_vec())
-        } else {
+        } else if curva == 0x0017 {
             self.nueva_p256()?;
             let p = self.p_priv.as_ref().ok_or(UNEXP)?;
             let c = pk::p256_ecdh(p, &punto).ok_or(ilegal("punto P-256 no válido"))?;
             (c.to_vec(), pk::p256_public(p).ok_or(UNEXP)?.to_vec())
+        } else {
+            self.nueva_p384()?;
+            let q = self.q_priv.as_ref().ok_or(UNEXP)?;
+            let c = pk::p384_ecdh(q, &punto).ok_or(ilegal("punto P-384 no válido"))?;
+            (c.to_vec(), pk::p384_public(q).ok_or(UNEXP)?.to_vec())
         };
         self.grupo = curva;
         if ct_eq(&pms, &vec![0u8; pms.len()]) {
@@ -244,6 +254,10 @@ impl Client {
             wipe(p);
         }
         self.p_priv = None;
+        if let Some(q) = self.q_priv.as_mut() {
+            wipe(q);
+        }
+        self.q_priv = None;
         // key_block (§6.3): claves de cliente y servidor, luego los IV (4 bytes implícitos en GCM, 12 en ChaCha20).
         let mut seed = self.s12.srv_random.to_vec();
         seed.extend_from_slice(&self.random);
@@ -280,7 +294,8 @@ impl Client {
             suite: s.nombre,
             chain: self.chain.take(),
             cert_error: self.cert_error,
-            group: if self.grupo == 0x0017 { "secp256r1" } else { "x25519" },
+            group: nombre_grupo(self.grupo),
+            revocation: self.revoc,
         });
         self.listo = true;
         self.st = St::Conectado;

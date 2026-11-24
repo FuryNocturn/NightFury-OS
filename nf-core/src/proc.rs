@@ -385,7 +385,8 @@ fn tag_de(d: &mut DialogRequest) -> &mut u32 {
         | DialogRequest::Open { tag, .. }
         | DialogRequest::Save { tag, .. }
         | DialogRequest::Folder { tag, .. }
-        | DialogRequest::Entropy { tag, .. } => tag,
+        | DialogRequest::Entropy { tag, .. }
+        | DialogRequest::Unlock { tag, .. } => tag,
     }
 }
 

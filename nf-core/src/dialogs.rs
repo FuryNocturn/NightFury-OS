@@ -12,7 +12,7 @@ use crate::geom::Rect;
 use crate::icons::{self, Icon};
 use crate::input::{Key, KeyEvent};
 use crate::keys::POOL_EVENTS_NEEDED;
-use crate::platform::Platform;
+use crate::platform::{DateTime, Platform};
 use crate::scrollbar::{Metrics, ScrollBar, SB_W};
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -71,11 +71,19 @@ pub enum DialogRequest {
     /// o `Cancel`. El escritorio ya alimenta el acumulador de la plataforma con cada movimiento;
     /// el diálogo solo cuenta los suyos y muestra una vista (no es la llave).
     Entropy { tag: u32, title: String },
+    /// Pide la contraseña (o, con `recovery`, el código de recuperación) de la unidad cifrada
+    /// `letter` y la abre en el propio diálogo: mientras deriva la clave muestra «Desbloqueando…»
+    /// con una barra animada y los botones desactivados (Escape y Cancelar no hacen nada hasta que
+    /// acaba). Si la clave es mala, el error sale en el diálogo y se puede reintentar. Solo el
+    /// sistema: un programa no puede pedirlo. Responde `Answer { Ok }` con la unidad abierta;
+    /// `Text` con `Some("")` si se aceptó una contraseña vacía (el Explorador pide entonces el
+    /// código de recuperación) o `None` si se canceló.
+    Unlock { tag: u32, title: String, label: String, letter: char, recovery: bool },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DialogResult {
-    /// Respuesta a `Message` y `Entropy`.
+    /// Respuesta a `Message`, `Entropy` y `Unlock`.
     Answer { tag: u32, answer: Answer },
     /// Respuesta a `Input` y `Password`; `None` si se canceló.
     Text { tag: u32, value: Option<String> },
@@ -105,6 +113,8 @@ const ENT_CELL_W: i32 = 12;
 const ENT_ROW_H: i32 = 19;
 const ENT_BOX_H: i32 = ENT_ROWS as i32 * ENT_ROW_H + 14;
 const SYSTEM: &str = "Sistema";
+/// Vueltas de PBKDF2 por trozo al desbloquear (el diálogo mide el tiempo entre trozos).
+const UNLOCK_STEP: u32 = 500;
 
 fn is_c(path: &str) -> bool {
     path.starts_with(['C', 'c'])
@@ -170,11 +180,13 @@ struct Field {
     cur: usize,
     /// Muestra puntos en vez del texto (claves).
     mask: bool,
+    /// Todo el texto seleccionado (Ctrl+A): lo siguiente que se escriba o borre lo sustituye.
+    all: bool,
 }
 
 impl Field {
     fn new(t: &str) -> Field {
-        Field { text: String::from(t), cur: t.chars().count(), mask: false }
+        Field { text: String::from(t), cur: t.chars().count(), mask: false, all: false }
     }
     /// Texto tal como se ve: el real o un punto por carácter.
     fn shown(&self) -> String {
@@ -187,6 +199,7 @@ impl Field {
     /// Entrega el contenido y deja el campo vacío.
     fn take(&mut self) -> String {
         self.cur = 0;
+        self.all = false;
         core::mem::take(&mut self.text)
     }
     /// Borra el búfer (claves).
@@ -195,6 +208,7 @@ impl Field {
         crate::crypto::wipe(unsafe { self.text.as_bytes_mut() });
         self.text.clear();
         self.cur = 0;
+        self.all = false;
     }
     fn len(&self) -> usize {
         self.text.chars().count()
@@ -204,6 +218,33 @@ impl Field {
     }
     /// ¿La tecla ha sido para el campo?
     fn key(&mut self, ev: &KeyEvent) -> bool {
+        if ev.ctrl && !ev.alt && matches!(ev.key, Key::Char('a' | 'A')) {
+            self.all = !self.text.is_empty();
+            self.cur = self.len();
+            return true;
+        }
+        if self.all {
+            let typed = matches!(ev.ch, Some(c) if !ev.ctrl && !ev.alt && !c.is_control());
+            match ev.key {
+                // Borrar o escribir con todo seleccionado vacía el campo (y escribe, si era una letra).
+                Key::Backspace | Key::Delete => {
+                    self.all = false;
+                    self.wipe();
+                    return true;
+                }
+                _ if typed => {
+                    self.all = false;
+                    self.wipe();
+                }
+                Key::Left => {
+                    self.all = false;
+                    self.cur = 0;
+                    return true;
+                }
+                Key::Right | Key::Home | Key::End => self.all = false,
+                _ => {}
+            }
+        }
         match ev.key {
             Key::Left if self.cur > 0 => self.cur -= 1,
             Key::Right if self.cur < self.len() => self.cur += 1,
@@ -246,6 +287,7 @@ impl Field {
             n += 1;
         }
         self.cur = n;
+        self.all = false;
     }
     fn draw(&self, s: &mut Surface, r: Rect, focused: bool, theme: &Theme) {
         s.fill_rect(r, 0xFFFFFF);
@@ -254,7 +296,14 @@ impl Field {
         let shift = self.shift(inner.w);
         let old = s.clip();
         s.set_clip(old.intersect(inner));
-        font::draw(s, inner.x - shift, r.y + (r.h - font::line_h(FS)) / 2, &self.shown(), FS, false, INK);
+        let ty = r.y + (r.h - font::line_h(FS)) / 2;
+        if self.all {
+            let w = font::width(&self.shown(), FS, false);
+            s.fill_rect(Rect::new(inner.x - shift, ty, w, font::line_h(FS)), theme.accent);
+            font::draw(s, inner.x - shift, ty, &self.shown(), FS, false, 0xFFFFFF);
+        } else {
+            font::draw(s, inner.x - shift, ty, &self.shown(), FS, false, INK);
+        }
         if focused {
             let head: String = self.shown().chars().take(self.cur).collect();
             let x = inner.x + font::width(&head, FS, false) - shift;
@@ -311,6 +360,11 @@ pub struct Dialog {
     moves: u32,
     last_pos: Option<(i32, i32)>,
     view: Vec<u8>,
+    /// `Unlock`: unidad y si se pide el código de recuperación; `busy`: derivando la clave;
+    /// `phase`: fotograma de la animación.
+    unlock: Option<(char, bool)>,
+    busy: bool,
+    phase: u64,
 }
 
 impl Drop for Dialog {
@@ -345,6 +399,9 @@ impl Dialog {
             moves: 0,
             last_pos: None,
             view: Vec::new(),
+            unlock: None,
+            busy: false,
+            phase: 0,
         };
         let lh = font::line_h(FS);
         match req {
@@ -381,6 +438,15 @@ impl Dialog {
                 d.title = title;
                 d.lines = vec![fit(&label, FS, d.w - 2 * PAD)];
                 d.field.mask = true;
+                d.h = PAD + lh + 8 + 28 + 24 + BTN_H + 16;
+            }
+            DialogRequest::Unlock { tag, title, label, letter, recovery } => {
+                d.tag = tag;
+                d.mode = Mode::Password;
+                d.title = title;
+                d.lines = vec![fit(&label, FS, d.w - 2 * PAD)];
+                d.field.mask = !recovery;
+                d.unlock = Some((letter, recovery));
                 d.h = PAD + lh + 8 + 28 + 24 + BTN_H + 16;
             }
             DialogRequest::Entropy { tag, title } => {
@@ -531,11 +597,32 @@ impl Dialog {
     }
 
     /// Reloj del diálogo (unas 100 veces por segundo): repite la flecha o la pista mantenida.
-    pub fn tick(&mut self, sys: &mut dyn Platform) {
+    pub fn tick(&mut self, sys: &mut dyn Platform) -> Option<DialogResult> {
         if self.has_sb() {
             if let Some(p) = self.sb.tick(&self.sb_metrics(), sys.uptime_ms()) {
                 self.scroll = p as usize;
                 self.dirty = true;
+            }
+        }
+        if !self.busy {
+            return None;
+        }
+        // Avanza la derivación de la clave unos 8 ms por tick: el escritorio sigue respondiendo.
+        let t = sys.uptime_ms();
+        while sys.files().unlock_step(UNLOCK_STEP) && sys.uptime_ms().saturating_sub(t) < 8 {}
+        let phase = sys.uptime_ms() / 40;
+        if phase != self.phase {
+            self.phase = phase;
+            self.dirty = true;
+        }
+        match sys.files().unlock_result()? {
+            Ok(()) => Some(DialogResult::Answer { tag: self.tag, answer: Answer::Ok }),
+            Err(e) => {
+                self.busy = false;
+                self.error = Some(String::from(e.text()));
+                self.focus = 0;
+                self.dirty = true;
+                None
             }
         }
     }
@@ -552,9 +639,24 @@ impl Dialog {
                     text_in(s, Rect::new(PAD, PAD + i as i32 * lh, self.w - 2 * PAD, lh), l, INK, Align::Left);
                 }
             }
+            Mode::Input | Mode::Password if self.busy => {
+                text_in(s, Rect::new(PAD, PAD, self.w - 2 * PAD, lh), "Desbloqueando…", INK, Align::Left);
+                // Barra sin final: un bloque que va y viene.
+                let f = self.field_rect();
+                let track = Rect::new(f.x, f.y + 7, f.w, 14);
+                s.fill_rect(track, 0xE6E6E6);
+                s.frame(track, 0xA0A0A0);
+                let (bw, span) = (track.w / 4, track.w - 2 - track.w / 4);
+                let x = (self.phase as i32 * 6) % (2 * span);
+                s.fill_rect(Rect::new(track.x + 1 + if x > span { 2 * span - x } else { x }, track.y + 1, bw, track.h - 2), theme.accent);
+            }
             Mode::Input | Mode::Password => {
                 text_in(s, Rect::new(PAD, PAD, self.w - 2 * PAD, lh), &self.lines[0], INK, Align::Left);
                 self.field.draw(s, self.field_rect(), self.focus == 0, theme);
+                if let Some(e) = &self.error {
+                    let f = self.field_rect();
+                    text_in(s, Rect::new(PAD, f.bottom() + 4, self.w - 2 * PAD, lh), e, RED, Align::Left);
+                }
             }
             Mode::Entropy => self.draw_entropy(s, theme),
             _ => self.draw_files(s, theme),
@@ -564,7 +666,7 @@ impl Dialog {
         for (i, label) in labels.iter().enumerate() {
             let r = self.btn_rect(i, n);
             let focused = self.focus == self.nbefore() + i;
-            if self.mode == Mode::Entropy && i == 0 && !self.entropy_done() {
+            if self.busy || (self.mode == Mode::Entropy && i == 0 && !self.entropy_done()) {
                 s.fill_rect(r, 0xD6D6D6);
                 text_in(s, r, label, 0x8A8A8A, Align::Center);
                 continue;
@@ -625,7 +727,7 @@ impl Dialog {
         s.stroke(&[(cx - 5.0, cy - 1.0), (cx, cy - 6.0), (cx + 5.0, cy - 1.0)], 1.5, INK);
         let path = Rect::new(52, 12, self.w - 64, 28);
         s.frame(path, 0xC8C8C8);
-        text_in(s, Rect::new(path.x + 8, path.y, path.w - 16, path.h), &self.dir, INK, Align::Left);
+        text_in(s, Rect::new(path.x + 8, path.y, path.w - 16, path.h), if self.dir.is_empty() { "Este equipo" } else { &self.dir }, INK, Align::Left);
         let list = self.list_rect();
         s.frame(list, if self.focus == 0 { theme.accent } else { 0x8A8A8A });
         if self.entries.is_empty() {
@@ -673,6 +775,11 @@ impl Dialog {
     // ---------------------------------------------------------------- lógica
 
     /// Resultado de cerrar el diálogo con su aspa.
+    /// Desbloqueando una unidad: no admite cerrar ni cancelar hasta que acaba.
+    pub fn is_busy(&self) -> bool {
+        self.busy
+    }
+
     pub fn cancel(&self) -> DialogResult {
         let tag = self.tag;
         match self.mode {
@@ -694,6 +801,9 @@ impl Dialog {
     }
 
     fn esc(&mut self) -> Option<DialogResult> {
+        if self.busy {
+            return None;
+        }
         if self.confirm.take().is_some() {
             self.focus = 1;
             return None;
@@ -744,7 +854,7 @@ impl Dialog {
     fn activate(&mut self, i: usize, sys: &mut dyn Platform) -> Option<DialogResult> {
         let e = self.entries.get(i)?.clone();
         if e.dir {
-            let p = files::join(&self.dir, &e.name);
+            let p = self.entry_path(&e.name);
             self.go(&p, sys);
             return None;
         }
@@ -755,9 +865,13 @@ impl Dialog {
     /// Acepta el nombre del campo en Abrir/Guardar.
     fn accept(&mut self, sys: &mut dyn Platform) -> Option<DialogResult> {
         let tag = self.tag;
+        if self.dir.is_empty() && (self.mode != Mode::Folder || self.sel.is_none()) {
+            self.error = Some(String::from("Elige una unidad."));
+            return None;
+        }
         if self.mode == Mode::Folder {
             let path = match self.sel.and_then(|i| self.entries.get(i)) {
-                Some(e) => files::join(&self.dir, &e.name),
+                Some(e) => self.entry_path(&e.name),
                 None => self.dir.clone(),
             };
             return Some(DialogResult::Path { tag, path: Some(path) });
@@ -808,8 +922,46 @@ impl Dialog {
         None
     }
 
+    /// Ruta de la entrada `name` de la vista actual. En «Este equipo» la entrada es una unidad,
+    /// «Nombre (X:)», y su ruta es la raíz `X:\`.
+    fn entry_path(&self, name: &str) -> String {
+        if self.dir.is_empty() {
+            let letter = name.chars().rev().nth(2).unwrap_or('C');
+            return format!("{letter}:\\");
+        }
+        files::join(&self.dir, name)
+    }
+
+    /// Sube una carpeta; desde la raíz de una unidad, a «Este equipo» (las unidades), para poder
+    /// cambiar de unidad.
+    fn up(&mut self, sys: &mut dyn Platform) {
+        if self.dir.is_empty() {
+            return;
+        }
+        if let Some(p) = files::parent(&self.dir) {
+            self.go(&p, sys);
+            return;
+        }
+        // Las cifradas sin abrir no se listan: se desbloquean desde el Explorador.
+        self.entries = sys
+            .files()
+            .drives()
+            .into_iter()
+            .filter(|d| !d.locked && (self.mode == Mode::Open || self.mode == Mode::Folder || !d.read_only))
+            .map(|d| Entry { name: d.name(), dir: true, size: 0, modified: DateTime::default(), hidden: false })
+            .collect();
+        self.dir.clear();
+        self.sel = None;
+        self.scroll = 0;
+        self.error = None;
+    }
+
     /// Crea "Nueva carpeta" (o con número) en la carpeta actual y la deja seleccionada.
     fn new_folder(&mut self, sys: &mut dyn Platform) {
+        if self.dir.is_empty() {
+            self.error = Some(String::from("Elige una unidad."));
+            return;
+        }
         let name = sys.files().free_name(&self.dir, "Nueva carpeta");
         let path = files::join(&self.dir, &name);
         let now = sys.now();
@@ -828,7 +980,11 @@ impl Dialog {
     /// Pulsa el botón `i` (según `labels`).
     fn press(&mut self, i: usize, sys: &mut dyn Platform) -> Option<DialogResult> {
         let tag = self.tag;
+        if self.busy {
+            return None;
+        }
         match self.mode {
+            Mode::Password if i == 0 && self.unlock.is_some() => self.start_unlock(sys),
             Mode::Message => Some(DialogResult::Answer { tag, answer: self.btns[i].1 }),
             Mode::Entropy if i == 0 => self.entropy_done().then_some(DialogResult::Answer { tag, answer: Answer::Ok }),
             Mode::Entropy => Some(self.cancel()),
@@ -856,8 +1012,25 @@ impl Dialog {
         }
     }
 
+    /// `Unlock`: Aceptar. Una contraseña vacía se devuelve tal cual (el Explorador pide el código);
+    /// si no, empieza a derivar la clave y el diálogo pasa a «Desbloqueando…».
+    fn start_unlock(&mut self, sys: &mut dyn Platform) -> Option<DialogResult> {
+        let (letter, recovery) = self.unlock?;
+        if !recovery && self.field.text.is_empty() {
+            return Some(DialogResult::Text { tag: self.tag, value: Some(String::new()) });
+        }
+        let r = sys.files().begin_unlock(letter, &self.field.text, recovery);
+        self.field.wipe();
+        match r {
+            Ok(()) => self.busy = true,
+            Err(e) => self.error = Some(String::from(e.text())),
+        }
+        self.dirty = true;
+        None
+    }
+
     pub fn key(&mut self, ev: &KeyEvent, sys: &mut dyn Platform) -> Option<DialogResult> {
-        if !ev.down {
+        if !ev.down || self.busy {
             return None;
         }
         self.dirty = true;
@@ -906,9 +1079,7 @@ impl Dialog {
             match (to, ev.key) {
                 (Some(i), _) if !self.entries.is_empty() => self.select(i),
                 (_, Key::Backspace) => {
-                    if let Some(p) = files::parent(&self.dir) {
-                        self.go(&p, sys);
-                    }
+                    self.up(sys);
                 }
                 _ => {}
             }
@@ -993,9 +1164,7 @@ impl Dialog {
                 match self.press.take() {
                     Some(Tgt::Btn(i)) if self.btn_rect(i, self.labels().len()).contains(x, y) => return self.press(i, sys),
                     Some(Tgt::Up) if self.up_rect().contains(x, y) => {
-                        if let Some(p) = files::parent(&self.dir) {
-                            self.go(&p, sys);
-                        }
+                        self.up(sys);
                     }
                     _ => {}
                 }
@@ -1190,6 +1359,27 @@ mod tests {
         // Cancelar.
         let mut d = save("x", &mut sys);
         assert_eq!(press(&mut d, &mut sys, Key::Escape), path(None));
+    }
+
+    #[test]
+    fn desde_la_raiz_se_sube_a_este_equipo_y_se_cambia_de_unidad() {
+        let mut sys = TestPlatform::default();
+        let mut d = Dialog::new(DialogRequest::Open { tag: 5, title: "A".into(), dir: "C:\\".into() }, &mut sys);
+        assert_eq!(d.dir, "C:\\");
+        press(&mut d, &mut sys, Key::Backspace);
+        assert!(d.dir.is_empty());
+        assert_eq!(d.entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["Disco local (C:)"]);
+        // En «Este equipo» no se puede aceptar un nombre ni crear carpetas.
+        d.field = Field::new("a.txt");
+        assert!(d.accept(&mut sys).is_none() && d.error.is_some());
+        d.new_folder(&mut sys);
+        assert!(d.dir.is_empty());
+        // Abrir la unidad vuelve a su raíz; subir otra vez no hace nada más.
+        d.activate(0, &mut sys);
+        assert_eq!(d.dir, "C:\\");
+        press(&mut d, &mut sys, Key::Backspace);
+        press(&mut d, &mut sys, Key::Backspace);
+        assert!(d.dir.is_empty() && d.entries.len() == 1);
     }
 
     #[test]
@@ -1456,6 +1646,69 @@ mod tests {
         Some(DialogResult::Text { tag: 9, value: Some(v.into()) })
     }
 
+    /// Disco en memoria compartido, para tener una unidad cifrada cerrada.
+    #[derive(Clone)]
+    struct Pen(alloc::rc::Rc<core::cell::RefCell<crate::vol::MemSectors>>);
+    impl crate::vol::SectorDev for Pen {
+        fn sector_size(&self) -> usize {
+            self.0.borrow().sector_size()
+        }
+        fn sectors(&self) -> u64 {
+            self.0.borrow().sectors()
+        }
+        fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().read(lba, buf)
+        }
+        fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), FsError> {
+            self.0.borrow_mut().write(lba, buf)
+        }
+        fn read_only(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn desbloquear_muestra_desbloqueando_y_abre_o_da_el_error() {
+        use crate::vol::{nfvol, MemSectors};
+        let mut sys = TestPlatform::default();
+        let pen = Pen(alloc::rc::Rc::new(core::cell::RefCell::new(MemSectors::new((16 << 20) / 512, 512))));
+        let mut pool = crate::keys::Pool::new();
+        for i in 0..POOL_EVENTS_NEEDED as i32 {
+            pool.add_event(i, i * 3, i as u64, i as u64 * 7);
+        }
+        nfvol::format(Box::new(pen.clone()), "S", Some(("clave-buena", &mut pool)), crate::platform::DateTime::default()).unwrap();
+        let p = crate::vol::partitions(&mut pen.clone()).unwrap();
+        let nfvol::Opened::Locked(drive) = nfvol::open(Box::new(pen.clone()), &p[0]).unwrap() else { panic!() };
+        let l = sys.files.attach_locked(crate::drives::Locked { disk: 1, part: 0, removable: true, device: "USB".into(), drive }).unwrap();
+        let nuevo = |sys: &mut TestPlatform| Dialog::new(DialogRequest::Unlock { tag: 4, title: "U".into(), label: "Clave:".into(), letter: l, recovery: false }, sys);
+        let dibuja = |d: &mut Dialog| {
+            let mut s = Surface::new(d.size().0, d.size().1, 0);
+            d.draw(&mut s, &Theme::default());
+        };
+        // Vacía: se devuelve para que el Explorador pida el código de recuperación.
+        let mut d = nuevo(&mut sys);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), Some(DialogResult::Text { tag: 4, value: Some(String::new()) }));
+        // Mala: pasa por «Desbloqueando…» (sin teclas ni Escape) y vuelve con el error y el campo vacío.
+        type_str(&mut d, &mut sys, "otra");
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), None);
+        assert!(d.busy && d.field.text.is_empty());
+        dibuja(&mut d);
+        assert_eq!(press(&mut d, &mut sys, Key::Escape), None);
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), None);
+        assert!(d.busy);
+        assert_eq!(d.tick(&mut sys), None);
+        assert!(!d.busy && d.error.as_deref() == Some(crate::keys::KeyError::WrongSecret.text()));
+        dibuja(&mut d);
+        // Reintento con la buena: abre la unidad.
+        type_str(&mut d, &mut sys, "clave-buena");
+        assert_eq!(press(&mut d, &mut sys, Key::Enter), None);
+        assert_eq!(d.tick(&mut sys), Some(DialogResult::Answer { tag: 4, answer: Answer::Ok }));
+        assert!(sys.files.drives().iter().any(|i| i.letter == l && !i.locked));
+        // Escape fuera de la espera cancela.
+        let mut d = nuevo(&mut sys);
+        assert_eq!(press(&mut d, &mut sys, Key::Escape), Some(DialogResult::Text { tag: 4, value: None }));
+    }
+
     #[test]
     fn clave_se_enmascara_y_responde_con_enter() {
         let mut sys = TestPlatform::default();
@@ -1509,6 +1762,29 @@ mod tests {
         // SAFETY: el búfer sigue reservado (clear no libera) y se lee dentro de su capacidad.
         let raw = unsafe { core::slice::from_raw_parts(p, 6) };
         assert_eq!(raw, [0u8; 6]);
+    }
+
+    #[test]
+    fn ctrl_a_selecciona_todo_y_lo_siguiente_lo_sustituye() {
+        let ctrl_a = KeyEvent { key: Key::Char('a'), ch: Some('a'), down: true, shift: false, ctrl: true, alt: false };
+        let mut f = Field::new("viejo.txt");
+        assert!(f.key(&ctrl_a));
+        assert!(f.all);
+        f.key(&kev(Key::Char('n'), Some('n')));
+        assert_eq!((f.text.as_str(), f.cur, f.all), ("n", 1, false));
+        // Con todo seleccionado, Retroceso vacía el campo.
+        f.key(&ctrl_a);
+        f.key(&kev(Key::Backspace, None));
+        assert!(f.text.is_empty());
+        // Una flecha quita la selección sin tocar el texto.
+        let mut f = Field::new("abc");
+        f.key(&ctrl_a);
+        f.key(&kev(Key::Left, None));
+        assert_eq!((f.text.as_str(), f.cur, f.all), ("abc", 0, false));
+        // En un campo vacío no hay nada que seleccionar.
+        let mut f = Field::new("");
+        f.key(&ctrl_a);
+        assert!(!f.all);
     }
 
     // ---- Aleatoriedad ("la pantalla del ratón")

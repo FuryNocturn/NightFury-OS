@@ -31,6 +31,8 @@ pub struct MemInfo {
 
 pub trait Platform {
     fn now(&mut self) -> DateTime;
+    /// Pone el reloj del equipo (hora LOCAL, como la que da `now`). Por defecto no hace nada (programas, pruebas).
+    fn set_now(&mut self, _t: DateTime) {}
     fn uptime_ms(&self) -> u64;
     fn mem(&self) -> MemInfo;
     fn cpu(&self) -> String;
@@ -90,11 +92,16 @@ pub struct TestPlatform {
     pub pool: Pool,
     /// Red de pruebas (los tests le enganchan una tarjeta en memoria).
     pub net: Option<crate::net::Net>,
+    /// Reloj puesto con `set_now`; sin él, `now` da una fecha fija.
+    pub reloj: Option<DateTime>,
 }
 
 impl Platform for TestPlatform {
     fn now(&mut self) -> DateTime {
-        DateTime { year: 2026, month: 11, day: 15, hour: 21, minute: 37, second: 5 }
+        self.reloj.unwrap_or(DateTime { year: 2026, month: 11, day: 15, hour: 21, minute: 37, second: 5 })
+    }
+    fn set_now(&mut self, t: DateTime) {
+        self.reloj = Some(t);
     }
     fn uptime_ms(&self) -> u64 {
         self.ms
