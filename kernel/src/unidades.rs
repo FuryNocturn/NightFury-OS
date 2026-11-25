@@ -100,13 +100,13 @@ impl Interno {
         ps.iter().map(|p| (p.kind, p.sectors.saturating_mul(ss as u64))).collect()
     }
     /// Instala NightFury en TODO el disco con `efi` como cargador. `NoSpace` (sin escribir nada) si no llega a 1 GiB.
-    pub fn instalar(&self, efi: &[u8], version: &str) -> Result<Esp, FsError> {
+    /// `arranque` es el menú de arranque; vacío, el núcleo hace también de cargador.
+    pub fn instalar(&self, efi: &[u8], arranque: &[u8], version: &str) -> Result<Esp, FsError> {
         if self.bytes() < MIN_INSTALAR {
             return Err(FsError::NoSpace);
         }
         let mut abrir = || Box::new(self.manejador(false)) as Box<dyn SectorDev>;
-        // shortcut: sin `arranque.efi` aparte (va vacío y el núcleo hace de BOOTX64); pasarlo aquí cuando el pendrive lo lleve.
-        let esp = instalar::instalar(&mut abrir, efi, &[], version, rtc::now(), &mut crate::entropia)?;
+        let esp = instalar::instalar(&mut abrir, efi, arranque, version, rtc::now(), &mut crate::entropia)?;
         abrir().flush()?;
         Ok(esp)
     }

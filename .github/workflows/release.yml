@@ -52,6 +52,8 @@ jobs:
         run: powershell -ExecutionPolicy Bypass -File tools/programas.ps1
       - name: Núcleo (UEFI)
         run: cargo build -p kernel --release --target x86_64-unknown-uefi
+      - name: Menú de arranque (UEFI)
+        run: cargo build -p arranque --release --target x86_64-unknown-uefi
       - name: nfdisk
         run: cargo build -p nfdisk --release
       - name: Ficheros de la versión
@@ -60,7 +62,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force dist, dist\qemu | Out-Null
           $efi = 'target\x86_64-unknown-uefi\release\nightfury.efi'
-          & target\release\nfdisk.exe pen-arranque "dist\nightfury-$env:VER-usb.img" $efi $env:VER
+          & target\release\nfdisk.exe pen-arranque "dist\nightfury-$env:VER-usb.img" $efi $env:VER target\x86_64-unknown-uefi\release\arranque.efi
           if ($LASTEXITCODE -ne 0) { throw 'nfdisk pen-arranque falló' }
           Copy-Item $efi dist\qemu\BOOTX64.EFI
           Copy-Item tools\arrancar.ps1, tools\LEEME-qemu.txt, LICENSE, NOTICE dist\qemu\

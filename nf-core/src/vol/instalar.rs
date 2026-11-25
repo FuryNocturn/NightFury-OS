@@ -107,8 +107,9 @@ pub(super) fn escribir_en_esp(abrir: Abrir, inicio: u64, sectores: u64, ficheros
 }
 
 /// Pendrive de arranque: GPT con una ESP FAT32 de `esp_bytes` (o hasta el final si no cabe) desde
-/// 1 MiB, `\EFI\BOOT\BOOTX64.EFI` = `efi` y el marcador `\EFI\NightFury\pendrive.txt`.
-pub fn crear_pendrive(abrir: Abrir, efi: &[u8], version: &str, esp_bytes: u64, now: DateTime, aleatorio: &mut dyn FnMut() -> u64) -> Result<(), FsError> {
+/// 1 MiB, `\EFI\BOOT\BOOTX64.EFI` = `efi`, el marcador `\EFI\NightFury\pendrive.txt` y, si no va vacío, el
+/// menú de arranque `\EFI\NightFury\arranque.efi` (lo que el instalador copia al disco).
+pub fn crear_pendrive(abrir: Abrir, efi: &[u8], arranque: &[u8], version: &str, esp_bytes: u64, now: DateTime, aleatorio: &mut dyn FnMut() -> u64) -> Result<(), FsError> {
     let mut d = abrir();
     let ss = d.sector_size();
     let inicio = gpt::alinear_mib(gpt::primer_lba_usable(ss), ss);
@@ -120,7 +121,11 @@ pub fn crear_pendrive(abrir: Abrir, efi: &[u8], version: &str, esp_bytes: u64, n
     gpt::crear_gpt(&mut *d, &[Particion { tipo: TIPO_ESP, unica, nombre: "NightFury ESP", inicio_lba: inicio, fin_lba: fin }], disco)?;
     drop(d);
     let marca = format!("NightFury pendrive {version}\r\n");
-    llenar_esp(abrir, inicio, fin - inicio + 1, &[(ARRANQUE, efi), (MARCA, marca.as_bytes())], now)
+    let mut f: Vec<(&str, &[u8])> = vec![(ARRANQUE, efi), (MARCA, marca.as_bytes())];
+    if !arranque.is_empty() {
+        f.push((NF_ARRANQUE, arranque));
+    }
+    llenar_esp(abrir, inicio, fin - inicio + 1, &f, now)
 }
 
 /// Manejador que solo lee: montar una FAT en escritura la marca como sucia, y mirar si es un pendrive no debe tocarlo.
@@ -194,16 +199,25 @@ const MAX_EFI: u64 = 64 * MIB;
 
 /// `\EFI\BOOT\BOOTX64.EFI` de la ESP (primera partición) del pendrive de arranque. No escribe nada.
 pub fn leer_efi(abrir: Abrir) -> Result<Vec<u8>, FsError> {
+    leer_de_pen(abrir, ARRANQUE)
+}
+
+/// El menú de arranque `\EFI\NightFury\arranque.efi` del pendrive (`NotFound` en pendrives de la 0.12.6).
+pub fn leer_arranque(abrir: Abrir) -> Result<Vec<u8>, FsError> {
+    leer_de_pen(abrir, NF_ARRANQUE)
+}
+
+fn leer_de_pen(abrir: Abrir, ruta: &str) -> Result<Vec<u8>, FsError> {
     let mut d = abrir();
     let (_, ent) = gpt::leer_gpt(&mut *d).ok_or(FsError::Corrupt)?;
     let e = ent.first().filter(|e| e.tipo == TIPO_ESP).ok_or(FsError::NotFound)?;
     let p = gpt::como_particion(&mut *d, e.inicio_lba, e.sectores());
     drop(d);
     let mut v = super::mount(Box::new(Lectura(abrir())), &p)?;
-    if v.stat(ARRANQUE)?.size > MAX_EFI {
+    if v.stat(ruta)?.size > MAX_EFI {
         return Err(FsError::Invalid);
     }
-    v.read(ARRANQUE)
+    v.read(ruta)
 }
 
 /// Deja a cero los 2 MiB del principio y del final de la partición (con margen sobre los 256 bloques de
@@ -642,13 +656,14 @@ mod tests {
     fn pendrive_de_arranque_y_modo_portatil() {
         for ss in [512usize, 4096] {
             let pen = Disco::nuevo(66, ss);
-            crear_pendrive(&mut pen.abrir(), &efi(), "0.12.6", ESP_PENDRIVE, NOW, &mut azar()).unwrap();
+            crear_pendrive(&mut pen.abrir(), &efi(), b"menu", "0.12.6", ESP_PENDRIVE, NOW, &mut azar()).unwrap();
             assert!(es_pendrive(&mut pen.abrir()), "ss={ss}");
             assert_eq!(portatil(&mut pen.abrir()), None);
             let antes = pen.0.borrow().data.clone();
             assert!(es_pendrive(&mut pen.abrir()));
             assert!(pen.0.borrow().data == antes, "es_pendrive no escribe (ni marca la FAT como sucia)");
             assert_eq!(leer_efi(&mut pen.abrir()).unwrap(), efi());
+            assert_eq!(leer_arranque(&mut pen.abrir()).unwrap(), b"menu");
             let (_, e) = gpt::leer_gpt(&mut pen.clone()).unwrap();
             assert_eq!(e.len(), 1);
             assert_eq!(leer(&pen, e[0].inicio_lba, e[0].sectores(), ARRANQUE), efi());

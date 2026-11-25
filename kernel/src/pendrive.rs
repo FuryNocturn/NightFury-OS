@@ -116,6 +116,13 @@ impl Pen {
         instalar::leer_efi(&mut || usb::abrir_disco(id).unwrap_or_else(vacio))
     }
 
+    /// El menú de arranque `arranque.efi` del pendrive; vacío si no lo lleva (pendrives de la 0.12.6): entonces
+    /// el núcleo hace de cargador, como antes.
+    pub fn arranque(&self) -> alloc::vec::Vec<u8> {
+        let Some(id) = self.disco else { return alloc::vec::Vec::new() };
+        instalar::leer_arranque(&mut || usb::abrir_disco(id).unwrap_or_else(vacio)).unwrap_or_default()
+    }
+
     /// Modo Portátil: crea la partición NFFS si falta y devuelve `C:` sobre ella. `true` si es nueva
     /// (queda como disco en blanco, para que el asistente pregunte el cifrado y formatee al final).
     pub fn portatil(&mut self, now: DateTime) -> Result<(bool, Files), FsError> {

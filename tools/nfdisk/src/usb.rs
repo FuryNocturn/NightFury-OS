@@ -161,18 +161,23 @@ pub(crate) fn azar() -> impl FnMut() -> u64 {
 }
 
 pub fn pen_arranque(args: &[&str], now: DateTime) -> R<()> {
-    let (img, efi, version) = match args {
-        [img, efi] => (img, efi, env!("CARGO_PKG_VERSION")),
-        [img, efi, v] => (img, efi, *v),
-        _ => return Err("Uso: nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]".into()),
+    let (img, efi, version, menu) = match args {
+        [img, efi] => (img, efi, env!("CARGO_PKG_VERSION"), None),
+        [img, efi, v] => (img, efi, *v, None),
+        [img, efi, v, m] => (img, efi, *v, Some(*m)),
+        _ => return Err("Uso: nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión] [arranque.efi]".into()),
     };
     let efi = std::fs::read(efi).map_err(|e| format!("No se puede leer «{efi}»: {e}"))?;
+    let menu = match menu {
+        Some(m) => std::fs::read(m).map_err(|e| format!("No se puede leer «{m}»: {e}"))?,
+        None => Vec::new(),
+    };
     let f = OpenOptions::new().read(true).write(true).create_new(true).open(img).map_err(|e| format!("No se puede crear «{img}»: {e}"))?;
     f.set_len(66 << 20).map_err(|e| e.to_string())?;
     let mut azar = azar();
     let sectors = 66 << 11;
     let mut abrir = || Box::new(Pendrive { f: f.try_clone().expect("duplicar el manejador"), sectors }) as Box<dyn SectorDev>;
-    let r = vol::instalar::crear_pendrive(&mut abrir, &efi, version, vol::instalar::ESP_PENDRIVE, now, &mut azar).map_err(fs_err);
+    let r = vol::instalar::crear_pendrive(&mut abrir, &efi, &menu, version, vol::instalar::ESP_PENDRIVE, now, &mut azar).map_err(fs_err);
     if r.is_err() {
         let _ = std::fs::remove_file(img);
     }

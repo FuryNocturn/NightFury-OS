@@ -8,7 +8,6 @@ use alloc::format;
 use alloc::vec::Vec;
 use nf_core::vol::instalar::{self, Esp};
 
-const RUTA: &str = "\\EFI\\NightFury\\nightfury.efi";
 /// Mayor `BootOrder` que se lee (512 entradas): uno más largo no se toca.
 const MAX_ORDEN: usize = 1024;
 /// Números `Boot####` que se prueban hasta dar con uno libre.
@@ -49,9 +48,11 @@ fn sin_interrupciones<T>(f: impl FnOnce() -> T) -> T {
     r
 }
 
-/// Crea `Boot####` (primer número libre) para la ESP recién instalada y la pone la primera en `BootOrder`.
-/// `Err` con el motivo si el firmware no lo permite: la ruta por defecto (`\EFI\BOOT\BOOTX64.EFI`) sigue valiendo.
-pub fn crear(rt: *mut RuntimeServices, esp: &Esp) -> Result<(), &'static str> {
+/// Crea `Boot####` (primer número libre) que arranca `ruta` (relativa a la raíz, como `EFI\NightFury\arranque.efi`)
+/// de la ESP recién instalada y la pone la primera en `BootOrder`. `Err` con el motivo si el firmware no lo
+/// permite: en una ESP propia la ruta por defecto (`\EFI\BOOT\BOOTX64.EFI`) sigue valiendo.
+pub fn crear(rt: *mut RuntimeServices, esp: &Esp, ruta: &str) -> Result<(), &'static str> {
+    let ruta = format!("\\{ruta}");
     if rt.is_null() {
         return Err("el firmware no da servicios de ejecucion");
     }
@@ -72,7 +73,7 @@ pub fn crear(rt: *mut RuntimeServices, esp: &Esp) -> Result<(), &'static str> {
             }
         }
         let n = nuestra.or(libre).ok_or("no hay un numero de entrada de arranque libre")?;
-        if escribir(rt, &nombre(&format!("Boot{n:04X}")), &instalar::opcion_arranque(esp, RUTA)) != 0 {
+        if escribir(rt, &nombre(&format!("Boot{n:04X}")), &instalar::opcion_arranque(esp, &ruta)) != 0 {
             return Err("el firmware no deja crear la entrada de arranque");
         }
         let mut buf = [0u8; MAX_ORDEN];

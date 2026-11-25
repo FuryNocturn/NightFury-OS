@@ -29,7 +29,7 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
   nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>  | nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
   nfdisk usb-ver <imagen>\n\
-  nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]   (pendrive de arranque UEFI de 66 MiB; el modo portátil se activa desde NightFury)\n\
+  nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión] [arranque.efi]   (pendrive de arranque UEFI de 66 MiB; el modo portátil se activa desde NightFury)\n\
   nfdisk disco-prueba <imagen> <windows|windows-datos|linux|bitlocker|mbr> <MiB> [efi_prueba]   (disco falso con otro sistema para probar «instalar junto a»; usa MiB grandes, p. ej. 2400)\n\
   nfdisk analizar <imagen>   (qué ofrecería NightFury en ese disco: huecos y particiones, y por qué se bloquea cada una; no escribe nada)\n\
   nfdisk ayuda\n\

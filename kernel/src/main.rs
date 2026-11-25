@@ -295,8 +295,10 @@ impl Platform for Plat {
         }
         let disco = self.internos.as_deref().and_then(|l| l.get(i)).ok_or(FsError::NotFound)?;
         let efi = self.pen.efi()?;
-        let esp = disco.instalar(&efi, nf_core::VERSION)?;
-        match entrada::crear(self.info.runtime, &esp) {
+        let arranque = self.pen.arranque();
+        let esp = disco.instalar(&efi, &arranque, nf_core::VERSION)?;
+        let ruta = if arranque.is_empty() { nf_core::vol::instalar::NF_NUCLEO } else { nf_core::vol::instalar::NF_ARRANQUE };
+        match entrada::crear(self.info.runtime, &esp, ruta) {
             Ok(()) => Ok(true),
             Err(e) => {
                 traza!("NF instalar: sin entrada de arranque UEFI: {}", e);
