@@ -1,0 +1,18 @@
+NightFury OS - prueba en QEMU / QEMU test
+==========================================
+
+ESPAÑOL
+Contenido: BOOTX64.EFI (el sistema), arrancar.ps1 (lanza QEMU), LICENSE y NOTICE.
+Requisitos: Windows y QEMU (https://www.qemu.org/download/#windows).
+Arrancar:   powershell -ExecutionPolicy Bypass -File arrancar.ps1
+Ctrl+Alt+G suelta el ratón de la ventana de QEMU.
+Es una versión de prueba: no está probada en un PC real. Aquí no toca ningún disco tuyo
+(usa disco.img, un fichero que se crea junto al guion).
+
+ENGLISH
+Contents: BOOTX64.EFI (the system), arrancar.ps1 (starts QEMU), LICENSE and NOTICE.
+Requirements: Windows and QEMU (https://www.qemu.org/download/#windows).
+Start:        powershell -ExecutionPolicy Bypass -File arrancar.ps1
+Ctrl+Alt+G releases the mouse from the QEMU window.
+This is a test version: it has not been tested on a real PC. Here it touches none of your
+disks (it uses disco.img, a file created next to the script).

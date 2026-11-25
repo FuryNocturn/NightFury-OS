@@ -6,6 +6,16 @@ use crate::uefi::*;
 use core::ffi::c_void;
 use core::ptr::{null, null_mut};
 
+/// Se arrancó desde un USB: nodo Hard Drive de la ruta del dispositivo (la partición de la imagen), si lo hay.
+#[derive(Clone, Copy)]
+pub struct ArranqueUsb {
+    pub particion: u32,
+    pub inicio: u64,
+    pub tamano: u64,
+    /// Firma GUID de la partición (en el orden de la GPT); `None` si el nodo no la trae o no hay nodo.
+    pub guid: Option<[u8; 16]>,
+}
+
 /// Lo que el arranque le deja al núcleo.
 #[derive(Clone, Copy)]
 pub struct BootInfo {
@@ -22,6 +32,8 @@ pub struct BootInfo {
     pub runtime: *mut RuntimeServices,
     /// Dirección de la RSDP de ACPI (0 si el firmware no la da).
     pub rsdp: u64,
+    /// `Some` si la imagen se cargó desde un dispositivo USB.
+    pub usb: Option<ArranqueUsb>,
 }
 
 static mut BOOT: BootInfo = BootInfo {
@@ -36,6 +48,7 @@ static mut BOOT: BootInfo = BootInfo {
     ram_end: 0,
     runtime: null_mut(),
     rsdp: 0,
+    usb: None,
 };
 
 pub fn info() -> BootInfo {
@@ -67,6 +80,43 @@ fn usable(gop: *mut Gop, mode: u32) -> Option<(u32, u32)> {
         let m = &*mi;
         (m.pixel_format <= 1).then_some((m.horizontal_resolution, m.vertical_resolution))
     }
+}
+
+/// ¿Se cargó esta imagen desde un USB? Mira la ruta del dispositivo (UEFI 2.x, «Device Path Protocol»): un nodo
+/// Messaging (3) USB (5), USB Class (0xF) o USB WWID (0x10). Cualquier fallo cuenta como «no».
+fn arranque_usb(image: *mut c_void, bs: &BootServices) -> Option<ArranqueUsb> {
+    let mut li: *mut c_void = null_mut();
+    if (bs.handle_protocol)(image, &LOADED_IMAGE_GUID, &mut li) != 0 || li.is_null() {
+        return None;
+    }
+    // EFI_LOADED_IMAGE_PROTOCOL: Revision (u32) en 0, ParentHandle en 8, SystemTable en 16, DeviceHandle en 24.
+    let dev = unsafe { li.cast::<u8>().add(24).cast::<*mut c_void>().read_unaligned() };
+    let mut dp: *mut c_void = null_mut();
+    if dev.is_null() || (bs.handle_protocol)(dev, &DEVICE_PATH_GUID, &mut dp) != 0 || dp.is_null() {
+        return None;
+    }
+    let (mut usb, mut hd) = (false, None);
+    let mut p = dp.cast::<u8>();
+    // Tope de nodos: una ruta rota no puede dejar el arranque dando vueltas.
+    for _ in 0..64 {
+        let (t, s, l) = unsafe { (p.read(), p.add(1).read(), u16::from_le_bytes([p.add(2).read(), p.add(3).read()]) as usize) };
+        if t == 0x7F || t == 0xFF || l < 4 {
+            break;
+        }
+        match (t, s) {
+            (3, 0x05 | 0x0F | 0x10) => usb = true,
+            // Hard Drive: partición u32 en 4, inicio u64 en 8, tamaño u64 en 16, firma de 16 bytes en 24 y tipo de firma en 41 (2 = GUID).
+            (4, 1) if l >= 42 => unsafe {
+                let mut g = [0u8; 16];
+                core::ptr::copy_nonoverlapping(p.add(24), g.as_mut_ptr(), 16);
+                let guid = (p.add(41).read() == 2).then_some(g);
+                hd = Some(ArranqueUsb { particion: p.add(4).cast::<u32>().read_unaligned(), inicio: p.add(8).cast::<u64>().read_unaligned(), tamano: p.add(16).cast::<u64>().read_unaligned(), guid });
+            },
+            _ => {}
+        }
+        p = unsafe { p.add(l) };
+    }
+    usb.then(|| hd.unwrap_or(ArranqueUsb { particion: 0, inicio: 0, tamano: 0, guid: None }))
 }
 
 #[no_mangle]
@@ -113,6 +163,8 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
         let i = &*mode.info;
         (mode.frame_buffer_base, i.horizontal_resolution, i.vertical_resolution, i.pixels_per_scan_line, i.pixel_format == 1)
     };
+
+    let usb = arranque_usb(image, bs);
 
     // Memoria del sistema: pila (primer MiB) y montón (el resto).
     let mut base = 0u64;
@@ -185,6 +237,7 @@ pub extern "efiapi" fn efi_main(image: *mut c_void, st: *mut SystemTable) -> usi
             ram_end,
             runtime: st.runtime_services,
             rsdp,
+            usb,
         });
         let top = (base + STACK_SIZE) & !15;
         core::arch::asm!(

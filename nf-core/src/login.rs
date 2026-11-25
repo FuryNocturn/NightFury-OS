@@ -11,6 +11,7 @@
 //! de sesión) y la recuperación de una cuenta (`Mode::Recover`, desde el inicio de sesión). Derivar
 //! una llave tarda (PBKDF2): se avisa con "Comprobando…" y el trabajo se hace en un tick posterior
 //! (`job`), para que ese aviso llegue a la pantalla antes.
+mod pen;
 use crate::accounts::{self, AccountError};
 use crate::crypto::wipe;
 use crate::dialogs::{fit, wrap};
@@ -39,6 +40,8 @@ pub enum Mode {
     Disk,
     /// Recuperar una cuenta cifrada con su código: código, clave nueva y repetirla.
     Recover,
+    /// Arranque desde un pendrive (v0.12.6): Probar, Portátil o Instalar. Va antes que todo lo demás.
+    Pen,
 }
 
 /// Lo que el escritorio debe hacer tras un evento.
@@ -58,6 +61,10 @@ pub enum Out {
     NeedEntropy,
     Shutdown,
     Reboot,
+    /// Pendrive: se eligió Probar (el núcleo ya lo sabe; sigue el arranque normal).
+    PenProbar,
+    /// Pendrive: C: pasa a ser el modo Portátil; `true` si es nuevo (hay que preparar el disco).
+    PenPortatil(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,6 +89,8 @@ enum Item {
     Back,
     /// Opción de cifrado del asistente (0 Ninguno, 1 Mi carpeta, 2 Disco entero, 3 Ambos).
     Opt(usize),
+    /// Tarjeta del menú de arranque desde pendrive (0 Probar, 1 Portátil, 2 Instalar).
+    Card(usize),
 }
 
 /// Qué se cifra en un disco nuevo (v0.7.1).
@@ -131,6 +140,10 @@ enum Job {
     Disk,
     Recover,
     Provision,
+    /// Preparar el modo Portátil del pendrive.
+    Pen,
+    /// Instalar NightFury en el disco elegido.
+    Instalar,
 }
 
 const FIELD_H: i32 = 30;
@@ -244,6 +257,8 @@ pub struct Login {
     /// Códigos de recuperación (a quién pertenece, código) y cuál se muestra.
     codes: Vec<(String, String)>,
     code_i: usize,
+    /// Arranque desde pendrive.
+    pen: pen::PenUi,
 }
 
 fn secret() -> String {
@@ -331,12 +346,13 @@ impl Login {
             disk_done: false,
             codes: Vec::new(),
             code_i: 0,
+            pen: Default::default(),
         }
     }
 
     /// Las pantallas que tapan todo el escritorio.
     pub fn covers(&self) -> bool {
-        matches!(self.mode, Mode::Setup | Mode::Pick | Mode::Lock | Mode::Disk | Mode::Recover)
+        matches!(self.mode, Mode::Setup | Mode::Pick | Mode::Lock | Mode::Disk | Mode::Recover | Mode::Pen)
     }
 
     pub fn take_damage(&mut self) -> Vec<Rect> {
@@ -569,6 +585,9 @@ impl Login {
                 self.dmg_item(self.focus);
             }
         }
+        if self.mode == Mode::Pen && self.job.is_none() {
+            self.pen_sondear(sys);
+        }
         if let Some((job, at)) = self.job {
             if ms >= at {
                 self.job = None;
@@ -611,6 +630,7 @@ impl Login {
             Mode::Pick if self.has_pw() && self.can_recover() => alloc::vec![Item::Pw, Item::Link, Item::Ok],
             Mode::Pick | Mode::Lock if self.has_pw() => alloc::vec![Item::Pw, Item::Ok],
             Mode::Pick | Mode::Lock => alloc::vec![Item::Ok],
+            Mode::Pen => self.pen_order(),
             _ => Vec::new(),
         }
     }
@@ -620,6 +640,9 @@ impl Login {
         let mut items: Vec<(Item, Rect)> = Vec::new();
         if self.mode == Mode::Disk {
             return self.layout_disk();
+        }
+        if self.mode == Mode::Pen {
+            return self.layout_pen();
         }
         if self.mode == Mode::Setup && self.fresh && self.step != Step::Account {
             return self.layout_step();
@@ -898,7 +921,7 @@ impl Login {
                 Out::None
             }
             Some(Item::Ok) => self.activate(Item::Ok, sys),
-            Some(it @ (Item::Done | Item::Link | Item::Skip | Item::Back | Item::Opt(_))) => self.activate(it, sys),
+            Some(it @ (Item::Done | Item::Link | Item::Skip | Item::Back | Item::Opt(_) | Item::Card(_))) => self.activate(it, sys),
             Some(Item::Avatar(i)) => {
                 self.select(i);
                 if self.has_pw() {
@@ -971,12 +994,17 @@ impl Login {
         match k.key {
             Key::Tab => self.move_focus(!k.shift),
             Key::Enter => return self.activate(self.focus, sys),
+            Key::Up | Key::Left if self.mode == Mode::Pen => self.move_focus(false),
+            Key::Down | Key::Right if self.mode == Mode::Pen => self.move_focus(true),
             Key::Up | Key::Left if self.choosing() => self.move_opt(false),
             Key::Down | Key::Right if self.choosing() => self.move_opt(true),
             Key::Escape => match self.mode {
                 Mode::Recover => self.cancel_recover(),
                 Mode::Setup if self.fresh && self.step == Step::DiskKey => self.to_choice(),
                 Mode::Disk if self.confirm_skip => self.set_confirm(false),
+                Mode::Pen => {
+                    self.pen_volver();
+                }
                 Mode::Setup => {}
                 _ => {
                     if !self.pw.is_empty() {
@@ -1032,6 +1060,9 @@ impl Login {
             None => self.dmg_item(f),
         }
         self.weak_ok = false;
+        if self.mode == Mode::Pen {
+            self.dmg_item(Item::Ok); // «Instalar» se habilita al escribir BORRAR
+        }
         self.warned = false;
         if f == Item::Pw && matches!(self.mode, Mode::Setup | Mode::Recover) {
             self.dmg_strength();
@@ -1050,6 +1081,7 @@ impl Login {
     /// Enter, espacio o clic sobre `it`.
     fn activate(&mut self, it: Item, sys: &mut dyn Platform) -> Out {
         match self.mode {
+            Mode::Pen => self.pen_activate(it, sys),
             Mode::Setup if self.fresh && self.step != Step::Account => match (self.step, it) {
                 (Step::Choice, Item::Opt(i)) => {
                     self.set_opt(i);
@@ -1182,6 +1214,8 @@ impl Login {
     fn run_job(&mut self, job: Job, sys: &mut dyn Platform) -> Out {
         let now = sys.now();
         match job {
+            Job::Pen => self.pen_crear(sys),
+            Job::Instalar => self.pen_instalar_hacer(sys),
             Job::Disk => {
                 let recovery = self.recovery_mode;
                 let mut typed = core::mem::replace(&mut self.pw, secret());
@@ -1602,6 +1636,7 @@ impl Login {
             Mode::Setup if self.fresh && self.step != Step::Account => self.paint_step(s, &l, accent),
             Mode::Setup | Mode::Recover => self.paint_setup(s, &l, accent),
             Mode::Disk => self.paint_disk(s, &l, accent),
+            Mode::Pen => self.paint_pen(s, &l, accent),
             _ => self.paint_pick(s, &l, accent),
         }
         let c = self.clock_rect();

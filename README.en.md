@@ -7,7 +7,7 @@
 **A desktop operating system written from scratch in Rust.**<br>
 Its own kernel, windowing, file system, encryption, USB, networking and web browser. No third-party dependencies.
 
-[![Version](https://img.shields.io/badge/version-0.12.5-7c5cff)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.12.6-7c5cff)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-no__std-orange?logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/UEFI-x86__64-555)](#try-it)
@@ -28,13 +28,12 @@ public specifications and never copies anyone else's code ([rules and sources](d
 
 The user interface is in Spanish.
 
-## What's new in 0.12.5
+## What's new in 0.12.6
 
-- **Forms** in the browser: GET and POST, with a warning when a password would travel over http.
-- **Cookies** kept in memory, on disk only for bookmarked sites or sites with "Remember session"; third-party cookies blocked.
-- 90-day **history** (Ctrl+H), **bookmarks** with a star, a bar and folders (Ctrl+D, Ctrl+Shift+O).
-- **Incognito** (Ctrl+Shift+N) and **downloads** that ask first and go to Downloads (Ctrl+J).
-- **Smooth TrueType text** across the whole system; the stroke font remains in Settings → Personalization.
+- **Bootable USB stick** with a menu: **Try** without touching anything, **Portable** (saves to the stick) or **Install**.
+- **Installer**: pick a SATA or NVMe disk, type BORRAR ("erase") and NightFury becomes the only system on that disk.
+- **Releases** on GitHub with the USB image, a QEMU zip and their SHA-256 sums.
+- The repository now has CI, secret scanning, a [security policy](SECURITY.md) and a [contributing guide](CONTRIBUTING.md).
 
 Every version is in the [changelog](CHANGELOG.md) (in Spanish).
 
@@ -61,15 +60,19 @@ Every version is in the [changelog](CHANGELOG.md) (in Spanish).
 
 ## Try it
 
-You need Rust with the `x86_64-unknown-uefi` target and QEMU with the edk2 firmware.
+**Without building:** download the USB image (write it with Rufus or balenaEtcher) or the QEMU zip from the
+[releases](https://github.com/FuryNocturn/NightFury-OS/releases). They are test builds: **Install erases the
+disk you choose** and Secure Boot must be disabled ([guide](docs/USB.md), in Spanish).
+
+**Building it:** you need Rust with the `x86_64-unknown-uefi` target and QEMU with the edk2 firmware.
 
 ```powershell
 rustup target add x86_64-unknown-uefi
 powershell -ExecutionPolicy Bypass -File run.ps1
 ```
 
-- Tests: `cargo test -p nf-core -p nf-web -p navegador`
-- Booting from a USB drive and the `nfdisk` tool: [docs/USB.md](docs/USB.md)
+- Tests: `cargo test -p nf-core -p nf-app -p nf-web -p navegador`
+- USB stick, installer and the `nfdisk` tool: [docs/USB.md](docs/USB.md)
 
 Tested in QEMU; not yet on real hardware.
 
@@ -82,7 +85,8 @@ Tested in QEMU; not yet on real hardware.
 
 | Version | What it will bring |
 |---|---|
-| 0.12.6 | Encrypted password and personal data manager that fills forms in the browser |
+| 0.12.7 | Install alongside Windows or Linux, with its own menu to pick a system at power-on |
+| 0.12.8 | Encrypted password and personal data manager that fills forms in the browser |
 | 0.13 | Image viewer, BMP, animated GIF, ZIP and faster redrawing |
 | 0.14 | Multiple CPU cores, sound and a media player |
 | 0.15 | Wi-Fi and IPv6 |

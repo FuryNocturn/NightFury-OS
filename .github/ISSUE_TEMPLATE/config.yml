@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Preguntas y charla / Questions and chat
+    url: https://github.com/FuryNocturn/NightFury-OS/discussions
+    about: Para dudas y conversación usa Discussions. / Use Discussions for questions.
+  - name: Vulnerabilidad de seguridad / Security vulnerability
+    url: https://github.com/FuryNocturn/NightFury-OS/security/policy
+    about: No abras un issue público; sigue la política de seguridad. / Do not open a public issue; follow the security policy.

@@ -12,10 +12,12 @@ mod arch;
 #[cfg(feature = "demo")]
 mod demo;
 mod boot;
+mod entrada;
 mod fb;
 mod nvme;
 mod paging;
 mod pci;
+mod pendrive;
 mod ps2;
 mod red;
 mod rtc;
@@ -34,16 +36,17 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering::*};
 use fb::Fb;
 use nf_core::desktop::Desktop;
-use nf_core::block::{BlockDev, BLOCK};
+use nf_core::block::BlockDev;
 use nf_core::files::Files;
 use nf_core::fs::Nffs;
 use nf_core::geom::Rect;
 use nf_core::heap::Heap;
 use nf_core::icons::{self, Icon};
 use nf_core::input::{Event, Keyboard, Ps2Mouse};
-use nf_core::platform::{DateTime, MemInfo, Platform};
+use nf_core::platform::{DateTime, MemInfo, PenEstado, Platform};
 use nf_core::proc::{ProcInfo, Process};
 use nf_core::surface::Surface;
+use nf_core::vol::nfvol::SectorBlocks;
 use nf_core::{font, NAME};
 use serial::traza;
 
@@ -164,6 +167,9 @@ struct Plat {
     files: Files,
     pool: nf_core::keys::Pool,
     net: nf_core::net::Net,
+    pen: pendrive::Pen,
+    /// Discos internos (SATA y NVMe) que aún no se han montado: se montan al elegir modo en el menú del pendrive.
+    internos: Option<Vec<unidades::Interno>>,
 }
 
 fn cpu_name() -> String {
@@ -263,6 +269,48 @@ impl Platform for Plat {
     fn entropy(&mut self) -> u64 {
         entropia()
     }
+    fn pen_menu(&self) -> bool {
+        self.pen.menu
+    }
+    fn pen_estado(&mut self) -> PenEstado {
+        let t = self.uptime_ms();
+        self.pen.estado(t)
+    }
+    fn pen_probar(&mut self) {
+        self.files.set_probar();
+        self.pen.elegir(pendrive::Eleccion::Probar);
+    }
+    fn pen_discos(&mut self) -> Vec<nf_core::platform::PenDisco> {
+        if !self.pen.menu {
+            return Vec::new();
+        }
+        let lista = self.internos.as_deref().unwrap_or(&[]);
+        lista.iter().map(|d| nf_core::platform::PenDisco { modelo: String::from(d.modelo()), bytes: d.bytes(), partes: d.contenido() }).collect()
+    }
+    fn pen_instalar(&mut self, i: usize) -> Result<bool, nf_core::fs::FsError> {
+        use nf_core::fs::FsError;
+        // Solo desde el menú del pendrive y sobre un disco interno de la lista: nada más se escribe nunca.
+        if !self.pen.menu {
+            return Err(FsError::Invalid);
+        }
+        let disco = self.internos.as_deref().and_then(|l| l.get(i)).ok_or(FsError::NotFound)?;
+        let efi = self.pen.efi()?;
+        let esp = disco.instalar(&efi, nf_core::VERSION)?;
+        match entrada::crear(self.info.runtime, &esp) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                traza!("NF instalar: sin entrada de arranque UEFI: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    fn pen_portatil(&mut self) -> Result<bool, nf_core::fs::FsError> {
+        let now = rtc::now();
+        let (nuevo, files) = self.pen.portatil(now)?;
+        self.files = files;
+        self.pen.elegir(pendrive::Eleccion::Portatil);
+        Ok(nuevo)
+    }
 }
 
 /// 64 bits impredecibles: ver `Platform::entropy`.
@@ -291,46 +339,55 @@ fn entropia() -> u64 {
 
 // ---------- Disco de datos ----------
 
-/// Sondea PCI/AHCI y ofrece el primer disco SATA que sea de NightFury o esté en blanco (el del
-/// sistema, C:). El resto de discos SATA, de todos los controladores, se devuelven aparte: son internos.
-fn elegir_disco() -> (Option<Box<dyn BlockDev>>, Vec<Box<ahci::Disco>>) {
-    let abars = pci::buscar_ahci();
-    if abars.is_empty() && TRAZA {
-        traza!("NF disco: sin controlador AHCI");
+/// Elige el disco del sistema (C:) entre los SATA y NVMe y devuelve aparte el resto, que son internos.
+/// 1.º un disco con NightFury instalado (GPT con una partición NFFS: C: es esa partición); 2.º, como siempre,
+/// el primer SATA que sea de NightFury entero o esté en blanco. Con `todo_interno` (arranque desde un pendrive)
+/// no se ofrece ninguno: C: no es un disco del equipo.
+fn elegir_disco(todo_interno: bool, sata: Vec<Box<ahci::Disco>>, nvme: Vec<nvme::Espacio>) -> (Option<Box<dyn BlockDev>>, Vec<unidades::Interno>) {
+    let mut lista = unidades::preparar(sata, nvme);
+    if todo_interno {
+        return (None, lista);
     }
-    let mut elegido: Option<Box<dyn BlockDev>> = None;
-    let mut resto = Vec::new();
-    for d in abars.into_iter().flat_map(ahci::sondear) {
-        let mut d = d;
-        let mib = d.blocks() * BLOCK as u64 >> 20;
-        let motivo = if Nffs::is_formatted(&mut *d) {
-            "NightFury"
-        } else if nf_core::cryptdev::detect(&mut *d).is_some() {
-            // Cifrado total: el NFFS no se ve, pero la cabecera del último bloque es la nuestra.
-            "NightFury cifrado"
-        } else if Nffs::is_blank(&mut *d) {
-            "en blanco"
-        } else {
-            ""
+    if let Some(k) = lista.iter().position(|d| d.instalada().is_some()) {
+        let d = lista.remove(k);
+        let (inicio, sectores) = d.instalada().unwrap_or_default();
+        traza!("NF disco: «{}» lleva NightFury instalado (partición desde {} con {} sectores): es C:", d.modelo(), inicio, sectores);
+        let dev: Box<dyn BlockDev> = Box::new(SectorBlocks { dev: Box::new(d.manejador(false)), start: inicio, sectors: sectores });
+        return (Some(dev), lista);
+    }
+    for k in 0..lista.len() {
+        let motivo = match &mut *lista[k].fis.borrow_mut() {
+            unidades::Fisico::Sata(d) => motivo_sata(&mut **d),
+            unidades::Fisico::Nvme(_) => "",
         };
-        let ofrecer = !motivo.is_empty() && elegido.is_none();
         if TRAZA {
-            let r = match (motivo, ofrecer) {
-                (_, true) => "se ofrece",
-                _ => "es interno",
-            };
-            traza!("NF disco: puerto {} {} MiB {} bloques ({}) {}", d.puerto(), mib, d.blocks(), motivo, r);
+            traza!("NF disco: «{}» {} MiB ({}) {}", lista[k].modelo(), lista[k].bytes() >> 20, motivo, if motivo.is_empty() { "es interno" } else { "se ofrece" });
         }
-        if ofrecer {
-            elegido = Some(d);
-        } else {
-            resto.push(d);
+        if !motivo.is_empty() {
+            if let Some(d) = lista.remove(k).en_sata() {
+                return (Some(d), lista);
+            }
+            break;
         }
     }
-    if elegido.is_none() && TRAZA {
+    if TRAZA {
         traza!("NF disco: ninguno ofrecido");
     }
-    (elegido, resto)
+    (None, lista)
+}
+
+/// Qué tiene un disco SATA entero que NightFury pueda usar como C: ("" si nada).
+fn motivo_sata(d: &mut ahci::Disco) -> &'static str {
+    if Nffs::is_formatted(d) {
+        "NightFury"
+    } else if nf_core::cryptdev::detect(d).is_some() {
+        // Cifrado total: el NFFS no se ve, pero la cabecera del último bloque es la nuestra.
+        "NightFury cifrado"
+    } else if Nffs::is_blank(d) {
+        "en blanco"
+    } else {
+        ""
+    }
 }
 
 // ---------- Núcleo ----------
@@ -358,8 +415,11 @@ extern "C" fn kmain() -> ! {
         traza!("NF usb: {} controlador(es) xHCI iniciado(s)", n_usb);
     }
 
-    let (disco, sata) = elegir_disco();
-    let nvme = nvme::sondear();
+    let abars = pci::buscar_ahci();
+    if abars.is_empty() && TRAZA {
+        traza!("NF disco: sin controlador AHCI");
+    }
+    let (disco, internos) = elegir_disco(info.usb.is_some(), abars.into_iter().flat_map(ahci::sondear).collect(), nvme::sondear());
     let files = Files::probe(disco, rtc::now());
     if TRAZA {
         traza!("NF archivos: persistente={} formato_pendiente={}", files.persistent(), files.pending_format());
@@ -377,7 +437,7 @@ extern "C" fn kmain() -> ! {
         traza!("NF red: {} {}", dev.name(), nf_core::net::mac_text(dev.mac()));
         net.attach(dev);
     }
-    let mut plat = Plat { info, files, pool, net };
+    let mut plat = Plat { info, files, pool, net, pen: pendrive::Pen::new(info.usb), internos: Some(internos) };
     let (w, h) = (info.width as i32, info.height as i32);
     // La letra TrueType del sistema sale de los bytes incluidos: no depende del disco (bloqueado al iniciar sesión).
     let fuente = |n: &str| FUENTES_SISTEMA.iter().find(|f| f.0 == n).map_or(&[][..], |f| f.1);
@@ -405,9 +465,13 @@ extern "C" fn kmain() -> ! {
     }
     #[cfg(feature = "demo")]
     demo::lanzar(&mut desk, &mut plat);
-    // Los discos internos se enganchan antes que ningún USB.
+    // Los discos internos se enganchan antes que ningún USB. Arrancando de un pendrive, esperan a que se elija
+    // modo (Probar los monta de solo lectura; Instalar no los monta): hasta entonces nada del equipo se toca.
     let mut unidades = unidades::Unidades::default();
-    unidades.internos(&mut plat.files, sata, nvme);
+    if !plat.pen.menu {
+        let lista = plat.internos.take().unwrap_or_default();
+        unidades.internos(&mut plat.files, lista, false);
+    }
     unsafe { core::arch::asm!("sti") };
 
     let mut teclado = Keyboard::new();
@@ -421,7 +485,12 @@ extern "C" fn kmain() -> ! {
     let mut estado_red = None;
     loop {
         // Programas del sistema: se instalan (o actualizan) en cuanto el disco está listo.
-        if !programas_listos && !plat.files.disk_locked() && !plat.files.pending_format() {
+        if let Some(e) = plat.pen.eleccion.take() {
+            if let Some(lista) = plat.internos.take() {
+                unidades.internos(&mut plat.files, lista, e == pendrive::Eleccion::Probar);
+            }
+        }
+        if !programas_listos && !plat.pen.menu && !plat.files.disk_locked() && !plat.files.pending_format() {
             programas_listos = true;
             let now = plat.now();
             for (dir, items) in PROGRAMAS_SISTEMA {
@@ -451,7 +520,7 @@ extern "C" fn kmain() -> ! {
         }
         // USB: sondeo del xHCI; el teclado entra por el mismo decodificador que el PS/2.
         usb::poll(arch::TICKS.load(Relaxed) * 10, &mut usb_teclado, &mut usb_raton, &mut usb_mandos);
-        unidades.sondear(&mut plat.files, &mut plat.pool);
+        unidades.sondear(&mut plat.files, &mut plat.pool, &mut plat.pen);
         plat.net.poll(arch::TICKS.load(Relaxed) * 10);
         if TRAZA {
             let st = plat.net.status();

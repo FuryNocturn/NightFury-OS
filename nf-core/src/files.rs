@@ -123,6 +123,7 @@ const NOTICE_LOCKED: &str =
     "Disco cifrado: escribe su clave para abrirlo. Mientras, los archivos se guardan solo en la memoria y se perderán al apagar.";
 const NOTICE_LOCKED_SKIPPED: &str =
     "Disco cifrado sin abrir: no se ha tocado y los archivos se guardan solo en la memoria y se perderán al apagar.";
+const NOTICE_PROBAR: &str = "Modo Probar: los archivos se guardan solo en la memoria y se perderán al apagar. Los discos del equipo no se tocan.";
 const NOTICE_NEW: &str =
     "Disco sin formato: mientras no se prepare, los archivos se guardan solo en la memoria y se perderán al apagar.";
 
@@ -435,6 +436,8 @@ struct XDrives {
     result: Option<Result<Option<String>, FsError>>,
     job: Option<UnlockJob>,
     unlocked: Option<Result<(), KeyError>>,
+    /// Modo Probar (pendrive de arranque): no se formatea ni cifra en los discos internos.
+    probar: bool,
 }
 
 /// Línea de `unidades.cfg`: la serie sin saltos de línea ni `|`.
@@ -493,6 +496,17 @@ impl Files {
         } else {
             Files::memory(NOTICE_IGNORED, None, now)
         }
+    }
+
+    /// Disco en blanco ya elegido (el modo Portátil): C: en memoria hasta que el asistente de disco nuevo lo formatee.
+    pub fn pendiente(dev: Box<dyn BlockDev>, now: DateTime) -> Files {
+        Files::memory(NOTICE_NEW, Some(dev), now)
+    }
+
+    /// Modo Probar: desde ahora `request_drive_action` rechaza formatear o cifrar discos internos.
+    pub fn set_probar(&mut self) {
+        self.xd.probar = true;
+        self.notice = Some(NOTICE_PROBAR);
     }
 
     /// Para herramientas (nfdisk): trabaja sobre un volumen NFFS ya montado, tal cual: sin arranque
@@ -3274,6 +3288,9 @@ impl Files {
         let x = self.xd.list.iter().find(|d| d.letter == letter).ok_or(FsError::BadPath)?;
         let (disk, part, internal) = (x.disk, x.part, !x.removable);
         let eject = req == FormatRequest::Eject;
+        if internal && self.xd.probar {
+            return Err(FsError::Denied);
+        }
         // Un disco interno nunca se expulsa, y formatear o cifrar toca solo su partición (las demás siguen montadas).
         if internal && eject {
             return Err(FsError::Denied);

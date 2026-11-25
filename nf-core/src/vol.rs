@@ -325,6 +325,7 @@ impl Volume for ReadOnly {
 pub mod exfat;
 pub mod ext;
 pub mod fat;
+pub mod instalar;
 pub mod iso;
 pub mod nfvol;
 pub mod ntfs;

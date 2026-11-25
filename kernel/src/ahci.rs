@@ -58,6 +58,7 @@ const CMD: usize = 0x18;
 const TFD: usize = 0x20;
 const SIG: usize = 0x24;
 const SSTS: usize = 0x28;
+const SCTL: usize = 0x2C;
 const SERR: usize = 0x30;
 const CI: usize = 0x38;
 
@@ -198,7 +199,10 @@ impl BlockDev for Disco {
 /// Prepara un puerto con disco SATA; `None` (con traza) si no sirve.
 fn iniciar(hba: usize, p: u32, c64: bool) -> Option<Disco> {
     let b = hba + 0x100 + p as usize * 0x80;
-    if rd(b + SIG) != 0x0000_0101 || rd(b + SSTS) & 0xF != 3 {
+    // Firma 0xFFFFFFFF con el enlace activo: el firmware no ha arrancado este puerto (p. ej. arranque desde un
+    // USB) y el disco aún no ha dado su firma; más abajo se arranca el receptor de FIS y se reinicia el enlace.
+    let sig = rd(b + SIG);
+    if (sig != 0x0000_0101 && sig != 0xFFFF_FFFF) || rd(b + SSTS) & 0xF != 3 {
         return None;
     }
     // Parar el motor de órdenes.
@@ -228,6 +232,18 @@ fn iniciar(hba: usize, p: u32, c64: bool) -> Option<Disco> {
     wr(b + IS, 0xFFFF_FFFF);
     wr(b + IE, 0);
     wr(b + CMD, rd(b + CMD) | CMD_FRE);
+    if sig == 0xFFFF_FFFF {
+        // COMRESET (SControl.DET = 1 durante al menos 1 ms) y espera a la firma de un disco SATA con el enlace listo.
+        wr(b + SCTL, 1);
+        for _ in 0..1_000_000 {
+            core::hint::spin_loop();
+        }
+        wr(b + SCTL, 0);
+        if !esperar(|| rd(b + SSTS) & 0xF == 3 && rd(b + SIG) == 0x0000_0101 && rd(b + TFD) & 0x88 == 0) {
+            traza!("AHCI puerto {}: el enlace no se reinicia, descartado", p);
+            return None;
+        }
+    }
     wr(b + CMD, rd(b + CMD) | CMD_ST);
     let mut d = Disco { puerto: p, base: b, lista, tabla, buf, sectores: 0, modelo: String::new(), serie: String::new() };
     // IDENTIFY DEVICE

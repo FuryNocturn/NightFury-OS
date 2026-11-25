@@ -1228,6 +1228,10 @@ impl Explorer {
         }
         match cx.sys.fs().request_drive_action(letter, req) {
             Ok(()) => self.waiting = Some((letter, enc)),
+            // En un disco interno solo se rechaza así en el modo Probar del pendrive de arranque.
+            Err(FsError::Denied) if cx.sys.fs().drives().iter().any(|i| i.letter == letter && !i.removable) => {
+                self.drive_msg("Modo Probar", String::from("En modo Probar no se escribe en los discos del equipo."), cx)
+            }
             Err(e) => self.fail(e, cx),
         }
         self.reload(cx.sys);

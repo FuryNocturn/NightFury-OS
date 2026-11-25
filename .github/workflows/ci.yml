@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust estable con los destinos del sistema
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --target x86_64-unknown-uefi --target x86_64-unknown-none
+          rustup default stable
+          rustc -vV
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Programas
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools/programas.ps1
+      - name: Núcleo (UEFI)
+        run: cargo build -p kernel --release --target x86_64-unknown-uefi
+      - name: nfdisk
+        run: cargo build -p nfdisk --release
+      - name: Tests
+        run: cargo test -p nf-core -p nf-app -p nf-web -p navegador
+      - name: Clippy del núcleo (solo informa)
+        continue-on-error: true
+        run: cargo clippy -p kernel --target x86_64-unknown-uefi
+
+  comprobaciones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Secretos y emails personales
+        run: sh tools/secretos.sh
+      - name: Email de autor y committer (solo PR)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          malos=$(git log "$BASE..$HEAD" --format='%h %ae %ce' | awk '
+            { for (i = 2; i <= 3; i++)
+                if ($i !~ /@users\.noreply\.github\.com$/ && $i != "noreply@github.com") { print $1; break } }')
+          if [ -n "$malos" ]; then
+            echo "Commits con autor o committer sin email noreply de GitHub:" >&2
+            echo "$malos" >&2
+            exit 1
+          fi

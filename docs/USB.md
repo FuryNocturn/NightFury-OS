@@ -9,15 +9,38 @@ Compila, prepara la carpeta `esp\` y abre QEMU. Al hacer clic en la ventana, QEM
 
 Para una captura sin ventana (pruebas): `tools\shot.ps1 -Out shots\a.png`.
 
-## En un PC real, desde USB
-1. Compila: `cargo build -p kernel --release --target x86_64-unknown-uefi`
-2. Formatea un USB en **FAT32** (borra su contenido).
-3. Crea en el USB la carpeta `EFI\BOOT\` y copia ahí
-   `target\x86_64-unknown-uefi\release\nightfury.efi` con el nombre **`BOOTX64.EFI`**.
-4. En el PC: desactiva *Secure Boot* en la BIOS/UEFI (el sistema no está firmado), arranca desde el USB
-   (menú de arranque: F12, F11, F8 o Esc según el fabricante) en modo UEFI.
+## En un PC real, desde un pendrive (v0.12.6)
+1. Descarga `nightfury-<versión>-usb.img` de las
+   [releases](https://github.com/FuryNocturn/NightFury-OS/releases) (comprueba su SHA-256 con
+   `SHA256SUMS.txt`) o créala tú:
+   ```powershell
+   target\release\nfdisk.exe pen-arranque pen.img target\x86_64-unknown-uefi\release\nightfury.efi 0.12.6
+   ```
+2. Grábala en un pendrive con Rufus o balenaEtcher en modo imagen (DD). **Borra el pendrive.** Para el modo
+   Portátil usa uno de al menos 1 GB.
+3. En el PC: desactiva *Secure Boot* (el sistema no está firmado) y arranca desde el pendrive en modo UEFI
+   (menú de arranque: F12, F11, F8 o Esc según el fabricante).
 
-No toca los discos del PC: todo vive en memoria.
+Sale un menú que espera a que elijas:
+- **Probar**: todo vive en memoria y se pierde al apagar. No escribe en los discos del equipo ni en el pendrive.
+- **Portátil**: la primera vez crea una partición en el espacio libre del pendrive (sin borrar lo que hay) y
+  guarda ahí cuentas y archivos, con cifrado opcional. Llévate NightFury a cualquier PC.
+- **Instalar**: elige un disco interno (SATA o NVMe) y escribe `BORRAR`. **Se borra todo ese disco** y NightFury
+  queda como único sistema en él; añade la entrada «NightFury» al menú de arranque del firmware. Quita el
+  pendrive y reinicia. Instalar junto a Windows o Linux, en una partición, llegará en la 0.12.7.
+
+### Pendrive en QEMU
+```powershell
+& "C:\Program Files\qemu\qemu-system-x86_64.exe" -machine q35 -m 1024 `
+  -drive "if=pflash,format=raw,readonly=on,file=C:\Program Files\qemu\share\edk2-x86_64-code.fd" `
+  -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 `
+  -drive if=none,id=pen,format=raw,file=pen.img -device usb-storage,bus=xhci.0,drive=pen,bootindex=0 -vga std
+```
+Para probar Instalar, añade un disco: `-drive file=nvme.img,if=none,id=nv,format=raw -device nvme,serial=nf1,drive=nv`.
+
+### Máquina virtual descargada
+El `nightfury-<versión>-qemu.zip` de cada release trae `BOOTX64.EFI` y `arrancar.ps1`: descomprímelo y ejecuta
+`powershell -ExecutionPolicy Bypass -File arrancar.ps1` (necesita QEMU para Windows).
 
 ### Dispositivos USB (v0.11)
 Desde la v0.11 NightFury tiene su propio controlador USB (xHCI, USB 3), así que no depende de que la placa

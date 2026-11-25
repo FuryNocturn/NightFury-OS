@@ -1,0 +1,10 @@
+#!/bin/sh
+# Activar con: git config core.hooksPath .githooks
+email=$(git config user.email)
+case "$email" in
+    *@users.noreply.github.com) ;;
+    *) echo "pre-commit: user.email debe terminar en @users.noreply.github.com (actual: '${email}')." >&2
+       echo "  Arréglalo con: git config user.email <id>+<usuario>@users.noreply.github.com" >&2
+       exit 1 ;;
+esac
+exec sh "$(git rev-parse --show-toplevel)/tools/secretos.sh" --staged

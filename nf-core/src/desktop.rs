@@ -969,6 +969,22 @@ impl Desktop {
             Out::SetupDone | Out::DiskDone => self.enter_flow(sys),
             Out::Shutdown => sys.shutdown(),
             Out::Reboot => sys.reboot(),
+            // Probar: C: sigue en memoria, como sin disco (aviso y escritorio).
+            Out::PenProbar => {
+                self.login.off();
+                self.boot_flow(sys);
+            }
+            // Portátil: C: ya es la partición del pendrive. Nueva = disco en blanco: asistente de disco nuevo
+            // (cifrado y cuentas) sin preguntar; existente = flujo normal (clave del disco, cuentas).
+            Out::PenPortatil(nuevo) => {
+                self.login.off();
+                if nuevo {
+                    self.login.start_new_disk();
+                    self.screen_on();
+                } else {
+                    self.boot_flow(sys);
+                }
+            }
             Out::NeedEntropy => {
                 let req = DialogRequest::Entropy { tag: TAG_SETUP, title: String::from("Generar las llaves") };
                 self.open_dialog(None, req, sys);
@@ -3389,7 +3405,13 @@ impl Desktop {
         self.login_out(out, sys);
         if !self.booted {
             self.booted = true;
-            self.boot_flow(sys);
+            if sys.pen_menu() {
+                // Arrancado desde un pendrive: antes que el disco, el asistente o las cuentas, el menú de modos.
+                self.login.start_pen();
+                self.screen_on();
+            } else {
+                self.boot_flow(sys);
+            }
         }
         self.convert_tick(sys);
         self.drives_tick(sys);
