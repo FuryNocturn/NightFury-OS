@@ -1,0 +1,31 @@
+[package]
+name = "arranque"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "NightFury: menú de arranque UEFI en modo texto (arranque.efi)"
+
+# Definiciones UEFI comunes a los dos binarios.
+[lib]
+name = "efi"
+path = "src/uefi.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "arranque"
+path = "src/main.rs"
+test = false
+bench = false
+
+# EFI de prueba: hace de «Windows/Linux falso» en QEMU.
+[[bin]]
+name = "prueba-so"
+path = "src/prueba_so.rs"
+test = false
+bench = false
+
+[dependencies]
+nf-core = { path = "../nf-core", default-features = false }

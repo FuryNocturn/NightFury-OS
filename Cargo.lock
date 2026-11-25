@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "arranque"
+version = "0.12.7"
+dependencies = [
+ "nf-core",
+]
+
+[[package]]
 name = "bloc-notas"
 version = "1.0.0"
 dependencies = [
@@ -36,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "nf-core",
 ]
@@ -60,39 +67,39 @@ dependencies = [
 
 [[package]]
 name = "nf-app"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nf-core"
-version = "0.12.6"
+version = "0.12.7"
 
 [[package]]
 name = "nf-web"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfdisk"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfpack"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "nf-core",
 ]
 
 [[package]]
 name = "nfprog"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "mensajes",
  "navegador",

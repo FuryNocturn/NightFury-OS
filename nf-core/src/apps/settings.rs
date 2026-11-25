@@ -14,6 +14,7 @@
 //! solo existe mientras se construye el diálogo que lo muestra.
 use super::{App, AppKind, Ctx, MouseEv};
 use crate::accounts::{salt_from, AccountError, MIN_PASSWORD};
+use crate::arranque::{self, InfoArranque};
 use crate::crypto::{ct_eq, wipe};
 use crate::dialogs::{Answer, Buttons, DialogRequest, DialogResult};
 use crate::font::{self, Align};
@@ -40,7 +41,7 @@ const PANEL_W: i32 = 220;
 const THUMB: (i32, i32) = (128, 72);
 const TEXT: u32 = 0x1A1A1A;
 const GRAY: u32 = 0x6A6A6A;
-const SECTIONS: [(&str, Icon); 8] = [
+const SECTIONS: [(&str, Icon); 9] = [
     ("Personalización", Icon::Palette),
     ("Cuentas", Icon::Cuentas),
     ("Aplicaciones", Icon::VistaIconosGrandes),
@@ -48,6 +49,7 @@ const SECTIONS: [(&str, Icon); 8] = [
     ("Dispositivos", Icon::Mando),
     ("Red", Icon::RedConectada),
     ("Fecha y hora", Icon::Reloj),
+    ("Arranque", Icon::Power),
     ("Acerca de", Icon::Info),
 ];
 const PAGE_ACCOUNTS: usize = 1;
@@ -56,7 +58,8 @@ const PAGE_DISK: usize = 3;
 const PAGE_DEVICES: usize = 4;
 const PAGE_NET: usize = 5;
 const PAGE_TIME: usize = 6;
-const PAGE_ABOUT: usize = 7;
+const PAGE_ARRANQUE: usize = 7;
+const PAGE_ABOUT: usize = 8;
 const BTN_H: i32 = 26;
 /// Paso de la rueda y de las flechas de la barra, en píxeles.
 const STEP: i32 = 24;
@@ -92,6 +95,8 @@ const T_CERT_DEL: u32 = 65;
 /// Fecha y hora (v0.12.3): cambiar la fecha o la hora a mano.
 const T_DATE: u32 = 66;
 const T_TIME: u32 = 67;
+/// Arranque (v0.12.7): nombre nuevo de una entrada del menú.
+const T_ARR_NOM: u32 = 68;
 const NO_MATCH: &str = "Las claves no coinciden.";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,6 +137,12 @@ enum Act {
     TimeZone(usize),
     TimeDate,
     TimeClock,
+    /// Arranque: segundos de la cuenta atrás, ocultar o mostrar y renombrar la entrada `i` de `Settings::arr`, y poner NightFury el primero.
+    ArrMenos,
+    ArrMas,
+    ArrOcultar(usize),
+    ArrNombre(usize),
+    ArrPrimero,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -229,6 +240,9 @@ struct Settings {
     /// Raíz elegida (DER) esperando la confirmación, y huella de la que se va a quitar.
     cert_der: Option<Vec<u8>>,
     cert_del: Option<[u8; 32]>,
+    /// Menú de arranque tal como se vio al dibujar la página Arranque, y la entrada que se está renombrando.
+    arr: Option<InfoArranque>,
+    arr_nom: Option<String>,
 }
 
 pub fn new() -> Box<dyn App> {
@@ -262,6 +276,8 @@ fn init() -> Settings {
         certs: Vec::new(),
         cert_der: None,
         cert_del: None,
+        arr: None,
+        arr_nom: None,
     }
 }
 
@@ -564,6 +580,74 @@ impl Settings {
                 self.hits.push((r, Hit::Act(Act::TimeZone(i))));
             }
             y += 24;
+        }
+        self.content_h = y + self.scroll + 16;
+    }
+
+    /// v0.12.7: ajustes del menú de arranque (`arranque.efi`): cuenta atrás, entradas y orden en el firmware.
+    fn arranque_page(&mut self, s: &mut Surface, theme: &Theme, sys: &mut dyn Platform) {
+        let compact = s.h < 440;
+        let x0 = PANEL_W + 24;
+        let right = (s.w - SB_W - 8).max(x0 + 1);
+        let mut y = if compact { 14 } else { 24 } - self.scroll;
+        font::draw(s, x0, y, "Arranque", 18, false, TEXT);
+        y += font::line_h(18) + if compact { 6 } else { 12 };
+        self.arr = sys.arranque_leer();
+        let Some(info) = self.arr.clone() else {
+            let y = note(s, x0, y, right - x0, "El menú de arranque de NightFury no está instalado en este equipo. Se instala al instalar NightFury desde el pendrive.");
+            self.content_h = y + self.scroll + 16;
+            return;
+        };
+        let admin = sys.fs().is_admin();
+        if !admin {
+            y = note(s, x0, y, right - x0, "Hace falta una cuenta de administrador.") + 10;
+        }
+        font::draw(s, x0, y, "Cuenta atrás", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        let seg = info.ajustes.segundos;
+        let txt = format!("{seg} s");
+        let mut at = (x0, y);
+        if admin {
+            self.button_if(s, &mut at, x0, right, "−", Act::ArrMenos, seg > 0, theme);
+        }
+        let w = font::width(&txt, 10, true) + 16;
+        font::draw_in(s, Rect::new(at.0, at.1, w, BTN_H), &txt, 10, true, TEXT, Align::Center);
+        at.0 += w + 8;
+        if admin {
+            self.button_if(s, &mut at, x0, right, "+", Act::ArrMas, seg < 30, theme);
+        }
+        y = at.1 + BTN_H + 4;
+        if seg == 0 {
+            y = note(s, x0, y, right - x0, "Arranca directo (mantén una tecla para ver el menú).");
+        }
+        y += if compact { 8 } else { 14 };
+        font::draw(s, x0, y, "Sistemas del menú", 11, true, TEXT);
+        y += font::line_h(11) + 6;
+        for (i, (clave, orig, ocultable)) in info.entradas.iter().enumerate() {
+            let oculta = info.ajustes.ocultas.contains(clave);
+            let nombre = info.ajustes.nombres.iter().find(|(c, n)| c == clave && !n.is_empty()).map_or(orig.as_str(), |(_, n)| n.as_str());
+            let end = font::draw(s, x0, y, nombre, 9, true, if oculta { GRAY } else { TEXT });
+            if oculta {
+                font::draw(s, end + 10, y, "Oculto", 9, false, GRAY);
+            }
+            y += font::line_h(9) + 4;
+            if admin {
+                let mut at = (x0, y);
+                if *ocultable {
+                    self.button(s, &mut at, x0, right, if oculta { "Mostrar" } else { "Ocultar" }, Act::ArrOcultar(i), theme);
+                }
+                self.button(s, &mut at, x0, right, "Renombrar", Act::ArrNombre(i), theme);
+                y = at.1 + BTN_H;
+            }
+            y += 10;
+        }
+        y += if compact { 4 } else { 10 };
+        font::draw(s, x0, y, if info.primero { "El menú de NightFury es lo primero al encender." } else { "Otro sistema se ha puesto delante." }, 9, false, if info.primero { TEXT } else { GRAY });
+        y += font::line_h(9) + 8;
+        if admin && !info.primero {
+            let mut at = (x0, y);
+            self.button(s, &mut at, x0, right, "Poner el menú de NightFury el primero", Act::ArrPrimero, theme);
+            y = at.1 + BTN_H;
         }
         self.content_h = y + self.scroll + 16;
     }
@@ -904,7 +988,7 @@ impl Settings {
     }
 
     fn scrolls(&self) -> bool {
-        self.page == 0 || self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || self.page == PAGE_TIME || (self.page == PAGE_DEVICES && self.testing.is_none())
+        self.page == 0 || self.page == PAGE_ACCOUNTS || self.page == PAGE_DISK || self.page == PAGE_APPS || self.page == PAGE_NET || self.page == PAGE_TIME || self.page == PAGE_ARRANQUE || (self.page == PAGE_DEVICES && self.testing.is_none())
     }
 
     fn metrics(&self) -> Metrics {
@@ -1224,6 +1308,7 @@ impl Settings {
                 cx.dialog = Some(DialogRequest::Input { tag, title: String::from("Fecha y hora"), label: String::from(label), value });
                 return;
             }
+            Act::ArrMenos | Act::ArrMas | Act::ArrOcultar(_) | Act::ArrNombre(_) | Act::ArrPrimero => return self.arranque_act(act, cx),
             Act::NetRenew => {
                 if let Some(n) = cx.sys.net() {
                     n.renew();
@@ -1279,7 +1364,7 @@ impl Settings {
                 Some((n, _)) => (Op::Delete, n),
                 None => return,
             },
-            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) | Act::CertAdd | Act::CertDel(_) | Act::TimeAuto | Act::TimeSync | Act::TimeZone(_) | Act::TimeDate | Act::TimeClock => return,
+            Act::HomeEnc | Act::HomeDec | Act::HomeCode | Act::DiskEnc | Act::DiskDec | Act::DiskChange | Act::DiskCode | Act::AppInstall | Act::AppUninstall(_) | Act::PadTest(_) | Act::PadBack | Act::NetRenew | Act::NetOut(_) | Act::NetIn(_) | Act::NetForget(_) | Act::CertAdd | Act::CertDel(_) | Act::TimeAuto | Act::TimeSync | Act::TimeZone(_) | Act::TimeDate | Act::TimeClock | Act::ArrMenos | Act::ArrMas | Act::ArrOcultar(_) | Act::ArrNombre(_) | Act::ArrPrimero => return,
             Act::Admin(i) => {
                 let Some((n, is_admin)) = other(i) else { return };
                 let now = cx.sys.now();
@@ -1305,6 +1390,38 @@ impl Settings {
             }
         }
         self.job = Some(Job { op, name, old: Secret::default(), new: Secret::default(), after: "" });
+    }
+
+    /// Cambios de la página Arranque: cada uno se guarda al momento y, si el firmware no deja, se avisa.
+    fn arranque_act(&mut self, act: Act, cx: &mut Ctx) {
+        cx.redraw = true;
+        let Some(info) = self.arr.clone() else { return };
+        let mut a = info.ajustes;
+        match act {
+            Act::ArrMenos => a.segundos = a.segundos.saturating_sub(1),
+            Act::ArrMas => a.segundos = (a.segundos + 1).min(30),
+            Act::ArrOcultar(i) => {
+                let Some((c, _, true)) = info.entradas.get(i) else { return };
+                match a.ocultas.iter().position(|x| x == c) {
+                    Some(p) => drop(a.ocultas.remove(p)),
+                    None => a.ocultas.push(c.clone()),
+                }
+            }
+            Act::ArrNombre(i) => {
+                let Some((c, orig, _)) = info.entradas.get(i) else { return };
+                let actual = a.nombres.iter().find(|(k, n)| k == c && !n.is_empty()).map_or(orig.as_str(), |(_, n)| n.as_str());
+                input(cx, T_ARR_NOM, "Nombre en el menú (vacío = el original):", actual);
+                self.arr_nom = Some(c.clone());
+                return;
+            }
+            _ => {
+                if let Err(e) = cx.sys.arranque_primero() {
+                    arranque_message(cx, e);
+                }
+                return;
+            }
+        }
+        arranque_guardar(cx, &a);
     }
 
     /// Primer paso de las operaciones de cifrado: el aviso o la primera clave.
@@ -1600,6 +1717,7 @@ impl App for Settings {
                 PAGE_DEVICES => self.devices_page(s, theme, sys, focused),
                 PAGE_NET => self.net_page(s, theme, sys),
                 PAGE_TIME => self.time_page(s, theme, sys),
+                PAGE_ARRANQUE => self.arranque_page(s, theme, sys),
                 _ => self.about(s, theme, sys),
             }
             s.reset_clip();
@@ -1768,6 +1886,19 @@ impl App for Settings {
                 }
             }
             DialogResult::Text { tag: T_DATE | T_TIME, value: None } => {}
+            DialogResult::Text { tag: T_ARR_NOM, value } => {
+                let (Some(v), Some(c), Some(info)) = (value, self.arr_nom.take(), self.arr.clone()) else { return };
+                let v = v.trim();
+                if v.chars().count() > arranque::MAX_NOMBRE {
+                    return arranque_message(cx, "El nombre puede tener hasta 32 letras.");
+                }
+                let mut a = info.ajustes;
+                a.nombres.retain(|(k, _)| *k != c);
+                if !v.is_empty() {
+                    a.nombres.push((c, String::from(v)));
+                }
+                arranque_guardar(cx, &a);
+            }
             DialogResult::Text { tag, value } => self.step_text(tag, value.map(Secret), cx),
             DialogResult::Answer { tag, answer } => self.step_answer(tag, answer, cx),
             DialogResult::Path { .. } => {}
@@ -1821,6 +1952,16 @@ impl Settings {
                 app_message(cx, &r.unwrap_or_else(|e| e));
             }
         }
+    }
+}
+
+fn arranque_message(cx: &mut Ctx, text: &str) {
+    cx.dialog = Some(DialogRequest::Message { tag: T_MSG, title: String::from("Arranque"), text: String::from(text), buttons: Buttons::Ok });
+}
+
+fn arranque_guardar(cx: &mut Ctx, a: &arranque::Ajustes) {
+    if let Err(e) = cx.sys.arranque_guardar(a) {
+        arranque_message(cx, e);
     }
 }
 
@@ -3229,5 +3370,72 @@ mod tests {
         assert_eq!(b.files().hora_pendiente(), (None, false));
         b.pulsa(Act::TimeSync);
         assert_eq!(b.files().hora_pendiente(), (None, true));
+    }
+
+    fn menu_arranque() -> InfoArranque {
+        let e = |c: &str, n: &str, o: bool| (String::from(c), String::from(n), o);
+        InfoArranque { ajustes: arranque::Ajustes::default(), entradas: vec![e("nightfury", "NightFury", false), e("windows", "Windows", true), e("firmware", "Configuración del firmware", true)], primero: false }
+    }
+
+    #[test]
+    fn arranque_sin_el_menu_instalado_solo_avisa() {
+        let mut b = Banco::new();
+        b.pagina(PAGE_ARRANQUE);
+        let s = b.dibuja(780, 520);
+        assert!(!b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
+        assert!(s.px.iter().any(|&p| p != 0xFFFFFF) && b.app.arr.is_none());
+    }
+
+    #[test]
+    fn arranque_cuenta_atras_ocultar_renombrar_y_primero() {
+        let mut b = Banco::new();
+        b.sys.arranque = Some(menu_arranque());
+        b.pagina(PAGE_ARRANQUE);
+        let aj = |b: &Banco| b.sys.arranque.clone().unwrap().ajustes;
+        // Cuenta atrás: de 5 a 6, y bajando hasta 0 ya no se puede bajar más; arriba, tope en 30.
+        b.pulsa(Act::ArrMas);
+        assert_eq!(aj(&b).segundos, 6);
+        for _ in 0..6 {
+            b.pulsa(Act::ArrMenos);
+        }
+        assert_eq!(aj(&b).segundos, 0);
+        assert!(!b.hay(Act::ArrMenos) && b.hay(Act::ArrMas));
+        b.sys.arranque.as_mut().unwrap().ajustes.segundos = 30;
+        assert!(!b.hay(Act::ArrMas) && b.hay(Act::ArrMenos));
+        // Ocultar y volver a mostrar; NightFury no se puede ocultar (pero sí renombrar).
+        assert!(!b.hay(Act::ArrOcultar(0)) && b.hay(Act::ArrNombre(0)));
+        b.pulsa(Act::ArrOcultar(1));
+        assert_eq!(aj(&b).ocultas, ["windows"]);
+        b.pulsa(Act::ArrOcultar(1));
+        assert!(aj(&b).ocultas.is_empty());
+        // Renombrar: el diálogo trae el nombre actual; vacío = el original.
+        b.pulsa(Act::ArrNombre(1));
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { tag: T_ARR_NOM, value, .. }) if value == "Windows"));
+        b.texto(T_ARR_NOM, "  Juegos ");
+        assert_eq!(aj(&b).nombres, [(String::from("windows"), String::from("Juegos"))]);
+        b.pulsa(Act::ArrNombre(1));
+        assert!(matches!(&b.dialog, Some(DialogRequest::Input { value, .. }) if value == "Juegos"));
+        b.texto(T_ARR_NOM, "");
+        assert!(aj(&b).nombres.is_empty());
+        b.pulsa(Act::ArrNombre(1));
+        b.texto(T_ARR_NOM, &"x".repeat(33));
+        assert!(b.mensaje().contains("32 letras") && aj(&b).nombres.is_empty());
+        // Otro sistema delante: el botón lo pone primero y desaparece.
+        assert!(b.hay(Act::ArrPrimero));
+        b.pulsa(Act::ArrPrimero);
+        assert!(b.sys.arranque.clone().unwrap().primero && !b.hay(Act::ArrPrimero));
+        // Si el firmware no deja guardar, se avisa.
+        b.sys.arranque = None;
+        b.pulsa_viejo(Act::ArrMenos);
+        assert_eq!(b.mensaje(), arranque::ERRORES[0]);
+    }
+
+    #[test]
+    fn arranque_sin_administrador_es_de_solo_lectura() {
+        let mut b = Banco::con_disco("Luis");
+        b.sys.arranque = Some(menu_arranque());
+        b.pagina(PAGE_ARRANQUE);
+        b.dibuja(780, 520);
+        assert!(b.app.arr.is_some() && !b.app.hits.iter().any(|h| matches!(h.1, Hit::Act(_))));
     }
 }

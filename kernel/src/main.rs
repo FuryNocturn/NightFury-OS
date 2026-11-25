@@ -237,6 +237,15 @@ impl Platform for Plat {
     fn shutdown(&mut self) {
         self.reset(uefi::RESET_SHUTDOWN);
     }
+    fn arranque_leer(&mut self) -> Option<nf_core::arranque::InfoArranque> {
+        entrada::arranque_leer(self.info.runtime)
+    }
+    fn arranque_guardar(&mut self, a: &nf_core::arranque::Ajustes) -> Result<(), &'static str> {
+        entrada::arranque_guardar(self.info.runtime, a)
+    }
+    fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        entrada::arranque_primero(self.info.runtime)
+    }
     fn files(&mut self) -> &mut Files {
         &mut self.files
     }
@@ -285,21 +294,50 @@ impl Platform for Plat {
             return Vec::new();
         }
         let lista = self.internos.as_deref().unwrap_or(&[]);
-        lista.iter().map(|d| nf_core::platform::PenDisco { modelo: String::from(d.modelo()), bytes: d.bytes(), partes: d.contenido() }).collect()
+        lista
+            .iter()
+            .map(|d| nf_core::platform::PenDisco { modelo: String::from(d.modelo()), bytes: d.bytes(), partes: d.contenido(), sector: d.sector(), analisis: d.analizar() })
+            .collect()
     }
-    fn pen_instalar(&mut self, i: usize) -> Result<bool, nf_core::fs::FsError> {
+    fn pen_instalar(&mut self, i: usize, donde: nf_core::platform::Donde) -> Result<bool, nf_core::fs::FsError> {
         use nf_core::fs::FsError;
+        use nf_core::platform::Donde;
+        use nf_core::vol::FsKind;
         // Solo desde el menú del pendrive y sobre un disco interno de la lista: nada más se escribe nunca.
         if !self.pen.menu {
             return Err(FsError::Invalid);
         }
         let disco = self.internos.as_deref().and_then(|l| l.get(i)).ok_or(FsError::NotFound)?;
         let efi = self.pen.efi()?;
-        let esp = disco.instalar(&efi, nf_core::VERSION)?;
-        match entrada::crear(self.info.runtime, &esp) {
+        let arranque = self.pen.arranque();
+        let esp = match donde {
+            // Los discos con BitLocker no se borran enteros: se rechaza aunque la pantalla no lo ofrezca.
+            Donde::DiscoEntero if disco.contenido().iter().any(|p| p.0 == FsKind::BitLocker) => return Err(FsError::Denied),
+            Donde::DiscoEntero => disco.instalar(&efi, &arranque, nf_core::VERSION)?,
+            Donde::Sitio(k) => {
+                let sitio = disco.analizar().sitios.get(k).cloned().ok_or(FsError::NotFound)?;
+                disco.instalar_junto(&sitio, &efi, &arranque, nf_core::VERSION)?
+            }
+        };
+        let ruta = if arranque.is_empty() { nf_core::vol::instalar::NF_NUCLEO } else { nf_core::vol::instalar::NF_ARRANQUE };
+        match entrada::crear(self.info.runtime, &esp, ruta) {
             Ok(()) => Ok(true),
             Err(e) => {
                 traza!("NF instalar: sin entrada de arranque UEFI: {}", e);
+                Ok(false)
+            }
+        }
+    }
+    fn pen_quitar(&mut self, i: usize) -> Result<bool, nf_core::fs::FsError> {
+        if !self.pen.menu {
+            return Err(nf_core::fs::FsError::Invalid);
+        }
+        let disco = self.internos.as_deref().and_then(|l| l.get(i)).ok_or(nf_core::fs::FsError::NotFound)?;
+        let q = disco.quitar()?;
+        match entrada::quitar(self.info.runtime, &q.esp) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                traza!("NF quitar: la entrada de arranque UEFI sigue: {}", e);
                 Ok(false)
             }
         }

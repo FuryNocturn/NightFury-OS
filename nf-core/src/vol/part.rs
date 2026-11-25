@@ -176,7 +176,7 @@ const NOT_DATA_GPT: [&str; 8] = [
 const NOT_DATA_MBR: [u8; 6] = [0xEF, 0x27, 0x82, 0x8E, 0xFD, 0x42];
 
 /// GUID en texto a los 16 bytes del disco (los tres primeros grupos van al revés).
-fn guid(s: &str) -> [u8; 16] {
+pub(crate) fn guid(s: &str) -> [u8; 16] {
     let h: Vec<u8> = s.bytes().filter(|c| *c != b'-').collect();
     let mut b = [0u8; 16];
     for (i, x) in b.iter_mut().enumerate() {

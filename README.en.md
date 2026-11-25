@@ -7,7 +7,7 @@
 **A desktop operating system written from scratch in Rust.**<br>
 Its own kernel, windowing, file system, encryption, USB, networking and web browser. No third-party dependencies.
 
-[![Version](https://img.shields.io/badge/version-0.12.6-7c5cff)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.12.7-7c5cff)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-no__std-orange?logo=rust)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/UEFI-x86__64-555)](#try-it)
@@ -28,12 +28,12 @@ public specifications and never copies anyone else's code ([rules and sources](d
 
 The user interface is in Spanish.
 
-## What's new in 0.12.6
+## What's new in 0.12.7
 
-- **Bootable USB stick** with a menu: **Try** without touching anything, **Portable** (saves to the stick) or **Install**.
-- **Installer**: pick a SATA or NVMe disk, type BORRAR ("erase") and NightFury becomes the only system on that disk.
-- **Releases** on GitHub with the USB image, a QEMU zip and their SHA-256 sums.
-- The repository now has CI, secret scanning, a [security policy](SECURITY.md) and a [contributing guide](CONTRIBUTING.md).
+- **Alongside Windows or Linux**: installs into free space or a data partition, never shrinking anything.
+- **Its own boot menu** at power-on to pick a system, with a countdown and the last choice as default.
+- **Settings › Boot** (Configuración › Arranque): countdown, hide or rename entries.
+- **Remove NightFury** from the USB stick, leaving Windows and Linux as they were.
 
 Every version is in the [changelog](CHANGELOG.md) (in Spanish).
 
@@ -85,7 +85,6 @@ Tested in QEMU; not yet on real hardware.
 
 | Version | What it will bring |
 |---|---|
-| 0.12.7 | Install alongside Windows or Linux, with its own menu to pick a system at power-on |
 | 0.12.8 | Encrypted password and personal data manager that fills forms in the browser |
 | 0.13 | Image viewer, BMP, animated GIF, ZIP and faster redrawing |
 | 0.14 | Multiple CPU cores, sound and a media player |

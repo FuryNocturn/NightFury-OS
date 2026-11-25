@@ -29,7 +29,9 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
   nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>  | nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
   nfdisk usb-ver <imagen>\n\
-  nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]   (pendrive de arranque UEFI de 66 MiB; el modo portátil se activa desde NightFury)\n\
+  nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión] [arranque.efi]   (pendrive de arranque UEFI de 66 MiB; el modo portátil se activa desde NightFury)\n\
+  nfdisk disco-prueba <imagen> <windows|windows-datos|linux|bitlocker|mbr> <MiB> [efi_prueba]   (disco falso con otro sistema para probar «instalar junto a»; usa MiB grandes, p. ej. 2400)\n\
+  nfdisk analizar <imagen>   (qué ofrecería NightFury en ese disco: huecos y particiones, y por qué se bloquea cada una; no escribe nada)\n\
   nfdisk ayuda\n\
 Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
 y la clave de esa cuenta en la variable NFDISK_CLAVE_USUARIO (o por teclado; nunca por argumento), «listar», «ver», «sacar», «meter»,\n\
@@ -44,6 +46,7 @@ Estructura: Usuarios\\<nombre>\\{Escritorio,Documentos,Descargas,Imágenes,Músi
 «instalar» copia el programa (app.txt, programa.nfx e icono.bmp si lo hay) a C:\\Programas\\<nombre>; no reemplaza los del sistema.\n\
 nfdisk trabaja directamente sobre el volumen, sin cuentas ni permisos (como administrador): no crea cuentas ni migra discos antiguos; eso lo hace NightFury al arrancar.";
 
+mod junto;
 mod usb;
 
 type R<T> = Result<T, String>;
@@ -451,6 +454,8 @@ fn run(args: &[String]) -> R<()> {
         Some("usb") => return usb::crear(&resto, now()),
         Some("usb-ver") => return usb::ver(&resto),
         Some("pen-arranque") => return usb::pen_arranque(&resto, now()),
+        Some("disco-prueba") => return junto::disco_prueba(&resto, now()),
+        Some("analizar") => return junto::analizar(&resto),
         _ => {}
     }
     run_with(args, &read_secret, &read_user_secret)
