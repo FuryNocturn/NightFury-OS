@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "arranque"
+version = "0.12.6"
+dependencies = [
+ "nf-core",
+]
+
+[[package]]
 name = "bloc-notas"
 version = "1.0.0"
 dependencies = [

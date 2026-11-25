@@ -7,6 +7,7 @@ extern crate alloc;
 pub mod abi;
 pub mod accounts;
 pub mod apps;
+pub mod arranque;
 pub mod block;
 pub mod cipher;
 pub mod cryptdev;
