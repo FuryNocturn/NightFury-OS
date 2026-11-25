@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use nf_core::abi::*;
+use nf_core::arranque::{Ajustes, InfoArranque};
 use nf_core::apps::{App, Ctx};
 use nf_core::proc::lleva_datos;
 use nf_core::request::Request;
@@ -226,6 +227,15 @@ impl Platform for PlataformaPrograma<'_> {
     }
     fn net(&mut self) -> Option<&mut dyn NetApi> {
         Some(&mut self.remota)
+    }
+    fn arranque_leer(&mut self) -> Option<InfoArranque> {
+        RemoteFiles(self.net.clone()).arranque_leer()
+    }
+    fn arranque_guardar(&mut self, a: &Ajustes) -> Result<(), &'static str> {
+        RemoteFiles(self.net.clone()).arranque_guardar(a)
+    }
+    fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        RemoteFiles(self.net.clone()).arranque_primero()
     }
 }
 

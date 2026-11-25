@@ -292,7 +292,13 @@ pub extern "efiapi" fn efi_main(imagen: Handle, tabla: *mut SystemTable) -> Stat
     let opciones: Vec<(u16, Vec<u8>)> = orden.iter().filter_map(|&n| Some((n, leer_var(&format!("Boot{n:04X}"), &GLOBAL_VARIABLE_GUID)?))).collect();
     let mut aj = leer_var(a::VARIABLE, &guid_nf()).map_or_else(Ajustes::default, |b| Ajustes::de_bytes(&b));
     let firmware_ok = leer_var("OsIndicationsSupported", &GLOBAL_VARIABLE_GUID).is_some_and(|b| b.first().is_some_and(|x| x & 1 != 0));
-    let lista = a::lista(&det, &a::otras_uefi(&orden, &opciones, &det), &aj, firmware_ok);
+    let otras = a::otras_uefi(&orden, &opciones, &det);
+    // Configuración lee esta lista (sin ocultas ni nombres); solo se escribe si cambió, para no gastar la NVRAM.
+    let completa = a::lista_a_bytes(&a::para_lista(&a::lista(&det, &otras, &Ajustes::default(), firmware_ok)));
+    if leer_var(a::VARIABLE_LISTA, &guid_nf()).as_deref() != Some(&completa[..]) {
+        escribir_var(a::VARIABLE_LISTA, &guid_nf(), &completa);
+    }
+    let lista = a::lista(&det, &otras, &aj, firmware_ok);
     let defecto = a::por_defecto(&lista, &aj);
     let mut menu = Menu::nuevo(lista, defecto, aj.segundos);
 

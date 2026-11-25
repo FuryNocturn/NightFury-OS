@@ -14,6 +14,7 @@
 //!   byte a byte, uno de los del sistema);
 //! - no hay llamada para instalar programas del sistema;
 //! - la fecha, la sal y el acumulador de aleatoriedad los pone siempre el sistema.
+use crate::arranque::{self, Ajustes, InfoArranque};
 use crate::accounts::{salt_from, Account, AccountError};
 use crate::drives::{DriveInfo, FormatKind, FormatRequest};
 use crate::files::{in_system, is_system_font, resolve, Files, TrashItem, PROGRAMS_DIR};
@@ -162,6 +163,9 @@ calls! {
     SetClock { t: DateTime } = 92,
     TimeSync = 93,
     TimeSyncInfo = 94,
+    ArranqueLeer = 95,
+    ArranqueGuardar { ajustes: Blob } = 96,
+    ArranquePrimero = 97,
 }
 
 /// Lo más que viaja de una vez por `NetSend` y `NetRecv` (el búfer de una conexión). Un programa
@@ -813,6 +817,14 @@ pub fn serve(sys: &mut dyn Platform, req: &[u8], system: bool, own: &mut NetOwn)
 }
 
 /// Ejecuta `f` si `ok`; si no, devuelve `deny` (el error de permiso o el valor neutro).
+const ERR_ARRANQUE_ADMIN: u8 = 1;
+const ERR_ARRANQUE_VALORES: u8 = 2;
+
+/// Índice de un motivo de `arranque::ERRORES` (el que no esté, el 3) para mandarlo por el servicio.
+fn codigo_arranque(e: &'static str) -> u8 {
+    arranque::ERRORES.iter().position(|x| *x == e).unwrap_or(3) as u8
+}
+
 fn gate<T: Wire>(ok: bool, deny: T, f: impl FnOnce() -> T) -> Vec<u8> {
     encode(&if ok { f() } else { deny })
 }
@@ -1024,6 +1036,19 @@ fn run(sys: &mut dyn Platform, call: Call, system: bool, own: &mut NetOwn) -> Ve
         SetClock { t } => gate(system, Err(denied), || sys.files().set_clock(t)),
         TimeSync => gate(system, Err(denied), || sys.files().time_sync()),
         TimeSyncInfo => encode(&sys.files().time_sync_info()),
+        // ---- Menú de arranque (v0.12.7): ver, el sistema; cambiar, el sistema y un administrador ----
+        ArranqueLeer => gate(system, None, || sys.arranque_leer().map(|i| Blob(i.a_bytes()))),
+        ArranqueGuardar { ajustes } => {
+            let ok = system && sys.files().is_admin();
+            gate(ok, Err(ERR_ARRANQUE_ADMIN), || match Ajustes::leer(&ajustes.0) {
+                Some(a) => sys.arranque_guardar(&a).map_err(codigo_arranque),
+                None => Err(ERR_ARRANQUE_VALORES),
+            })
+        }
+        ArranquePrimero => {
+            let ok = system && sys.files().is_admin();
+            gate(ok, Err(ERR_ARRANQUE_ADMIN), || sys.arranque_primero().map_err(codigo_arranque))
+        }
         NetStatus | NetRenew | NetPing { .. } | NetPingPoll { .. } | NetResolve { .. } | NetResolvePoll { .. } | NetConnect { .. } | NetConnectTls { .. } | NetTlsInfo { .. } | NetState { .. } | NetSend { .. } | NetRecv { .. } | NetClose { .. } | NetAbort { .. }
         | UdpBind { .. } | UdpSend { .. } | UdpRecv { .. } | UdpClose { .. } | TcpListen { .. } | TcpAccept { .. } | TcpUnlisten { .. } | NetConnections => {
             if !system {
@@ -1280,6 +1305,20 @@ impl<T: Transport> RemoteFiles<T> {
     }
     fn key<R: Wire>(&mut self, c: Call) -> Result<R, KeyError> {
         self.ask(c, Err(KeyError::Fs(FsError::Disk)))
+    }
+
+    /// Menú de arranque (v0.12.7), para la `Platform` de un programa. Sin respuesta, como si no estuviera instalado.
+    pub fn arranque_leer(&mut self) -> Option<InfoArranque> {
+        self.ask::<Option<Blob>>(Call::ArranqueLeer, None).and_then(|b| InfoArranque::de_bytes(&b.0))
+    }
+    pub fn arranque_guardar(&mut self, a: &Ajustes) -> Result<(), &'static str> {
+        self.arranque(Call::ArranqueGuardar { ajustes: Blob(a.a_bytes()) })
+    }
+    pub fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        self.arranque(Call::ArranquePrimero)
+    }
+    fn arranque(&mut self, c: Call) -> Result<(), &'static str> {
+        self.ask::<Result<(), u8>>(c, Err(0)).map_err(|n| arranque::ERRORES.get(n as usize).copied().unwrap_or(arranque::ERRORES[3]))
     }
 }
 
@@ -1929,6 +1968,52 @@ pub(crate) mod tests {
         p.fs.ask(Call::Reboot, ());
         p.fs.ask(Call::Shutdown, ());
         assert!(real.borrow().rebooted && real.borrow().halted);
+    }
+
+    #[test]
+    fn menu_de_arranque_solo_sistema_y_administrador() {
+        let info = InfoArranque { ajustes: Ajustes::default(), entradas: vec![(s("windows"), s("Windows"), true)], primero: false };
+        let nuevo = Ajustes { segundos: 9, ocultas: vec![s("windows")], ..Ajustes::default() };
+        // Un programa de terceros ni lo ve ni lo cambia.
+        let (real, mut q) = prog(false);
+        real.borrow_mut().arranque = Some(info.clone());
+        assert_eq!(q.fs.arranque_leer(), None);
+        assert_eq!(q.fs.arranque_guardar(&nuevo), Err(arranque::ERRORES[1]));
+        assert_eq!(q.fs.arranque_primero(), Err(arranque::ERRORES[1]));
+        assert_eq!(real.borrow().arranque, Some(info.clone()));
+        // El sistema: sin menú instalado no hay nada; con él, lee y cambia (valida en el núcleo).
+        let (real, mut p) = prog(true);
+        assert_eq!((p.fs.arranque_leer(), p.fs.arranque_guardar(&nuevo)), (None, Err(arranque::ERRORES[0])));
+        real.borrow_mut().arranque = Some(info.clone());
+        assert_eq!(p.fs.arranque_leer(), Some(info.clone()));
+        assert_eq!(p.fs.arranque_guardar(&nuevo), Ok(()));
+        assert_eq!(p.fs.arranque_guardar(&Ajustes { ocultas: vec![s("nightfury")], ..nuevo.clone() }), Err(arranque::ERRORES[2]));
+        assert_eq!(p.fs.ask::<Result<(), u8>>(Call::ArranqueGuardar { ajustes: Blob(vec![1, 2, 3]) }, Err(0)), Err(2), "bytes rotos no se guardan");
+        assert_eq!(p.fs.arranque_primero(), Ok(()));
+        assert_eq!(real.borrow().arranque, Some(InfoArranque { ajustes: nuevo.clone(), primero: true, ..info.clone() }));
+        // Un usuario normal lo ve, pero no lo cambia.
+        let n = DateTime::default();
+        let mut f = Files::probe(Some(Box::new(crate::block::RamDisk::new(2048))), n);
+        f.format_pending(n).unwrap();
+        f.create_account("Ana", None, true, [1; 16], n).unwrap();
+        f.login("Ana", "").unwrap();
+        f.create_account("Luis", None, false, [2; 16], n).unwrap();
+        f.login("Luis", "").unwrap();
+        real.borrow_mut().files = f;
+        real.borrow_mut().arranque = Some(info.clone());
+        assert_eq!(p.fs.arranque_leer(), Some(info.clone()));
+        assert_eq!(p.fs.arranque_guardar(&nuevo), Err(arranque::ERRORES[1]));
+        assert_eq!(p.fs.arranque_primero(), Err(arranque::ERRORES[1]));
+        assert_eq!(real.borrow().arranque, Some(info));
+        // Respuesta rota: error, no pánico.
+        struct Roto;
+        impl Transport for Roto {
+            fn call(&mut self, _: &[u8]) -> Vec<u8> {
+                vec![0, 9]
+            }
+        }
+        assert_eq!(RemoteFiles(Roto).arranque_leer(), None);
+        assert_eq!(RemoteFiles(Roto).arranque_primero(), Err(arranque::ERRORES[0]));
     }
 
     fn usb() -> Box<dyn crate::vol::Volume> {

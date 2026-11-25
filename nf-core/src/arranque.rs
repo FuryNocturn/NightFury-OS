@@ -79,7 +79,8 @@ impl Ajustes {
         Self::leer(b).unwrap_or_default()
     }
 
-    fn leer(b: &[u8]) -> Option<Ajustes> {
+    /// `None` si los datos no valen (a diferencia de `de_bytes`, que da los de por defecto).
+    pub fn leer(b: &[u8]) -> Option<Ajustes> {
         if b.len() > MAX_AJUSTES || b.get(..4)? != b"NFA\x01" {
             return None;
         }
@@ -269,6 +270,101 @@ pub fn lista(detectados: &[Detectado], otras: &[Entrada], ajustes: &Ajustes, fir
 pub fn por_defecto(lista: &[Entrada], ajustes: &Ajustes) -> usize {
     let buscar = |k: &str| lista.iter().position(|e| e.clave == k);
     ajustes.ultimo.as_deref().and_then(buscar).or_else(|| buscar("nightfury")).unwrap_or(0)
+}
+
+/// Variable UEFI (con `GUID_NF`) con las entradas detectadas en el último arranque del menú, antes de aplicar
+/// ocultas y nombres. La escribe `arranque.efi` y la lee Configuración.
+pub const VARIABLE_LISTA: &str = "NfArranqueLista";
+/// Tamaño máximo de `lista_a_bytes`.
+pub const MAX_LISTA: usize = 2048;
+/// Letras como máximo de un nombre puesto por el usuario.
+pub const MAX_NOMBRE: usize = 32;
+
+/// Entrada para Configuración: (clave, nombre original, se puede ocultar).
+pub type Item = (String, String, bool);
+
+/// Lo que Configuración enseña de un `lista` sin ocultas ni nombres: sin Reiniciar ni Apagar.
+pub fn para_lista(lista: &[Entrada]) -> Vec<Item> {
+    lista.iter().filter(|e| !matches!(e.tipo, Tipo::Reiniciar | Tipo::Apagar)).map(|e| (e.clave.clone(), e.nombre.clone(), !FIJAS.contains(&e.clave.as_str()))).collect()
+}
+
+/// Formato: "NFL", versión 1, nº de entradas y por cada una: se puede ocultar (0/1), clave y nombre (longitud u8
+/// + texto). Lo que no cabe en `MAX_LISTA` (o pasa de 255 bytes) se descarta.
+pub fn lista_a_bytes(v: &[Item]) -> Vec<u8> {
+    let mut o = vec![b'N', b'F', b'L', 1, 0];
+    for (c, n, oc) in v {
+        if c.len() > 255 || n.len() > 255 || c.len() + n.len() + 3 + o.len() > MAX_LISTA || o[4] == 255 {
+            continue;
+        }
+        o.push(*oc as u8);
+        o.push(c.len() as u8);
+        o.extend(c.bytes());
+        o.push(n.len() as u8);
+        o.extend(n.bytes());
+        o[4] += 1;
+    }
+    o
+}
+
+/// `None` si falta algo, sobra algo o es de otra versión.
+pub fn lista_de_bytes(b: &[u8]) -> Option<Vec<Item>> {
+    if b.len() > MAX_LISTA || b.get(..4)? != b"NFL\x01" {
+        return None;
+    }
+    let mut i = 5;
+    let v = (0..*b.get(4)?)
+        .map(|_| {
+            let oc = *b.get(i)?;
+            i += 1;
+            Some((cadena(b, &mut i)?, cadena(b, &mut i)?, match oc { 0 => false, 1 => true, _ => return None }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (i == b.len()).then_some(v)
+}
+
+/// Lo que Configuración lee del menú de arranque.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InfoArranque {
+    pub ajustes: Ajustes,
+    pub entradas: Vec<Item>,
+    /// La entrada «NightFury» del firmware es la primera de `BootOrder`.
+    pub primero: bool,
+}
+
+impl InfoArranque {
+    /// Para viajar por el servicio: `primero`, longitud (u16) de los ajustes, ajustes y lista.
+    pub fn a_bytes(&self) -> Vec<u8> {
+        let aj = self.ajustes.a_bytes();
+        let mut o = vec![self.primero as u8];
+        o.extend((aj.len() as u16).to_le_bytes());
+        o.extend(aj);
+        o.extend(lista_a_bytes(&self.entradas));
+        o
+    }
+
+    pub fn de_bytes(b: &[u8]) -> Option<InfoArranque> {
+        let n = u16::from_le_bytes(b.get(1..3)?.try_into().ok()?) as usize;
+        let ajustes = Ajustes::leer(b.get(3..3 + n)?)?;
+        let entradas = lista_de_bytes(b.get(3 + n..)?)?;
+        let primero = match b[0] { 0 => false, 1 => true, _ => return None };
+        Some(InfoArranque { ajustes, entradas, primero })
+    }
+}
+
+/// Motivos de fallo de `Platform::arranque_*`. Van por el servicio como índice: el texto tiene que estar aquí.
+pub const ERRORES: [&str; 6] = [
+    "No disponible en este equipo.",
+    "Hace falta una cuenta de administrador.",
+    "Los valores no son válidos.",
+    "El firmware no deja guardar el cambio.",
+    "No se encuentra la entrada de NightFury en el firmware.",
+    "El firmware no deja cambiar el orden de arranque.",
+];
+
+/// Comprueba lo que se va a guardar: cuenta atrás hasta 30 s, nombres de hasta 32 letras y nada oculto de lo fijo.
+pub fn validar(a: &Ajustes) -> Result<(), &'static str> {
+    let mal = a.segundos > MAX_SEGUNDOS || a.nombres.iter().any(|(_, n)| n.chars().count() > MAX_NOMBRE) || a.ocultas.iter().any(|c| FIJAS.contains(&c.as_str()));
+    if mal { Err(ERRORES[2]) } else { Ok(()) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -473,6 +569,62 @@ mod tests {
         assert_eq!(por_defecto(&l, &a), 0);
         a.ultimo = None;
         assert_eq!(por_defecto(&l, &a), 0);
+    }
+
+    #[test]
+    fn lista_ida_y_vuelta_y_basura() {
+        let det = detectar(&[rutas(&["\\EFI\\Microsoft\\Boot\\bootmgfw.efi"])]);
+        let l = lista(&det, &[Entrada::nueva("boot:0004", "Disco ñ", Tipo::Uefi(4))], &Ajustes::default(), true);
+        let v = para_lista(&l);
+        let claves: Vec<_> = v.iter().map(|(c, _, o)| (c.as_str(), *o)).collect();
+        assert_eq!(claves, [("nightfury", false), ("windows", true), ("boot:0004", true), ("firmware", true)]);
+        let b = lista_a_bytes(&v);
+        assert_eq!(lista_de_bytes(&b), Some(v));
+        assert_eq!(lista_de_bytes(&lista_a_bytes(&[])), Some(vec![]));
+        for n in 0..b.len() {
+            assert_eq!(lista_de_bytes(&b[..n]), None, "cortada a {n}");
+        }
+        let mut largo = b.clone();
+        largo.push(0);
+        assert_eq!(lista_de_bytes(&largo), None);
+        let mut mal = b.clone();
+        mal[5] = 7; // indicador distinto de 0 y 1
+        assert_eq!(lista_de_bytes(&mal), None);
+        mal = b.clone();
+        mal[8] = 0xFF; // UTF-8 inválido
+        assert_eq!(lista_de_bytes(&mal), None);
+        assert_eq!(lista_de_bytes(&[0u8; 3000]), None);
+        assert_eq!(lista_de_bytes(b"NFL\x01\xFF"), None);
+        let mucho: Vec<Item> = (0..300).map(|i| (format!("c{i}"), "n".repeat(200), true)).collect();
+        let b = lista_a_bytes(&mucho);
+        assert!(b.len() <= MAX_LISTA);
+        assert!(lista_de_bytes(&b).is_some_and(|r| !r.is_empty() && r.len() < 300));
+    }
+
+    #[test]
+    fn info_arranque_y_validar() {
+        let i = InfoArranque { ajustes: Ajustes { segundos: 9, ultimo: Some("windows".into()), ..Ajustes::default() }, entradas: vec![("windows".into(), "Windows".into(), true)], primero: true };
+        let b = i.a_bytes();
+        assert_eq!(InfoArranque::de_bytes(&b), Some(i));
+        for n in 0..b.len() {
+            assert_eq!(InfoArranque::de_bytes(&b[..n]), None, "cortada a {n}");
+        }
+        assert_eq!(InfoArranque::de_bytes(&[2, 0, 0]), None);
+        assert_eq!(InfoArranque::de_bytes(&[0xFF; 50]), None);
+        let mut a = Ajustes::default();
+        assert!(validar(&a).is_ok());
+        a.segundos = 31;
+        assert!(validar(&a).is_err());
+        a.segundos = 30;
+        a.nombres = vec![("windows".into(), "ñ".repeat(32))];
+        assert!(validar(&a).is_ok());
+        a.nombres = vec![("windows".into(), "ñ".repeat(33))];
+        assert!(validar(&a).is_err());
+        a.nombres.clear();
+        a.ocultas = vec!["nightfury".into()];
+        assert!(validar(&a).is_err());
+        a.ocultas = vec!["firmware".into(), "windows".into()];
+        assert!(validar(&a).is_ok());
     }
 
     fn menu(segundos: u8) -> Menu {

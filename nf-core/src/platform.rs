@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Tare Fernandez Salas (FuryNocturn) — ver NOTICE
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
+use crate::arranque::{self, Ajustes, InfoArranque};
 use crate::files::Files;
 use crate::fs::FsError;
 use crate::fsapi::FilesApi;
@@ -121,6 +122,18 @@ pub trait Platform {
     fn pen_instalar(&mut self, _i: usize) -> Result<bool, FsError> {
         Err(FsError::Invalid)
     }
+    /// Menú de arranque (v0.12.7): sus ajustes y entradas. `None` si no se arrancó desde él o no hay servicios de ejecución.
+    fn arranque_leer(&mut self) -> Option<InfoArranque> {
+        None
+    }
+    /// Guarda los ajustes del menú de arranque (los valida: ver `arranque::validar`).
+    fn arranque_guardar(&mut self, _a: &Ajustes) -> Result<(), &'static str> {
+        Err(arranque::ERRORES[0])
+    }
+    /// Pone la entrada «NightFury» la primera de `BootOrder`, sin quitar ni repetir ninguna.
+    fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        Err(arranque::ERRORES[0])
+    }
 }
 
 /// Plataforma simulada para pruebas y para la vista previa en el PC.
@@ -139,6 +152,8 @@ pub struct TestPlatform {
     pub net: Option<crate::net::Net>,
     /// Reloj puesto con `set_now`; sin él, `now` da una fecha fija.
     pub reloj: Option<DateTime>,
+    /// Menú de arranque de pruebas; `None` = no instalado.
+    pub arranque: Option<InfoArranque>,
 }
 
 impl Platform for TestPlatform {
@@ -147,6 +162,18 @@ impl Platform for TestPlatform {
     }
     fn set_now(&mut self, t: DateTime) {
         self.reloj = Some(t);
+    }
+    fn arranque_leer(&mut self) -> Option<InfoArranque> {
+        self.arranque.clone()
+    }
+    fn arranque_guardar(&mut self, a: &Ajustes) -> Result<(), &'static str> {
+        arranque::validar(a)?;
+        self.arranque.as_mut().ok_or(arranque::ERRORES[0])?.ajustes = a.clone();
+        Ok(())
+    }
+    fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        self.arranque.as_mut().ok_or(arranque::ERRORES[0])?.primero = true;
+        Ok(())
     }
     fn uptime_ms(&self) -> u64 {
         self.ms

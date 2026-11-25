@@ -237,6 +237,15 @@ impl Platform for Plat {
     fn shutdown(&mut self) {
         self.reset(uefi::RESET_SHUTDOWN);
     }
+    fn arranque_leer(&mut self) -> Option<nf_core::arranque::InfoArranque> {
+        entrada::arranque_leer(self.info.runtime)
+    }
+    fn arranque_guardar(&mut self, a: &nf_core::arranque::Ajustes) -> Result<(), &'static str> {
+        entrada::arranque_guardar(self.info.runtime, a)
+    }
+    fn arranque_primero(&mut self) -> Result<(), &'static str> {
+        entrada::arranque_primero(self.info.runtime)
+    }
     fn files(&mut self) -> &mut Files {
         &mut self.files
     }
