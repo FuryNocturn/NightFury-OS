@@ -7,7 +7,7 @@
 **Un sistema operativo de escritorio hecho desde cero en Rust.**<br>
 Núcleo, ventanas, archivos, cifrado, USB, red y navegador propios. Sin dependencias de terceros.
 
-[![Versión](https://img.shields.io/badge/versi%C3%B3n-0.12.6-7c5cff)](CHANGELOG.md)
+[![Versión](https://img.shields.io/badge/versi%C3%B3n-0.12.7-7c5cff)](CHANGELOG.md)
 [![Licencia](https://img.shields.io/badge/licencia-GPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-no__std-orange?logo=rust)](https://www.rust-lang.org)
 [![Plataforma](https://img.shields.io/badge/UEFI-x86__64-555)](#probarlo)
@@ -26,12 +26,12 @@ NightFury OS es un sistema operativo x86_64 que arranca por UEFI y está escrito
 cuentas, cifrado de disco, USB, red, TLS y el Navegador. Se desarrolla en *sala limpia*: se parte de
 especificaciones públicas y nunca se copia código ajeno ([reglas y fuentes](docs/CLEANROOM.md)).
 
-## Novedades de la 0.12.6
+## Novedades de la 0.12.7
 
-- **Pendrive de arranque** con menú: **Probar** sin tocar nada, **Portátil** (guarda en el pendrive) o **Instalar**.
-- **Instalador**: elige un disco SATA o NVMe, escribe BORRAR y NightFury queda como único sistema de ese disco.
-- **Releases** en GitHub con la imagen del pendrive, un zip para QEMU y sus SHA-256.
-- Repositorio con CI, búsqueda de secretos, [política de seguridad](SECURITY.md) y [guía para aportar](CONTRIBUTING.md).
+- **Junto a Windows o Linux**: instala en el espacio libre o en una partición de datos, sin encoger nada.
+- **Menú de arranque** propio al encender para elegir sistema, con cuenta atrás y el último elegido por defecto.
+- **Configuración › Arranque**: cuenta atrás, ocultar o renombrar entradas.
+- **Quitar NightFury** desde el pendrive dejando a Windows y Linux como estaban.
 
 Todas las versiones en el [historial de cambios](CHANGELOG.md).
 
@@ -83,7 +83,6 @@ Probado en QEMU; en hardware real todavía no.
 
 | Versión | Qué traerá |
 |---|---|
-| 0.12.7 | Instalar junto a Windows o Linux, y menú propio para elegir sistema al encender |
 | 0.12.8 | Gestor de contraseñas y datos, cifrado, que rellena formularios en el Navegador |
 | 0.13 | Visor de imágenes, BMP, GIF animado, ZIP y redibujo más rápido |
 | 0.14 | Varios núcleos de CPU, sonido y reproductor multimedia |

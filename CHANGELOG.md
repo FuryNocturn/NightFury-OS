@@ -3,6 +3,18 @@
 Todas las versiones de NightFury OS, de la más nueva a la más antigua. Todas probadas en QEMU; en hardware
 real todavía no.
 
+## 0.12.7 · 2026-11-25 · Junto a Windows y Linux
+- Instalar en el **espacio libre** de un disco que ya tiene Windows o Linux, o en una **partición de datos** que se
+  borra (escribiendo BORRAR). Nunca se encogen particiones ni se toca la partición donde está otro sistema.
+- Usa la partición EFI que ya tiene el disco: solo añade la carpeta `\EFI\NightFury`.
+- **Menú de arranque** propio al encender: NightFury, Windows, Linux y las demás entradas del equipo,
+  Configuración del firmware, Reiniciar y Apagar. Cuenta atrás de 5 s y arranca el último sistema elegido.
+- **Configuración › Arranque**: segundos de la cuenta atrás, ocultar o renombrar entradas y volver a poner el
+  menú el primero si otro sistema se ha puesto delante.
+- **Quitar NightFury** desde el pendrive, sin tocar Windows ni Linux.
+- No se instala en discos con BitLocker ni en discos MBR.
+- `nfdisk disco-prueba` y `nfdisk analizar` para probar el instalador con discos de prueba.
+
 ## 0.12.6 · 2026-11-25 · Pendrive con instalador
 - Imagen de pendrive con un menú al arrancar: **Probar** (en memoria, sin tocar ningún disco), **Portátil**
   (guarda cuentas y archivos en el propio pendrive) e **Instalar**.
