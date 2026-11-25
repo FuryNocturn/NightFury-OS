@@ -17,7 +17,6 @@ use nf_core::files::Files;
 use nf_core::fs::FsError;
 use nf_core::keys::{KeyError, Pool};
 use nf_core::vol::instalar::{self, Esp};
-use nf_core::vol::part::gpt;
 use nf_core::vol::{self, nfvol, FsKind, SectorDev, Window};
 
 /// Los discos internos (SATA y NVMe) llevan este bit en su id para no chocar con los de USB.
@@ -79,10 +78,10 @@ impl Interno {
             Fisico::Nvme(_) => None,
         }
     }
-    /// Si el disco lleva una instalación de NightFury (GPT con una partición NFFS): su (primer sector, sectores).
+    /// Si el disco lleva una instalación de NightFury: la partición NFFS que nombra `\EFI\NightFury\particion`
+    /// de su ESP (o, sin ese archivo, la primera NFFS): su (primer sector, sectores).
     pub fn instalada(&self) -> Option<(u64, u64)> {
-        let (_, ent) = gpt::leer_gpt(&mut self.manejador(true))?;
-        ent.iter().find(|e| e.tipo == gpt::TIPO_NFFS).map(|e| (e.inicio_lba, e.sectores()))
+        instalar::particion_nightfury(&mut || Box::new(self.manejador(true)) as Box<dyn SectorDev>)
     }
     /// Lo que tiene, por partición (formato y bytes), para la lista del instalador. Vacío si está a cero.
     pub fn contenido(&self) -> Vec<(FsKind, u64)> {
@@ -106,7 +105,8 @@ impl Interno {
             return Err(FsError::NoSpace);
         }
         let mut abrir = || Box::new(self.manejador(false)) as Box<dyn SectorDev>;
-        let esp = instalar::instalar(&mut abrir, efi, version, rtc::now(), &mut crate::entropia)?;
+        // shortcut: sin `arranque.efi` aparte (va vacío y el núcleo hace de BOOTX64); pasarlo aquí cuando el pendrive lo lleve.
+        let esp = instalar::instalar(&mut abrir, efi, &[], version, rtc::now(), &mut crate::entropia)?;
         abrir().flush()?;
         Ok(esp)
     }

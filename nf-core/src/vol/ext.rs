@@ -773,6 +773,9 @@ pub fn mount(dev: Box<dyn SectorDev>, p: &Partition) -> Result<Box<dyn Volume>, 
     }
 }
 
+#[cfg(any(test, feature = "imagenes"))]
+pub mod pruebas;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -780,65 +783,7 @@ mod tests {
     use alloc::format;
     use alloc::vec;
 
-    fn w16(d: &mut [u8], o: usize, v: u16) {
-        d[o..o + 2].copy_from_slice(&v.to_le_bytes());
-    }
-    fn w32(d: &mut [u8], o: usize, v: u32) {
-        d[o..o + 4].copy_from_slice(&v.to_le_bytes());
-    }
-    fn words(v: &[u32]) -> Vec<u8> {
-        v.iter().flat_map(|x| x.to_le_bytes()).collect()
-    }
-    /// Inodo en el byte `at` (tiempos 0x6553F100 = 2023-11-14 22:13:20).
-    fn inode(d: &mut [u8], at: usize, mode: u16, flags: u32, size: u32, blk: &[u8]) {
-        w16(d, at, mode);
-        w32(d, at + 4, size);
-        for o in [8, 0xC, 0x10] {
-            w32(d, at + o, 0x6553_F100);
-        }
-        w16(d, at + 0x1A, 1);
-        w32(d, at + 0x20, flags);
-        d[at + 0x28..at + 0x28 + blk.len()].copy_from_slice(blk);
-    }
-    /// Raíz de extents (o nodo) con `max` entradas posibles.
-    fn eroot(depth: u16, max: u16, ents: &[Vec<u8>]) -> Vec<u8> {
-        let mut b = vec![0u8; 12];
-        w16(&mut b, 0, 0xF30A);
-        w16(&mut b, 2, ents.len() as u16);
-        w16(&mut b, 4, max);
-        w16(&mut b, 6, depth);
-        ents.iter().for_each(|e| b.extend_from_slice(e));
-        b
-    }
-    fn leaf(l: u32, len: u16, p: u32) -> Vec<u8> {
-        let mut e = vec![0u8; 12];
-        w32(&mut e, 0, l);
-        w16(&mut e, 4, len);
-        w32(&mut e, 8, p);
-        e
-    }
-    fn idx(l: u32, child: u32) -> Vec<u8> {
-        let mut e = vec![0u8; 12];
-        w32(&mut e, 0, l);
-        w32(&mut e, 4, child);
-        e
-    }
-    /// Bloque de carpeta: la última entrada llega hasta el final.
-    fn dir(d: &mut [u8], at: usize, size: usize, ents: &[(u32, &str)]) {
-        let mut p = at;
-        for (k, (ino, name)) in ents.iter().enumerate() {
-            let rec = if k == ents.len() - 1 { at + size - p } else { (8 + name.len() + 3) & !3 };
-            w32(d, p, *ino);
-            w16(d, p + 4, rec as u16);
-            d[p + 6] = name.len() as u8;
-            d[p + 7] = 1;
-            d[p + 8..p + 8 + name.len()].copy_from_slice(name.as_bytes());
-            p += rec;
-        }
-    }
-    fn fill(d: &mut [u8], blk: usize, v: u8) {
-        d[blk * 1024..(blk + 1) * 1024].fill(v);
-    }
+    use super::pruebas::*;
 
     /// Imagen A del anexo 4.1: ext2 de 1 KiB, 64 bloques, inodos de 128, indirección simple y huecos.
     fn img_a() -> Vec<u8> {

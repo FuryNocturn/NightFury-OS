@@ -14,3 +14,5 @@ default = ["apps"]
 # Bloc de notas, Terminal, Configuración, Explorador y Calculadora dentro del binario. El núcleo va
 # sin ella (v0.10: son programas); los programas y las pruebas, con ella.
 apps = []
+# Constructores de imágenes de prueba (NTFS de Windows, ext de Linux) para nfdisk; los tests ya las tienen.
+imagenes = []

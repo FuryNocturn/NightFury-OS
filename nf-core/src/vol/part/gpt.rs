@@ -14,7 +14,8 @@ pub const TIPO_ESP: [u8; 16] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 
 /// Tipo propio de las particiones NFFS (6B3F2D8E-5C41-4A97-B0E2-7D9A1F4C8E35), tal como va en el disco.
 pub const TIPO_NFFS: [u8; 16] = [0x8E, 0x2D, 0x3F, 0x6B, 0x41, 0x5C, 0x97, 0x4A, 0xB0, 0xE2, 0x7D, 0x9A, 0x1F, 0x4C, 0x8E, 0x35];
 
-const ENTRADAS: usize = 128;
+/// Entradas de la tabla (siempre 128).
+pub const ENTRADAS: usize = 128;
 const TAM_ENTRADA: usize = 128;
 const TABLA: usize = ENTRADAS * TAM_ENTRADA;
 
@@ -30,6 +31,8 @@ pub struct Particion<'a> {
 /// Una entrada leída de la tabla.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entrada {
+    /// Puesto en la tabla, desde 1 (el «número de partición» que usan UEFI y los sistemas).
+    pub numero: usize,
     pub tipo: [u8; 16],
     pub unica: [u8; 16],
     pub inicio_lba: u64,
@@ -163,32 +166,62 @@ pub fn leer_gpt(dev: &mut dyn SectorDev) -> Option<([u8; 16], Vec<Entrada>)> {
     let (h, t) = gpt_raw(dev, 1).or_else(|| gpt_raw(dev, n.checked_sub(1)?))?;
     let esz = u32le(&h, 84) as usize;
     let mut out = Vec::new();
-    for e in t.chunks(esz) {
+    for (k, e) in t.chunks(esz).enumerate() {
         let (i, f) = (u64le(e, 32), u64le(e, 40));
         if e[..16].iter().any(|&b| b != 0) && i <= f && f < n {
-            out.push(Entrada { tipo: e[..16].try_into().ok()?, unica: e[16..32].try_into().ok()?, inicio_lba: i, fin_lba: f, cruda: e[..TAM_ENTRADA].to_vec() });
+            out.push(Entrada { numero: k + 1, tipo: e[..16].try_into().ok()?, unica: e[16..32].try_into().ok()?, inicio_lba: i, fin_lba: f, cruda: e[..TAM_ENTRADA].to_vec() });
         }
     }
     Some((h[56..72].try_into().ok()?, out))
 }
 
-/// Añade una partición a la GPT existente (la reescribe entera, con la copia de respaldo en el final
-/// real del disco). Conserva las demás entradas tal cual.
-pub fn anadir_particion(dev: &mut dyn SectorDev, nueva: &Particion) -> Result<(), FsError> {
-    let (guid, mut ent) = leer_gpt(dev).ok_or(FsError::Corrupt)?;
+/// Tabla de 128 entradas con cada una en su puesto (los números de partición no cambian).
+fn tabla_de(ent: &[Entrada]) -> Result<Vec<u8>, FsError> {
+    let mut t = vec![0u8; TABLA];
+    for e in ent {
+        if e.numero == 0 || e.numero > ENTRADAS || e.cruda.len() != TAM_ENTRADA {
+            return Err(FsError::Invalid);
+        }
+        t[(e.numero - 1) * TAM_ENTRADA..e.numero * TAM_ENTRADA].copy_from_slice(&e.cruda);
+    }
+    Ok(t)
+}
+
+/// ¿Cabe `nueva` en el disco sin pisar a ninguna de `otras`?
+fn cabe(dev: &dyn SectorDev, otras: &[Entrada], nueva: &Particion) -> bool {
     let (ss, n) = (dev.sector_size(), dev.sectors());
-    let (primero, ultimo) = (primer_lba_usable(ss), ultimo_lba_usable(n, ss));
-    let solapa = ent.iter().any(|e| nueva.inicio_lba <= e.fin_lba && e.inicio_lba <= nueva.fin_lba);
-    if ent.len() >= ENTRADAS || nueva.inicio_lba < primero || nueva.fin_lba > ultimo || nueva.inicio_lba > nueva.fin_lba || solapa || nueva.tipo == [0; 16] {
+    let solapa = otras.iter().any(|e| nueva.inicio_lba <= e.fin_lba && e.inicio_lba <= nueva.fin_lba);
+    !(nueva.inicio_lba < primer_lba_usable(ss) || nueva.fin_lba > ultimo_lba_usable(n, ss) || nueva.inicio_lba > nueva.fin_lba || solapa || nueva.tipo == [0; 16])
+}
+
+/// Añade una partición a la GPT existente en el primer puesto libre (la reescribe entera, con la copia
+/// de respaldo en el final real del disco). Conserva las demás entradas tal cual y en su puesto.
+pub fn anadir_particion(dev: &mut dyn SectorDev, nueva: &Particion) -> Result<(), FsError> {
+    let (guid, ent) = leer_gpt(dev).ok_or(FsError::Corrupt)?;
+    if !cabe(dev, &ent, nueva) {
         return Err(FsError::Invalid);
     }
-    let mut tabla = vec![0u8; TABLA];
-    for (i, e) in ent.drain(..).enumerate() {
-        tabla[i * TAM_ENTRADA..(i + 1) * TAM_ENTRADA].copy_from_slice(&e.cruda);
-    }
-    // La tabla leída puede tener huecos entre entradas: se compacta; las nuevas van al final.
+    let mut tabla = tabla_de(&ent)?;
     let sitio = tabla.chunks(TAM_ENTRADA).position(|c| c.iter().all(|&b| b == 0)).ok_or(FsError::Invalid)?;
     tabla[sitio * TAM_ENTRADA..(sitio + 1) * TAM_ENTRADA].copy_from_slice(&entrada(nueva));
+    escribir(dev, &tabla, &guid)
+}
+
+/// Cambia la entrada número `numero` por `nueva` (en el mismo puesto), o la borra si es `None`. Las demás
+/// quedan tal cual, con las dos cabeceras y tablas rehechas.
+pub fn reemplazar(dev: &mut dyn SectorDev, numero: usize, nueva: Option<&Particion>) -> Result<(), FsError> {
+    let (guid, ent) = leer_gpt(dev).ok_or(FsError::Corrupt)?;
+    if !ent.iter().any(|e| e.numero == numero) {
+        return Err(FsError::NotFound);
+    }
+    let resto: Vec<Entrada> = ent.into_iter().filter(|e| e.numero != numero).collect();
+    let mut tabla = tabla_de(&resto)?;
+    if let Some(p) = nueva {
+        if !cabe(dev, &resto, p) {
+            return Err(FsError::Invalid);
+        }
+        tabla[(numero - 1) * TAM_ENTRADA..numero * TAM_ENTRADA].copy_from_slice(&entrada(p));
+    }
     escribir(dev, &tabla, &guid)
 }
 
@@ -269,6 +302,34 @@ mod tests {
             anadir_particion(&mut d, &nueva).unwrap();
             assert_eq!(crate::vol::partitions(&mut d).unwrap().len(), 2);
             assert!(gpt_raw(&mut d, 1).is_some());
+        }
+    }
+
+    #[test]
+    fn reemplazar_conserva_numeros_y_crc() {
+        for ss in [512usize, 4096] {
+            let n = (64 << 20) / ss as u64;
+            let mut d = MemSectors::new(n, ss);
+            let m = (1 << 20) / ss as u64;
+            let ini = alinear_mib(primer_lba_usable(ss), ss);
+            let p = |k: u64, tipo| Particion { tipo, unica: [k as u8; 16], nombre: "x", inicio_lba: ini + k * 4 * m, fin_lba: ini + k * 4 * m + 2 * m - 1 };
+            crear_gpt(&mut d, &[p(0, TIPO_ESP), p(1, TIPO_ESP), p(2, TIPO_ESP)], [9; 16]).unwrap();
+            // Borrar la 2 deja hueco: la 3 sigue siendo la 3, y añadir ocupa el puesto libre.
+            reemplazar(&mut d, 2, None).unwrap();
+            let (_, e) = leer_gpt(&mut d).unwrap();
+            assert_eq!(e.iter().map(|e| e.numero).collect::<Vec<_>>(), [1, 3]);
+            anadir_particion(&mut d, &p(1, TIPO_NFFS)).unwrap();
+            let (g, e) = leer_gpt(&mut d).unwrap();
+            assert_eq!((g, e.iter().map(|e| (e.numero, e.tipo == TIPO_NFFS)).collect::<Vec<_>>()), ([9; 16], vec![(1, false), (2, true), (3, false)]));
+            // Cambiar de tipo y nombre en el sitio; solapar o pedir un puesto inexistente falla.
+            reemplazar(&mut d, 3, Some(&Particion { tipo: TIPO_NFFS, nombre: "NightFury", ..p(2, TIPO_NFFS) })).unwrap();
+            assert_eq!(reemplazar(&mut d, 3, Some(&Particion { inicio_lba: ini, ..p(2, TIPO_NFFS) })), Err(FsError::Invalid));
+            assert_eq!(reemplazar(&mut d, 9, None), Err(FsError::NotFound));
+            let (_, e) = leer_gpt(&mut d).unwrap();
+            assert_eq!((e[2].tipo, nombre(&e[2]), e[2].unica), (TIPO_NFFS, "NightFury".into(), [2; 16]));
+            for lba in [1, n - 1] {
+                assert!(gpt_raw(&mut d, lba).is_some());
+            }
         }
     }
 

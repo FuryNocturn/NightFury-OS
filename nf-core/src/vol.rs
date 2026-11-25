@@ -325,6 +325,8 @@ impl Volume for ReadOnly {
 pub mod exfat;
 pub mod ext;
 pub mod fat;
+#[cfg(any(test, feature = "imagenes"))]
+pub mod imagenes;
 pub mod instalar;
 pub mod iso;
 pub mod nfvol;

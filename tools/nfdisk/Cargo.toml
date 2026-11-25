@@ -8,4 +8,4 @@ repository.workspace = true
 description = "NightFury: herramienta de consola para leer y escribir imágenes de disco NFFS"
 
 [dependencies]
-nf-core = { path = "../../nf-core" }
+nf-core = { path = "../../nf-core", features = ["imagenes"] }

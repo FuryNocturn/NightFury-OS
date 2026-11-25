@@ -16,13 +16,13 @@ use std::io::{Read, Seek, SeekFrom, Write};
 type R<T> = Result<T, String>;
 
 /// Disco de sectores de 512 bytes sobre un archivo regular.
-struct Pendrive {
-    f: File,
-    sectors: u64,
+pub(crate) struct Pendrive {
+    pub(crate) f: File,
+    pub(crate) sectors: u64,
 }
 
 impl Pendrive {
-    fn abrir(path: &str) -> R<Pendrive> {
+    pub(crate) fn abrir(path: &str) -> R<Pendrive> {
         let f = OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("No se puede abrir «{path}»: {e}"))?;
         let m = f.metadata().map_err(|e| e.to_string())?;
         if !m.is_file() || m.len() == 0 || m.len() % 512 != 0 {
@@ -148,6 +148,18 @@ pub fn crear(args: &[&str], now: DateTime) -> R<()> {
 }
 
 /// Pendrive de arranque: imagen NUEVA de 66 MiB (ESP de 64 MiB + hueco para el GPT de respaldo).
+/// shortcut: azar = hora + pid (basta para GUID únicos entre imágenes, no para secretos); splitmix64.
+pub(crate) fn azar() -> impl FnMut() -> u64 {
+    let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ (std::process::id() as u64) << 32;
+    move || {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ z >> 30).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ z >> 27).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ z >> 31
+    }
+}
+
 pub fn pen_arranque(args: &[&str], now: DateTime) -> R<()> {
     let (img, efi, version) = match args {
         [img, efi] => (img, efi, env!("CARGO_PKG_VERSION")),
@@ -157,15 +169,7 @@ pub fn pen_arranque(args: &[&str], now: DateTime) -> R<()> {
     let efi = std::fs::read(efi).map_err(|e| format!("No se puede leer «{efi}»: {e}"))?;
     let f = OpenOptions::new().read(true).write(true).create_new(true).open(img).map_err(|e| format!("No se puede crear «{img}»: {e}"))?;
     f.set_len(66 << 20).map_err(|e| e.to_string())?;
-    // shortcut: azar = hora + pid (basta para GUID únicos entre imágenes, no para secretos); splitmix64.
-    let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ (std::process::id() as u64) << 32;
-    let mut azar = move || {
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = x;
-        z = (z ^ z >> 30).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ z >> 27).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ z >> 31
-    };
+    let mut azar = azar();
     let sectors = 66 << 11;
     let mut abrir = || Box::new(Pendrive { f: f.try_clone().expect("duplicar el manejador"), sectors }) as Box<dyn SectorDev>;
     let r = vol::instalar::crear_pendrive(&mut abrir, &efi, version, vol::instalar::ESP_PENDRIVE, now, &mut azar).map_err(fs_err);
