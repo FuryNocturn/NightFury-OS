@@ -18,6 +18,13 @@ pub struct Guid {
 pub const GOP_GUID: Guid =
     Guid { d1: 0x9042a9de, d2: 0x23dc, d3: 0x4a38, d4: [0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a] };
 
+/// EFI_LOADED_IMAGE_PROTOCOL: de ella sale el dispositivo desde el que se cargó esta imagen.
+pub const LOADED_IMAGE_GUID: Guid =
+    Guid { d1: 0x5b1b31a1, d2: 0x9562, d3: 0x11d2, d4: [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b] };
+
+pub const DEVICE_PATH_GUID: Guid =
+    Guid { d1: 0x09576e91, d2: 0x6d3f, d3: 0x11d2, d4: [0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b] };
+
 pub const ACPI20_GUID: Guid =
     Guid { d1: 0x8868e871, d2: 0xe4f1, d3: 0x11d3, d4: [0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81] };
 
@@ -61,7 +68,9 @@ pub struct BootServices {
     pub allocate_pages: extern "efiapi" fn(u32, u32, usize, *mut u64) -> Status,
     _free_pages: usize,
     pub get_memory_map: extern "efiapi" fn(*mut usize, *mut u8, *mut usize, *mut usize, *mut u32) -> Status,
-    _pool_events_protocols_images: [usize; 21],
+    _pool_y_eventos: [usize; 11],
+    pub handle_protocol: extern "efiapi" fn(*mut c_void, *const Guid, *mut *mut c_void) -> Status,
+    _protocolos_e_imagenes: [usize; 9],
     pub exit_boot_services: extern "efiapi" fn(*mut c_void, usize) -> Status,
     _monotonic_stall: [usize; 2],
     pub set_watchdog_timer: extern "efiapi" fn(usize, u64, usize, *const u16) -> Status,
@@ -72,9 +81,22 @@ pub struct BootServices {
 #[repr(C)]
 pub struct RuntimeServices {
     pub hdr: TableHeader,
-    _time_variables: [usize; 10],
+    /// GetTime, SetTime, GetWakeupTime, SetWakeupTime, SetVirtualAddressMap, ConvertPointer.
+    _tiempo_y_mapa: [usize; 6],
+    pub get_variable: extern "efiapi" fn(*const u16, *const Guid, *mut u32, *mut usize, *mut c_void) -> Status,
+    _get_next_variable_name: usize,
+    pub set_variable: extern "efiapi" fn(*const u16, *const Guid, u32, usize, *const c_void) -> Status,
+    _get_next_high_monotonic_count: usize,
     pub reset_system: extern "efiapi" fn(u32, usize, usize, *const c_void),
 }
+
+/// GUID de las variables globales de UEFI (BootOrder, Boot####).
+pub const GLOBAL_VARIABLE_GUID: Guid =
+    Guid { d1: 0x8be4df61, d2: 0x93ca, d3: 0x11d2, d4: [0xaa, 0x0d, 0x00, 0xe0, 0x98, 0x03, 0x2b, 0x8c] };
+/// NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS.
+pub const VAR_NV_BS_RT: u32 = 0x7;
+pub const EFI_NOT_FOUND: Status = 0x8000_0000_0000_000E;
+pub const EFI_BUFFER_TOO_SMALL: Status = 0x8000_0000_0000_0005;
 
 pub const RESET_COLD: u32 = 0;
 pub const RESET_SHUTDOWN: u32 = 2;

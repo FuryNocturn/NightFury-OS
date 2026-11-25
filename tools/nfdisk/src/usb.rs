@@ -3,6 +3,7 @@
 //! Imágenes de pendrive para probar el almacenamiento masivo USB de NightFury en QEMU:
 //!   nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>   crea y formatea una imagen con carpetas y archivos de prueba
 //!   nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   ídem, NightFury cifrada (imprime el código de recuperación)
+//!   nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]   imagen de 66 MiB de pendrive de arranque UEFI (se graba tal cual en un pendrive)
 //!   nfdisk usb-ver <imagen>                   lista lo que hay (y el CRC de cada archivo) tras usarla en QEMU;
 //!                                             las NightFury cifradas se abren con la variable NFDISK_CLAVE
 //! Solo crea archivos regulares nuevos (`usb`) y nunca escribe en dispositivos ni unidades.
@@ -146,6 +147,36 @@ pub fn crear(args: &[&str], now: DateTime) -> R<()> {
     Ok(())
 }
 
+/// Pendrive de arranque: imagen NUEVA de 66 MiB (ESP de 64 MiB + hueco para el GPT de respaldo).
+pub fn pen_arranque(args: &[&str], now: DateTime) -> R<()> {
+    let (img, efi, version) = match args {
+        [img, efi] => (img, efi, env!("CARGO_PKG_VERSION")),
+        [img, efi, v] => (img, efi, *v),
+        _ => return Err("Uso: nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]".into()),
+    };
+    let efi = std::fs::read(efi).map_err(|e| format!("No se puede leer «{efi}»: {e}"))?;
+    let f = OpenOptions::new().read(true).write(true).create_new(true).open(img).map_err(|e| format!("No se puede crear «{img}»: {e}"))?;
+    f.set_len(66 << 20).map_err(|e| e.to_string())?;
+    // shortcut: azar = hora + pid (basta para GUID únicos entre imágenes, no para secretos); splitmix64.
+    let mut x = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64) ^ (std::process::id() as u64) << 32;
+    let mut azar = move || {
+        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = x;
+        z = (z ^ z >> 30).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ z >> 27).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ z >> 31
+    };
+    let sectors = 66 << 11;
+    let mut abrir = || Box::new(Pendrive { f: f.try_clone().expect("duplicar el manejador"), sectors }) as Box<dyn SectorDev>;
+    let r = vol::instalar::crear_pendrive(&mut abrir, &efi, version, vol::instalar::ESP_PENDRIVE, now, &mut azar).map_err(fs_err);
+    if r.is_err() {
+        let _ = std::fs::remove_file(img);
+    }
+    r?;
+    println!("Imagen {img} creada (66 MiB, arranque UEFI). Grábala con un programa de imágenes (Rufus en modo DD, balenaEtcher…) o prueba: QEMU -drive format=raw,file={img}");
+    Ok(())
+}
+
 fn listar(m: &mut dyn vol::Volume, dir: &str, nivel: usize) -> R<()> {
     let mut es = m.list(dir).map_err(fs_err)?;
     es.sort_by(|a, b| a.name.cmp(&b.name));
@@ -191,6 +222,22 @@ mod tests {
             ver(&[&p]).unwrap();
             std::fs::remove_file(&p).unwrap();
         }
+    }
+    #[test]
+    fn pen_arranque_crea_y_no_pisa() {
+        let now = DateTime { year: 2026, month: 11, day: 25, hour: 12, minute: 0, second: 0 };
+        let dir = std::env::temp_dir();
+        let (img, efi) = (dir.join(format!("nfdisk-pen-{}.img", std::process::id())), dir.join(format!("nfdisk-pen-{}.efi", std::process::id())));
+        let (img, efi) = (img.to_string_lossy().into_owned(), efi.to_string_lossy().into_owned());
+        let _ = std::fs::remove_file(&img);
+        std::fs::write(&efi, patron(100_000)).unwrap();
+        pen_arranque(&[&img, &efi, "9.9"], now).unwrap();
+        assert!(pen_arranque(&[&img, &efi], now).is_err(), "no pisa una imagen");
+        let f = OpenOptions::new().read(true).write(true).open(&img).unwrap();
+        let mut abrir = || Box::new(Pendrive { f: f.try_clone().unwrap(), sectors: 66 << 11 }) as Box<dyn SectorDev>;
+        assert!(vol::instalar::es_pendrive(&mut abrir));
+        std::fs::remove_file(&img).unwrap();
+        std::fs::remove_file(&efi).unwrap();
     }
     #[test]
     fn crea_y_lee_nightfury_cifrado() {

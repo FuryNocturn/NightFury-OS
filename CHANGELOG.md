@@ -3,6 +3,17 @@
 Todas las versiones de NightFury OS, de la más nueva a la más antigua. Todas probadas en QEMU; en hardware
 real todavía no.
 
+## 0.12.6 · 2026-11-25 · Pendrive con instalador
+- Imagen de pendrive con un menú al arrancar: **Probar** (en memoria, sin tocar ningún disco), **Portátil**
+  (guarda cuentas y archivos en el propio pendrive) e **Instalar**.
+- Instalar en un disco interno SATA o NVMe: hay que escribir BORRAR; NightFury queda como único sistema de ese
+  disco, con su entrada en el menú de arranque del equipo y la elección de cifrado en el primer arranque.
+- El disco del sistema puede ser NVMe.
+- `nfdisk pen-arranque` crea la imagen del pendrive.
+- Cada versión se publica en GitHub con la imagen del pendrive, un zip para QEMU y sus SHA-256.
+- El repositorio se comprueba solo: compilación y tests en cada PR, búsqueda de secretos, plantillas de issues,
+  política de seguridad y guía para aportar.
+
 ## 0.12.5 · 2026-11-25 · Navegador, fase 2, y letra TrueType en todo el sistema
 - Formularios: `input`, `select`, `textarea`, `button` y `label`; envío GET y POST, con aviso si una contraseña va a viajar por http.
 - Cookies: en memoria, en disco solo para favoritos o sitios con «Recordar sesión»; las de terceros, bloqueadas; panel del candado para borrarlas.

@@ -3,6 +3,7 @@
 //! Tabla de llamadas entre las apps/escritorio y el núcleo. Las apps nunca tocan hardware:
 //! todo pasa por aquí, lo que permite añadir otros "subsistemas" más adelante.
 use crate::files::Files;
+use crate::fs::FsError;
 use crate::fsapi::FilesApi;
 use crate::keys::Pool;
 use crate::proc::{ProcInfo, Process};
@@ -27,6 +28,26 @@ pub struct MemInfo {
     /// Memoria reservada para el sistema (montón), en bytes.
     pub heap_total: u64,
     pub heap_used: u64,
+}
+
+/// Dónde está el pendrive del que arrancó el sistema (v0.12.6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PenEstado {
+    /// Todavía no ha aparecido (los USB tardan unos segundos).
+    Buscando,
+    /// No ha aparecido en el plazo.
+    NoEncontrado,
+    /// Encontrado. Con `portatil` ya tiene la partición del modo Portátil; si no, `hueco` son los bytes libres donde se crearía.
+    Listo { portatil: bool, hueco: u64 },
+}
+
+/// Un disco interno que se puede elegir para instalar NightFury (v0.12.6).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PenDisco {
+    pub modelo: String,
+    pub bytes: u64,
+    /// Lo que tiene, por partición: (formato, bytes). Vacío = disco sin particiones ni datos.
+    pub partes: Vec<(crate::vol::FsKind, u64)>,
 }
 
 pub trait Platform {
@@ -75,6 +96,30 @@ pub trait Platform {
     /// La red (v0.12), solo para las apps del sistema. `None` si el equipo no tiene pila de red.
     fn net(&mut self) -> Option<&mut dyn crate::net::NetApi> {
         None
+    }
+    /// Se arrancó desde un pendrive y aún no se ha elegido modo: el escritorio enseña antes de nada el menú de arranque.
+    fn pen_menu(&self) -> bool {
+        false
+    }
+    /// Estado del pendrive de arranque (para los modos Portátil e Instalar).
+    fn pen_estado(&mut self) -> PenEstado {
+        PenEstado::NoEncontrado
+    }
+    /// Modo Probar: C: en memoria, los discos del equipo y el pendrive de arranque solo se leen.
+    fn pen_probar(&mut self) {}
+    /// Modo Portátil: crea la partición si falta y C: pasa a ser ella. `Ok(true)` si es nueva (disco en blanco:
+    /// el asistente pregunta el cifrado y las cuentas); `Ok(false)` si ya existía.
+    fn pen_portatil(&mut self) -> Result<bool, FsError> {
+        Err(FsError::Invalid)
+    }
+    /// Discos internos (SATA y NVMe, nunca USB ni el pendrive de arranque) donde se puede instalar.
+    fn pen_discos(&mut self) -> Vec<PenDisco> {
+        Vec::new()
+    }
+    /// Instala NightFury en el disco `i` de `pen_discos`, BORRÁNDOLO entero. `Ok(true)` si además quedó creada
+    /// la entrada de arranque UEFI; `Ok(false)` si no (el equipo debe arrancarlo desde su menú de arranque).
+    fn pen_instalar(&mut self, _i: usize) -> Result<bool, FsError> {
+        Err(FsError::Invalid)
     }
 }
 

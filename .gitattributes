@@ -1,0 +1,27 @@
+# Los .rs nuevos van en LF. Los ficheros listados abajo ya estaban en CRLF o mezclados en el repo:
+# se marcan -text (sin conversión) para no reescribirlos; al tocarlos de verdad se pueden normalizar
+# y quitar de la lista.
+*.rs text eol=lf
+kernel/src/arch.rs -text
+kernel/src/user.rs -text
+nf-core/examples/apps_text_preview.rs -text
+nf-core/examples/apps_ui_preview.rs -text
+nf-core/examples/art_preview.rs -text
+nf-core/examples/explorer_preview.rs -text
+nf-core/examples/font_preview.rs -text
+nf-core/examples/login_preview.rs -text
+nf-core/src/fs.rs -text
+nf-core/src/glyphs.rs -text
+nf-core/src/login.rs -text
+nf-core/src/net/tests.rs -text
+nf-core/src/net/tests/http_tests.rs -text
+nf-core/src/platform.rs -text
+nf-core/src/theme.rs -text
+
+*.png binary
+*.img binary
+*.efi binary
+*.bmp binary
+*.ttf binary
+*.der binary
+*.bin binary

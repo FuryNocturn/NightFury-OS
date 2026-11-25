@@ -29,6 +29,7 @@ const AYUDA: &str = "nfdisk: imágenes de disco NightFury (NFFS). Cierra QEMU an
   nfdisk instalar <imagen> <carpeta de Windows con app.txt y programa.nfx> [--reemplazar]\n\
   nfdisk usb <imagen> <fat32|exfat|nightfury> <MiB>  | nfdisk usb <imagen> nightfury-cifrado <MiB> <contraseña>   (pendrive de prueba para QEMU: run.ps1 -Usb <imagen>)\n\
   nfdisk usb-ver <imagen>\n\
+  nfdisk pen-arranque <salida.img> <BOOTX64.EFI> [versión]   (pendrive de arranque UEFI de 66 MiB; el modo portátil se activa desde NightFury)\n\
   nfdisk ayuda\n\
 Carpetas de usuario cifradas: sin clave se ven tal como están en disco (nombres cifrados, «(carpeta cifrada)»). Con --usuario <nombre>\n\
 y la clave de esa cuenta en la variable NFDISK_CLAVE_USUARIO (o por teclado; nunca por argumento), «listar», «ver», «sacar», «meter»,\n\
@@ -449,6 +450,7 @@ fn run(args: &[String]) -> R<()> {
     match args.first().map(|s| s.as_str()) {
         Some("usb") => return usb::crear(&resto, now()),
         Some("usb-ver") => return usb::ver(&resto),
+        Some("pen-arranque") => return usb::pen_arranque(&resto, now()),
         _ => {}
     }
     run_with(args, &read_secret, &read_user_secret)

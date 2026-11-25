@@ -7,6 +7,8 @@ use crate::fs::FsError;
 use alloc::vec;
 use alloc::vec::Vec;
 
+pub mod gpt;
+
 pub(super) fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }

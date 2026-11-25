@@ -7,7 +7,7 @@
 **Un sistema operativo de escritorio hecho desde cero en Rust.**<br>
 Núcleo, ventanas, archivos, cifrado, USB, red y navegador propios. Sin dependencias de terceros.
 
-[![Versión](https://img.shields.io/badge/versi%C3%B3n-0.12.5-7c5cff)](CHANGELOG.md)
+[![Versión](https://img.shields.io/badge/versi%C3%B3n-0.12.6-7c5cff)](CHANGELOG.md)
 [![Licencia](https://img.shields.io/badge/licencia-GPL--3.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-no__std-orange?logo=rust)](https://www.rust-lang.org)
 [![Plataforma](https://img.shields.io/badge/UEFI-x86__64-555)](#probarlo)
@@ -26,13 +26,12 @@ NightFury OS es un sistema operativo x86_64 que arranca por UEFI y está escrito
 cuentas, cifrado de disco, USB, red, TLS y el Navegador. Se desarrolla en *sala limpia*: se parte de
 especificaciones públicas y nunca se copia código ajeno ([reglas y fuentes](docs/CLEANROOM.md)).
 
-## Novedades de la 0.12.5
+## Novedades de la 0.12.6
 
-- **Formularios** en el Navegador: GET y POST, con aviso si una contraseña va a viajar por http.
-- **Cookies** en memoria, en disco solo para favoritos o sitios con «Recordar sesión»; las de terceros, bloqueadas.
-- **Historial** de 90 días (Ctrl+H), **favoritos** con estrella, barra y carpetas (Ctrl+D, Ctrl+Mayús+O).
-- **Incógnito** (Ctrl+Mayús+N) y **descargas** que preguntan antes y van a Descargas (Ctrl+J).
-- **Letra TrueType suavizada** en todo el sistema; la de trazos sigue en Configuración → Personalización.
+- **Pendrive de arranque** con menú: **Probar** sin tocar nada, **Portátil** (guarda en el pendrive) o **Instalar**.
+- **Instalador**: elige un disco SATA o NVMe, escribe BORRAR y NightFury queda como único sistema de ese disco.
+- **Releases** en GitHub con la imagen del pendrive, un zip para QEMU y sus SHA-256.
+- Repositorio con CI, búsqueda de secretos, [política de seguridad](SECURITY.md) y [guía para aportar](CONTRIBUTING.md).
 
 Todas las versiones en el [historial de cambios](CHANGELOG.md).
 
@@ -59,15 +58,19 @@ Todas las versiones en el [historial de cambios](CHANGELOG.md).
 
 ## Probarlo
 
-Necesitas Rust con el destino `x86_64-unknown-uefi` y QEMU con el firmware edk2.
+**Sin compilar:** descarga de las [releases](https://github.com/FuryNocturn/NightFury-OS/releases) la imagen
+del pendrive (grábala con Rufus o balenaEtcher) o el zip para QEMU. Son versiones de prueba: **Instalar borra el
+disco que elijas** y hay que desactivar Secure Boot ([guía](docs/USB.md)).
+
+**Compilando:** necesitas Rust con el destino `x86_64-unknown-uefi` y QEMU con el firmware edk2.
 
 ```powershell
 rustup target add x86_64-unknown-uefi
 powershell -ExecutionPolicy Bypass -File run.ps1
 ```
 
-- Pruebas: `cargo test -p nf-core -p nf-web -p navegador`
-- Arrancar desde un pendrive y la herramienta `nfdisk`: [docs/USB.md](docs/USB.md)
+- Pruebas: `cargo test -p nf-core -p nf-app -p nf-web -p navegador`
+- Pendrive, instalador y la herramienta `nfdisk`: [docs/USB.md](docs/USB.md)
 
 Probado en QEMU; en hardware real todavía no.
 
@@ -80,7 +83,8 @@ Probado en QEMU; en hardware real todavía no.
 
 | Versión | Qué traerá |
 |---|---|
-| 0.12.6 | Gestor de contraseñas y datos, cifrado, que rellena formularios en el Navegador |
+| 0.12.7 | Instalar junto a Windows o Linux, y menú propio para elegir sistema al encender |
+| 0.12.8 | Gestor de contraseñas y datos, cifrado, que rellena formularios en el Navegador |
 | 0.13 | Visor de imágenes, BMP, GIF animado, ZIP y redibujo más rápido |
 | 0.14 | Varios núcleos de CPU, sonido y reproductor multimedia |
 | 0.15 | Wi-Fi e IPv6 |

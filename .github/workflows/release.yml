@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  construir:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Versión
+        shell: pwsh
+        env:
+          EVENTO: ${{ github.event_name }}
+          ETIQUETA: ${{ github.ref_name }}
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"' | Select-Object -First 1
+          if (-not $m) { throw 'No encuentro la versión en Cargo.toml' }
+          $ver = $m.Matches[0].Groups[1].Value
+          if ($env:EVENTO -eq 'push') {
+            if ($env:ETIQUETA -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "Etiqueta no válida: $env:ETIQUETA" }
+            if ($env:ETIQUETA.Substring(1) -ne $ver) { throw "La etiqueta $env:ETIQUETA no coincide con Cargo.toml ($ver)" }
+          }
+          "VER=$ver" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Rust estable con los destinos del sistema
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-uefi --target x86_64-unknown-none
+          rustup default stable
+          rustc -vV
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+      - name: Programas
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File tools/programas.ps1
+      - name: Núcleo (UEFI)
+        run: cargo build -p kernel --release --target x86_64-unknown-uefi
+      - name: nfdisk
+        run: cargo build -p nfdisk --release
+      - name: Ficheros de la versión
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist, dist\qemu | Out-Null
+          $efi = 'target\x86_64-unknown-uefi\release\nightfury.efi'
+          & target\release\nfdisk.exe pen-arranque "dist\nightfury-$env:VER-usb.img" $efi $env:VER
+          if ($LASTEXITCODE -ne 0) { throw 'nfdisk pen-arranque falló' }
+          Copy-Item $efi dist\qemu\BOOTX64.EFI
+          Copy-Item tools\arrancar.ps1, tools\LEEME-qemu.txt, LICENSE, NOTICE dist\qemu\
+          Compress-Archive -Path dist\qemu\* -DestinationPath "dist\nightfury-$env:VER-qemu.zip"
+          Remove-Item -Recurse dist\qemu
+          $lineas = foreach ($f in "nightfury-$env:VER-usb.img", "nightfury-$env:VER-qemu.zip") {
+            (Get-FileHash "dist\$f" -Algorithm SHA256).Hash.ToLower() + '  ' + $f
+          }
+          [IO.File]::WriteAllText("$PWD\dist\SHA256SUMS.txt", (($lineas -join "`n") + "`n"))
+      - name: Notas de la versión
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sec = @()
+          $dentro = $false
+          foreach ($l in Get-Content CHANGELOG.md -Encoding utf8) {
+            if ($l.StartsWith('## ')) {
+              if ($dentro) { break }
+              if ($l.StartsWith("## $env:VER ·")) { $dentro = $true }
+            }
+            if ($dentro) { $sec += $l }
+          }
+          if (-not $sec) { throw "CHANGELOG.md no tiene la sección '## $env:VER ·'" }
+          $aviso = @(
+            '⚠️ **Versión de prueba.** No está probada en un PC real. Instalar BORRA el disco que elijas. Desactiva Secure Boot para arrancarla.',
+            'Cómo usarla: graba el `.img` en un pendrive con Rufus o balenaEtcher (modo imagen DD), o prueba el `.zip` con QEMU (lee `LEEME-qemu.txt`).',
+            '',
+            '⚠️ **Test version.** It has not been tested on a real PC. Installing ERASES the disk you choose. Disable Secure Boot to boot it.',
+            'How to use: write the `.img` to a USB stick with Rufus or balenaEtcher (DD image mode), or try the `.zip` with QEMU (read `LEEME-qemu.txt`).',
+            ''
+          )
+          [IO.File]::WriteAllText("$PWD\dist\notas.md", (($aviso + $sec) -join "`n") + "`n", (New-Object Text.UTF8Encoding $false))
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist
+          retention-days: 7
+
+  publicar:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: construir
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: Crear la release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "Etiqueta no válida" >&2; exit 1; }
+          gh release create "$TAG" dist/*.img dist/*.zip dist/SHA256SUMS.txt --prerelease --title "NightFury OS ${TAG#v}" --notes-file dist/notas.md
