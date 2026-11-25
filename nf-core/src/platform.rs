@@ -49,6 +49,19 @@ pub struct PenDisco {
     pub bytes: u64,
     /// Lo que tiene, por partición: (formato, bytes). Vacío = disco sin particiones ni datos.
     pub partes: Vec<(crate::vol::FsKind, u64)>,
+    /// Bytes por sector (para dar tamaño a los sitios de `analisis`).
+    pub sector: u32,
+    /// Qué se puede hacer con el disco (v0.12.7): dónde instalar junto a lo que hay y si ya lleva NightFury.
+    pub analisis: crate::vol::instalar::Analisis,
+}
+
+/// Dónde instala `Platform::pen_instalar` (v0.12.7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Donde {
+    /// Todo el disco, borrándolo.
+    DiscoEntero,
+    /// El sitio `k` de `PenDisco::analisis.sitios`.
+    Sitio(usize),
 }
 
 pub trait Platform {
@@ -117,9 +130,14 @@ pub trait Platform {
     fn pen_discos(&mut self) -> Vec<PenDisco> {
         Vec::new()
     }
-    /// Instala NightFury en el disco `i` de `pen_discos`, BORRÁNDOLO entero. `Ok(true)` si además quedó creada
+    /// Instala NightFury en el disco `i` de `pen_discos`, en `donde`. `Ok(true)` si además quedó creada
     /// la entrada de arranque UEFI; `Ok(false)` si no (el equipo debe arrancarlo desde su menú de arranque).
-    fn pen_instalar(&mut self, _i: usize) -> Result<bool, FsError> {
+    fn pen_instalar(&mut self, _i: usize, _donde: Donde) -> Result<bool, FsError> {
+        Err(FsError::Invalid)
+    }
+    /// Quita NightFury del disco `i` de `pen_discos` (sus particiones y su entrada de arranque; lo demás no se toca).
+    /// `Ok(true)` si también se quitó la entrada UEFI; `Ok(false)` si el firmware no dejó (el disco ya está limpio).
+    fn pen_quitar(&mut self, _i: usize) -> Result<bool, FsError> {
         Err(FsError::Invalid)
     }
     /// Menú de arranque (v0.12.7): sus ajustes y entradas. `None` si no se arrancó desde él o no hay servicios de ejecución.

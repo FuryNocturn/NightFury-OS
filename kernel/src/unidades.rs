@@ -99,6 +99,28 @@ impl Interno {
         }
         ps.iter().map(|p| (p.kind, p.sectors.saturating_mul(ss as u64))).collect()
     }
+    /// Dónde se puede instalar NightFury junto a lo que hay (solo lee).
+    pub fn analizar(&self) -> instalar::Analisis {
+        instalar::analizar(&mut || Box::new(self.manejador(true)) as Box<dyn SectorDev>)
+    }
+    /// Bytes por sector.
+    pub fn sector(&self) -> u32 {
+        self.fis.borrow().sector_size() as u32
+    }
+    /// Instala NightFury en `sitio` (uno de `analizar`) sin tocar lo demás: ver `instalar::instalar_junto`.
+    pub fn instalar_junto(&self, sitio: &instalar::Sitio, efi: &[u8], arranque: &[u8], version: &str) -> Result<Esp, FsError> {
+        let mut abrir = || Box::new(self.manejador(false)) as Box<dyn SectorDev>;
+        let esp = instalar::instalar_junto(&mut abrir, sitio, efi, arranque, version, rtc::now(), &mut crate::entropia)?;
+        abrir().flush()?;
+        Ok(esp)
+    }
+    /// Quita la instalación de NightFury de este disco: ver `instalar::quitar`.
+    pub fn quitar(&self) -> Result<instalar::Quitado, FsError> {
+        let mut abrir = || Box::new(self.manejador(false)) as Box<dyn SectorDev>;
+        let q = instalar::quitar(&mut abrir)?;
+        abrir().flush()?;
+        Ok(q)
+    }
     /// Instala NightFury en TODO el disco con `efi` como cargador. `NoSpace` (sin escribir nada) si no llega a 1 GiB.
     /// `arranque` es el menú de arranque; vacío, el núcleo hace también de cargador.
     pub fn instalar(&self, efi: &[u8], arranque: &[u8], version: &str) -> Result<Esp, FsError> {

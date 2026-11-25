@@ -91,6 +91,49 @@ pub fn crear(rt: *mut RuntimeServices, esp: &Esp, ruta: &str) -> Result<(), &'st
     })
 }
 
+/// Quita la entrada `Boot####` «NightFury» de la ESP `esp` (la que lleva su GUID única en el nodo Hard Drive;
+/// una «NightFury» cuyo destino no se puede leer también) y la saca de `BootOrder` sin perder las demás.
+/// Una «NightFury» que apunta a otra ESP se deja: es de otra instalación. `Err` con el motivo si no la hay
+/// o el firmware no deja: el quitado del disco ya está hecho.
+pub fn quitar(rt: *mut RuntimeServices, esp: &Esp) -> Result<(), &'static str> {
+    if rt.is_null() {
+        return Err("el firmware no da servicios de ejecucion");
+    }
+    // La tabla la dejó el firmware y sigue ahí (ver `crear`).
+    let rt = unsafe { &*rt };
+    sin_interrupciones(|| {
+        let (mut por_guid, mut sin_destino) = (None, None);
+        let mut v = [0u8; MAX_VAR];
+        for n in 0..MAX_NUM {
+            if let (0, len) = leer(rt, &nombre(&format!("Boot{n:04X}")), &GLOBAL_VARIABLE_GUID, &mut v) {
+                let v = &v[..len.min(MAX_VAR)];
+                if es_nuestra(v) {
+                    match instalar::unica_de_opcion(v) {
+                        Some(g) if g == esp.unica => por_guid = por_guid.or(Some(n)),
+                        None => sin_destino = sin_destino.or(Some(n)),
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+        let n = por_guid.or(sin_destino).ok_or("no hay entrada de arranque de NightFury para esta instalacion")?;
+        if escribir(rt, &nombre(&format!("Boot{n:04X}")), &GLOBAL_VARIABLE_GUID, &[]) != 0 {
+            return Err("el firmware no deja borrar la entrada de arranque");
+        }
+        let mut buf = [0u8; MAX_ORDEN];
+        match leer(rt, &nombre("BootOrder"), &GLOBAL_VARIABLE_GUID, &mut buf) {
+            (0, len) if len <= MAX_ORDEN => {
+                if escribir(rt, &nombre("BootOrder"), &GLOBAL_VARIABLE_GUID, &instalar::orden_sin(&buf[..len], n)) != 0 {
+                    return Err("no se pudo quitar la entrada de BootOrder");
+                }
+            }
+            (EFI_NOT_FOUND, _) => {}
+            _ => return Err("no se puede leer BootOrder"),
+        }
+        Ok(())
+    })
+}
+
 // ---------- Menú de arranque (v0.12.7): lo que lee y cambia Configuración ----------
 
 const GUID_NF: Guid = Guid { d1: arranque::GUID_NF.0, d2: arranque::GUID_NF.1, d3: arranque::GUID_NF.2, d4: arranque::GUID_NF.3 };

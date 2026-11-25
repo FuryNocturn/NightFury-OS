@@ -584,6 +584,30 @@ pub fn orden_con(actual: &[u8], n: u16) -> Vec<u8> {
     o
 }
 
+/// Nuevo valor de `BootOrder` sin la entrada `n`; las demás como estaban.
+pub fn orden_sin(actual: &[u8], n: u16) -> Vec<u8> {
+    actual.chunks_exact(2).filter(|c| *c != n.to_le_bytes()).flatten().copied().collect()
+}
+
+/// GUID única de la partición del primer nodo Hard Drive de una variable `Boot####` (la firma, si es GPT).
+/// `None` si no tiene ese nodo o está mal formada.
+pub fn unica_de_opcion(v: &[u8]) -> Option<[u8; 16]> {
+    let lista = u16::from_le_bytes([*v.get(4)?, *v.get(5)?]) as usize;
+    let desc = v.get(6..)?.chunks_exact(2).position(|c| c == [0, 0])? * 2 + 8;
+    let mut nodos = v.get(desc..desc.checked_add(lista)?)?;
+    while nodos.len() >= 4 {
+        let n = u16::from_le_bytes([nodos[2], nodos[3]]) as usize;
+        if n < 4 || n > nodos.len() {
+            return None;
+        }
+        if nodos[..2] == [4, 1] && n >= 42 && nodos[41] == 2 {
+            return nodos[24..40].try_into().ok();
+        }
+        nodos = &nodos[n..];
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,6 +792,19 @@ mod tests {
         assert_eq!(n, 4 + 2 * ("\\EFI\\NightFury\\nightfury.efi".len() + 1));
         assert_eq!(&fp[n..], &[0x7F, 0xFF, 4, 0]);
         assert_eq!(&fp[n - 2..n], &[0, 0]);
+    }
+
+    #[test]
+    fn quitar_la_entrada_uefi() {
+        let esp = Esp { unica: [0xAB; 16], inicio_lba: 2048, sectores: 524_288, numero: 3 };
+        let o = opcion_arranque(&esp, "\\EFI\\NightFury\\arranque.efi");
+        assert_eq!(unica_de_opcion(&o), Some([0xAB; 16]));
+        assert_eq!(unica_de_opcion(&o[..o.len() - 6]), None, "recortada");
+        assert_eq!(unica_de_opcion(&[1, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(unica_de_opcion(&[]), None);
+        assert_eq!(orden_sin(&[3, 0, 5, 0, 1, 0], 5), [3, 0, 1, 0]);
+        assert_eq!(orden_sin(&[5, 0], 5), []);
+        assert_eq!(orden_sin(&[3, 0, 7], 1), [3, 0]);
     }
 
     #[test]

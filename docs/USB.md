@@ -64,7 +64,9 @@ El «Windows» de prueba es un EFI mínimo que solo escribe un mensaje.
   -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0 `
   -drive if=none,id=pen,format=raw,file=pen.img -device usb-storage,bus=xhci.0,drive=pen,bootindex=0 -vga std
 ```
-Para probar Instalar, añade un disco: `-drive file=nvme.img,if=none,id=nv,format=raw -device nvme,serial=nf1,drive=nv`.
+Para probar Instalar, añade un disco con `bootindex=1` (sin él, el firmware de QEMU borra la entrada «NightFury» al
+arrancar desde el pendrive) y una copia de las variables UEFI (`edk2-i386-vars.fd`) como segundo `pflash`, para que
+la entrada de arranque se conserve: `-drive file=nvme.img,if=none,id=nv,format=raw -device nvme,serial=nf1,drive=nv,bootindex=1`.
 
 ### Máquina virtual descargada
 El `nightfury-<versión>-qemu.zip` de cada release trae `BOOTX64.EFI` y `arrancar.ps1`: descomprímelo y ejecuta
